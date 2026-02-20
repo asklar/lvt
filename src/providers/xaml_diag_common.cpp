@@ -55,8 +55,10 @@ static void collect_bridges(Element& el, std::vector<Element*>& bridges) {
     }
 }
 
-// Recursively graft JSON tree nodes into an Element tree
-static void graft_json_node(const json& j, Element& parent, const std::string& framework) {
+// Recursively graft JSON tree nodes into an Element tree.
+// parentOffsetX/Y accumulate offsets from the XAML root for screen coordinate computation.
+static void graft_json_node(const json& j, Element& parent, const std::string& framework,
+                            double parentOffsetX = 0, double parentOffsetY = 0) {
     Element el;
     el.framework = framework;
     el.className = sanitize(j.value("type", ""));
@@ -66,9 +68,23 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     auto lastDot = el.className.rfind('.');
     el.type = (lastDot != std::string::npos) ? el.className.substr(lastDot + 1) : el.className;
 
+    // Parse bounds from TAP DLL data
+    double ox = j.value("offsetX", 0.0);
+    double oy = j.value("offsetY", 0.0);
+    double w = j.value("width", 0.0);
+    double h = j.value("height", 0.0);
+    double absX = parentOffsetX + ox;
+    double absY = parentOffsetY + oy;
+    if (w > 0 && h > 0) {
+        el.bounds.x = static_cast<int>(absX);
+        el.bounds.y = static_cast<int>(absY);
+        el.bounds.width = static_cast<int>(w);
+        el.bounds.height = static_cast<int>(h);
+    }
+
     if (j.contains("children") && j["children"].is_array()) {
         for (auto& child : j["children"]) {
-            graft_json_node(child, el, framework);
+            graft_json_node(child, el, framework, absX, absY);
         }
     }
 
@@ -214,6 +230,8 @@ bool inject_and_collect_xaml_tree(
     // Graft XAML elements into corresponding bridge windows.
     // Each DesktopWindowXamlSource root maps 1:1 to a DesktopChildSiteBridge HWND.
     // We match them by order since both lists are enumerated in the same order.
+    // XAML element offsets are relative to the XAML root; we add the bridge window's
+    // screen position to convert to screen coordinates for annotation.
     if (treeJson.is_array()) {
         std::vector<Element*> bridges;
         collect_bridges(root, bridges);
@@ -224,7 +242,11 @@ bool inject_and_collect_xaml_tree(
             // Try to graft DesktopWindowXamlSource roots into matching bridges
             if (typeName.find("DesktopWindowXamlSource") != std::string::npos
                 && bridgeIdx < bridges.size()) {
-                graft_json_node(node, *bridges[bridgeIdx], frameworkLabel);
+                auto* bridge = bridges[bridgeIdx];
+                // Use bridge window's screen bounds as coordinate origin for XAML elements
+                double baseX = bridge->bounds.x;
+                double baseY = bridge->bounds.y;
+                graft_json_node(node, *bridge, frameworkLabel, baseX, baseY);
                 bridgeIdx++;
             } else {
                 // Non-bridge XAML root: graft at the top level

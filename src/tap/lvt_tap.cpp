@@ -57,16 +57,29 @@ struct TreeNode {
     unsigned int childIndex = 0;
     std::vector<InstanceHandle> childHandles;
     std::vector<std::pair<std::wstring, std::wstring>> properties; // name, value
+    double width = 0, height = 0;
+    double offsetX = 0, offsetY = 0;
+    bool hasBounds = false;
 };
+
+class LvtTap;
+
+// Forward declaration for WndProc
+static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     LONG m_refCount = 1;
     IUnknown* m_site = nullptr;
-    IVisualTreeService* m_vts = nullptr;
+    IXamlDiagnostics* m_diag = nullptr;
+    HWND m_msgWnd = nullptr; // Message-only window for UI thread dispatch
     std::map<InstanceHandle, TreeNode> m_nodes;
     std::vector<InstanceHandle> m_roots;
     std::wstring m_pipeName;
     bool m_collectProps = false;
+
+public:
+    IVisualTreeService* m_vts = nullptr;
+    static constexpr UINT WM_COLLECT_BOUNDS = WM_USER + 100;
 
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -145,10 +158,26 @@ public:
         }
 
         hr = diag->QueryInterface(__uuidof(IVisualTreeService), (void**)&m_vts);
-        diag->Release();
         if (FAILED(hr) || !m_vts) {
             LogMsg("QI for IVisualTreeService failed: 0x%08X", hr);
+            diag->Release();
             return S_OK;
+        }
+
+        m_diag = diag; // Keep reference for GetIInspectableFromHandle
+
+        // Create a message-only window on the UI thread for dispatching
+        // GetPropertyValuesChain calls (which have thread affinity).
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = LvtTapMsgWndProc;
+        wc.hInstance = GetCurrentModuleHandle();
+        wc.lpszClassName = L"LvtTapMsg";
+        RegisterClassW(&wc);
+        m_msgWnd = CreateWindowExW(0, L"LvtTapMsg", nullptr, 0,
+            0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+        if (m_msgWnd) {
+            SetWindowLongPtrW(m_msgWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+            LogMsg("Created message window %p on thread %lu", m_msgWnd, GetCurrentThreadId());
         }
 
         // AdviseVisualTreeChange hangs if called on the SetSite thread.
@@ -179,12 +208,16 @@ public:
                    hr, self->m_nodes.size(), self->m_roots.size());
 
             if (SUCCEEDED(hr)) {
-                // AdviseVisualTreeChange replays the current tree synchronously
-                // during the call, then continues firing for mutations.
-                // If no nodes yet, wait briefly for async delivery.
                 if (self->m_nodes.empty()) {
                     Sleep(500);
                     LogMsg("After sleep: nodes=%zu", self->m_nodes.size());
+                }
+                // Dispatch GetPropertyValuesChain to UI thread via message window.
+                // SendMessage blocks until the UI thread processes the message.
+                if (self->m_msgWnd) {
+                    LogMsg("Dispatching CollectBounds to UI thread via SendMessage");
+                    SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS, 0,
+                                 reinterpret_cast<LPARAM>(self));
                 }
                 self->SerializeAndSend();
                 self->m_vts->UnadviseVisualTreeChange(cb);
@@ -192,6 +225,7 @@ public:
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             LogMsg("AdviseThread crashed: 0x%08X", GetExceptionCode());
         }
+
         self->Release();
         return 0;
     }
@@ -237,6 +271,95 @@ public:
     }
 
 private:
+    // Parse "x,y,z" or "<x, y, z>" formatted offset string
+    static bool ParseOffset(const std::wstring& val, double& x, double& y) {
+        // Try "x,y,z" or "<x, y, z>" format
+        const wchar_t* p = val.c_str();
+        while (*p && (*p == L'<' || *p == L' ')) p++;
+        wchar_t* end = nullptr;
+        x = wcstod(p, &end);
+        if (end == p) return false;
+        p = end;
+        while (*p && (*p == L',' || *p == L' ')) p++;
+        y = wcstod(p, &end);
+        return end != p;
+    }
+
+    // Collect bounds for a single node — isolated for SEH compatibility
+    static void CollectBoundsForNode(IVisualTreeService* vts, TreeNode& node, InstanceHandle handle,
+                                     bool /*logDetail*/) {
+        unsigned int srcCount = 0, propCount = 0;
+        PropertyChainSource* sources = nullptr;
+        PropertyChainValue* props = nullptr;
+        HRESULT hr = vts->GetPropertyValuesChain(
+            handle, &srcCount, &sources, &propCount, &props);
+        if (FAILED(hr)) {
+            return;
+        }
+        bool hasWidth = false, hasHeight = false;
+        for (unsigned int i = 0; i < propCount; i++) {
+            std::wstring name = props[i].PropertyName ? props[i].PropertyName : L"";
+            std::wstring value = props[i].Value ? props[i].Value : L"";
+            if (name == L"ActualWidth" && !value.empty()) {
+                node.width = _wtof(value.c_str());
+                hasWidth = true;
+            } else if (name == L"ActualHeight" && !value.empty()) {
+                node.height = _wtof(value.c_str());
+                hasHeight = true;
+            } else if (name == L"ActualOffset" && !value.empty()) {
+                ParseOffset(value, node.offsetX, node.offsetY);
+            }
+            if (props[i].Type) SysFreeString(props[i].Type);
+            if (props[i].DeclaringType) SysFreeString(props[i].DeclaringType);
+            if (props[i].ValueType) SysFreeString(props[i].ValueType);
+            if (props[i].PropertyName) SysFreeString(props[i].PropertyName);
+            if (props[i].Value) SysFreeString(props[i].Value);
+        }
+        for (unsigned int i = 0; i < srcCount; i++) {
+            if (sources[i].TargetType) SysFreeString(sources[i].TargetType);
+            if (sources[i].Name) SysFreeString(sources[i].Name);
+        }
+        if (props) CoTaskMemFree(props);
+        if (sources) CoTaskMemFree(sources);
+        node.hasBounds = hasWidth && hasHeight;
+    }
+
+    // SEH wrapper for single-node bounds collection (cannot use __try with C++ objects)
+    static int CollectBoundsForNodeSEH(IVisualTreeService* vts, TreeNode& node, InstanceHandle handle,
+                                       bool logDetail) {
+        __try {
+            CollectBoundsForNode(vts, node, handle, logDetail);
+            return 0;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            return GetExceptionCode();
+        }
+    }
+
+    void CollectBounds(IVisualTreeService* vts) {
+        LogMsg("CollectBounds: collecting layout for %zu nodes on thread %lu",
+               m_nodes.size(), GetCurrentThreadId());
+        int collected = 0;
+        int idx = 0;
+        for (auto& [handle, node] : m_nodes) {
+            bool logDetail = (idx < 3); // Log details for first 3 nodes
+            int code = CollectBoundsForNodeSEH(vts, node, handle, logDetail);
+            if (code != 0) {
+                LogMsg("GetPropertyValuesChain crashed for handle %llu: 0x%08X",
+                       (unsigned long long)handle, code);
+            }
+            if (node.hasBounds) collected++;
+            idx++;
+        }
+        LogMsg("CollectBounds: collected bounds for %d/%zu nodes", collected, m_nodes.size());
+    }
+
+    // Called on the UI thread via SendMessage from the worker thread
+public:
+    void CollectBoundsOnUIThread() {
+        CollectBounds(m_vts);
+    }
+private:
+
     static std::wstring Escape(const std::wstring& s) {
         std::wstring r;
         r.reserve(s.size());
@@ -263,6 +386,15 @@ private:
         if (!n.name.empty())
             j += L",\"name\":\"" + Escape(n.name) + L"\"";
         j += L",\"handle\":" + std::to_wstring(n.handle);
+
+        if (n.hasBounds) {
+            // Use snprintf for consistent decimal formatting
+            char buf[128];
+            snprintf(buf, sizeof(buf), ",\"width\":%.1f,\"height\":%.1f,\"offsetX\":%.1f,\"offsetY\":%.1f",
+                     n.width, n.height, n.offsetX, n.offsetY);
+            // Convert to wide string
+            for (const char* p = buf; *p; p++) j += static_cast<wchar_t>(*p);
+        }
 
         if (!n.childHandles.empty()) {
             j += L",\"children\":[";
@@ -309,10 +441,24 @@ private:
     }
 
     ~LvtTap() {
+        if (m_msgWnd) DestroyWindow(m_msgWnd);
         if (m_vts) m_vts->Release();
+        if (m_diag) m_diag->Release();
         if (m_site) m_site->Release();
     }
 };
+
+// Window procedure for dispatching GetPropertyValuesChain to UI thread
+static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == LvtTap::WM_COLLECT_BOUNDS) {
+        auto* self = reinterpret_cast<LvtTap*>(lParam);
+        if (self) {
+            self->CollectBoundsOnUIThread();
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
 
 // COM class factory
 class LvtTapFactory : public IClassFactory {
