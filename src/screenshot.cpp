@@ -245,6 +245,12 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
     // Copy annotated pixels back
     memcpy(pixels, dibBits, bmpWidth * bmpHeight * 4);
 
+    // GDI drawing doesn't set the alpha channel — force all pixels to fully opaque
+    // so annotations don't appear as black/transparent in the PNG output.
+    for (int i = 3; i < bmpWidth * bmpHeight * 4; i += 4) {
+        pixels[i] = 255;
+    }
+
     DeleteObject(hBitmap);
     DeleteDC(memDC);
 }
