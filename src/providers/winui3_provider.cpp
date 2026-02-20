@@ -67,7 +67,8 @@ void WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid) {
         initDll = L"Windows.UI.Xaml.dll";
     }
 
-    inject_and_collect_xaml_tree(root, hwnd, pid, L"", initDll, "winui3");
+    inject_and_collect_xaml_tree(root, hwnd, pid, L"", initDll, "winui3",
+                               L"WinUIVisualDiagConnection");
 }
 
 } // namespace lvt

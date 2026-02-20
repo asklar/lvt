@@ -5,6 +5,18 @@
 
 namespace lvt {
 
+// Timeout in ms for cross-process SendMessage calls
+static constexpr UINT kSendMsgTimeout = 1000;
+
+// Safe cross-process SendMessage with timeout to avoid hanging on unresponsive windows
+static LRESULT SafeSendMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    DWORD_PTR result = 0;
+    LRESULT lr = SendMessageTimeoutW(hwnd, msg, wParam, lParam,
+        SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, kSendMsgTimeout, &result);
+    if (lr == 0) return 0; // timeout or error
+    return static_cast<LRESULT>(result);
+}
+
 static std::string wstr_to_str(const wchar_t* ws, int len = -1) {
     if (!ws || (len == 0)) return {};
     if (len < 0) len = static_cast<int>(wcslen(ws));
@@ -78,10 +90,10 @@ void ComCtlProvider::enrich_listview(Element& el, HWND hwnd) {
     el.framework = "comctl";
 
     // These messages don't use pointers — safe cross-process
-    int count = ListView_GetItemCount(hwnd);
+    int count = static_cast<int>(SafeSendMessage(hwnd, LVM_GETITEMCOUNT, 0, 0));
     el.properties["itemCount"] = std::to_string(count);
 
-    DWORD viewMode = ListView_GetView(hwnd);
+    DWORD viewMode = static_cast<DWORD>(SafeSendMessage(hwnd, LVM_GETVIEW, 0, 0));
     switch (viewMode) {
     case LV_VIEW_ICON:      el.properties["viewMode"] = "icon"; break;
     case LV_VIEW_DETAILS:   el.properties["viewMode"] = "details"; break;
@@ -90,9 +102,9 @@ void ComCtlProvider::enrich_listview(Element& el, HWND hwnd) {
     case LV_VIEW_TILE:      el.properties["viewMode"] = "tile"; break;
     }
 
-    HWND header = ListView_GetHeader(hwnd);
+    HWND header = reinterpret_cast<HWND>(SafeSendMessage(hwnd, LVM_GETHEADER, 0, 0));
     if (header) {
-        int colCount = Header_GetItemCount(header);
+        int colCount = static_cast<int>(SafeSendMessage(header, HDM_GETITEMCOUNT, 0, 0));
         el.properties["columnCount"] = std::to_string(colCount);
     }
 
@@ -124,7 +136,7 @@ void ComCtlProvider::enrich_listview(Element& el, HWND hwnd) {
         lvi.cchTextMax = kTextBufSize;
 
         if (remote.write(&lvi, sizeof(lvi))) {
-            SendMessageW(hwnd, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(remoteItem));
+            SafeSendMessage(hwnd, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(remoteItem));
 
             LVITEMW result{};
             remote.read(&result, sizeof(result));
@@ -147,11 +159,12 @@ void ComCtlProvider::enrich_treeview(Element& el, HWND hwnd) {
     el.type = "TreeView";
     el.framework = "comctl";
 
-    int count = TreeView_GetCount(hwnd);
+    int count = static_cast<int>(SafeSendMessage(hwnd, TVM_GETCOUNT, 0, 0));
     el.properties["itemCount"] = std::to_string(count);
 
     // TVM_GETNEXTITEM/TVM_GETROOT don't use pointers — safe
-    HTREEITEM hItem = TreeView_GetRoot(hwnd);
+    HTREEITEM hItem = reinterpret_cast<HTREEITEM>(
+        SafeSendMessage(hwnd, TVM_GETNEXTITEM, TVGN_ROOT, 0));
 
     auto proc = open_hwnd_process(hwnd);
     if (!proc || !hItem) return;
@@ -179,7 +192,7 @@ void ComCtlProvider::enrich_treeview(Element& el, HWND hwnd) {
         tvi.cchTextMax = kTextBufSize;
 
         if (remote.write(&tvi, sizeof(tvi))) {
-            SendMessageW(hwnd, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(remoteItem));
+            SafeSendMessage(hwnd, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(remoteItem));
 
             TVITEMW result{};
             remote.read(&result, sizeof(result));
@@ -196,7 +209,9 @@ void ComCtlProvider::enrich_treeview(Element& el, HWND hwnd) {
         }
 
         el.children.push_back(std::move(item));
-        hItem = TreeView_GetNextSibling(hwnd, hItem);
+        hItem = reinterpret_cast<HTREEITEM>(
+            SafeSendMessage(hwnd, TVM_GETNEXTITEM, TVGN_NEXT,
+                            reinterpret_cast<LPARAM>(hItem)));
         added++;
     }
 }
@@ -205,7 +220,7 @@ void ComCtlProvider::enrich_toolbar(Element& el, HWND hwnd) {
     el.type = "Toolbar";
     el.framework = "comctl";
 
-    int count = static_cast<int>(SendMessageW(hwnd, TB_BUTTONCOUNT, 0, 0));
+    int count = static_cast<int>(SafeSendMessage(hwnd, TB_BUTTONCOUNT, 0, 0));
     el.properties["buttonCount"] = std::to_string(count);
 
     auto proc = open_hwnd_process(hwnd);
@@ -220,7 +235,7 @@ void ComCtlProvider::enrich_toolbar(Element& el, HWND hwnd) {
     if (!remoteTextBuf) return;
 
     for (int i = 0; i < count && i < 50; i++) {
-        SendMessageW(hwnd, TB_GETBUTTON, i, reinterpret_cast<LPARAM>(remoteBtnBuf.ptr));
+        SafeSendMessage(hwnd, TB_GETBUTTON, i, reinterpret_cast<LPARAM>(remoteBtnBuf.ptr));
 
         TBBUTTON btn{};
         remoteBtnBuf.read(&btn, sizeof(btn));
@@ -234,7 +249,7 @@ void ComCtlProvider::enrich_toolbar(Element& el, HWND hwnd) {
         if (btn.fsStyle & BTNS_SEP) {
             item.type = "ToolbarSeparator";
         } else {
-            SendMessageW(hwnd, TB_GETBUTTONTEXTW, btn.idCommand,
+            SafeSendMessage(hwnd, TB_GETBUTTONTEXTW, btn.idCommand,
                          reinterpret_cast<LPARAM>(remoteTextBuf.ptr));
             wchar_t textBuf[kTextBufSize]{};
             remoteTextBuf.read(textBuf, sizeof(textBuf));
@@ -254,7 +269,7 @@ void ComCtlProvider::enrich_statusbar(Element& el, HWND hwnd) {
     el.type = "StatusBar";
     el.framework = "comctl";
 
-    int parts = static_cast<int>(SendMessageW(hwnd, SB_GETPARTS, 0, 0));
+    int parts = static_cast<int>(SafeSendMessage(hwnd, SB_GETPARTS, 0, 0));
     el.properties["partCount"] = std::to_string(parts);
 
     auto proc = open_hwnd_process(hwnd);
@@ -271,7 +286,7 @@ void ComCtlProvider::enrich_statusbar(Element& el, HWND hwnd) {
         item.properties["index"] = std::to_string(i);
 
         // SB_GETTEXTW with a remote buffer
-        SendMessageW(hwnd, SB_GETTEXTW, i, reinterpret_cast<LPARAM>(remoteTextBuf.ptr));
+        SafeSendMessage(hwnd, SB_GETTEXTW, i, reinterpret_cast<LPARAM>(remoteTextBuf.ptr));
         wchar_t textBuf[kTextBufSize]{};
         remoteTextBuf.read(textBuf, sizeof(textBuf));
         item.text = wstr_to_str(textBuf);
@@ -284,8 +299,8 @@ void ComCtlProvider::enrich_tabcontrol(Element& el, HWND hwnd) {
     el.type = "TabControl";
     el.framework = "comctl";
 
-    int count = TabCtrl_GetItemCount(hwnd);
-    int selected = TabCtrl_GetCurSel(hwnd);
+    int count = static_cast<int>(SafeSendMessage(hwnd, TCM_GETITEMCOUNT, 0, 0));
+    int selected = static_cast<int>(SafeSendMessage(hwnd, TCM_GETCURSEL, 0, 0));
     el.properties["tabCount"] = std::to_string(count);
     el.properties["selectedIndex"] = std::to_string(selected);
 
@@ -315,7 +330,7 @@ void ComCtlProvider::enrich_tabcontrol(Element& el, HWND hwnd) {
         tci.cchTextMax = kTextBufSize;
 
         if (remote.write(&tci, sizeof(tci))) {
-            SendMessageW(hwnd, TCM_GETITEMW, i, reinterpret_cast<LPARAM>(remoteItem));
+            SafeSendMessage(hwnd, TCM_GETITEMW, i, reinterpret_cast<LPARAM>(remoteItem));
 
             wchar_t textBuf[kTextBufSize]{};
             remote.read(textBuf, sizeof(textBuf));

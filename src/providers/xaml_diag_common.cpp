@@ -97,7 +97,8 @@ bool inject_and_collect_xaml_tree(
     DWORD pid,
     const std::wstring& xamlDiagDll,
     const std::wstring& initDllPath,
-    const std::string& frameworkLabel)
+    const std::string& frameworkLabel,
+    const std::wstring& connPrefix)
 {
     std::wstring tapDll = get_exe_dir() + L"\\lvt_tap.dll";
 
@@ -109,7 +110,7 @@ bool inject_and_collect_xaml_tree(
     std::wstring pipeName = make_pipe_name();
     HANDLE pipe = CreateNamedPipeW(
         pipeName.c_str(),
-        PIPE_ACCESS_INBOUND,
+        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
         1, 0, 1024 * 1024, 10000, nullptr);
 
@@ -141,30 +142,20 @@ bool inject_and_collect_xaml_tree(
         return false;
     }
 
-    // Try both endpoint name prefixes.
-    // System XAML: "VisualDiagConnection1", "VisualDiagConnection2", ...
-    // WinUI3: "WinUIVisualDiagConnection1", "WinUIVisualDiagConnection2", ...
-    static const wchar_t* prefixes[] = {
-        L"VisualDiagConnection",
-        L"WinUIVisualDiagConnection",
-    };
+    // Try connection endpoint names: prefix + "1", prefix + "2", ...
     HRESULT hr = E_FAIL;
-    for (auto* prefix : prefixes) {
-        for (int i = 0; i < 100; i++) {
-            wchar_t endPoint[64];
-            swprintf_s(endPoint, L"%s%d", prefix, i + 1);
+    for (int i = 0; i < 10; i++) {
+        wchar_t endPoint[64];
+        swprintf_s(endPoint, L"%s%d", connPrefix.c_str(), i + 1);
 
-            hr = pInit(
-                endPoint,
-                pid,
-                xamlDiagDll.c_str(),
-                tapDll.c_str(),
-                CLSID_LvtTap,
-                pipeName.c_str());
+        hr = pInit(
+            endPoint,
+            pid,
+            xamlDiagDll.c_str(),
+            tapDll.c_str(),
+            CLSID_LvtTap,
+            pipeName.c_str());
 
-            if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
-                break;
-        }
         if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
             break;
     }
@@ -203,13 +194,33 @@ bool inject_and_collect_xaml_tree(
     }
     CloseHandle(ov.hEvent);
 
-    // Read all data from pipe
+    // Read all data from pipe (overlapped with timeout)
     std::string data;
     char buf[4096];
     DWORD bytesRead = 0;
-    while (ReadFile(pipe, buf, sizeof(buf), &bytesRead, nullptr) && bytesRead > 0) {
+    OVERLAPPED readOv = {};
+    readOv.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    for (;;) {
+        ResetEvent(readOv.hEvent);
+        BOOL ok = ReadFile(pipe, buf, sizeof(buf), &bytesRead, &readOv);
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                if (WaitForSingleObject(readOv.hEvent, 15000) != WAIT_OBJECT_0) {
+                    CancelIo(pipe);
+                    break;
+                }
+                if (!GetOverlappedResult(pipe, &readOv, &bytesRead, FALSE) || bytesRead == 0)
+                    break;
+            } else {
+                break;
+            }
+        } else if (bytesRead == 0) {
+            break;
+        }
         data.append(buf, bytesRead);
     }
+    CloseHandle(readOv.hEvent);
     CloseHandle(pipe);
 
     fprintf(stderr, "lvt: received %zu bytes of XAML tree data\n", data.size());

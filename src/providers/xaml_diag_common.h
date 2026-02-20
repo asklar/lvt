@@ -10,7 +10,8 @@ namespace lvt {
 // `xamlDiagDll` is passed as wszDllXamlDiagnostics to the init function.
 // `initDllPath` is the DLL to load InitializeXamlDiagnosticsEx from
 //   (e.g. L"Windows.UI.Xaml.dll" or full path to FrameworkUdk.dll).
-// `frameworkLabel` is the framework name to tag elements with (e.g. "xaml" or "winui3").
+// `connPrefix` is the connection endpoint name prefix to use
+//   (e.g. L"VisualDiagConnection" for system XAML, L"WinUIVisualDiagConnection" for WinUI3).
 // Returns true if the tree was successfully enriched.
 bool inject_and_collect_xaml_tree(
     Element& root,
@@ -18,6 +19,7 @@ bool inject_and_collect_xaml_tree(
     DWORD pid,
     const std::wstring& xamlDiagDll,
     const std::wstring& initDllPath,
-    const std::string& frameworkLabel);
+    const std::string& frameworkLabel,
+    const std::wstring& connPrefix = L"VisualDiagConnection");
 
 } // namespace lvt
