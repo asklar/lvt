@@ -12,6 +12,8 @@
       "binaryDir": "${sourceDir}/build",
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl.exe",
+        "CMAKE_CXX_COMPILER": "cl.exe",
         "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
     },
@@ -26,6 +28,8 @@
       "binaryDir": "${sourceDir}/build-arm64",
       "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl.exe",
+        "CMAKE_CXX_COMPILER": "cl.exe",
         "VCPKG_TARGET_TRIPLET": "arm64-windows"
       }
     }
