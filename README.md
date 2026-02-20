@@ -4,6 +4,8 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 
 ![lvt inspecting File Explorer](docs/hero.png)
 
+![Annotated screenshot of Notepad](docs/notepad-lorem.png)
+
 ## What it does
 
 - Targets any running Windows app by HWND, PID, process name, or window title
