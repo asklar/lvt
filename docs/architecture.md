@@ -4,13 +4,11 @@
 
 lvt is structured as a 4-stage pipeline that transforms a target window identifier into a structured element tree.
 
-```
-┌─────────────────┐    ┌──────────────────┐    ┌──────────────┐    ┌───────────────┐
-│ Target          │ -> │ Framework        │ -> │ Tree         │ -> │ Serialization │
-│ Resolution      │    │ Detection        │    │ Building     │    │ & Output      │
-└─────────────────┘    └──────────────────┘    └──────────────┘    └───────────────┘
-  target.cpp             framework_detector.cpp   tree_builder.cpp   json_serializer.cpp
-                                                  providers/*        screenshot.cpp
+```mermaid
+flowchart LR
+    A["Target\nResolution\n<small>target.cpp</small>"] --> B["Framework\nDetection\n<small>framework_detector.cpp</small>"]
+    B --> C["Tree\nBuilding\n<small>tree_builder.cpp\nproviders/*</small>"]
+    C --> D["Serialization\n& Output\n<small>json_serializer.cpp\nscreenshot.cpp</small>"]
 ```
 
 ## Stage 1: Target Resolution (`target.cpp`)
@@ -45,21 +43,16 @@ ComCtl detection uses `EnumChildWindows` and checks against a list of known clas
 
 The tree is always rooted in the Win32 HWND hierarchy. Framework-specific providers layer additional detail on top:
 
-```
-                    ┌─────────────────────────┐
-                    │     Unified Element Tree │
-                    └────────────┬────────────┘
-                                 │
-            ┌────────────────────┼────────────────────┐
-            │                    │                     │
-     ┌──────┴──────┐    ┌───────┴───────┐    ┌───────┴───────┐
-     │ ComCtl      │    │ XAML Provider  │    │ WinUI3        │
-     │ Provider    │    │               │    │ Provider      │
-     └──────┬──────┘    └───────┬───────┘    └───────┬───────┘
-            │                    │                     │
-     ┌──────┴────────────────────┴─────────────────────┴──────┐
-     │                    Win32 Provider (base)                │
-     └─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart BT
+    Win32["Win32Provider\n<small>(base HWND tree)</small>"]
+    ComCtl["ComCtlProvider\n<small>(enrich controls)</small>"]
+    XAML["XamlProvider\n<small>(inject TAP DLL)</small>"]
+    WinUI3["WinUI3Provider\n<small>(inject TAP DLL)</small>"]
+    Tree["Unified Element Tree"]
+
+    Win32 --> ComCtl & XAML & WinUI3
+    ComCtl & XAML & WinUI3 --> Tree
 ```
 
 1. **Win32Provider** builds the base tree by recursively enumerating child windows (`EnumChildWindows`). Each HWND becomes an `Element` with class name, text, bounds, styles.

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01
+
+      - name: Configure
+        run: cmake --preset default
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Unit tests
+        run: ctest --test-dir build -R unit_tests --output-on-failure
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lvt-binaries
+          path: |
+            build/lvt.exe
+            build/lvt_tap.dll
+
+  integration-test:
+    runs-on: windows-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01
+
+      - name: Configure & Build
+        run: |
+          cmake --preset default
+          cmake --build build
+
+      - name: Integration tests
+        run: ctest --test-dir build -R integration_tests --output-on-failure
+        # Integration tests need a desktop session with Notepad available.
+        # They may fail on headless CI runners.
+        continue-on-error: true

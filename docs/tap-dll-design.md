@@ -6,21 +6,27 @@ The TAP DLL (`lvt_tap.dll`) is a COM in-process server that gets injected into t
 
 ## Injection flow
 
-```
-lvt.exe                              Target Process
-───────                              ──────────────
-1. LoadLibrary(initDllPath)
-2. Get InitializeXamlDiagnosticsEx
-3. Call InitializeXamlDiagnosticsEx(   ──→  4. LoadLibrary("lvt_tap.dll")
-     connectionName,                        5. DllGetClassObject(CLSID_LvtTap)
-     pid,                                   6. IClassFactory::CreateInstance()
-     pipeName,                              7. IObjectWithSite::SetSite(IXamlDiagnostics)
-     tapDllPath,                            8. QI → IVisualTreeService
-     CLSID_LvtTap)                          9. AdviseVisualTreeChange(callback)
-                                            10. OnVisualTreeChange × N (tree replay)
-4. CreateNamedPipe(pipeName)                11. CollectBounds via UI thread dispatch
-5. ReadFile(pipe) ← JSON ────────────  ←── 12. SerializeAndSend() → pipe
-6. Parse JSON, graft into tree
+```mermaid
+sequenceDiagram
+    participant lvt as lvt.exe
+    participant target as Target Process
+
+    lvt->>lvt: LoadLibrary(initDllPath)
+    lvt->>lvt: GetProcAddress(InitializeXamlDiagnosticsEx)
+    lvt->>target: InitializeXamlDiagnosticsEx(connectionName, pid, pipe, tapDll, CLSID)
+    target->>target: LoadLibrary("lvt_tap.dll")
+    target->>target: DllGetClassObject(CLSID_LvtTap)
+    target->>target: IClassFactory::CreateInstance()
+    target->>target: SetSite(IXamlDiagnostics)
+    target->>target: QI → IVisualTreeService
+    target->>target: AdviseVisualTreeChange(callback)
+    loop Tree replay
+        target->>target: OnVisualTreeChange(node)
+    end
+    target->>target: CollectBounds (UI thread dispatch)
+    lvt->>lvt: CreateNamedPipe(pipeName)
+    target->>lvt: SerializeAndSend() → JSON over pipe
+    lvt->>lvt: Parse JSON, graft into element tree
 ```
 
 ### Connection names
