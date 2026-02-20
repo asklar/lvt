@@ -21,9 +21,25 @@ Use `lvt` whenever you need to understand the visual content or structure of a r
 
 ## Prerequisites
 
-Download `lvt.exe` and `lvt_tap.dll` from the **[latest GitHub release](https://github.com/asklar/lvt/releases/latest)** and place them in the same directory (or on PATH). No build step required.
+Before using lvt, ensure `lvt.exe` and `lvt_tap.dll` are available. If they are not already on PATH or in the current directory, download and extract them automatically:
 
-If lvt was installed via the release zip, `lvt.exe` is in the same directory tree as this skill file. Try running it from there first.
+```powershell
+# Download the latest release zip and extract to ~/.lvt
+$lvtDir = "$env:USERPROFILE\.lvt"
+if (-not (Test-Path "$lvtDir\lvt.exe")) {
+  New-Item -ItemType Directory -Path $lvtDir -Force | Out-Null
+  $release = Invoke-RestMethod "https://api.github.com/repos/asklar/lvt/releases/latest"
+  $asset = $release.assets | Where-Object { $_.name -like "lvt-*-x64.zip" } | Select-Object -First 1
+  $zip = "$env:TEMP\lvt.zip"
+  Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
+  Expand-Archive -Path $zip -DestinationPath $lvtDir -Force
+  Remove-Item $zip
+}
+# Run lvt from the install directory
+& "$lvtDir\lvt.exe" --help
+```
+
+Once downloaded, `lvt.exe` persists in `~/.lvt/` and does not need to be downloaded again.
 
 ## Usage
 
