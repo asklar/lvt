@@ -132,28 +132,26 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
         }
     }
 
+    bool detectedWinUI3 = false;
     bool detectedXaml = false;
     if (pid) {
         auto winui = detect_module(pid, L"Microsoft.UI.Xaml.dll");
         if (winui.found) {
             result.push_back({Framework::WinUI3, winui.version});
+            detectedWinUI3 = true;
+        }
+        auto xaml = detect_module(pid, L"Windows.UI.Xaml.dll");
+        if (xaml.found) {
+            result.push_back({Framework::Xaml, xaml.version});
             detectedXaml = true;
-        } else {
-            auto xaml = detect_module(pid, L"Windows.UI.Xaml.dll");
-            if (xaml.found) {
-                result.push_back({Framework::Xaml, xaml.version});
-                detectedXaml = true;
-            }
         }
     }
 
     // Class-name fallback (works when module enumeration fails)
-    if (!detectedXaml) {
-        if (data.hasWinUI3)
-            result.push_back({Framework::WinUI3, {}});
-        else if (data.hasXaml)
-            result.push_back({Framework::Xaml, {}});
-    }
+    if (!detectedWinUI3 && data.hasWinUI3)
+        result.push_back({Framework::WinUI3, {}});
+    if (!detectedXaml && data.hasXaml)
+        result.push_back({Framework::Xaml, {}});
 
     return result;
 }
