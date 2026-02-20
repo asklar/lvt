@@ -2,6 +2,8 @@
 #include <wil/resource.h>
 #include <Psapi.h>
 
+#pragma comment(lib, "version.lib")
+
 namespace lvt {
 
 std::string framework_to_string(Framework f) {
@@ -40,7 +42,6 @@ static BOOL CALLBACK detect_child_proc(HWND hwnd, LPARAM lParam) {
         }
     }
 
-    // WinUI 3 signature class names
     if (wcsstr(cls, L"Microsoft.UI.Content.DesktopChildSiteBridge") ||
         wcsstr(cls, L"Microsoft.UI.") ||
         _wcsicmp(cls, L"WinUIDesktopWin32WindowClass") == 0 ||
@@ -48,7 +49,6 @@ static BOOL CALLBACK detect_child_proc(HWND hwnd, LPARAM lParam) {
         data->hasWinUI3 = true;
     }
 
-    // UWP XAML signature
     if (_wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0) {
         data->hasXaml = true;
     }
@@ -56,55 +56,103 @@ static BOOL CALLBACK detect_child_proc(HWND hwnd, LPARAM lParam) {
     return TRUE;
 }
 
-static bool process_has_module(DWORD pid, const wchar_t* moduleName) {
-    wil::unique_handle proc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
-    if (!proc) return false;
-
+// Get the full path of a module loaded in a remote process.
+static std::wstring get_module_path(HANDLE proc, const wchar_t* moduleName) {
     HMODULE modules[1024];
     DWORD needed = 0;
-    // LIST_MODULES_ALL to handle cross-bitness (x86 process inspecting x64 target)
-    if (!EnumProcessModulesEx(proc.get(), modules, sizeof(modules), &needed, LIST_MODULES_ALL))
-        return false;
+    if (!EnumProcessModulesEx(proc, modules, sizeof(modules), &needed, LIST_MODULES_ALL))
+        return {};
 
     for (DWORD i = 0; i < needed / sizeof(HMODULE); i++) {
         wchar_t name[MAX_PATH]{};
-        if (GetModuleBaseNameW(proc.get(), modules[i], name, MAX_PATH)) {
-            if (_wcsicmp(name, moduleName) == 0)
-                return true;
+        if (GetModuleBaseNameW(proc, modules[i], name, MAX_PATH)) {
+            if (_wcsicmp(name, moduleName) == 0) {
+                wchar_t fullPath[MAX_PATH]{};
+                if (GetModuleFileNameExW(proc, modules[i], fullPath, MAX_PATH))
+                    return fullPath;
+                return {};
+            }
         }
     }
-    return false;
+    return {};
 }
 
-std::vector<Framework> detect_frameworks(HWND hwnd, DWORD pid) {
-    std::vector<Framework> result;
-    result.push_back(Framework::Win32);
+// Extract file version string from a DLL path (e.g. "3.1.7.2602").
+static std::string get_file_version(const std::wstring& path) {
+    if (path.empty()) return {};
+    DWORD verHandle = 0;
+    DWORD verSize = GetFileVersionInfoSizeW(path.c_str(), &verHandle);
+    if (verSize == 0) return {};
+
+    std::vector<BYTE> verData(verSize);
+    if (!GetFileVersionInfoW(path.c_str(), verHandle, verSize, verData.data()))
+        return {};
+
+    VS_FIXEDFILEINFO* fileInfo = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueW(verData.data(), L"\\", reinterpret_cast<void**>(&fileInfo), &len))
+        return {};
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%d.%d.%d.%d",
+             HIWORD(fileInfo->dwFileVersionMS), LOWORD(fileInfo->dwFileVersionMS),
+             HIWORD(fileInfo->dwFileVersionLS), LOWORD(fileInfo->dwFileVersionLS));
+    return buf;
+}
+
+struct ModuleDetection {
+    bool found = false;
+    std::string version;
+};
+
+static ModuleDetection detect_module(DWORD pid, const wchar_t* moduleName) {
+    wil::unique_handle proc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
+    if (!proc) return {};
+
+    auto path = get_module_path(proc.get(), moduleName);
+    if (path.empty()) return {};
+
+    return {true, get_file_version(path)};
+}
+
+std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
+    std::vector<FrameworkInfo> result;
+    result.push_back({Framework::Win32, {}});
 
     DetectData data;
     if (hwnd) {
         EnumChildWindows(hwnd, detect_child_proc, reinterpret_cast<LPARAM>(&data));
-        if (data.hasComCtl)
-            result.push_back(Framework::ComCtl);
-    }
-
-    // Try module-based detection first, fall back to class-name heuristics
-    bool detectedXaml = false;
-    if (pid) {
-        if (process_has_module(pid, L"Microsoft.UI.Xaml.dll")) {
-            result.push_back(Framework::WinUI3);
-            detectedXaml = true;
-        } else if (process_has_module(pid, L"Windows.UI.Xaml.dll")) {
-            result.push_back(Framework::Xaml);
-            detectedXaml = true;
+        if (data.hasComCtl) {
+            std::string comctlVer;
+            if (pid) {
+                auto det = detect_module(pid, L"comctl32.dll");
+                if (det.found) comctlVer = det.version;
+            }
+            result.push_back({Framework::ComCtl, comctlVer});
         }
     }
 
-    // Class-name fallback (works cross-bitness where EnumProcessModulesEx may fail)
+    bool detectedXaml = false;
+    if (pid) {
+        auto winui = detect_module(pid, L"Microsoft.UI.Xaml.dll");
+        if (winui.found) {
+            result.push_back({Framework::WinUI3, winui.version});
+            detectedXaml = true;
+        } else {
+            auto xaml = detect_module(pid, L"Windows.UI.Xaml.dll");
+            if (xaml.found) {
+                result.push_back({Framework::Xaml, xaml.version});
+                detectedXaml = true;
+            }
+        }
+    }
+
+    // Class-name fallback (works when module enumeration fails)
     if (!detectedXaml) {
         if (data.hasWinUI3)
-            result.push_back(Framework::WinUI3);
+            result.push_back({Framework::WinUI3, {}});
         else if (data.hasXaml)
-            result.push_back(Framework::Xaml);
+            result.push_back({Framework::Xaml, {}});
     }
 
     return result;

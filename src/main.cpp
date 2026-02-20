@@ -157,8 +157,12 @@ int main(int argc, char* argv[]) {
 
     if (args.frameworksOnly) {
         // Just print detected frameworks
-        for (auto f : frameworks) {
-            printf("%s\n", lvt::framework_to_string(f).c_str());
+        for (auto& fi : frameworks) {
+            if (fi.version.empty())
+                printf("%s\n", lvt::framework_to_string(fi.type).c_str());
+            else
+                printf("%s %s\n", lvt::framework_to_string(fi.type).c_str(),
+                       fi.version.c_str());
         }
         return 0;
     }
@@ -178,8 +182,11 @@ int main(int argc, char* argv[]) {
 
     // Serialize to JSON
     std::vector<std::string> frameworkNames;
-    for (auto f : frameworks) {
-        frameworkNames.push_back(lvt::framework_to_string(f));
+    for (auto& fi : frameworks) {
+        if (fi.version.empty())
+            frameworkNames.push_back(lvt::framework_to_string(fi.type));
+        else
+            frameworkNames.push_back(lvt::framework_to_string(fi.type) + " " + fi.version);
     }
 
     auto json = lvt::serialize_to_json(*outputRoot, target.hwnd, target.pid,

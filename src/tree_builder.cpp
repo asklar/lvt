@@ -21,14 +21,14 @@ void assign_element_ids(Element& root) {
     assign_ids_recursive(root, counter);
 }
 
-Element build_tree(HWND hwnd, const std::vector<Framework>& frameworks, int maxDepth) {
+Element build_tree(HWND hwnd, const std::vector<FrameworkInfo>& frameworks, int maxDepth) {
     // Start with the Win32 provider as the base — it always applies
     Win32Provider win32;
     Element root = win32.build(hwnd, maxDepth);
 
     // Layer on framework-specific providers
-    for (auto f : frameworks) {
-        switch (f) {
+    for (auto& fi : frameworks) {
+        switch (fi.type) {
         case Framework::ComCtl: {
             ComCtlProvider comctl;
             comctl.enrich(root);
