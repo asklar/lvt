@@ -28,6 +28,7 @@ static void print_usage() {
         "  --output <file>      Write output to file instead of stdout\n"
         "  --format <fmt>       Output format: json (default) or xml\n"
         "  --screenshot <file>  Capture annotated screenshot to PNG\n"
+        "  --dump               Output the tree (default; implied unless --screenshot)\n"
         "  --element <id>       Scope to a specific element subtree\n"
         "  --frameworks         Just detect and list frameworks\n"
         "  --depth <n>          Max tree traversal depth (default: unlimited)\n"
@@ -46,6 +47,8 @@ struct Args {
     std::string elementId;
     int depth = -1;
     bool frameworksOnly = false;
+    bool dump = false;      // explicitly requested via --dump
+    bool dumpSet = false;   // true if --dump was passed on command line
 };
 
 static Args parse_args(int argc, char* argv[]) {
@@ -75,6 +78,9 @@ static Args parse_args(int argc, char* argv[]) {
             args.depth = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--frameworks") == 0) {
             args.frameworksOnly = true;
+        } else if (strcmp(argv[i], "--dump") == 0) {
+            args.dump = true;
+            args.dumpSet = true;
         } else {
             fprintf(stderr, "lvt: unknown argument '%s'\n", argv[i]);
             print_usage();
@@ -100,6 +106,10 @@ int main(int argc, char* argv[]) {
     }
 
     auto args = parse_args(argc, argv);
+
+    // --dump is default unless --screenshot is specified without --dump
+    if (!args.dumpSet)
+        args.dump = args.screenshotFile.empty();
 
     if (!args.hwnd && !args.pid && args.processName.empty() && args.windowTitle.empty()) {
         fprintf(stderr, "lvt: must specify --hwnd, --pid, --name, or --title\n");
@@ -184,35 +194,36 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Serialize
-    std::vector<std::string> frameworkNames;
-    for (auto& fi : frameworks) {
-        if (fi.version.empty())
-            frameworkNames.push_back(lvt::framework_to_string(fi.type));
-        else
-            frameworkNames.push_back(lvt::framework_to_string(fi.type) + " " + fi.version);
-    }
-
-    std::string serialized;
-    if (args.format == "xml") {
-        serialized = lvt::serialize_to_xml(*outputRoot, target.hwnd, target.pid,
-                                           target.processName, frameworkNames);
-    } else {
-        serialized = lvt::serialize_to_json(*outputRoot, target.hwnd, target.pid,
-                                            target.processName, frameworkNames);
-    }
-
-    // Write output
-    if (args.outputFile.empty()) {
-        printf("%s\n", serialized.c_str());
-    } else {
-        std::ofstream out(args.outputFile);
-        if (!out) {
-            fprintf(stderr, "lvt: cannot write to '%s'\n", args.outputFile.c_str());
-            return 1;
+    // Serialize and output tree (unless suppressed by --screenshot without --dump)
+    if (args.dump) {
+        std::vector<std::string> frameworkNames;
+        for (auto& fi : frameworks) {
+            if (fi.version.empty())
+                frameworkNames.push_back(lvt::framework_to_string(fi.type));
+            else
+                frameworkNames.push_back(lvt::framework_to_string(fi.type) + " " + fi.version);
         }
-        out << serialized << "\n";
-        fprintf(stderr, "lvt: wrote tree to %s\n", args.outputFile.c_str());
+
+        std::string serialized;
+        if (args.format == "xml") {
+            serialized = lvt::serialize_to_xml(*outputRoot, target.hwnd, target.pid,
+                                                target.processName, frameworkNames);
+        } else {
+            serialized = lvt::serialize_to_json(*outputRoot, target.hwnd, target.pid,
+                                                 target.processName, frameworkNames);
+        }
+
+        if (args.outputFile.empty()) {
+            printf("%s\n", serialized.c_str());
+        } else {
+            std::ofstream out(args.outputFile);
+            if (!out) {
+                fprintf(stderr, "lvt: cannot write to '%s'\n", args.outputFile.c_str());
+                return 1;
+            }
+            out << serialized << "\n";
+            fprintf(stderr, "lvt: wrote tree to %s\n", args.outputFile.c_str());
+        }
     }
 
     // Screenshot
