@@ -54,3 +54,41 @@ set_property(TARGET lvt_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONF
 set_target_properties(lvt_tap PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>
 )
+
+# --- Tests ---
+enable_testing()
+find_package(GTest CONFIG REQUIRED)
+
+# Unit tests — pure logic, no live HWND needed
+add_executable(lvt_unit_tests
+    tests/unit_tests.cpp
+    src/tree_builder.cpp
+    src/json_serializer.cpp
+    src/framework_detector.cpp
+    src/target.cpp
+    src/providers/win32_provider.cpp
+    src/providers/comctl_provider.cpp
+    src/providers/xaml_provider.cpp
+    src/providers/winui3_provider.cpp
+    src/providers/xaml_diag_common.cpp
+)
+target_include_directories(lvt_unit_tests PRIVATE src)
+target_compile_definitions(lvt_unit_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN)
+target_link_libraries(lvt_unit_tests PRIVATE
+    GTest::gtest GTest::gtest_main
+    WIL::WIL nlohmann_json::nlohmann_json
+    dwmapi windowsapp
+)
+add_test(NAME unit_tests COMMAND lvt_unit_tests)
+
+# Integration tests — require a running Notepad instance
+add_executable(lvt_integration_tests
+    tests/integration_tests.cpp
+)
+target_include_directories(lvt_integration_tests PRIVATE src)
+target_compile_definitions(lvt_integration_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN)
+target_link_libraries(lvt_integration_tests PRIVATE
+    GTest::gtest GTest::gtest_main
+    WIL::WIL nlohmann_json::nlohmann_json
+)
+add_test(NAME integration_tests COMMAND lvt_integration_tests)

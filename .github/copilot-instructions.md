@@ -16,7 +16,15 @@ cmake --preset default
 cmake --build build
 ```
 
-Produces `build/lvt.exe` and `build/lvt_tap.dll`. There are no tests or linters currently.
+Produces `build/lvt.exe` and `build/lvt_tap.dll`.
+
+```powershell
+# Run unit tests
+build\lvt_unit_tests.exe
+
+# Run integration tests (launches Notepad)
+build\lvt_integration_tests.exe
+```
 
 **Important:** `lvt_tap.dll` gets locked by target processes after injection. You must kill the target app before rebuilding the TAP DLL.
 
