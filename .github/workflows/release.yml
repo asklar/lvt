@@ -15,9 +15,11 @@ jobs:
       matrix:
         include:
           - arch: x64
+            msvc_arch: x64
             preset: default
             build_dir: build
           - arch: arm64
+            msvc_arch: amd64_arm64
             preset: arm64
             build_dir: build-arm64
 
@@ -27,7 +29,7 @@ jobs:
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: ${{ matrix.arch }}
+          arch: ${{ matrix.msvc_arch }}
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
