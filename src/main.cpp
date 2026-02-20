@@ -170,6 +170,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Check architecture match
+    auto hostArch = lvt::get_host_architecture();
+    if (target.architecture != lvt::Architecture::unknown &&
+        hostArch != lvt::Architecture::unknown &&
+        target.architecture != hostArch) {
+        const char* targetArchName = lvt::architecture_name(target.architecture);
+        const char* hostArchName = lvt::architecture_name(hostArch);
+        fprintf(stderr,
+            "lvt: architecture mismatch - this is lvt.exe (%s) but the target process "
+            "(pid %lu) is %s.\nRun lvt-%s.exe instead.\n",
+            hostArchName, target.pid, targetArchName, targetArchName);
+        return 1;
+    }
+
     // Detect frameworks
     auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
 

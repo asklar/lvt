@@ -49,4 +49,4 @@ jobs:
           name: lvt-binaries
           path: |
             build/lvt.exe
-            build/lvt_tap.dll
+            build/lvt_tap_x64.dll

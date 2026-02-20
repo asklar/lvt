@@ -16,7 +16,14 @@ cmake --preset default
 cmake --build build
 ```
 
-This produces `build/lvt.exe` and `build/lvt_tap.dll`.
+This produces `build/lvt.exe` and `build/lvt_tap_x64.dll`.
+
+For ARM64:
+
+```powershell
+cmake --preset arm64
+cmake --build build-arm64
+```
 
 ### Running tests
 

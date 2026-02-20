@@ -14,12 +14,30 @@
       "cacheVariables": {
         "VCPKG_TARGET_TRIPLET": "x64-windows"
       }
+    },
+    {
+      "name": "arm64",
+      "displayName": "ARM64",
+      "generator": "Ninja",
+      "architecture": {
+        "value": "arm64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build-arm64",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "arm64-windows"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "default",
       "configurePreset": "default"
+    },
+    {
+      "name": "arm64",
+      "configurePreset": "arm64"
     }
   ]
 }

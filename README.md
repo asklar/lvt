@@ -40,11 +40,18 @@ This gives Copilot the ability to inspect any running Windows app's UI when you 
 #### Build
 
 ```powershell
+# x64 build (default)
 cmake --preset default
 cmake --build build
+
+# ARM64 build
+cmake --preset arm64
+cmake --build build-arm64
 ```
 
-Produces `build/lvt.exe` and `build/lvt_tap.dll`.
+Produces `build/lvt.exe` and `build/lvt_tap_x64.dll` (or `build-arm64/lvt.exe` and `build-arm64/lvt_tap_arm64.dll` for ARM64).
+
+> **Note:** lvt.exe must match the target process's architecture. If you target an ARM64 app, use the ARM64 build. A clear error message is shown on mismatch.
 
 ### Usage
 

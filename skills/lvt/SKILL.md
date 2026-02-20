@@ -21,15 +21,16 @@ Use `lvt` whenever you need to understand the visual content or structure of a r
 
 ## Prerequisites
 
-Before using lvt, ensure `lvt.exe` and `lvt_tap.dll` are available. If they are not already on PATH or in the current directory, download and extract them automatically:
+Before using lvt, ensure `lvt.exe` and `lvt_tap_{arch}.dll` are available. If they are not already on PATH or in the current directory, download and extract them automatically:
 
 ```powershell
-# Download the latest release zip and extract to ~/.lvt
+# Download the latest release zip (matching host architecture) and extract to ~/.lvt
 $lvtDir = "$env:USERPROFILE\.lvt"
 if (-not (Test-Path "$lvtDir\lvt.exe")) {
   New-Item -ItemType Directory -Path $lvtDir -Force | Out-Null
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
   $release = Invoke-RestMethod "https://api.github.com/repos/asklar/lvt/releases/latest"
-  $asset = $release.assets | Where-Object { $_.name -like "lvt-*-x64.zip" } | Select-Object -First 1
+  $asset = $release.assets | Where-Object { $_.name -like "lvt-*-$arch.zip" } | Select-Object -First 1
   $zip = "$env:TEMP\lvt.zip"
   Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
   Expand-Archive -Path $zip -DestinationPath $lvtDir -Force
@@ -165,4 +166,5 @@ Every element gets a stable ID like `e0`, `e1`, `e2`, etc., assigned in depth-fi
 - If the tree is very large, use `--depth` to limit traversal depth first, then drill deeper with `--element`
 - Element IDs change between invocations if the UI structure changes — always re-query before acting on stale IDs
 - The tool requires no special permissions beyond being able to read the target process (same user session)
-- For XAML/WinUI 3 apps, lvt injects a helper DLL into the target — this is safe and non-destructive but means `lvt_tap.dll` must be next to `lvt.exe`
+- For XAML/WinUI 3 apps, lvt injects a helper DLL into the target — this is safe and non-destructive but means `lvt_tap_{arch}.dll` must be next to `lvt.exe`
+- lvt.exe must match the target process architecture (x64 or ARM64) — a clear error is shown on mismatch

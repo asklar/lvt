@@ -39,6 +39,13 @@ target_compile_definitions(lvt PRIVATE
     WINRT_LEAN_AND_MEAN
 )
 
+# Determine TAP DLL architecture suffix from vcpkg triplet
+if(VCPKG_TARGET_TRIPLET MATCHES "arm64")
+    set(TAP_ARCH_SUFFIX "arm64")
+else()
+    set(TAP_ARCH_SUFFIX "x64")
+endif()
+
 # TAP DLL — injected into target process for XAML diagnostics
 # Uses static CRT (/MT) to avoid CRT version conflicts in the target process
 add_library(lvt_tap SHARED
@@ -50,8 +57,9 @@ target_include_directories(lvt_tap PRIVATE src)
 target_link_libraries(lvt_tap PRIVATE ole32)
 set_property(TARGET lvt_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-# Place lvt_tap.dll next to lvt.exe
+# Place lvt_tap_{arch}.dll next to lvt.exe
 set_target_properties(lvt_tap PROPERTIES
+    OUTPUT_NAME "lvt_tap_${TAP_ARCH_SUFFIX}"
     RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>
 )
 
