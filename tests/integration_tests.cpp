@@ -28,7 +28,8 @@ static std::string get_lvt_path() {
     return "lvt.exe";  // fallback
 }
 
-// Run a command and capture stdout
+// Run a command and capture stdout (stderr is suppressed)
+// Wraps in cmd /c "..." to handle multiple quoted arguments correctly.
 static std::string run_command(const std::string& cmd) {
     std::string result;
     std::array<char, 4096> buffer;
@@ -39,6 +40,11 @@ static std::string run_command(const std::string& cmd) {
     }
     _pclose(pipe);
     return result;
+}
+
+// Build a command string
+static std::string make_cmd(const std::string& lvt, const std::string& args) {
+    return "\"" + lvt + "\" " + args;
 }
 
 // Launch a dedicated Notepad instance for testing
@@ -60,10 +66,31 @@ protected:
         if (s_pi.hProcess) {
             WaitForInputIdle(s_pi.hProcess, 5000);
         }
-        Sleep(3000);  // Extra time for window creation
+        Sleep(5000);  // Wait for WinUI3 Notepad to fully initialize
 
-        // Find the HWND for our Notepad by PID
-        s_pid = s_pi.dwProcessId;
+        // Modern Notepad may launch through an App Execution Alias, so the
+        // PID from CreateProcess may not be the actual window owner.
+        // Find the window by title instead.
+        s_hwnd = nullptr;
+        for (int attempt = 0; attempt < 10 && !s_hwnd; attempt++) {
+            EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+                char title[256];
+                GetWindowTextA(hwnd, title, sizeof(title));
+                if (strstr(title, "lvt_integration_test") && IsWindowVisible(hwnd)) {
+                    *reinterpret_cast<HWND*>(lParam) = hwnd;
+                    return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&s_hwnd));
+            if (!s_hwnd) Sleep(1000);
+        }
+
+        if (s_hwnd) {
+            GetWindowThreadProcessId(s_hwnd, &s_pid);
+        } else {
+            // Fallback to CreateProcess PID
+            s_pid = s_pi.dwProcessId;
+        }
     }
 
     static void TearDownTestSuite() {
@@ -76,23 +103,31 @@ protected:
     }
 
     static std::string get_pid_arg() {
+        if (s_hwnd) {
+            // Use HWND for reliable targeting
+            char buf[32];
+            sprintf_s(buf, "--hwnd 0x%llX", (unsigned long long)(uintptr_t)s_hwnd);
+            return buf;
+        }
         return "--pid " + std::to_string(s_pid);
     }
 
     static std::string s_temp_file;
     static PROCESS_INFORMATION s_pi;
     static DWORD s_pid;
+    static HWND s_hwnd;
 };
 
 std::string NotepadFixture::s_temp_file;
 PROCESS_INFORMATION NotepadFixture::s_pi = {};
 DWORD NotepadFixture::s_pid = 0;
+HWND NotepadFixture::s_hwnd = nullptr;
 
 // ---- Basic functionality ----
 
 TEST_F(NotepadFixture, CanDumpJsonTree) {
     auto lvt = get_lvt_path();
-    auto output = run_command("\"" + lvt + "\" " + get_pid_arg() + " 2>nul");
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
     ASSERT_FALSE(output.empty()) << "lvt produced no output";
 
     auto j = json::parse(output, nullptr, false);
@@ -104,7 +139,7 @@ TEST_F(NotepadFixture, CanDumpJsonTree) {
 
 TEST_F(NotepadFixture, TargetInfo) {
     auto lvt = get_lvt_path();
-    auto output = run_command("\"" + lvt + "\" " + get_pid_arg() + " 2>nul");
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
     auto j = json::parse(output, nullptr, false);
     ASSERT_FALSE(j.is_discarded());
 
@@ -119,7 +154,7 @@ TEST_F(NotepadFixture, TargetInfo) {
 
 TEST_F(NotepadFixture, FrameworkDetection) {
     auto lvt = get_lvt_path();
-    auto output = run_command("\"" + lvt + "\" " + get_pid_arg() + " --frameworks 2>nul");
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
     ASSERT_FALSE(output.empty());
     // Notepad should at least have win32
     EXPECT_NE(output.find("win32"), std::string::npos);
@@ -127,7 +162,7 @@ TEST_F(NotepadFixture, FrameworkDetection) {
 
 TEST_F(NotepadFixture, TreeHasElements) {
     auto lvt = get_lvt_path();
-    auto output = run_command("\"" + lvt + "\" " + get_pid_arg() + " 2>nul");
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
     auto j = json::parse(output, nullptr, false);
     ASSERT_FALSE(j.is_discarded());
 
@@ -140,7 +175,7 @@ TEST_F(NotepadFixture, TreeHasElements) {
 
 TEST_F(NotepadFixture, XmlOutput) {
     auto lvt = get_lvt_path();
-    auto output = run_command("\"" + lvt + "\" " + get_pid_arg() + " --format xml 2>nul");
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --format xml"));
     ASSERT_FALSE(output.empty());
 
     EXPECT_NE(output.find("<LiveVisualTree"), std::string::npos);
@@ -150,8 +185,8 @@ TEST_F(NotepadFixture, XmlOutput) {
 
 TEST_F(NotepadFixture, DepthLimit) {
     auto lvt = get_lvt_path();
-    auto deep = run_command("\"" + lvt + "\" " + get_pid_arg() + " --depth 1 2>nul");
-    auto full = run_command("\"" + lvt + "\" " + get_pid_arg() + " 2>nul");
+    auto deep = run_command(make_cmd(lvt, get_pid_arg() + " --depth 1"));
+    auto full = run_command(make_cmd(lvt, get_pid_arg()));
 
     ASSERT_FALSE(deep.empty());
     ASSERT_FALSE(full.empty());
@@ -161,7 +196,7 @@ TEST_F(NotepadFixture, DepthLimit) {
 
 TEST_F(NotepadFixture, ElementSubtree) {
     auto lvt = get_lvt_path();
-    auto output = run_command("\"" + lvt + "\" " + get_pid_arg() + " --element e1 2>nul");
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --element e1"));
     if (output.empty()) {
         GTEST_SKIP() << "No output for --element e1 (element may not exist)";
     }
@@ -173,11 +208,12 @@ TEST_F(NotepadFixture, ElementSubtree) {
 
 TEST_F(NotepadFixture, ScreenshotCapture) {
     auto lvt = get_lvt_path();
-    auto tmpFile = fs::temp_directory_path() / "lvt_test_screenshot.png";
+    // Use build directory (no spaces) to avoid cmd.exe quoting issues
+    auto tmpFile = fs::path(lvt).parent_path() / "lvt_test_screenshot.png";
     fs::remove(tmpFile);
 
-    auto cmd = "\"" + lvt + "\" " + get_pid_arg() + " --screenshot \"" + tmpFile.string() + "\" 2>nul";
-    auto output = run_command(cmd);
+    auto output = run_command(make_cmd(lvt,
+        get_pid_arg() + " --screenshot " + tmpFile.string()));
 
     // --screenshot without --dump should produce no stdout
     EXPECT_TRUE(output.empty()) << "stdout should be empty with --screenshot only";
@@ -200,11 +236,11 @@ TEST_F(NotepadFixture, ScreenshotCapture) {
 
 TEST_F(NotepadFixture, ScreenshotWithDump) {
     auto lvt = get_lvt_path();
-    auto tmpFile = fs::temp_directory_path() / "lvt_test_both.png";
+    auto tmpFile = fs::path(lvt).parent_path() / "lvt_test_both.png";
     fs::remove(tmpFile);
 
-    auto cmd = "\"" + lvt + "\" " + get_pid_arg() + " --screenshot \"" + tmpFile.string() + "\" --dump 2>nul";
-    auto output = run_command(cmd);
+    auto output = run_command(make_cmd(lvt,
+        get_pid_arg() + " --screenshot " + tmpFile.string() + " --dump"));
 
     // Should have both tree output and screenshot file
     EXPECT_FALSE(output.empty()) << "stdout should have tree output with --dump";
@@ -219,11 +255,11 @@ TEST_F(NotepadFixture, ScreenshotWithDump) {
 
 TEST_F(NotepadFixture, OutputToFile) {
     auto lvt = get_lvt_path();
-    auto tmpFile = fs::temp_directory_path() / "lvt_test_output.json";
+    auto tmpFile = fs::path(lvt).parent_path() / "lvt_test_output.json";
     fs::remove(tmpFile);
 
-    auto cmd = "\"" + lvt + "\" " + get_pid_arg() + " --output \"" + tmpFile.string() + "\" 2>nul";
-    run_command(cmd);
+    run_command(make_cmd(lvt,
+        get_pid_arg() + " --output " + tmpFile.string()));
 
     EXPECT_TRUE(fs::exists(tmpFile)) << "Output file was not created";
     if (fs::exists(tmpFile)) {
@@ -239,18 +275,18 @@ TEST_F(NotepadFixture, OutputToFile) {
 
 TEST(LvtCli, NoArgs) {
     auto lvt = get_lvt_path();
-    auto ret = system(("\"" + lvt + "\" >nul 2>nul").c_str());
+    auto ret = system(("\"" + lvt + "\" >nul").c_str());
     EXPECT_NE(ret, 0) << "Should return non-zero with no args";
 }
 
 TEST(LvtCli, InvalidHwnd) {
     auto lvt = get_lvt_path();
-    auto ret = system(("\"" + lvt + "\" --hwnd 0xDEADBEEF >nul 2>nul").c_str());
+    auto ret = system(("\"" + lvt + "\" --hwnd 0xDEADBEEF >nul").c_str());
     EXPECT_NE(ret, 0) << "Should fail with invalid HWND";
 }
 
 TEST(LvtCli, UnknownArg) {
     auto lvt = get_lvt_path();
-    auto ret = system(("\"" + lvt + "\" --bogus >nul 2>nul").c_str());
+    auto ret = system(("\"" + lvt + "\" --bogus >nul").c_str());
     EXPECT_NE(ret, 0) << "Should fail with unknown argument";
 }
