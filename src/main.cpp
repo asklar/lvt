@@ -168,7 +168,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Build tree
-    auto tree = lvt::build_tree(target.hwnd, frameworks, args.depth);
+    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks, args.depth);
 
     // Scope to element if requested
     const lvt::Element* outputRoot = &tree;

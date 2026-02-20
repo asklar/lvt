@@ -37,3 +37,17 @@ target_compile_definitions(lvt PRIVATE
     NOMINMAX
     WINRT_LEAN_AND_MEAN
 )
+
+# TAP DLL — injected into target process for XAML diagnostics
+add_library(lvt_tap SHARED
+    src/tap/lvt_tap.cpp
+    src/tap/lvt_tap.def
+)
+target_compile_definitions(lvt_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(lvt_tap PRIVATE src)
+target_link_libraries(lvt_tap PRIVATE ole32)
+
+# Place lvt_tap.dll next to lvt.exe
+set_target_properties(lvt_tap PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>
+)

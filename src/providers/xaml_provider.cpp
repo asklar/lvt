@@ -1,22 +1,23 @@
 #include "xaml_provider.h"
-#include <stdio.h>
-
-// TODO: Implement UWP XAML diagnostics via IXamlDiagnostics / IVisualTreeService3.
-// These COM interfaces allow direct access to the XAML visual tree — the same
-// mechanism Visual Studio's Live Visual Tree uses. No UIA involved.
-//
-// Steps to implement:
-// 1. Use ActivateXamlDiagnosticsEx to connect to the target process
-// 2. Obtain IVisualTreeService3 interface
-// 3. Walk the visual tree using GetEnums / GetCollectionElements
-// 4. For each visual, extract type name, properties, bounds
-// 5. Map XAML visuals to their owning HWNDs and graft into the element tree
+#include <cstdio>
+#include <Windows.h>
 
 namespace lvt {
 
-void XamlProvider::enrich(Element& /*root*/, HWND /*hwnd*/) {
-    // Stub — XAML diagnostics provider not yet implemented
-    fprintf(stderr, "lvt: XAML diagnostics provider not yet implemented\n");
+// Mark CoreWindow children as XAML content without injecting into the target
+static void label_xaml_windows(Element& el) {
+    // Windows.UI.Core.CoreWindow is the host for UWP XAML content
+    if (el.className == "Windows.UI.Core.CoreWindow") {
+        el.framework = "xaml";
+        el.type = "CoreWindow";
+    }
+    for (auto& child : el.children) {
+        label_xaml_windows(child);
+    }
+}
+
+void XamlProvider::enrich(Element& root, HWND /*hwnd*/, DWORD /*pid*/) {
+    label_xaml_windows(root);
 }
 
 } // namespace lvt

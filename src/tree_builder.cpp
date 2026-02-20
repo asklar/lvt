@@ -21,7 +21,7 @@ void assign_element_ids(Element& root) {
     assign_ids_recursive(root, counter);
 }
 
-Element build_tree(HWND hwnd, const std::vector<FrameworkInfo>& frameworks, int maxDepth) {
+Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frameworks, int maxDepth) {
     // Start with the Win32 provider as the base — it always applies
     Win32Provider win32;
     Element root = win32.build(hwnd, maxDepth);
@@ -36,12 +36,12 @@ Element build_tree(HWND hwnd, const std::vector<FrameworkInfo>& frameworks, int 
         }
         case Framework::Xaml: {
             XamlProvider xaml;
-            xaml.enrich(root, hwnd);
+            xaml.enrich(root, hwnd, pid);
             break;
         }
         case Framework::WinUI3: {
             WinUI3Provider winui3;
-            winui3.enrich(root, hwnd);
+            winui3.enrich(root, hwnd, pid);
             break;
         }
         default:
