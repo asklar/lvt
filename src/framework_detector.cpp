@@ -95,8 +95,8 @@ static std::string get_file_version(const std::wstring& path) {
 
     char buf[64];
     snprintf(buf, sizeof(buf), "%d.%d.%d.%d",
-             HIWORD(fileInfo->dwFileVersionMS), LOWORD(fileInfo->dwFileVersionMS),
-             HIWORD(fileInfo->dwFileVersionLS), LOWORD(fileInfo->dwFileVersionLS));
+             HIWORD(fileInfo->dwProductVersionMS), LOWORD(fileInfo->dwProductVersionMS),
+             HIWORD(fileInfo->dwProductVersionLS), LOWORD(fileInfo->dwProductVersionLS));
     return buf;
 }
 
