@@ -1,0 +1,13 @@
+# Build output
+build/
+
+# IDE files
+.vs/
+.vscode/
+*.user
+CMakeSettings.json
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
