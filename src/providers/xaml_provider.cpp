@@ -1,23 +1,27 @@
 #include "xaml_provider.h"
+#include "xaml_diag_common.h"
 #include <cstdio>
+#include <functional>
 #include <Windows.h>
 
 namespace lvt {
 
-// Mark CoreWindow children as XAML content without injecting into the target
-static void label_xaml_windows(Element& el) {
-    // Windows.UI.Core.CoreWindow is the host for UWP XAML content
-    if (el.className == "Windows.UI.Core.CoreWindow") {
-        el.framework = "xaml";
-        el.type = "CoreWindow";
-    }
-    for (auto& child : el.children) {
-        label_xaml_windows(child);
-    }
-}
+void XamlProvider::enrich(Element& root, HWND hwnd, DWORD pid) {
+    bool hasCoreWindow = false;
+    std::function<void(Element&)> findCoreWindow = [&](Element& el) {
+        if (el.className == "Windows.UI.Core.CoreWindow") {
+            el.framework = "xaml";
+            el.type = "CoreWindow";
+            hasCoreWindow = true;
+        }
+        for (auto& child : el.children) findCoreWindow(child);
+    };
+    findCoreWindow(root);
 
-void XamlProvider::enrich(Element& root, HWND /*hwnd*/, DWORD /*pid*/) {
-    label_xaml_windows(root);
+    // Only attempt injection if there are actually CoreWindow elements
+    if (hasCoreWindow) {
+        inject_and_collect_xaml_tree(root, hwnd, pid, L"", L"Windows.UI.Xaml.dll", "xaml");
+    }
 }
 
 } // namespace lvt

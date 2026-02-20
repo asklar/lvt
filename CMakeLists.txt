@@ -18,6 +18,7 @@ add_executable(lvt
     src/providers/comctl_provider.cpp
     src/providers/xaml_provider.cpp
     src/providers/winui3_provider.cpp
+    src/providers/xaml_diag_common.cpp
 )
 
 target_include_directories(lvt PRIVATE src)
@@ -39,6 +40,7 @@ target_compile_definitions(lvt PRIVATE
 )
 
 # TAP DLL — injected into target process for XAML diagnostics
+# Uses static CRT (/MT) to avoid CRT version conflicts in the target process
 add_library(lvt_tap SHARED
     src/tap/lvt_tap.cpp
     src/tap/lvt_tap.def
@@ -46,6 +48,7 @@ add_library(lvt_tap SHARED
 target_compile_definitions(lvt_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(lvt_tap PRIVATE src)
 target_link_libraries(lvt_tap PRIVATE ole32)
+set_property(TARGET lvt_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Place lvt_tap.dll next to lvt.exe
 set_target_properties(lvt_tap PROPERTIES

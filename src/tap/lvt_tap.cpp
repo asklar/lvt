@@ -1,7 +1,7 @@
 // lvt_tap.cpp — Tool Attachment Point DLL for XAML diagnostics
-// This DLL gets injected into the target process by InitializeXamlDiagnosticsEx.
-// It implements IObjectWithSite to receive IXamlDiagnostics, then walks the
-// XAML visual tree via IVisualTreeService and sends results back over a named pipe.
+// Injected into the target process by InitializeXamlDiagnosticsEx.
+// Implements IObjectWithSite → receives IXamlDiagnostics → walks XAML tree
+// via IVisualTreeService::AdviseVisualTreeChange → sends JSON over named pipe.
 
 #include <Windows.h>
 #include <objbase.h>
@@ -10,19 +10,43 @@
 #include <string>
 #include <map>
 #include <vector>
+#include <cstdio>
 
-// Define GUIDs that xamlOM.h only forward-declares
-// (no _i.c file or .lib provides these definitions)
-// IVisualTreeServiceCallback: {AA7A8931-80E4-4FEC-8F3B-553F87B4966E}
+// GUIDs only forward-declared in xamlOM.h (no .lib provides them)
 const IID IID_IVisualTreeServiceCallback =
     { 0xAA7A8931, 0x80E4, 0x4FEC, { 0x8F, 0x3B, 0x55, 0x3F, 0x87, 0xB4, 0x96, 0x6E } };
-// IVisualTreeServiceCallback2: {BAD9EB88-AE77-4397-B948-5FA2DB0A19EA}
 const IID IID_IVisualTreeServiceCallback2 =
     { 0xBAD9EB88, 0xAE77, 0x4397, { 0xB9, 0x48, 0x5F, 0xA2, 0xDB, 0x0A, 0x19, 0xEA } };
 
-// {B8F3E2D1-9A4C-4F5E-B6D7-8C1A3E5F7D9B}
 static const CLSID CLSID_LvtTap =
     { 0xB8F3E2D1, 0x9A4C, 0x4F5E, { 0xB6, 0xD7, 0x8C, 0x1A, 0x3E, 0x5F, 0x7D, 0x9B } };
+
+// Debug logging to file (since OutputDebugString may not be visible)
+static void LogMsg(const char* fmt, ...) {
+    static FILE* logFile = nullptr;
+    if (!logFile) {
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        wcscat_s(tmp, L"lvt_tap.log");
+        logFile = _wfopen(tmp, L"a");
+        if (!logFile) return;
+    }
+    fprintf(logFile, "[%lu] ", GetCurrentThreadId());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(logFile, fmt, ap);
+    va_end(ap);
+    fprintf(logFile, "\n");
+    fflush(logFile);
+}
+
+static HMODULE GetCurrentModuleHandle() {
+    HMODULE hm = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&GetCurrentModuleHandle), &hm);
+    return hm;
+}
 
 struct TreeNode {
     InstanceHandle handle = 0;
@@ -43,7 +67,6 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     std::wstring m_pipeName;
 
 public:
-    // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
         if (riid == IID_IUnknown) {
@@ -69,8 +92,10 @@ public:
         return c;
     }
 
-    // IObjectWithSite
+    // IObjectWithSite — called by the XAML runtime on the UI thread
     HRESULT STDMETHODCALLTYPE SetSite(IUnknown* pSite) override {
+        LogMsg("SetSite called, pSite=%p", pSite);
+
         if (m_site) { m_site->Release(); m_site = nullptr; }
         if (m_vts) { m_vts->Release(); m_vts = nullptr; }
 
@@ -79,40 +104,50 @@ public:
 
         if (!pSite) return S_OK;
 
+        // Note: Windhawk calls FreeLibrary(GetCurrentModuleHandle()) here to balance
+        // the refcount from InitializeXamlDiagnosticsEx. We skip this because our DLL
+        // only has one LoadLibrary reference (unlike Windhawk which has two from its
+        // hook mechanism). The DLL stays loaded in the target, which is acceptable.
+
         __try {
             return SetSiteImpl(pSite);
         } __except(EXCEPTION_EXECUTE_HANDLER) {
+            LogMsg("SetSiteImpl crashed, code=0x%08X", GetExceptionCode());
             return E_FAIL;
         }
     }
 
     HRESULT SetSiteImpl(IUnknown* pSite) {
-        // Get IXamlDiagnostics from the site
         IXamlDiagnostics* diag = nullptr;
         HRESULT hr = pSite->QueryInterface(__uuidof(IXamlDiagnostics), (void**)&diag);
-        if (FAILED(hr) || !diag) return S_OK;
+        if (FAILED(hr) || !diag) {
+            LogMsg("QI for IXamlDiagnostics failed: 0x%08X", hr);
+            return S_OK;
+        }
 
-        // Retrieve pipe name from initialization data
         BSTR initData = nullptr;
         diag->GetInitializationData(&initData);
         if (initData) {
             m_pipeName = initData;
             SysFreeString(initData);
+            LogMsg("Pipe name: %ls", m_pipeName.c_str());
         }
 
-        // Get IVisualTreeService
         hr = diag->QueryInterface(__uuidof(IVisualTreeService), (void**)&m_vts);
         diag->Release();
-        if (FAILED(hr) || !m_vts) return S_OK;
+        if (FAILED(hr) || !m_vts) {
+            LogMsg("QI for IVisualTreeService failed: 0x%08X", hr);
+            return S_OK;
+        }
 
-        // Calling AdviseVisualTreeChange from SetSite thread can hang.
-        // Use a worker thread (same approach as Windhawk / microsoft-ui-xaml).
+        // AdviseVisualTreeChange hangs if called on the SetSite thread.
+        // Fire-and-forget a worker thread (same as Windhawk).
         AddRef();
         HANDLE hThread = CreateThread(nullptr, 0, &AdviseThreadProc, this, 0, nullptr);
         if (hThread) {
-            WaitForSingleObject(hThread, 10000);
-            CloseHandle(hThread);
+            CloseHandle(hThread); // Don't wait — return immediately to unblock UI thread
         } else {
+            LogMsg("CreateThread failed: %lu", GetLastError());
             Release();
         }
 
@@ -121,24 +156,35 @@ public:
 
     static DWORD WINAPI AdviseThreadProc(LPVOID param) {
         auto* self = reinterpret_cast<LvtTap*>(param);
+        LogMsg("AdviseThread starting");
+
         __try {
             IVisualTreeServiceCallback* cb =
                 static_cast<IVisualTreeServiceCallback*>(
                     static_cast<IVisualTreeServiceCallback2*>(self));
 
             HRESULT hr = self->m_vts->AdviseVisualTreeChange(cb);
+            LogMsg("AdviseVisualTreeChange returned 0x%08X, nodes=%zu, roots=%zu",
+                   hr, self->m_nodes.size(), self->m_roots.size());
+
             if (SUCCEEDED(hr)) {
-                // Give the XAML runtime time to dispatch initial tree nodes
-                Sleep(500);
+                // AdviseVisualTreeChange replays the current tree synchronously
+                // during the call, then continues firing for mutations.
+                // If no nodes yet, wait briefly for async delivery.
+                if (self->m_nodes.empty()) {
+                    Sleep(500);
+                    LogMsg("After sleep: nodes=%zu", self->m_nodes.size());
+                }
                 self->SerializeAndSend();
                 self->m_vts->UnadviseVisualTreeChange(cb);
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
-            // Silently handle crash — don't bring down the target process
+            LogMsg("AdviseThread crashed: 0x%08X", GetExceptionCode());
         }
         self->Release();
         return 0;
     }
+
     HRESULT STDMETHODCALLTYPE GetSite(REFIID riid, void** ppvSite) override {
         if (!m_site) { *ppvSite = nullptr; return E_FAIL; }
         return m_site->QueryInterface(riid, ppvSite);
@@ -184,14 +230,15 @@ private:
         std::wstring r;
         r.reserve(s.size());
         for (wchar_t c : s) {
-            switch (c) {
-            case L'"':  r += L"\\\""; break;
-            case L'\\': r += L"\\\\"; break;
-            case L'\n': r += L"\\n";  break;
-            case L'\r': r += L"\\r";  break;
-            case L'\t': r += L"\\t";  break;
-            default:    r += c;
+            if (c == L'"') { r += L"\\\""; }
+            else if (c == L'\\') { r += L"\\\\"; }
+            else if (c < 0x20) {
+                // Escape all control characters as \uXXXX
+                wchar_t buf[8];
+                swprintf_s(buf, L"\\u%04X", (unsigned)c);
+                r += buf;
             }
+            else { r += c; }
         }
         return r;
     }
@@ -206,11 +253,6 @@ private:
             j += L",\"name\":\"" + Escape(n.name) + L"\"";
         j += L",\"handle\":" + std::to_wstring(n.handle);
 
-        // Note: GetPropertyValuesChain is not called here because it requires
-        // the same apartment as the XAML runtime (STA). Our worker thread can't
-        // safely call it. The type and name from OnVisualTreeChange are sufficient.
-
-        // Children
         if (!n.childHandles.empty()) {
             j += L",\"children\":[";
             for (size_t i = 0; i < n.childHandles.size(); i++) {
@@ -224,9 +266,11 @@ private:
     }
 
     void SerializeAndSend() {
+        LogMsg("SerializeAndSend: nodes=%zu, roots=%zu, pipe=%ls",
+               m_nodes.size(), m_roots.size(), m_pipeName.c_str());
+
         if (m_pipeName.empty() || m_nodes.empty()) return;
 
-        // Build JSON array of root elements
         std::wstring json = L"[";
         for (size_t i = 0; i < m_roots.size(); i++) {
             if (i) json += L",";
@@ -234,14 +278,12 @@ private:
         }
         json += L"]";
 
-        // Convert to UTF-8
         int len = WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
                                       nullptr, 0, nullptr, nullptr);
         std::string utf8(len, '\0');
         WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
                             utf8.data(), len, nullptr, nullptr);
 
-        // Write to named pipe
         HANDLE pipe = CreateFileW(m_pipeName.c_str(), GENERIC_WRITE, 0,
                                   nullptr, OPEN_EXISTING, 0, nullptr);
         if (pipe != INVALID_HANDLE_VALUE) {
@@ -249,6 +291,9 @@ private:
             WriteFile(pipe, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
             FlushFileBuffers(pipe);
             CloseHandle(pipe);
+            LogMsg("Wrote %lu bytes to pipe", written);
+        } else {
+            LogMsg("Failed to open pipe: %lu", GetLastError());
         }
     }
 
@@ -289,10 +334,10 @@ public:
     HRESULT STDMETHODCALLTYPE LockServer(BOOL) override { return S_OK; }
 };
 
-// DLL exports
 extern "C" {
 
 HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
+    LogMsg("DllGetClassObject called");
     if (rclsid != CLSID_LvtTap) return CLASS_E_CLASSNOTAVAILABLE;
     auto* factory = new (std::nothrow) LvtTapFactory();
     if (!factory) return E_OUTOFMEMORY;
@@ -303,6 +348,12 @@ HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* p
 
 HRESULT STDAPICALLTYPE DllCanUnloadNow() { return S_FALSE; }
 
-BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID) { return TRUE; }
+BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hMod);
+        LogMsg("DllMain: DLL_PROCESS_ATTACH");
+    }
+    return TRUE;
+}
 
 } // extern "C"

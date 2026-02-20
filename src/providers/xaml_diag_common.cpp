@@ -9,15 +9,11 @@
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <string>
-#include <thread>
-#include <chrono>
-#include <random>
 
 using json = nlohmann::json;
 
 namespace lvt {
 
-// Generate a unique pipe name for this diagnostics session
 static std::wstring make_pipe_name() {
     GUID guid;
     CoCreateGuid(&guid);
@@ -29,7 +25,6 @@ static std::wstring make_pipe_name() {
     return buf;
 }
 
-// Get the directory of the running executable
 static std::wstring get_exe_dir() {
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -39,32 +34,27 @@ static std::wstring get_exe_dir() {
     return dir;
 }
 
+// Strip control characters from XAML type names (runtime sometimes includes them)
+static std::string sanitize(const std::string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (char c : s) {
+        if (static_cast<unsigned char>(c) >= 0x20 || c == '\t')
+            r += c;
+    }
+    return r;
+}
+
 // Recursively graft JSON tree nodes into an Element tree
 static void graft_json_node(const json& j, Element& parent, const std::string& framework) {
     Element el;
     el.framework = framework;
-    el.className = j.value("type", "");
-    el.text = j.value("name", "");
+    el.className = sanitize(j.value("type", ""));
+    el.text = sanitize(j.value("name", ""));
 
     // Simplify type name: "Windows.UI.Xaml.Controls.Button" -> "Button"
     auto lastDot = el.className.rfind('.');
     el.type = (lastDot != std::string::npos) ? el.className.substr(lastDot + 1) : el.className;
-
-    if (j.contains("properties") && j["properties"].is_object()) {
-        for (auto& [k, v] : j["properties"].items()) {
-            el.properties[k] = v.get<std::string>();
-        }
-        // Use Name/x:Name as text if element text is empty
-        if (el.text.empty()) {
-            if (el.properties.count("Name")) el.text = el.properties["Name"];
-            else if (el.properties.count("x:Name")) el.text = el.properties["x:Name"];
-        }
-        // Use Text/Content property as text if still empty
-        if (el.text.empty()) {
-            if (el.properties.count("Text")) el.text = el.properties["Text"];
-            else if (el.properties.count("Content")) el.text = el.properties["Content"];
-        }
-    }
 
     if (j.contains("children") && j["children"].is_array()) {
         for (auto& child : j["children"]) {
@@ -83,36 +73,30 @@ bool inject_and_collect_xaml_tree(
     const std::wstring& initDllPath,
     const std::string& frameworkLabel)
 {
-    // Resolve TAP DLL path (next to lvt.exe)
     std::wstring tapDll = get_exe_dir() + L"\\lvt_tap.dll";
 
-    // Verify TAP DLL exists
     if (GetFileAttributesW(tapDll.c_str()) == INVALID_FILE_ATTRIBUTES) {
         fprintf(stderr, "lvt: TAP DLL not found: %ls\n", tapDll.c_str());
         return false;
     }
 
-    // Create named pipe server
     std::wstring pipeName = make_pipe_name();
     HANDLE pipe = CreateNamedPipeW(
         pipeName.c_str(),
         PIPE_ACCESS_INBOUND,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1,          // max instances
-        0,          // out buffer
-        1024 * 1024, // in buffer (1 MB)
-        5000,       // timeout ms
-        nullptr);
+        1, 0, 1024 * 1024, 10000, nullptr);
 
     if (pipe == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "lvt: failed to create named pipe (error %lu)\n", GetLastError());
         return false;
     }
 
-    // Load InitializeXamlDiagnosticsEx from the specified DLL
-    HMODULE hXaml = LoadLibraryExW(initDllPath.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    // Load InitializeXamlDiagnosticsEx from the specified DLL.
+    // This function runs in OUR process but injects into the target.
+    HMODULE hXaml = LoadLibraryExW(initDllPath.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!hXaml) {
-        // Try without search flags (for full paths)
         hXaml = LoadLibraryW(initDllPath.c_str());
     }
     if (!hXaml) {
@@ -125,17 +109,15 @@ bool inject_and_collect_xaml_tree(
     auto pInit = reinterpret_cast<FnInit>(
         GetProcAddress(hXaml, "InitializeXamlDiagnosticsEx"));
     if (!pInit) {
-        fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx not found\n");
+        fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx not found in %ls\n", initDllPath.c_str());
         FreeLibrary(hXaml);
         CloseHandle(pipe);
         return false;
     }
 
-    // Call InitializeXamlDiagnosticsEx — this injects lvt_tap.dll into the target.
-    // System XAML registers connections as "VisualDiagConnection1", "VisualDiagConnection2", ...
-    // WinUI3 registers as "WinUIVisualDiagConnection1", "WinUIVisualDiagConnection2", ...
-    // We try both prefixes until we find the active connection.
-    // Reference: microsoft/microsoft-ui-xaml DXamlCore.cpp RegisterVisualDiagnosticsPort()
+    // Try both endpoint name prefixes.
+    // System XAML: "VisualDiagConnection1", "VisualDiagConnection2", ...
+    // WinUI3: "WinUIVisualDiagConnection1", "WinUIVisualDiagConnection2", ...
     static const wchar_t* prefixes[] = {
         L"VisualDiagConnection",
         L"WinUIVisualDiagConnection",
@@ -152,7 +134,7 @@ bool inject_and_collect_xaml_tree(
                 xamlDiagDll.c_str(),
                 tapDll.c_str(),
                 CLSID_LvtTap,
-                pipeName.c_str());  // init data = pipe name
+                pipeName.c_str());
 
             if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
                 break;
@@ -169,22 +151,31 @@ bool inject_and_collect_xaml_tree(
         return false;
     }
 
+    fprintf(stderr, "lvt: injection succeeded, waiting for XAML tree data...\n");
+
     // Wait for the TAP DLL to connect and send data
-    // Use overlapped I/O with a timeout
     OVERLAPPED ov = {};
     ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    ConnectNamedPipe(pipe, &ov);
-    DWORD waitResult = WaitForSingleObject(ov.hEvent, 10000); // 10 second timeout
-    CloseHandle(ov.hEvent);
-
-    if (waitResult != WAIT_OBJECT_0) {
+    BOOL connected = ConnectNamedPipe(pipe, &ov);
+    if (!connected) {
         DWORD err = GetLastError();
-        if (err != ERROR_PIPE_CONNECTED) {
-            fprintf(stderr, "lvt: TAP DLL did not connect (timeout or error %lu)\n", err);
+        if (err == ERROR_IO_PENDING) {
+            DWORD waitResult = WaitForSingleObject(ov.hEvent, 15000);
+            if (waitResult != WAIT_OBJECT_0) {
+                fprintf(stderr, "lvt: TAP DLL did not connect (timeout)\n");
+                CancelIo(pipe);
+                CloseHandle(ov.hEvent);
+                CloseHandle(pipe);
+                return false;
+            }
+        } else if (err != ERROR_PIPE_CONNECTED) {
+            fprintf(stderr, "lvt: ConnectNamedPipe failed (error %lu)\n", err);
+            CloseHandle(ov.hEvent);
             CloseHandle(pipe);
             return false;
         }
     }
+    CloseHandle(ov.hEvent);
 
     // Read all data from pipe
     std::string data;
@@ -195,12 +186,13 @@ bool inject_and_collect_xaml_tree(
     }
     CloseHandle(pipe);
 
+    fprintf(stderr, "lvt: received %zu bytes of XAML tree data\n", data.size());
+
     if (data.empty()) {
         fprintf(stderr, "lvt: no XAML tree data received from target process\n");
         return false;
     }
 
-    // Parse JSON
     json treeJson;
     try {
         treeJson = json::parse(data);
@@ -209,7 +201,7 @@ bool inject_and_collect_xaml_tree(
         return false;
     }
 
-    // Graft XAML elements into the root element tree
+    // Graft XAML elements into the element tree
     if (treeJson.is_array()) {
         for (auto& node : treeJson) {
             graft_json_node(node, root, frameworkLabel);
