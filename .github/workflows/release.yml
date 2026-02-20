@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01
+
+      - name: Configure
+        run: cmake --preset default
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Unit tests
+        run: build\lvt_unit_tests.exe
+
+      - name: Integration tests
+        run: build\lvt_integration_tests.exe
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Path release -Force
+          Copy-Item build\lvt.exe release\
+          Copy-Item build\lvt_tap.dll release\
+          Compress-Archive -Path release\* -DestinationPath lvt-${{ github.ref_name }}-x64.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lvt-${{ github.ref_name }}-x64.zip
+          generate_release_notes: true

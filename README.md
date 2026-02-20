@@ -12,14 +12,20 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 
 ## Quick start
 
-### Prerequisites
+### Download
+
+Grab the latest release from **[GitHub Releases](https://github.com/asklar/lvt/releases/latest)** — extract the zip and run `lvt.exe` from any terminal.
+
+### Build from source
+
+#### Prerequisites
 
 - Visual Studio 2022+ (C++ Desktop workload)
 - [vcpkg](https://vcpkg.io) with `VCPKG_ROOT` environment variable set
 - CMake 3.20+
 - x64 Developer Command Prompt
 
-### Build
+#### Build
 
 ```powershell
 cmake --preset default

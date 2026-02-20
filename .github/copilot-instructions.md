@@ -4,7 +4,11 @@
 
 lvt (Live Visual Tree) is a Windows C++20 CLI tool that inspects the visual tree of running Windows applications. It targets apps by HWND, PID, process name, or window title, detects UI frameworks (Win32, ComCtl, XAML, WinUI3), and outputs a unified element tree as JSON or XML markup. It also captures annotated PNG screenshots. The primary consumer is AI agents (e.g. Copilot) that need a textual representation of an app's UI.
 
-## Build
+## Download
+
+Download the latest release from **[GitHub Releases](https://github.com/asklar/lvt/releases/latest)**. The zip contains `lvt.exe` and `lvt_tap.dll` — place them in the same directory and run from any terminal.
+
+## Build from source
 
 Requires an **x64 Visual Studio Developer Command Prompt** (VS 2022+) and `VCPKG_ROOT` set.
 
