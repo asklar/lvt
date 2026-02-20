@@ -46,22 +46,28 @@ lvt tries connection names sequentially until one succeeds (doesn't return `ERRO
 
 ## COM class structure
 
-```
-LvtTap : IObjectWithSite, IVisualTreeServiceCallback2
-  │
-  ├── SetSite(IXamlDiagnostics*)
-  │     ├── QI → IVisualTreeService (m_vts)
-  │     ├── Create message-only window (m_msgWnd)
-  │     └── Launch worker thread (AdviseThreadProc)
-  │
-  ├── OnVisualTreeChange(relation, element, mutation)
-  │     └── Build TreeNode map (m_nodes, m_roots)
-  │
-  └── Worker thread:
-        ├── AdviseVisualTreeChange(callback)  [replays existing tree]
-        ├── SendMessage(WM_COLLECT_BOUNDS)    [dispatch to UI thread]
-        ├── SerializeAndSend()                [JSON → named pipe]
-        └── UnadviseVisualTreeChange()
+```mermaid
+flowchart TB
+    LvtTap["LvtTap : IObjectWithSite, IVisualTreeServiceCallback2"]
+
+    SetSite["SetSite(IXamlDiagnostics*)"]
+    QI["QI → IVisualTreeService (m_vts)"]
+    MsgWnd["Create message-only window (m_msgWnd)"]
+    Launch["Launch worker thread (AdviseThreadProc)"]
+
+    OnVTC["OnVisualTreeChange(relation, element, mutation)"]
+    BuildMap["Build TreeNode map (m_nodes, m_roots)"]
+
+    WorkerThread["Worker thread"]
+    Advise["AdviseVisualTreeChange — replays existing tree"]
+    SendMsg["SendMessage(WM_COLLECT_BOUNDS) — dispatch to UI thread"]
+    Serialize["SerializeAndSend() — JSON → named pipe"]
+    Unadvise["UnadviseVisualTreeChange()"]
+
+    LvtTap --> SetSite & OnVTC & WorkerThread
+    SetSite --> QI & MsgWnd & Launch
+    OnVTC --> BuildMap
+    WorkerThread --> Advise --> SendMsg --> Serialize --> Unadvise
 ```
 
 ## Threading model
@@ -78,25 +84,33 @@ These constraints are contradictory: the tree replay (via `AdviseVisualTreeChang
 
 ### The solution: message-only window dispatch
 
-```
-UI Thread                          Worker Thread
-─────────                          ─────────────
-SetSite() called
-  ├─ Create message window
-  ├─ Launch worker thread ──────→  AdviseVisualTreeChange()
-  └─ Return S_OK                     ├─ OnVisualTreeChange × N
-     (UI thread is now free)          │   (builds m_nodes map)
-                                      │
-                                      ├─ SendMessage(WM_COLLECT_BOUNDS)
-     ┌────────────────────────────────┘   (blocks worker thread)
-     │
-  WndProc: WM_COLLECT_BOUNDS
-     ├─ CollectBoundsOnUIThread()
-     │   └─ For each node:
-     │       GetPropertyValuesChain()
-     │       → extract ActualWidth, ActualHeight, ActualOffset
-     └─ Return ──────────────────→  SerializeAndSend()
-                                      └─ Write JSON to pipe
+```mermaid
+sequenceDiagram
+    participant UI as UI Thread
+    participant Worker as Worker Thread
+    participant Pipe as Named Pipe → lvt.exe
+
+    UI->>UI: SetSite() called
+    UI->>UI: Create message-only window (HWND_MESSAGE)
+    UI->>Worker: Launch worker thread
+    UI->>UI: Return S_OK (UI thread is now free)
+
+    Worker->>Worker: AdviseVisualTreeChange(callback)
+    loop Tree replay
+        Worker->>Worker: OnVisualTreeChange(node) → builds m_nodes map
+    end
+
+    Worker->>UI: SendMessage(WM_COLLECT_BOUNDS)
+    Note over Worker: blocks until UI thread responds
+
+    UI->>UI: WndProc: WM_COLLECT_BOUNDS
+    loop For each node
+        UI->>UI: GetPropertyValuesChain() → ActualWidth, ActualHeight, ActualOffset
+    end
+    UI->>Worker: Return (unblocks SendMessage)
+
+    Worker->>Pipe: SerializeAndSend() → JSON
+    Worker->>Worker: UnadviseVisualTreeChange()
 ```
 
 Key details:

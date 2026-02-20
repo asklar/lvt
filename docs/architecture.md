@@ -5,7 +5,7 @@
 lvt is structured as a 4-stage pipeline that transforms a target window identifier into a structured element tree.
 
 ```mermaid
-flowchart LR
+flowchart TB
     A["Target\nResolution\n<small>target.cpp</small>"] --> B["Framework\nDetection\n<small>framework_detector.cpp</small>"]
     B --> C["Tree\nBuilding\n<small>tree_builder.cpp\nproviders/*</small>"]
     C --> D["Serialization\n& Output\n<small>json_serializer.cpp\nscreenshot.cpp</small>"]
