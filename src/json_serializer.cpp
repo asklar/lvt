@@ -13,9 +13,6 @@ static json bounds_to_json(const Bounds& b) {
 
 static json element_to_json(const Element& el) {
     json j;
-    j["id"] = el.id;
-    j["type"] = el.type;
-    j["framework"] = el.framework;
     // Strip control characters from strings (XAML runtime can include them in type names)
     auto sanitize = [](const std::string& s) {
         std::string r;
@@ -26,6 +23,9 @@ static json element_to_json(const Element& el) {
         }
         return r;
     };
+    j["id"] = el.id;
+    j["type"] = sanitize(el.type);
+    j["framework"] = el.framework;
     if (!el.className.empty()) j["className"] = sanitize(el.className);
     if (!el.text.empty()) j["text"] = sanitize(el.text);
     j["bounds"] = bounds_to_json(el.bounds);

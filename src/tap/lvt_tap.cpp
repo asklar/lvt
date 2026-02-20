@@ -56,6 +56,7 @@ struct TreeNode {
     InstanceHandle parent = 0;
     unsigned int childIndex = 0;
     std::vector<InstanceHandle> childHandles;
+    std::vector<std::pair<std::wstring, std::wstring>> properties; // name, value
 };
 
 class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
@@ -65,6 +66,7 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     std::map<InstanceHandle, TreeNode> m_nodes;
     std::vector<InstanceHandle> m_roots;
     std::wstring m_pipeName;
+    bool m_collectProps = false;
 
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -128,9 +130,18 @@ public:
         BSTR initData = nullptr;
         diag->GetInitializationData(&initData);
         if (initData) {
-            m_pipeName = initData;
+            std::wstring data(initData);
             SysFreeString(initData);
-            LogMsg("Pipe name: %ls", m_pipeName.c_str());
+            // Format: "pipe_name" or "pipe_name|PROPS"
+            auto sep = data.find(L'|');
+            if (sep != std::wstring::npos) {
+                m_pipeName = data.substr(0, sep);
+                std::wstring flags = data.substr(sep + 1);
+                m_collectProps = (flags.find(L"PROPS") != std::wstring::npos);
+            } else {
+                m_pipeName = data;
+            }
+            LogMsg("Pipe name: %ls, collectProps: %d", m_pipeName.c_str(), m_collectProps);
         }
 
         hr = diag->QueryInterface(__uuidof(IVisualTreeService), (void**)&m_vts);

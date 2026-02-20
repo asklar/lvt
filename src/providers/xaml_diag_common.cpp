@@ -45,6 +45,16 @@ static std::string sanitize(const std::string& s) {
     return r;
 }
 
+// Collect all DesktopChildSiteBridge elements in tree order
+static void collect_bridges(Element& el, std::vector<Element*>& bridges) {
+    if (el.className == "Microsoft.UI.Content.DesktopChildSiteBridge") {
+        bridges.push_back(&el);
+    }
+    for (auto& child : el.children) {
+        collect_bridges(child, bridges);
+    }
+}
+
 // Recursively graft JSON tree nodes into an Element tree
 static void graft_json_node(const json& j, Element& parent, const std::string& framework) {
     Element el;
@@ -201,10 +211,25 @@ bool inject_and_collect_xaml_tree(
         return false;
     }
 
-    // Graft XAML elements into the element tree
+    // Graft XAML elements into corresponding bridge windows.
+    // Each DesktopWindowXamlSource root maps 1:1 to a DesktopChildSiteBridge HWND.
+    // We match them by order since both lists are enumerated in the same order.
     if (treeJson.is_array()) {
+        std::vector<Element*> bridges;
+        collect_bridges(root, bridges);
+
+        size_t bridgeIdx = 0;
         for (auto& node : treeJson) {
-            graft_json_node(node, root, frameworkLabel);
+            std::string typeName = sanitize(node.value("type", ""));
+            // Try to graft DesktopWindowXamlSource roots into matching bridges
+            if (typeName.find("DesktopWindowXamlSource") != std::string::npos
+                && bridgeIdx < bridges.size()) {
+                graft_json_node(node, *bridges[bridgeIdx], frameworkLabel);
+                bridgeIdx++;
+            } else {
+                // Non-bridge XAML root: graft at the top level
+                graft_json_node(node, root, frameworkLabel);
+            }
         }
     } else if (treeJson.is_object()) {
         graft_json_node(treeJson, root, frameworkLabel);
