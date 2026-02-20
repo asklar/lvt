@@ -16,6 +16,16 @@ static void assign_ids_recursive(Element& el, int& counter) {
     }
 }
 
+static void trim_to_depth(Element& el, int currentDepth, int maxDepth) {
+    if (maxDepth >= 0 && currentDepth >= maxDepth) {
+        el.children.clear();
+        return;
+    }
+    for (auto& child : el.children) {
+        trim_to_depth(child, currentDepth + 1, maxDepth);
+    }
+}
+
 void assign_element_ids(Element& root) {
     int counter = 0;
     assign_ids_recursive(root, counter);
@@ -47,6 +57,12 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         default:
             break;
         }
+    }
+
+    // Trim tree to maxDepth (applied after all providers so XAML/ComCtl subtrees
+    // are also limited). Depth 0 = root only, depth 1 = root + direct children, etc.
+    if (maxDepth >= 0) {
+        trim_to_depth(root, 0, maxDepth);
     }
 
     assign_element_ids(root);
