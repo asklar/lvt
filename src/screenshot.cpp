@@ -21,8 +21,6 @@
 #include <mutex>
 #include <condition_variable>
 
-namespace lvt {
-
 // {A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1}
 MIDL_INTERFACE("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")
 IDirect3DDxgiInterfaceAccess : public IUnknown {

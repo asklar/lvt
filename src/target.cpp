@@ -6,6 +6,16 @@
 
 namespace lvt {
 
+static std::string wstr_to_utf8(const wchar_t* ws, int len = -1) {
+    if (!ws) return {};
+    if (len < 0) len = static_cast<int>(wcslen(ws));
+    if (len == 0) return {};
+    int sz = WideCharToMultiByte(CP_UTF8, 0, ws, len, nullptr, 0, nullptr, nullptr);
+    std::string s(sz, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws, len, s.data(), sz, nullptr, nullptr);
+    return s;
+}
+
 struct EnumData {
     DWORD pid;
     std::vector<HWND> candidates;
@@ -30,12 +40,28 @@ static std::string get_process_name(DWORD pid) {
         std::wstring ws(path, size);
         auto pos = ws.find_last_of(L"\\/");
         if (pos != std::wstring::npos) ws = ws.substr(pos + 1);
-        int sz = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), nullptr, 0, nullptr, nullptr);
-        std::string s(sz, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), static_cast<int>(ws.size()), s.data(), sz, nullptr, nullptr);
-        return s;
+        return wstr_to_utf8(ws.c_str(), static_cast<int>(ws.size()));
     }
     return {};
+}
+
+static std::string get_window_title(HWND hwnd) {
+    int len = GetWindowTextLengthW(hwnd);
+    if (len == 0) return {};
+    std::wstring buf(len + 1, L'\0');
+    GetWindowTextW(hwnd, buf.data(), len + 1);
+    return wstr_to_utf8(buf.c_str(), len);
+}
+
+// Case-insensitive substring match on ASCII/UTF-8 strings.
+static bool icontains(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return true;
+    if (haystack.size() < needle.size()) return false;
+    auto it = std::search(haystack.begin(), haystack.end(),
+                          needle.begin(), needle.end(),
+                          [](char a, char b) { return tolower(static_cast<unsigned char>(a)) ==
+                                                      tolower(static_cast<unsigned char>(b)); });
+    return it != haystack.end();
 }
 
 TargetInfo resolve_target(HWND hwnd, DWORD pid) {
@@ -49,7 +75,6 @@ TargetInfo resolve_target(HWND hwnd, DWORD pid) {
         EnumData data{pid, {}};
         EnumWindows(enum_windows_proc, reinterpret_cast<LPARAM>(&data));
 
-        // Pick the largest visible window as the main window
         HWND best = nullptr;
         int bestArea = 0;
         for (auto h : data.candidates) {
@@ -71,6 +96,52 @@ TargetInfo resolve_target(HWND hwnd, DWORD pid) {
         info.processName = get_process_name(info.pid);
     }
     return info;
+}
+
+struct EnumAllData {
+    std::vector<WindowMatch> matches;
+};
+
+static BOOL CALLBACK enum_all_windows_proc(HWND hwnd, LPARAM lParam) {
+    auto* data = reinterpret_cast<EnumAllData*>(lParam);
+    if (!IsWindowVisible(hwnd)) return TRUE;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+
+    WindowMatch m;
+    m.hwnd = hwnd;
+    m.pid = pid;
+    m.processName = get_process_name(pid);
+    m.windowTitle = get_window_title(hwnd);
+    data->matches.push_back(std::move(m));
+    return TRUE;
+}
+
+std::vector<WindowMatch> find_by_process_name(const std::string& name) {
+    EnumAllData data;
+    EnumWindows(enum_all_windows_proc, reinterpret_cast<LPARAM>(&data));
+
+    std::vector<WindowMatch> results;
+    for (auto& m : data.matches) {
+        if (icontains(m.processName, name)) {
+            results.push_back(std::move(m));
+        }
+    }
+    return results;
+}
+
+std::vector<WindowMatch> find_by_title(const std::string& title) {
+    EnumAllData data;
+    EnumWindows(enum_all_windows_proc, reinterpret_cast<LPARAM>(&data));
+
+    std::vector<WindowMatch> results;
+    for (auto& m : data.matches) {
+        if (icontains(m.windowTitle, title)) {
+            results.push_back(std::move(m));
+        }
+    }
+    return results;
 }
 
 } // namespace lvt

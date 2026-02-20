@@ -17,10 +17,14 @@ static void print_usage() {
         "Usage:\n"
         "  lvt --hwnd <handle>  [options]\n"
         "  lvt --pid <pid>      [options]\n"
+        "  lvt --name <exe>     [options]\n"
+        "  lvt --title <text>   [options]\n"
         "\n"
         "Options:\n"
         "  --hwnd <handle>      Target window by HWND (hex, e.g. 0x1A0B3C)\n"
         "  --pid <pid>          Target process by PID (finds main window)\n"
+        "  --name <exe>         Target by process name (e.g. notepad.exe)\n"
+        "  --title <text>       Target by window title substring\n"
         "  --output <file>      Write JSON to file instead of stdout\n"
         "  --screenshot <file>  Capture annotated screenshot to PNG\n"
         "  --element <id>       Scope to a specific element subtree\n"
@@ -33,6 +37,8 @@ static void print_usage() {
 struct Args {
     HWND hwnd = nullptr;
     DWORD pid = 0;
+    std::string processName;
+    std::string windowTitle;
     std::string outputFile;
     std::string screenshotFile;
     std::string elementId;
@@ -51,6 +57,10 @@ static Args parse_args(int argc, char* argv[]) {
             args.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(val));
         } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             args.pid = static_cast<DWORD>(strtoul(argv[++i], nullptr, 10));
+        } else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+            args.processName = argv[++i];
+        } else if (strcmp(argv[i], "--title") == 0 && i + 1 < argc) {
+            args.windowTitle = argv[++i];
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             args.outputFile = argv[++i];
         } else if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
@@ -87,9 +97,47 @@ int main(int argc, char* argv[]) {
 
     auto args = parse_args(argc, argv);
 
-    if (!args.hwnd && !args.pid) {
-        fprintf(stderr, "lvt: must specify --hwnd or --pid\n");
+    if (!args.hwnd && !args.pid && args.processName.empty() && args.windowTitle.empty()) {
+        fprintf(stderr, "lvt: must specify --hwnd, --pid, --name, or --title\n");
         return 1;
+    }
+
+    // Resolve target via --name or --title (with multi-match handling)
+    if (!args.processName.empty()) {
+        auto matches = lvt::find_by_process_name(args.processName);
+        if (matches.empty()) {
+            fprintf(stderr, "lvt: no visible windows found for process '%s'\n",
+                    args.processName.c_str());
+            return 1;
+        }
+        if (matches.size() > 1) {
+            fprintf(stderr, "lvt: multiple windows match '%s':\n", args.processName.c_str());
+            for (auto& m : matches) {
+                fprintf(stderr, "  --hwnd 0x%p  pid=%lu  %s  \"%s\"\n",
+                        static_cast<void*>(m.hwnd), m.pid,
+                        m.processName.c_str(), m.windowTitle.c_str());
+            }
+            return 1;
+        }
+        args.hwnd = matches[0].hwnd;
+    } else if (!args.windowTitle.empty()) {
+        auto matches = lvt::find_by_title(args.windowTitle);
+        if (matches.empty()) {
+            fprintf(stderr, "lvt: no visible windows found with title containing '%s'\n",
+                    args.windowTitle.c_str());
+            return 1;
+        }
+        if (matches.size() > 1) {
+            fprintf(stderr, "lvt: multiple windows match title '%s':\n",
+                    args.windowTitle.c_str());
+            for (auto& m : matches) {
+                fprintf(stderr, "  --hwnd 0x%p  pid=%lu  %s  \"%s\"\n",
+                        static_cast<void*>(m.hwnd), m.pid,
+                        m.processName.c_str(), m.windowTitle.c_str());
+            }
+            return 1;
+        }
+        args.hwnd = matches[0].hwnd;
     }
 
     // Resolve target
