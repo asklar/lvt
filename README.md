@@ -16,6 +16,17 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 
 Grab the latest release from **[GitHub Releases](https://github.com/asklar/lvt/releases/latest)** — extract the zip and run `lvt.exe` from any terminal.
 
+### Install the Copilot skill
+
+The release zip includes a `skills/lvt/SKILL.md` file that teaches GitHub Copilot CLI how to use lvt. To install it:
+
+```powershell
+# Extract the release zip, then copy the skill to your personal skills directory
+Copy-Item -Recurse path\to\lvt\skills\lvt "$env:USERPROFILE\.copilot\skills\lvt"
+```
+
+Then in Copilot CLI, run `/skills reload`. You can verify with `/skills list` — you should see `lvt` listed. Now Copilot can inspect any running app's UI when you ask it to.
+
 ### Build from source
 
 #### Prerequisites

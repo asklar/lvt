@@ -21,7 +21,9 @@ Use `lvt` whenever you need to understand the visual content or structure of a r
 
 ## Prerequisites
 
-Download `lvt.exe` and `lvt_tap.dll` from the **[latest GitHub release](https://github.com/asklar/lvt/releases/latest)** and place them in the same directory. No build step required.
+Download `lvt.exe` and `lvt_tap.dll` from the **[latest GitHub release](https://github.com/asklar/lvt/releases/latest)** and place them in the same directory (or on PATH). No build step required.
+
+If lvt was installed via the release zip, `lvt.exe` is in the same directory tree as this skill file. Try running it from there first.
 
 ## Usage
 

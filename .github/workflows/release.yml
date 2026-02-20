@@ -42,6 +42,8 @@ jobs:
           New-Item -ItemType Directory -Path release -Force
           Copy-Item build\lvt.exe release\
           Copy-Item build\lvt_tap.dll release\
+          New-Item -ItemType Directory -Path release\skills\lvt -Force
+          Copy-Item .github\skills\lvt\SKILL.md release\skills\lvt\
           Compress-Archive -Path release\* -DestinationPath lvt-${{ github.ref_name }}-x64.zip
 
       - name: Create GitHub Release
