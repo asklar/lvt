@@ -1,4 +1,4 @@
-// lvt_tap.cpp — Tool Attachment Point DLL for XAML diagnostics
+// lvt_tap.cpp — TAP DLL for XAML diagnostics
 // Injected into the target process by InitializeXamlDiagnosticsEx.
 // Implements IObjectWithSite → receives IXamlDiagnostics → walks XAML tree
 // via IVisualTreeService::AdviseVisualTreeChange → sends JSON over named pipe.

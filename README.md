@@ -150,4 +150,4 @@ ctest --test-dir build
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
