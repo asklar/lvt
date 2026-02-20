@@ -90,7 +90,7 @@ static Args parse_args(int argc, char* argv[]) {
     return args;
 }
 
-static const lvt::Element* find_element(const lvt::Element& root, const std::string& id) {
+static lvt::Element* find_element(lvt::Element& root, const std::string& id) {
     if (root.id == id) return &root;
     for (auto& child : root.children) {
         auto* found = find_element(child, id);
@@ -181,17 +181,22 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Build tree
-    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks, args.depth);
+    // Build full tree (no depth limit) so element IDs are stable
+    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks);
 
     // Scope to element if requested
-    const lvt::Element* outputRoot = &tree;
+    lvt::Element* outputRoot = &tree;
     if (!args.elementId.empty()) {
         outputRoot = find_element(tree, args.elementId);
         if (!outputRoot) {
             fprintf(stderr, "lvt: element '%s' not found\n", args.elementId.c_str());
             return 1;
         }
+    }
+
+    // Apply depth limit relative to the output root
+    if (args.depth >= 0) {
+        lvt::trim_to_depth(*outputRoot, args.depth);
     }
 
     // Serialize and output tree (unless suppressed by --screenshot without --dump)

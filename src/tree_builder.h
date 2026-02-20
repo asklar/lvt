@@ -11,4 +11,7 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
 // Assign deterministic element IDs (e0, e1, ...) in depth-first order.
 void assign_element_ids(Element& root);
 
+// Trim element tree to a maximum depth (0 = root only, 1 = root + children, etc.)
+void trim_to_depth(Element& root, int maxDepth);
+
 } // namespace lvt
