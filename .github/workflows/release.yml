@@ -26,10 +26,10 @@ jobs:
           vcpkgGitCommitId: b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01
 
       - name: Configure
-        run: cmake --preset default
+        run: cmake --preset default -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build
 
       - name: Unit tests
         run: build\lvt_unit_tests.exe

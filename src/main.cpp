@@ -3,6 +3,7 @@
 #include "tree_builder.h"
 #include "json_serializer.h"
 #include "screenshot.h"
+#include "debug.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +33,7 @@ static void print_usage() {
         "  --element <id>       Scope to a specific element subtree\n"
         "  --frameworks         Just detect and list frameworks\n"
         "  --depth <n>          Max tree traversal depth (default: unlimited)\n"
+        "  --debug              Show verbose diagnostic output\n"
         "  --help               Show this help\n"
     );
 }
@@ -81,6 +83,8 @@ static Args parse_args(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--dump") == 0) {
             args.dump = true;
             args.dumpSet = true;
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            lvt::g_debug = true;
         } else {
             fprintf(stderr, "lvt: unknown argument '%s'\n", argv[i]);
             print_usage();
@@ -227,7 +231,8 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             out << serialized << "\n";
-            fprintf(stderr, "lvt: wrote tree to %s\n", args.outputFile.c_str());
+            if (lvt::g_debug)
+                fprintf(stderr, "lvt: wrote tree to %s\n", args.outputFile.c_str());
         }
     }
 
@@ -235,7 +240,7 @@ int main(int argc, char* argv[]) {
     if (!args.screenshotFile.empty()) {
         bool ok = lvt::capture_screenshot(target.hwnd, args.screenshotFile,
                                           &tree, args.elementId);
-        if (ok) {
+        if (ok && lvt::g_debug) {
             fprintf(stderr, "lvt: saved screenshot to %s\n", args.screenshotFile.c_str());
         }
     }

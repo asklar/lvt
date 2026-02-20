@@ -3,6 +3,7 @@
 
 #include "xaml_diag_common.h"
 #include "../tap/tap_clsid.h"
+#include "../debug.h"
 
 #include <Windows.h>
 #include <xamlOM.h>
@@ -168,7 +169,8 @@ bool inject_and_collect_xaml_tree(
         return false;
     }
 
-    fprintf(stderr, "lvt: injection succeeded, waiting for XAML tree data...\n");
+    if (g_debug)
+        fprintf(stderr, "lvt: injection succeeded, waiting for XAML tree data...\n");
 
     // Wait for the TAP DLL to connect and send data
     OVERLAPPED ov = {};
@@ -223,7 +225,8 @@ bool inject_and_collect_xaml_tree(
     CloseHandle(readOv.hEvent);
     CloseHandle(pipe);
 
-    fprintf(stderr, "lvt: received %zu bytes of XAML tree data\n", data.size());
+    if (g_debug)
+        fprintf(stderr, "lvt: received %zu bytes of XAML tree data\n", data.size());
 
     if (data.empty()) {
         fprintf(stderr, "lvt: no XAML tree data received from target process\n");
