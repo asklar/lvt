@@ -2,6 +2,8 @@
 
 A Windows CLI tool that inspects the visual tree of running applications. Designed for AI agents (e.g. GitHub Copilot) that need a textual representation of an app's UI content.
 
+![lvt inspecting File Explorer](docs/hero.png)
+
 ## What it does
 
 - Targets any running Windows app by HWND, PID, process name, or window title
