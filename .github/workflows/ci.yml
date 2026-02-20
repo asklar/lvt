@@ -13,6 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
         with:
@@ -42,6 +47,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
