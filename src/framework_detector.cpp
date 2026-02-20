@@ -77,8 +77,10 @@ static std::wstring get_module_path(HANDLE proc, const wchar_t* moduleName) {
     return {};
 }
 
-// Extract file version string from a DLL path (e.g. "3.1.7.2602").
-static std::string get_file_version(const std::wstring& path) {
+// Extract version string from a DLL path.
+// useFileVersion=true reads dwFileVersion (e.g. "6.10" for comctl32),
+// useFileVersion=false reads dwProductVersion (e.g. "10.0.26568.5001" for system DLLs).
+static std::string get_file_version(const std::wstring& path, bool useFileVersion = false) {
     if (path.empty()) return {};
     DWORD verHandle = 0;
     DWORD verSize = GetFileVersionInfoSizeW(path.c_str(), &verHandle);
@@ -93,10 +95,11 @@ static std::string get_file_version(const std::wstring& path) {
     if (!VerQueryValueW(verData.data(), L"\\", reinterpret_cast<void**>(&fileInfo), &len))
         return {};
 
+    DWORD ms = useFileVersion ? fileInfo->dwFileVersionMS : fileInfo->dwProductVersionMS;
+    DWORD ls = useFileVersion ? fileInfo->dwFileVersionLS : fileInfo->dwProductVersionLS;
     char buf[64];
     snprintf(buf, sizeof(buf), "%d.%d.%d.%d",
-             HIWORD(fileInfo->dwProductVersionMS), LOWORD(fileInfo->dwProductVersionMS),
-             HIWORD(fileInfo->dwProductVersionLS), LOWORD(fileInfo->dwProductVersionLS));
+             HIWORD(ms), LOWORD(ms), HIWORD(ls), LOWORD(ls));
     return buf;
 }
 
@@ -105,14 +108,14 @@ struct ModuleDetection {
     std::string version;
 };
 
-static ModuleDetection detect_module(DWORD pid, const wchar_t* moduleName) {
+static ModuleDetection detect_module(DWORD pid, const wchar_t* moduleName, bool useFileVersion = false) {
     wil::unique_handle proc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
     if (!proc) return {};
 
     auto path = get_module_path(proc.get(), moduleName);
     if (path.empty()) return {};
 
-    return {true, get_file_version(path)};
+    return {true, get_file_version(path, useFileVersion)};
 }
 
 std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
@@ -125,8 +128,18 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
         if (data.hasComCtl) {
             std::string comctlVer;
             if (pid) {
-                auto det = detect_module(pid, L"comctl32.dll");
-                if (det.found) comctlVer = det.version;
+                auto det = detect_module(pid, L"comctl32.dll", true);
+                if (det.found) {
+                    // Truncate to major.minor (e.g. "6.10")
+                    auto& v = det.version;
+                    auto dot1 = v.find('.');
+                    if (dot1 != std::string::npos) {
+                        auto dot2 = v.find('.', dot1 + 1);
+                        if (dot2 != std::string::npos)
+                            v.resize(dot2);
+                    }
+                    comctlVer = v;
+                }
             }
             result.push_back({Framework::ComCtl, comctlVer});
         }
