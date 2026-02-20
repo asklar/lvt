@@ -46,8 +46,16 @@ jobs:
           Copy-Item .github\skills\lvt\SKILL.md release\skills\lvt\
           Compress-Archive -Path release\* -DestinationPath lvt-${{ github.ref_name }}-x64.zip
 
+      - name: Extract release notes from tag
+        id: notes
+        run: |
+          $msg = git tag -l --format='%(contents)' ${{ github.ref_name }}
+          # Write to file for multi-line support
+          $msg | Out-File -FilePath release_notes.md -Encoding utf8
+        shell: pwsh
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: lvt-${{ github.ref_name }}-x64.zip
-          generate_release_notes: true
+          body_path: release_notes.md

@@ -39,14 +39,29 @@ Use `/release` to publish a new version of lvt to GitHub Releases.
 
    If there are uncommitted changes, stop and tell the user.
 
-5. **Create and push the tag**:
+5. **Generate release notes** from the commits since the last tag:
 
    ```bash
-   git tag v<NEW_VERSION>
+   git log <PREV_TAG>..HEAD --oneline --no-decorate
+   ```
+
+   Summarize the commits into a human-readable changelog grouped by category:
+   - **Bug fixes** — things that were broken and are now fixed
+   - **New features** — new capabilities, CLI flags, providers
+   - **Other changes** — refactors, docs, CI, etc.
+
+   Omit empty categories. Write the notes in markdown. Show the draft to the user and ask for confirmation before proceeding.
+
+6. **Create an annotated tag and push it**. Write the release notes into a temp file, then:
+
+   ```bash
+   git tag -a v<NEW_VERSION> -F <temp_file>
    git push origin v<NEW_VERSION>
    ```
 
-6. **Confirm** by showing the user the tag and a link to the GitHub Actions run:
+   The release pipeline reads the tag message and uses it as the GitHub Release body.
+
+7. **Confirm** by showing the user the tag and a link to the GitHub Actions run:
    `https://github.com/asklar/lvt/actions`
 
 ## Version format
