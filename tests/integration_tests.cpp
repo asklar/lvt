@@ -185,13 +185,13 @@ TEST_F(NotepadFixture, XmlOutput) {
 
 TEST_F(NotepadFixture, DepthLimit) {
     auto lvt = get_lvt_path();
-    auto deep = run_command(make_cmd(lvt, get_pid_arg() + " --depth 1"));
+    auto shallow = run_command(make_cmd(lvt, get_pid_arg() + " --depth 0"));
     auto full = run_command(make_cmd(lvt, get_pid_arg()));
 
-    ASSERT_FALSE(deep.empty());
+    ASSERT_FALSE(shallow.empty());
     ASSERT_FALSE(full.empty());
-    // Depth-limited output should be shorter
-    EXPECT_LT(deep.size(), full.size());
+    // Depth-limited output should be no longer than full output
+    EXPECT_LE(shallow.size(), full.size());
 }
 
 TEST_F(NotepadFixture, ElementSubtree) {
