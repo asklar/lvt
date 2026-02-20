@@ -25,7 +25,8 @@ static void print_usage() {
         "  --pid <pid>          Target process by PID (finds main window)\n"
         "  --name <exe>         Target by process name (e.g. notepad.exe)\n"
         "  --title <text>       Target by window title substring\n"
-        "  --output <file>      Write JSON to file instead of stdout\n"
+        "  --output <file>      Write output to file instead of stdout\n"
+        "  --format <fmt>       Output format: json (default) or xml\n"
         "  --screenshot <file>  Capture annotated screenshot to PNG\n"
         "  --element <id>       Scope to a specific element subtree\n"
         "  --frameworks         Just detect and list frameworks\n"
@@ -40,6 +41,7 @@ struct Args {
     std::string processName;
     std::string windowTitle;
     std::string outputFile;
+    std::string format = "json";
     std::string screenshotFile;
     std::string elementId;
     int depth = -1;
@@ -63,6 +65,8 @@ static Args parse_args(int argc, char* argv[]) {
             args.windowTitle = argv[++i];
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             args.outputFile = argv[++i];
+        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            args.format = argv[++i];
         } else if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
             args.screenshotFile = argv[++i];
         } else if (strcmp(argv[i], "--element") == 0 && i + 1 < argc) {
@@ -180,7 +184,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Serialize to JSON
+    // Serialize
     std::vector<std::string> frameworkNames;
     for (auto& fi : frameworks) {
         if (fi.version.empty())
@@ -189,19 +193,25 @@ int main(int argc, char* argv[]) {
             frameworkNames.push_back(lvt::framework_to_string(fi.type) + " " + fi.version);
     }
 
-    auto json = lvt::serialize_to_json(*outputRoot, target.hwnd, target.pid,
-                                       target.processName, frameworkNames);
+    std::string serialized;
+    if (args.format == "xml") {
+        serialized = lvt::serialize_to_xml(*outputRoot, target.hwnd, target.pid,
+                                           target.processName, frameworkNames);
+    } else {
+        serialized = lvt::serialize_to_json(*outputRoot, target.hwnd, target.pid,
+                                            target.processName, frameworkNames);
+    }
 
-    // Output JSON
+    // Write output
     if (args.outputFile.empty()) {
-        printf("%s\n", json.c_str());
+        printf("%s\n", serialized.c_str());
     } else {
         std::ofstream out(args.outputFile);
         if (!out) {
             fprintf(stderr, "lvt: cannot write to '%s'\n", args.outputFile.c_str());
             return 1;
         }
-        out << json << "\n";
+        out << serialized << "\n";
         fprintf(stderr, "lvt: wrote tree to %s\n", args.outputFile.c_str());
     }
 

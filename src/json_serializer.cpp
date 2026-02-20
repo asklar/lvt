@@ -71,4 +71,93 @@ std::string serialize_to_json(const Element& root, HWND hwnd, DWORD pid,
     return output.dump(2);
 }
 
+// --- XML serialization ---
+
+static std::string xml_escape(const std::string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+        case '&':  r += "&amp;";  break;
+        case '<':  r += "&lt;";   break;
+        case '>':  r += "&gt;";   break;
+        case '"':  r += "&quot;"; break;
+        case '\'': r += "&apos;"; break;
+        default:
+            if (static_cast<unsigned char>(c) >= 0x20)
+                r += c;
+        }
+    }
+    return r;
+}
+
+// Make a valid XML tag name from a type string
+static std::string xml_tag(const std::string& type) {
+    std::string tag;
+    for (char c : type) {
+        if (static_cast<unsigned char>(c) >= 0x20 && c != '<' && c != '>' && c != ' ')
+            tag += c;
+    }
+    if (tag.empty() || !(isalpha((unsigned char)tag[0]) || tag[0] == '_'))
+        tag = "Element";
+    return tag;
+}
+
+static void element_to_xml(const Element& el, std::ostringstream& out, int indent) {
+    std::string pad(indent * 2, ' ');
+    std::string tag = xml_tag(el.type);
+
+    out << pad << "<" << tag;
+    out << " id=\"" << xml_escape(el.id) << "\"";
+    out << " framework=\"" << xml_escape(el.framework) << "\"";
+    if (!el.className.empty() && el.className != el.type)
+        out << " className=\"" << xml_escape(el.className) << "\"";
+    if (!el.text.empty())
+        out << " text=\"" << xml_escape(el.text) << "\"";
+    if (el.bounds.width > 0 || el.bounds.height > 0)
+        out << " bounds=\"" << el.bounds.x << "," << el.bounds.y
+            << "," << el.bounds.width << "," << el.bounds.height << "\"";
+
+    for (auto& [k, v] : el.properties) {
+        out << " " << xml_escape(k) << "=\"" << xml_escape(v) << "\"";
+    }
+
+    if (el.children.empty()) {
+        out << " />\n";
+    } else {
+        out << ">\n";
+        for (auto& child : el.children) {
+            element_to_xml(child, out, indent + 1);
+        }
+        out << pad << "</" << tag << ">\n";
+    }
+}
+
+std::string serialize_to_xml(const Element& root, HWND hwnd, DWORD pid,
+                             const std::string& processName,
+                             const std::vector<std::string>& frameworks) {
+    std::ostringstream out;
+
+    std::ostringstream hwndStr;
+    hwndStr << "0x" << std::hex << std::uppercase
+            << std::setfill('0') << std::setw(8)
+            << reinterpret_cast<uintptr_t>(hwnd);
+
+    out << "<LiveVisualTree";
+    out << " hwnd=\"" << hwndStr.str() << "\"";
+    out << " pid=\"" << pid << "\"";
+    out << " process=\"" << xml_escape(processName) << "\"";
+    out << " frameworks=\"";
+    for (size_t i = 0; i < frameworks.size(); i++) {
+        if (i) out << ",";
+        out << xml_escape(frameworks[i]);
+    }
+    out << "\">\n";
+
+    element_to_xml(root, out, 1);
+
+    out << "</LiveVisualTree>\n";
+    return out.str();
+}
+
 } // namespace lvt
