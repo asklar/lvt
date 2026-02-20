@@ -18,14 +18,13 @@ Grab the latest release from **[GitHub Releases](https://github.com/asklar/lvt/r
 
 ### Install the Copilot skill
 
-The release zip includes a `skills/lvt/SKILL.md` file that teaches GitHub Copilot CLI how to use lvt. To install it:
+The easiest way to add the lvt skill to GitHub Copilot CLI is to install it as a plugin:
 
-```powershell
-# Extract the release zip, then copy the skill to your personal skills directory
-Copy-Item -Recurse path\to\lvt\skills\lvt "$env:USERPROFILE\.copilot\skills\lvt"
+```
+/plugin install asklar/lvt
 ```
 
-Then in Copilot CLI, run `/skills reload`. You can verify with `/skills list` — you should see `lvt` listed. Now Copilot can inspect any running app's UI when you ask it to.
+This gives Copilot the ability to inspect any running Windows app's UI when you ask it to. Verify with `/skills list`.
 
 ### Build from source
 

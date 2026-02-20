@@ -1,0 +1,11 @@
+{
+  "name": "lvt",
+  "description": "Inspect running Windows application UIs — visual tree, screenshots, framework detection",
+  "version": "0.1.0",
+  "author": {
+    "name": "Alexander Sklar"
+  },
+  "license": "MIT",
+  "keywords": ["windows", "ui", "visual-tree", "accessibility", "win32", "xaml", "winui3"],
+  "skills": ["skills/"]
+}
