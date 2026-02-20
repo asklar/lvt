@@ -11,6 +11,15 @@ permissions:
 jobs:
   release:
     runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            preset: default
+            build_dir: build
+          - arch: arm64
+            preset: arm64
+            build_dir: build-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +27,7 @@ jobs:
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
+          arch: ${{ matrix.arch }}
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
@@ -26,36 +35,55 @@ jobs:
           vcpkgGitCommitId: b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01
 
       - name: Configure
-        run: cmake --preset default -DCMAKE_BUILD_TYPE=Release
+        run: cmake --preset ${{ matrix.preset }} -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build
+        run: cmake --build ${{ matrix.build_dir }}
 
       - name: Unit tests
-        run: build\lvt_unit_tests.exe
+        if: matrix.arch == 'x64'
+        run: ${{ matrix.build_dir }}\lvt_unit_tests.exe
 
       - name: Integration tests
-        run: build\lvt_integration_tests.exe
+        if: matrix.arch == 'x64'
+        run: ${{ matrix.build_dir }}\lvt_integration_tests.exe
 
       - name: Package
         run: |
           New-Item -ItemType Directory -Path release -Force
-          Copy-Item build\lvt.exe release\
-          Copy-Item build\lvt_tap.dll release\
+          Copy-Item ${{ matrix.build_dir }}\lvt.exe release\
+          Copy-Item ${{ matrix.build_dir }}\lvt_tap_${{ matrix.arch }}.dll release\
           New-Item -ItemType Directory -Path release\skills\lvt -Force
           Copy-Item .github\skills\lvt\SKILL.md release\skills\lvt\
-          Compress-Archive -Path release\* -DestinationPath lvt-${{ github.ref_name }}-x64.zip
+          Compress-Archive -Path release\* -DestinationPath lvt-${{ github.ref_name }}-${{ matrix.arch }}.zip
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: lvt-${{ github.ref_name }}-${{ matrix.arch }}.zip
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: release-*
+          merge-multiple: true
 
       - name: Extract release notes from tag
         id: notes
         run: |
-          $msg = git tag -l --format='%(contents)' ${{ github.ref_name }}
-          # Write to file for multi-line support
-          $msg | Out-File -FilePath release_notes.md -Encoding utf8
-        shell: pwsh
+          git fetch --tags
+          git tag -l --format='%(contents)' ${{ github.ref_name }} > release_notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: lvt-${{ github.ref_name }}-x64.zip
+          files: artifacts/*.zip
           body_path: release_notes.md

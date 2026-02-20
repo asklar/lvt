@@ -5,6 +5,7 @@
 #include "tree_builder.h"
 #include "json_serializer.h"
 #include "framework_detector.h"
+#include "target.h"
 #include <nlohmann/json.hpp>
 #include <string>
 
@@ -392,4 +393,34 @@ TEST(XmlSerializer, MultipleFrameworksList) {
     auto root = make_test_tree();
     auto result = serialize_to_xml(root, nullptr, 0, "test.exe", {"win32", "comctl"});
     EXPECT_NE(result.find("frameworks=\"win32,comctl\""), std::string::npos);
+}
+
+// ---- Architecture detection ----
+
+TEST(Architecture, NameStrings) {
+    EXPECT_STREQ(architecture_name(Architecture::x64), "x64");
+    EXPECT_STREQ(architecture_name(Architecture::arm64), "arm64");
+    EXPECT_STREQ(architecture_name(Architecture::unknown), "unknown");
+}
+
+TEST(Architecture, HostArchitecture) {
+    auto host = get_host_architecture();
+#if defined(_M_ARM64)
+    EXPECT_EQ(host, Architecture::arm64);
+#elif defined(_M_X64)
+    EXPECT_EQ(host, Architecture::x64);
+#endif
+}
+
+TEST(Architecture, DetectCurrentProcess) {
+    auto arch = detect_process_architecture(GetCurrentProcessId());
+    // Current process must match host
+    EXPECT_EQ(arch, get_host_architecture());
+}
+
+TEST(Architecture, DetectInvalidPid) {
+    // PID 0 (System Idle Process) — OpenProcess will fail
+    auto arch = detect_process_architecture(0);
+    // Should fall back to host architecture
+    EXPECT_EQ(arch, get_host_architecture());
 }

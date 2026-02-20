@@ -6,10 +6,17 @@
 
 namespace lvt {
 
+enum class Architecture { unknown, x64, arm64 };
+
+const char* architecture_name(Architecture arch);
+Architecture get_host_architecture();
+Architecture detect_process_architecture(DWORD pid);
+
 struct TargetInfo {
     HWND hwnd = nullptr;
     DWORD pid = 0;
     std::string processName;
+    Architecture architecture = Architecture::unknown;
 };
 
 struct WindowMatch {

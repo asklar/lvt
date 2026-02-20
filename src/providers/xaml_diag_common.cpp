@@ -5,6 +5,8 @@
 #include "../tap/tap_clsid.h"
 #include "../debug.h"
 
+#include "../target.h"
+
 #include <Windows.h>
 #include <xamlOM.h>
 #include <nlohmann/json.hpp>
@@ -101,7 +103,9 @@ bool inject_and_collect_xaml_tree(
     const std::string& frameworkLabel,
     const std::wstring& connPrefix)
 {
-    std::wstring tapDll = get_exe_dir() + L"\\lvt_tap.dll";
+    const wchar_t* tapSuffix = (get_host_architecture() == Architecture::arm64)
+        ? L"\\lvt_tap_arm64.dll" : L"\\lvt_tap_x64.dll";
+    std::wstring tapDll = get_exe_dir() + tapSuffix;
 
     if (GetFileAttributesW(tapDll.c_str()) == INVALID_FILE_ATTRIBUTES) {
         fprintf(stderr, "lvt: TAP DLL not found: %ls\n", tapDll.c_str());

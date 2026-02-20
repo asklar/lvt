@@ -6,6 +6,49 @@
 
 namespace lvt {
 
+const char* architecture_name(Architecture arch) {
+    switch (arch) {
+    case Architecture::x64:   return "x64";
+    case Architecture::arm64: return "arm64";
+    default:                  return "unknown";
+    }
+}
+
+Architecture get_host_architecture() {
+#if defined(_M_ARM64)
+    return Architecture::arm64;
+#elif defined(_M_X64)
+    return Architecture::x64;
+#else
+    return Architecture::unknown;
+#endif
+}
+
+Architecture detect_process_architecture(DWORD pid) {
+    wil::unique_handle proc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!proc) return get_host_architecture();
+
+    // IsWow64Process2 is available on Win10 1709+
+    auto fnIsWow64Process2 = reinterpret_cast<decltype(&IsWow64Process2)>(
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2"));
+    if (fnIsWow64Process2) {
+        USHORT processMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+        USHORT nativeMachine = IMAGE_FILE_MACHINE_UNKNOWN;
+        if (fnIsWow64Process2(proc.get(), &processMachine, &nativeMachine)) {
+            // processMachine == IMAGE_FILE_MACHINE_UNKNOWN means the process is native
+            USHORT actual = (processMachine != IMAGE_FILE_MACHINE_UNKNOWN)
+                            ? processMachine : nativeMachine;
+            switch (actual) {
+            case IMAGE_FILE_MACHINE_AMD64: return Architecture::x64;
+            case IMAGE_FILE_MACHINE_ARM64: return Architecture::arm64;
+            }
+        }
+    }
+
+    // Fallback: assume same as host
+    return get_host_architecture();
+}
+
 static std::string wstr_to_utf8(const wchar_t* ws, int len = -1) {
     if (!ws) return {};
     if (len < 0) len = static_cast<int>(wcslen(ws));
@@ -94,6 +137,7 @@ TargetInfo resolve_target(HWND hwnd, DWORD pid) {
     }
     if (info.pid) {
         info.processName = get_process_name(info.pid);
+        info.architecture = detect_process_architecture(info.pid);
     }
     return info;
 }
