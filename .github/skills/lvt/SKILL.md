@@ -1,4 +1,13 @@
-# Skill: Inspect Windows application UI with lvt
+---
+name: lvt
+description: >
+  Inspect running Windows application UIs using the lvt (Live Visual Tree) CLI tool.
+  Use this skill when you need to understand a Windows app's visual tree structure,
+  capture annotated screenshots, detect UI frameworks, or find specific UI elements
+  for verification or interaction planning.
+---
+
+# Inspect Windows application UI with lvt
 
 ## When to use
 
