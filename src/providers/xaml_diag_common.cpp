@@ -8,10 +8,16 @@
 #include "../target.h"
 
 #include <Windows.h>
+#include <sddl.h>
+#include <aclapi.h>
+#include <userenv.h>
+#include <wil/resource.h>
 #include <xamlOM.h>
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <string>
+
+#pragma comment(lib, "userenv.lib")
 
 using json = nlohmann::json;
 
@@ -35,6 +41,74 @@ static std::wstring get_exe_dir() {
     auto pos = dir.find_last_of(L"\\/");
     if (pos != std::wstring::npos) dir.resize(pos);
     return dir;
+}
+
+// Check if a process is running inside an AppContainer (UWP).
+static bool is_appcontainer_process(DWORD pid) {
+    wil::unique_handle proc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!proc) return false;
+
+    wil::unique_handle token;
+    if (!OpenProcessToken(proc.get(), TOKEN_QUERY, token.put()))
+        return false;
+
+    BOOL isAppContainer = FALSE;
+    DWORD size = sizeof(isAppContainer);
+    if (!GetTokenInformation(token.get(), TokenIsAppContainer,
+                             &isAppContainer, size, &size))
+        return false;
+    return isAppContainer != FALSE;
+}
+
+// Stage the TAP DLL in a temp directory accessible to AppContainer processes.
+// Returns the staged path, or empty on failure.
+static std::wstring stage_tap_dll_for_appcontainer(const std::wstring& srcDll) {
+    wchar_t tmpDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmpDir);
+
+    std::wstring destDir = std::wstring(tmpDir) + L"lvt_tap";
+    CreateDirectoryW(destDir.c_str(), nullptr);
+
+    // Extract filename from source path
+    auto pos = srcDll.find_last_of(L"\\/");
+    std::wstring filename = (pos != std::wstring::npos) ? srcDll.substr(pos + 1) : srcDll;
+    std::wstring destPath = destDir + L"\\" + filename;
+
+    // Copy, but tolerate ERROR_SHARING_VIOLATION — the DLL is already loaded
+    // in the target process from a previous run, which is fine.
+    if (!CopyFileW(srcDll.c_str(), destPath.c_str(), FALSE)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SHARING_VIOLATION &&
+            GetFileAttributesW(destPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (g_debug)
+                fprintf(stderr, "lvt: TAP DLL already staged (in use by target)\n");
+            return destPath;
+        }
+        if (g_debug)
+            fprintf(stderr, "lvt: failed to stage TAP DLL (error %lu)\n", err);
+        return {};
+    }
+
+    // Grant ALL_APPLICATION_PACKAGES read+execute access to the directory and DLL
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GRGX;;;AC)(A;;GRGX;;;WD)", SDDL_REVISION_1, &sd, nullptr)) {
+        PACL dacl = nullptr;
+        BOOL daclPresent = FALSE, daclDefaulted = FALSE;
+        if (GetSecurityDescriptorDacl(sd, &daclPresent, &dacl, &daclDefaulted) && daclPresent) {
+            SetNamedSecurityInfoW(const_cast<LPWSTR>(destDir.c_str()),
+                                  SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                  nullptr, nullptr, dacl, nullptr);
+            SetNamedSecurityInfoW(const_cast<LPWSTR>(destPath.c_str()),
+                                  SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                  nullptr, nullptr, dacl, nullptr);
+        }
+        LocalFree(sd);
+    }
+
+    if (g_debug)
+        fprintf(stderr, "lvt: staged TAP DLL to %ls\n", destPath.c_str());
+    return destPath;
 }
 
 // Strip control characters from XAML type names (runtime sometimes includes them)
@@ -112,12 +186,31 @@ bool inject_and_collect_xaml_tree(
         return false;
     }
 
+    // AppContainer (UWP) processes can't load DLLs from arbitrary paths.
+    // Stage the TAP DLL in a temp directory with appropriate ACLs.
+    std::wstring stagedDll;
+    if (is_appcontainer_process(pid)) {
+        stagedDll = stage_tap_dll_for_appcontainer(tapDll);
+        if (!stagedDll.empty())
+            tapDll = stagedDll;
+    }
+
     std::wstring pipeName = make_pipe_name();
+
+    // Build a security descriptor that allows AppContainer (UWP) processes to connect.
+    // S-1-15-2-1 = ALL_APPLICATION_PACKAGES
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
+
     HANDLE pipe = CreateNamedPipeW(
         pipeName.c_str(),
         PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1, 0, 1024 * 1024, 10000, nullptr);
+        1, 0, 1024 * 1024, 10000, &sa);
+    LocalFree(sa.lpSecurityDescriptor);
 
     if (pipe == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "lvt: failed to create named pipe (error %lu)\n", GetLastError());
@@ -148,6 +241,15 @@ bool inject_and_collect_xaml_tree(
     }
 
     // Try connection endpoint names: prefix + "1", prefix + "2", ...
+    // Start the overlapped pipe connect BEFORE injection. When the TAP DLL
+    // is already loaded in the target (repeated runs), pInit triggers SetSite
+    // synchronously and the TAP DLL can connect+write+close before we'd
+    // otherwise reach ConnectNamedPipe, causing a missed connection.
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ConnectNamedPipe(pipe, &ov);
+    DWORD connectErr = GetLastError();
+
     HRESULT hr = E_FAIL;
     for (int i = 0; i < 10; i++) {
         wchar_t endPoint[64];
@@ -161,6 +263,9 @@ bool inject_and_collect_xaml_tree(
             CLSID_LvtTap,
             pipeName.c_str());
 
+        if (g_debug)
+            fprintf(stderr, "lvt: %ls pid=%lu -> 0x%08lX\n", endPoint, pid, hr);
+
         if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
             break;
     }
@@ -169,6 +274,8 @@ bool inject_and_collect_xaml_tree(
 
     if (FAILED(hr)) {
         fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx failed (0x%08lX)\n", hr);
+        CancelIo(pipe);
+        CloseHandle(ov.hEvent);
         CloseHandle(pipe);
         return false;
     }
@@ -176,27 +283,21 @@ bool inject_and_collect_xaml_tree(
     if (g_debug)
         fprintf(stderr, "lvt: injection succeeded, waiting for XAML tree data...\n");
 
-    // Wait for the TAP DLL to connect and send data
-    OVERLAPPED ov = {};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    BOOL connected = ConnectNamedPipe(pipe, &ov);
-    if (!connected) {
-        DWORD err = GetLastError();
-        if (err == ERROR_IO_PENDING) {
-            DWORD waitResult = WaitForSingleObject(ov.hEvent, 15000);
-            if (waitResult != WAIT_OBJECT_0) {
-                fprintf(stderr, "lvt: TAP DLL did not connect (timeout)\n");
-                CancelIo(pipe);
-                CloseHandle(ov.hEvent);
-                CloseHandle(pipe);
-                return false;
-            }
-        } else if (err != ERROR_PIPE_CONNECTED) {
-            fprintf(stderr, "lvt: ConnectNamedPipe failed (error %lu)\n", err);
+    // Wait for the TAP DLL to connect
+    if (connectErr == ERROR_IO_PENDING) {
+        DWORD waitResult = WaitForSingleObject(ov.hEvent, 15000);
+        if (waitResult != WAIT_OBJECT_0) {
+            fprintf(stderr, "lvt: TAP DLL did not connect (timeout)\n");
+            CancelIo(pipe);
             CloseHandle(ov.hEvent);
             CloseHandle(pipe);
             return false;
         }
+    } else if (connectErr != ERROR_PIPE_CONNECTED) {
+        fprintf(stderr, "lvt: ConnectNamedPipe failed (error %lu)\n", connectErr);
+        CloseHandle(ov.hEvent);
+        CloseHandle(pipe);
+        return false;
     }
     CloseHandle(ov.hEvent);
 
@@ -267,8 +368,9 @@ bool inject_and_collect_xaml_tree(
                 graft_json_node(node, *bridge, frameworkLabel, baseX, baseY);
                 bridgeIdx++;
             } else {
-                // Non-bridge XAML root: graft at the top level
-                graft_json_node(node, root, frameworkLabel);
+                // Non-bridge XAML root (e.g. UWP CoreWindow): graft under root,
+                // using root's screen bounds as coordinate base
+                graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
             }
         }
     } else if (treeJson.is_object()) {
