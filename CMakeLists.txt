@@ -19,6 +19,7 @@ add_executable(lvt
     src/providers/xaml_provider.cpp
     src/providers/winui3_provider.cpp
     src/providers/wpf_provider.cpp
+    src/providers/wpf_inject.cpp
     src/providers/xaml_diag_common.cpp
 )
 
@@ -64,6 +65,32 @@ set_target_properties(lvt_tap PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>
 )
 
+# WPF TAP DLL — native loader injected into WPF target process
+# Hosts CLR and calls managed WpfTreeWalker assembly
+add_library(lvt_wpf_tap SHARED
+    src/tap_wpf/wpf_tap_native.cpp
+    src/tap_wpf/wpf_tap_native.def
+)
+target_compile_definitions(lvt_wpf_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(lvt_wpf_tap PRIVATE src)
+target_link_libraries(lvt_wpf_tap PRIVATE mscoree ole32)
+set_property(TARGET lvt_wpf_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+set_target_properties(lvt_wpf_tap PROPERTIES
+    OUTPUT_NAME "lvt_wpf_tap_${TAP_ARCH_SUFFIX}"
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>
+)
+
+# Build managed WPF tree walker assembly and copy to output
+# Run dotnet build separately; the managed DLL must be pre-built before running lvt
+# with WPF targets. Use: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release -o build
+add_custom_command(TARGET lvt_wpf_tap POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/x64/Release/LvtWpfTap.dll"
+        "$<TARGET_FILE_DIR:lvt>/LvtWpfTap.dll"
+    COMMENT "Copying managed WPF tree walker assembly (pre-build with: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release)"
+)
+
 # --- Tests ---
 enable_testing()
 find_package(GTest CONFIG REQUIRED)
@@ -80,6 +107,7 @@ add_executable(lvt_unit_tests
     src/providers/xaml_provider.cpp
     src/providers/winui3_provider.cpp
     src/providers/wpf_provider.cpp
+    src/providers/wpf_inject.cpp
     src/providers/xaml_diag_common.cpp
 )
 target_include_directories(lvt_unit_tests PRIVATE src)

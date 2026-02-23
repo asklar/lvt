@@ -1,4 +1,5 @@
 #include "wpf_provider.h"
+#include "wpf_inject.h"
 #include <cstdio>
 #include <functional>
 #include <Windows.h>
@@ -16,11 +17,9 @@ static void label_wpf_windows(Element& el) {
     }
 }
 
-void WpfProvider::enrich(Element& root, HWND /*hwnd*/, DWORD /*pid*/) {
+void WpfProvider::enrich(Element& root, HWND hwnd, DWORD pid) {
     label_wpf_windows(root);
-
-    // TODO (Phase 2+): Inject managed TAP DLL to walk WPF visual tree
-    // via VisualTreeHelper and graft results into the element tree.
+    inject_and_collect_wpf_tree(root, hwnd, pid);
 }
 
 } // namespace lvt
