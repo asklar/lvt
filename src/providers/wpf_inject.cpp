@@ -141,7 +141,16 @@ static bool inject_dll(DWORD pid, const std::wstring& dllPath) {
 
     // Wait for the DLL to load (5 second timeout)
     WaitForSingleObject(thread.get(), 5000);
+
+    DWORD exitCode = 0;
+    GetExitCodeThread(thread.get(), &exitCode);
     VirtualFreeEx(proc.get(), remoteMem, 0, MEM_RELEASE);
+
+    // exitCode is the HMODULE returned by LoadLibraryW (0 = failed)
+    if (exitCode == 0) {
+        fprintf(stderr, "lvt: LoadLibraryW failed in target process\n");
+        return false;
+    }
 
     if (g_debug)
         fprintf(stderr, "lvt: WPF TAP DLL injected into pid %lu\n", pid);
@@ -149,6 +158,27 @@ static bool inject_dll(DWORD pid, const std::wstring& dllPath) {
 }
 
 bool inject_and_collect_wpf_tree(Element& root, HWND /*hwnd*/, DWORD pid) {
+    // Check target process bitness matches ours — can't inject x64 DLL into x86 process
+    auto targetArch = detect_process_architecture(pid);
+    auto hostArch = get_host_architecture();
+    if (targetArch != hostArch) {
+        if (g_debug)
+            fprintf(stderr, "lvt: WPF target is %s but lvt is %s, skipping injection\n",
+                    architecture_name(targetArch), architecture_name(hostArch));
+        return false;
+    }
+
+    // Also check for WoW64 (32-bit on 64-bit) which detect_process_architecture may miss
+    wil::unique_handle proc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (proc) {
+        BOOL isWow64 = FALSE;
+        if (IsWow64Process(proc.get(), &isWow64) && isWow64) {
+            if (g_debug)
+                fprintf(stderr, "lvt: WPF target is 32-bit (WoW64), skipping injection\n");
+            return false;
+        }
+    }
+
     std::wstring exeDir = get_exe_dir();
     const wchar_t* tapSuffix = (get_host_architecture() == Architecture::arm64)
         ? L"\\lvt_wpf_tap_arm64.dll" : L"\\lvt_wpf_tap_x64.dll";

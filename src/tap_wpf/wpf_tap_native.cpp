@@ -7,8 +7,6 @@
 #include <string>
 #include <cstdio>
 
-#pragma comment(lib, "mscoree.lib")
-
 static void LogMsg(const char* fmt, ...) {
     static FILE* logFile = nullptr;
     if (!logFile) {
@@ -74,10 +72,26 @@ static std::wstring ReadPipeName() {
 
 // Try .NET Framework hosting via ICLRMetaHost
 static bool TryNetFramework(const std::wstring& assemblyPath, const std::wstring& pipeName) {
+    HMODULE hMscoree = LoadLibraryW(L"mscoree.dll");
+    if (!hMscoree) {
+        LogMsg("mscoree.dll not found");
+        return false;
+    }
+
+    using CLRCreateInstanceFn = HRESULT(WINAPI*)(REFCLSID, REFIID, LPVOID*);
+    auto pCLRCreateInstance = reinterpret_cast<CLRCreateInstanceFn>(
+        GetProcAddress(hMscoree, "CLRCreateInstance"));
+    if (!pCLRCreateInstance) {
+        LogMsg("CLRCreateInstance not found in mscoree.dll");
+        FreeLibrary(hMscoree);
+        return false;
+    }
+
     ICLRMetaHost* metaHost = nullptr;
-    HRESULT hr = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (void**)&metaHost);
+    HRESULT hr = pCLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (void**)&metaHost);
     if (FAILED(hr)) {
         LogMsg("CLRCreateInstance failed: 0x%08X", hr);
+        FreeLibrary(hMscoree);
         return false;
     }
 

@@ -73,7 +73,7 @@ add_library(lvt_wpf_tap SHARED
 )
 target_compile_definitions(lvt_wpf_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(lvt_wpf_tap PRIVATE src)
-target_link_libraries(lvt_wpf_tap PRIVATE mscoree ole32)
+target_link_libraries(lvt_wpf_tap PRIVATE ole32)
 set_property(TARGET lvt_wpf_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set_target_properties(lvt_wpf_tap PROPERTIES

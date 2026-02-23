@@ -130,6 +130,13 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
 
     DetectData data;
     if (hwnd) {
+        // Check the top-level window class too (WPF apps use HwndWrapper as the main window)
+        wchar_t topCls[256]{};
+        GetClassNameW(hwnd, topCls, 256);
+        if (wcsstr(topCls, L"HwndWrapper[")) {
+            data.hasWpf = true;
+        }
+
         EnumChildWindows(hwnd, detect_child_proc, reinterpret_cast<LPARAM>(&data));
         if (data.hasComCtl) {
             std::string comctlVer;
@@ -166,6 +173,10 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
             detectedXaml = true;
         }
         auto wpf = detect_module(pid, L"PresentationFramework.dll");
+        if (!wpf.found)
+            wpf = detect_module(pid, L"wpfgfx_cor3.dll");
+        if (!wpf.found)
+            wpf = detect_module(pid, L"wpfgfx_v0400.dll");
         if (wpf.found) {
             result.push_back({Framework::Wpf, wpf.version});
             detectedWpf = true;
