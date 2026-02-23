@@ -10,6 +10,7 @@ enum class Framework {
     ComCtl,
     Xaml,
     WinUI3,
+    Wpf,
 };
 
 struct FrameworkInfo {

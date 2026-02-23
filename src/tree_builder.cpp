@@ -4,6 +4,7 @@
 #include "providers/comctl_provider.h"
 #include "providers/xaml_provider.h"
 #include "providers/winui3_provider.h"
+#include "providers/wpf_provider.h"
 #include <algorithm>
 #include <memory>
 
@@ -56,6 +57,11 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         case Framework::WinUI3: {
             WinUI3Provider winui3;
             winui3.enrich(root, hwnd, pid);
+            break;
+        }
+        case Framework::Wpf: {
+            WpfProvider wpf;
+            wpf.enrich(root, hwnd, pid);
             break;
         }
         default:

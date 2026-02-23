@@ -12,6 +12,7 @@ std::string framework_to_string(Framework f) {
     case Framework::ComCtl: return "comctl";
     case Framework::Xaml:   return "xaml";
     case Framework::WinUI3: return "winui3";
+    case Framework::Wpf:    return "wpf";
     }
     return "unknown";
 }
@@ -28,6 +29,7 @@ struct DetectData {
     bool hasComCtl = false;
     bool hasWinUI3 = false;
     bool hasXaml = false;
+    bool hasWpf = false;
 };
 
 static BOOL CALLBACK detect_child_proc(HWND hwnd, LPARAM lParam) {
@@ -51,6 +53,10 @@ static BOOL CALLBACK detect_child_proc(HWND hwnd, LPARAM lParam) {
 
     if (_wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0) {
         data->hasXaml = true;
+    }
+
+    if (wcsstr(cls, L"HwndWrapper[")) {
+        data->hasWpf = true;
     }
 
     return TRUE;
@@ -147,6 +153,7 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
 
     bool detectedWinUI3 = false;
     bool detectedXaml = false;
+    bool detectedWpf = false;
     if (pid) {
         auto winui = detect_module(pid, L"Microsoft.UI.Xaml.dll");
         if (winui.found) {
@@ -158,6 +165,11 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
             result.push_back({Framework::Xaml, xaml.version});
             detectedXaml = true;
         }
+        auto wpf = detect_module(pid, L"PresentationFramework.dll");
+        if (wpf.found) {
+            result.push_back({Framework::Wpf, wpf.version});
+            detectedWpf = true;
+        }
     }
 
     // Class-name fallback (works when module enumeration fails)
@@ -165,6 +177,8 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
         result.push_back({Framework::WinUI3, {}});
     if (!detectedXaml && data.hasXaml)
         result.push_back({Framework::Xaml, {}});
+    if (!detectedWpf && data.hasWpf)
+        result.push_back({Framework::Wpf, {}});
 
     return result;
 }

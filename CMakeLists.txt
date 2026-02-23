@@ -18,6 +18,7 @@ add_executable(lvt
     src/providers/comctl_provider.cpp
     src/providers/xaml_provider.cpp
     src/providers/winui3_provider.cpp
+    src/providers/wpf_provider.cpp
     src/providers/xaml_diag_common.cpp
 )
 
@@ -78,6 +79,7 @@ add_executable(lvt_unit_tests
     src/providers/comctl_provider.cpp
     src/providers/xaml_provider.cpp
     src/providers/winui3_provider.cpp
+    src/providers/wpf_provider.cpp
     src/providers/xaml_diag_common.cpp
 )
 target_include_directories(lvt_unit_tests PRIVATE src)
