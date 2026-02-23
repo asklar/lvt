@@ -27,6 +27,38 @@ static void LogMsg(const char* fmt, ...) {
 
 static DWORD WINAPI WorkerThread(LPVOID);
 
+// Named event used to trigger re-collection when the DLL is already loaded.
+// The monitor thread waits on this event in a loop.
+static std::wstring MakeTriggerEventName(DWORD pid) {
+    wchar_t buf[64];
+    swprintf_s(buf, L"Local\\lvt_wpf_trigger_%lu", pid);
+    return buf;
+}
+
+static DWORD WINAPI MonitorThread(LPVOID) {
+    DWORD pid = GetCurrentProcessId();
+    std::wstring eventName = MakeTriggerEventName(pid);
+    HANDLE hEvent = CreateEventW(nullptr, FALSE, FALSE, eventName.c_str());
+    if (!hEvent) {
+        LogMsg("Failed to create trigger event: %lu", GetLastError());
+        return 1;
+    }
+    LogMsg("MonitorThread: waiting on event %ls", eventName.c_str());
+
+    for (;;) {
+        DWORD result = WaitForSingleObject(hEvent, INFINITE);
+        if (result != WAIT_OBJECT_0) break;
+        LogMsg("MonitorThread: triggered, spawning worker");
+        HANDLE hThread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+        if (hThread) {
+            WaitForSingleObject(hThread, 30000);
+            CloseHandle(hThread);
+        }
+    }
+    CloseHandle(hEvent);
+    return 0;
+}
+
 static std::wstring GetDllDirectory() {
     wchar_t path[MAX_PATH];
     HMODULE hm = nullptr;
@@ -328,20 +360,22 @@ static DWORD WINAPI WorkerThread(LPVOID) {
         return 1;
     }
 
+    DWORD result = 1;
     LogMsg("Attempting .NET Framework hosting...");
     if (TryNetFramework(assemblyPath, pipeName)) {
         LogMsg("Tree collection succeeded via .NET Framework");
-        return 0;
+        result = 0;
+    } else {
+        LogMsg("Attempting .NET Core hosting...");
+        if (TryNetCore(assemblyPath, pipeName)) {
+            LogMsg("Tree collection succeeded via .NET Core");
+            result = 0;
+        } else {
+            LogMsg("All CLR hosting attempts failed");
+        }
     }
 
-    LogMsg("Attempting .NET Core hosting...");
-    if (TryNetCore(assemblyPath, pipeName)) {
-        LogMsg("Tree collection succeeded via .NET Core");
-        return 0;
-    }
-
-    LogMsg("All CLR hosting attempts failed");
-    return 1;
+    return result;
 }
 
 extern "C" {
@@ -351,9 +385,14 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(hMod);
         LogMsg("DllMain: DLL_PROCESS_ATTACH");
 
-        // Spawn worker thread to avoid blocking DllMain
+        // Spawn worker thread for the initial collection
         HANDLE hThread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
         if (hThread) CloseHandle(hThread);
+
+        // Start monitor thread that listens for trigger events from lvt.exe
+        // for subsequent collections (LoadLibrary won't re-fire DLL_PROCESS_ATTACH)
+        HANDLE hMonitor = CreateThread(nullptr, 0, MonitorThread, nullptr, 0, nullptr);
+        if (hMonitor) CloseHandle(hMonitor);
     }
     return TRUE;
 }
