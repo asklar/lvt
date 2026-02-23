@@ -25,6 +25,10 @@ jobs:
             msvc_arch: x64
             preset: default
             build_dir: build
+          - arch: x86
+            msvc_arch: amd64_x86
+            preset: x86
+            build_dir: build-x86
           - arch: arm64
             msvc_arch: amd64_arm64
             preset: arm64
@@ -48,6 +52,9 @@ jobs:
       - name: Configure
         run: cmake --preset ${{ matrix.preset }} -DCMAKE_BUILD_TYPE=Release
 
+      - name: Build managed WPF assembly
+        run: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release
+
       - name: Build
         run: cmake --build ${{ matrix.build_dir }}
 
@@ -64,6 +71,12 @@ jobs:
           New-Item -ItemType Directory -Path release -Force
           Copy-Item ${{ matrix.build_dir }}\lvt.exe release\
           Copy-Item ${{ matrix.build_dir }}\lvt_tap_${{ matrix.arch }}.dll release\
+          if (Test-Path ${{ matrix.build_dir }}\lvt_wpf_tap_${{ matrix.arch }}.dll) {
+            Copy-Item ${{ matrix.build_dir }}\lvt_wpf_tap_${{ matrix.arch }}.dll release\
+          }
+          if (Test-Path ${{ matrix.build_dir }}\LvtWpfTap.dll) {
+            Copy-Item ${{ matrix.build_dir }}\LvtWpfTap.dll release\
+          }
           New-Item -ItemType Directory -Path release\skills\lvt -Force
           Copy-Item .github\skills\lvt\SKILL.md release\skills\lvt\
           Compress-Archive -Path release\* -DestinationPath lvt-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip

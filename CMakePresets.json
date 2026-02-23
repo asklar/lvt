@@ -18,6 +18,22 @@
       }
     },
     {
+      "name": "x86",
+      "displayName": "x86",
+      "generator": "Ninja",
+      "architecture": {
+        "value": "x86",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build-x86",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl.exe",
+        "CMAKE_CXX_COMPILER": "cl.exe",
+        "VCPKG_TARGET_TRIPLET": "x86-windows"
+      }
+    },
+    {
       "name": "arm64",
       "displayName": "ARM64",
       "generator": "Ninja",
@@ -38,6 +54,10 @@
     {
       "name": "default",
       "configurePreset": "default"
+    },
+    {
+      "name": "x86",
+      "configurePreset": "x86"
     },
     {
       "name": "arm64",

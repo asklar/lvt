@@ -158,30 +158,23 @@ static bool inject_dll(DWORD pid, const std::wstring& dllPath) {
 }
 
 bool inject_and_collect_wpf_tree(Element& root, HWND /*hwnd*/, DWORD pid) {
-    // Check target process bitness matches ours — can't inject x64 DLL into x86 process
-    auto targetArch = detect_process_architecture(pid);
-    auto hostArch = get_host_architecture();
-    if (targetArch != hostArch) {
-        if (g_debug)
-            fprintf(stderr, "lvt: WPF target is %s but lvt is %s, skipping injection\n",
-                    architecture_name(targetArch), architecture_name(hostArch));
-        return false;
-    }
-
-    // Also check for WoW64 (32-bit on 64-bit) which detect_process_architecture may miss
+    // Check target process bitness matches ours
     wil::unique_handle proc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
     if (proc) {
         BOOL isWow64 = FALSE;
         if (IsWow64Process(proc.get(), &isWow64) && isWow64) {
-            if (g_debug)
-                fprintf(stderr, "lvt: WPF target is 32-bit (WoW64), skipping injection\n");
+#if defined(_M_X64) || defined(_M_ARM64)
+            fprintf(stderr,
+                "lvt: WPF target is 32-bit (WoW64) - run lvt-x86.exe instead\n");
             return false;
+#endif
         }
     }
 
     std::wstring exeDir = get_exe_dir();
     const wchar_t* tapSuffix = (get_host_architecture() == Architecture::arm64)
-        ? L"\\lvt_wpf_tap_arm64.dll" : L"\\lvt_wpf_tap_x64.dll";
+        ? L"\\lvt_wpf_tap_arm64.dll" : (sizeof(void*) == 4)
+        ? L"\\lvt_wpf_tap_x86.dll" : L"\\lvt_wpf_tap_x64.dll";
     std::wstring tapDll = exeDir + tapSuffix;
 
     if (GetFileAttributesW(tapDll.c_str()) == INVALID_FILE_ATTRIBUTES) {

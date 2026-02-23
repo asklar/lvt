@@ -26,6 +26,9 @@ jobs:
       - name: Configure
         run: cmake --preset default
 
+      - name: Build managed WPF assembly
+        run: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release
+
       - name: Build
         run: cmake --build build
 
@@ -50,3 +53,5 @@ jobs:
           path: |
             build/lvt.exe
             build/lvt_tap_x64.dll
+            build/lvt_wpf_tap_x64.dll
+            build/LvtWpfTap.dll

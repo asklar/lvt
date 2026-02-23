@@ -44,6 +44,8 @@ target_compile_definitions(lvt PRIVATE
 # Determine TAP DLL architecture suffix from vcpkg triplet
 if(VCPKG_TARGET_TRIPLET MATCHES "arm64")
     set(TAP_ARCH_SUFFIX "arm64")
+elseif(VCPKG_TARGET_TRIPLET MATCHES "x86")
+    set(TAP_ARCH_SUFFIX "x86")
 else()
     set(TAP_ARCH_SUFFIX "x64")
 endif()
@@ -82,13 +84,12 @@ set_target_properties(lvt_wpf_tap PROPERTIES
 )
 
 # Build managed WPF tree walker assembly and copy to output
-# Run dotnet build separately; the managed DLL must be pre-built before running lvt
-# with WPF targets. Use: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release -o build
+# Pre-build with: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release
 add_custom_command(TARGET lvt_wpf_tap POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/x64/Release/LvtWpfTap.dll"
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/$<IF:$<STREQUAL:${TAP_ARCH_SUFFIX},x86>,x86,x64>/Release/LvtWpfTap.dll"
         "$<TARGET_FILE_DIR:lvt>/LvtWpfTap.dll"
-    COMMENT "Copying managed WPF tree walker assembly (pre-build with: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release)"
+    COMMENT "Copying managed WPF tree walker assembly"
 )
 
 # --- Tests ---
