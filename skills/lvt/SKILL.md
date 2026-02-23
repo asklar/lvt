@@ -16,7 +16,7 @@ Use `lvt` whenever you need to understand the visual content or structure of a r
 - **UI verification** — confirm that a UI change was applied correctly (e.g. a button label changed, a dialog appeared)
 - **Finding UI elements** — locate a specific control, menu item, or text field in an app's visual tree
 - **Screenshot capture** — take an annotated screenshot of an app with element IDs overlaid
-- **Framework detection** — determine which UI frameworks an app uses (Win32, ComCtl, XAML, WinUI 3)
+- **Framework detection** — determine which UI frameworks an app uses (Win32, ComCtl, XAML, WinUI 3, WPF)
 - **Automated UI interaction planning** — get element IDs and bounds to plan mouse clicks or keyboard input
 
 ## Prerequisites
@@ -28,7 +28,7 @@ Before using lvt, ensure `lvt.exe` and `lvt_tap_{arch}.dll` are available. If th
 $lvtDir = "$env:USERPROFILE\.lvt"
 if (-not (Test-Path "$lvtDir\lvt.exe")) {
   New-Item -ItemType Directory -Path $lvtDir -Force | Out-Null
-  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } elseif ($env:PROCESSOR_ARCHITECTURE -eq "x86") { "x86" } else { "x64" }
   $release = Invoke-RestMethod "https://api.github.com/repos/asklar/lvt/releases/latest"
   $asset = $release.assets | Where-Object { $_.name -like "lvt-*-$arch.zip" } | Select-Object -First 1
   $zip = "$env:TEMP\lvt.zip"
@@ -118,7 +118,7 @@ Every element gets a stable ID like `e0`, `e1`, `e2`, etc., assigned in depth-fi
 |----------|-------------|
 | `id` | Stable element ID (e.g. `e0`) |
 | `type` | Element type name (e.g. `Window`, `Button`, `TextBlock`) |
-| `framework` | Which framework owns this element (`win32`, `comctl`, `xaml`, `winui3`) |
+| `framework` | Which framework owns this element (`win32`, `comctl`, `xaml`, `winui3`, `wpf`) |
 | `className` | Win32 window class name (Win32/ComCtl elements) |
 | `text` | Visible text content or window title |
 | `bounds` | Screen-relative bounding rectangle `{x, y, width, height}` |
@@ -167,4 +167,5 @@ Every element gets a stable ID like `e0`, `e1`, `e2`, etc., assigned in depth-fi
 - Element IDs change between invocations if the UI structure changes — always re-query before acting on stale IDs
 - The tool requires no special permissions beyond being able to read the target process (same user session)
 - For XAML/WinUI 3 apps, lvt injects a helper DLL into the target — this is safe and non-destructive but means `lvt_tap_{arch}.dll` must be next to `lvt.exe`
-- lvt.exe must match the target process architecture (x64 or ARM64) — a clear error is shown on mismatch
+- For WPF apps, lvt injects `lvt_wpf_tap_{arch}.dll` and the managed `LvtWpfTap.dll` — both must be next to `lvt.exe`
+- lvt.exe must match the target process architecture (x64, x86, or ARM64) — a clear error is shown on mismatch. Use `lvt-x86.exe` for 32-bit WPF apps.
