@@ -85,9 +85,10 @@ set_target_properties(lvt_wpf_tap PROPERTIES
 
 # Build managed WPF tree walker assembly and copy to output
 # Pre-build with: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release
+# The managed DLL is AnyCPU so the same binary works for all architectures.
 add_custom_command(TARGET lvt_wpf_tap POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/$<IF:$<STREQUAL:${TAP_ARCH_SUFFIX},x86>,x86,x64>/Release/LvtWpfTap.dll"
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/Release/LvtWpfTap.dll"
         "$<TARGET_FILE_DIR:lvt>/LvtWpfTap.dll"
     COMMENT "Copying managed WPF tree walker assembly"
 )

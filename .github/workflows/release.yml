@@ -53,7 +53,7 @@ jobs:
         run: cmake --preset ${{ matrix.preset }} -DCMAKE_BUILD_TYPE=Release
 
       - name: Build managed WPF assembly
-        run: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release
+        run: msbuild src/tap_wpf/LvtWpfTap.csproj /p:Configuration=Release /restore /v:minimal
 
       - name: Build
         run: cmake --build ${{ matrix.build_dir }}
