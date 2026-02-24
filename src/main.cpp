@@ -3,6 +3,7 @@
 #include "tree_builder.h"
 #include "json_serializer.h"
 #include "screenshot.h"
+#include "plugin_loader.h"
 #include "debug.h"
 
 #include <cstdio>
@@ -111,6 +112,9 @@ int main(int argc, char* argv[]) {
 
     auto args = parse_args(argc, argv);
 
+    // Load plugins from %USERPROFILE%/.lvt/plugins/
+    lvt::load_plugins();
+
     // --dump is default unless --screenshot is specified without --dump
     if (!args.dumpSet)
         args.dump = args.screenshotFile.empty();
@@ -190,12 +194,13 @@ int main(int argc, char* argv[]) {
     if (args.frameworksOnly) {
         // Just print detected frameworks
         for (auto& fi : frameworks) {
+            auto name = lvt::framework_display_name(fi);
             if (fi.version.empty())
-                printf("%s\n", lvt::framework_to_string(fi.type).c_str());
+                printf("%s\n", name.c_str());
             else
-                printf("%s %s\n", lvt::framework_to_string(fi.type).c_str(),
-                       fi.version.c_str());
+                printf("%s %s\n", name.c_str(), fi.version.c_str());
         }
+        lvt::unload_plugins();
         return 0;
     }
 
@@ -221,10 +226,11 @@ int main(int argc, char* argv[]) {
     if (args.dump) {
         std::vector<std::string> frameworkNames;
         for (auto& fi : frameworks) {
+            auto name = lvt::framework_display_name(fi);
             if (fi.version.empty())
-                frameworkNames.push_back(lvt::framework_to_string(fi.type));
+                frameworkNames.push_back(name);
             else
-                frameworkNames.push_back(lvt::framework_to_string(fi.type) + " " + fi.version);
+                frameworkNames.push_back(name + " " + fi.version);
         }
 
         std::string serialized;
@@ -259,5 +265,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    lvt::unload_plugins();
     return 0;
 }

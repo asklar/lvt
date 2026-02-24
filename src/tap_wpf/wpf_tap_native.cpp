@@ -27,38 +27,6 @@ static void LogMsg(const char* fmt, ...) {
 
 static DWORD WINAPI WorkerThread(LPVOID);
 
-// Named event used to trigger re-collection when the DLL is already loaded.
-// The monitor thread waits on this event in a loop.
-static std::wstring MakeTriggerEventName(DWORD pid) {
-    wchar_t buf[64];
-    swprintf_s(buf, L"Local\\lvt_wpf_trigger_%lu", pid);
-    return buf;
-}
-
-static DWORD WINAPI MonitorThread(LPVOID) {
-    DWORD pid = GetCurrentProcessId();
-    std::wstring eventName = MakeTriggerEventName(pid);
-    HANDLE hEvent = CreateEventW(nullptr, FALSE, FALSE, eventName.c_str());
-    if (!hEvent) {
-        LogMsg("Failed to create trigger event: %lu", GetLastError());
-        return 1;
-    }
-    LogMsg("MonitorThread: waiting on event %ls", eventName.c_str());
-
-    for (;;) {
-        DWORD result = WaitForSingleObject(hEvent, INFINITE);
-        if (result != WAIT_OBJECT_0) break;
-        LogMsg("MonitorThread: triggered, spawning worker");
-        HANDLE hThread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
-        if (hThread) {
-            WaitForSingleObject(hThread, 30000);
-            CloseHandle(hThread);
-        }
-    }
-    CloseHandle(hEvent);
-    return 0;
-}
-
 static std::wstring GetDllDirectory() {
     wchar_t path[MAX_PATH];
     HMODULE hm = nullptr;
@@ -343,12 +311,14 @@ static bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pip
     return retVal == 0;
 }
 
-static DWORD WINAPI WorkerThread(LPVOID) {
+static DWORD WINAPI WorkerThread(LPVOID lpParameter) {
+    HMODULE hSelf = reinterpret_cast<HMODULE>(lpParameter);
     LogMsg("WorkerThread starting");
 
     std::wstring pipeName = ReadPipeName();
     if (pipeName.empty()) {
         LogMsg("No pipe name, exiting");
+        if (hSelf) FreeLibraryAndExitThread(hSelf, 1);
         return 1;
     }
 
@@ -357,6 +327,7 @@ static DWORD WINAPI WorkerThread(LPVOID) {
 
     if (GetFileAttributesW(assemblyPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         LogMsg("Managed assembly not found: %ls", assemblyPath.c_str());
+        if (hSelf) FreeLibraryAndExitThread(hSelf, 1);
         return 1;
     }
 
@@ -375,6 +346,10 @@ static DWORD WINAPI WorkerThread(LPVOID) {
         }
     }
 
+    // Unload ourselves from the target process.
+    // FreeLibraryAndExitThread atomically frees and exits so we don't
+    // return to unloaded code (Raymond Chen, Old New Thing 2013-11-05).
+    if (hSelf) FreeLibraryAndExitThread(hSelf, result);
     return result;
 }
 
@@ -385,14 +360,10 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(hMod);
         LogMsg("DllMain: DLL_PROCESS_ATTACH");
 
-        // Spawn worker thread for the initial collection
-        HANDLE hThread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+        // Spawn worker thread for the initial collection.
+        // The worker calls FreeLibraryAndExitThread when done to unload this DLL.
+        HANDLE hThread = CreateThread(nullptr, 0, WorkerThread, reinterpret_cast<LPVOID>(hMod), 0, nullptr);
         if (hThread) CloseHandle(hThread);
-
-        // Start monitor thread that listens for trigger events from lvt.exe
-        // for subsequent collections (LoadLibrary won't re-fire DLL_PROCESS_ATTACH)
-        HANDLE hMonitor = CreateThread(nullptr, 0, MonitorThread, nullptr, 0, nullptr);
-        if (hMonitor) CloseHandle(hMonitor);
     }
     return TRUE;
 }

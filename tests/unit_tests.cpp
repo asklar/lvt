@@ -68,6 +68,23 @@ TEST(FrameworkToString, AllFrameworks) {
     EXPECT_EQ(framework_to_string(Framework::ComCtl), "comctl");
     EXPECT_EQ(framework_to_string(Framework::Xaml), "xaml");
     EXPECT_EQ(framework_to_string(Framework::WinUI3), "winui3");
+    EXPECT_EQ(framework_to_string(Framework::Wpf), "wpf");
+    EXPECT_EQ(framework_to_string(Framework::Plugin), "plugin");
+}
+
+TEST(FrameworkDisplayName, BuiltInFramework) {
+    FrameworkInfo fi{Framework::Win32, "", ""};
+    EXPECT_EQ(framework_display_name(fi), "win32");
+}
+
+TEST(FrameworkDisplayName, PluginFramework) {
+    FrameworkInfo fi{Framework::Plugin, "14", "dui"};
+    EXPECT_EQ(framework_display_name(fi), "dui");
+}
+
+TEST(FrameworkDisplayName, BuiltInWithName) {
+    FrameworkInfo fi{Framework::ComCtl, "6.10", "comctl"};
+    EXPECT_EQ(framework_display_name(fi), "comctl");
 }
 
 // ---- JSON serialization ----
@@ -423,4 +440,223 @@ TEST(Architecture, DetectInvalidPid) {
     auto arch = detect_process_architecture(0);
     // Should fall back to host architecture
     EXPECT_EQ(arch, get_host_architecture());
+}
+
+// ---- Plugin grafting tests ----
+
+#include "plugin_loader.h"
+
+// Mock plugin: returns canned JSON from enrich()
+static const char* s_mockJson = nullptr;
+
+static LvtPluginInfo s_mockInfo = {
+    sizeof(LvtPluginInfo), LVT_PLUGIN_API_VERSION, "mock", "Mock plugin"
+};
+static LvtPluginInfo* mock_plugin_info() { return &s_mockInfo; }
+static int mock_detect(DWORD, HWND, LvtFrameworkDetection*) { return 0; }
+static int mock_enrich(HWND, DWORD, const char*, char** json_out) {
+    if (!s_mockJson) return 0;
+    *json_out = _strdup(s_mockJson);
+    return 1;
+}
+static void mock_free(void* p) { free(p); }
+
+static LoadedPlugin make_mock_plugin() {
+    LoadedPlugin lp{};
+    lp.info = &s_mockInfo;
+    lp.detect = mock_detect;
+    lp.enrich = mock_enrich;
+    lp.free_fn = mock_free;
+    return lp;
+}
+
+static PluginFrameworkInfo make_mock_fw(const LoadedPlugin* p) {
+    return {"mock", "", p};
+}
+
+TEST(PluginGraft, GraftByTargetHwnd) {
+    // Build a simple Win32 tree: root -> child (hwnd=0x1234)
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+    root.properties["hwnd"] = "0x1234";
+
+    Element child;
+    child.type = "Window";
+    child.framework = "win32";
+    child.className = "HostClass";
+    child.properties["hwnd"] = "0xABCD";
+    child.bounds = {100, 200, 300, 400};
+    root.children.push_back(child);
+
+    // Plugin returns JSON targeting hwnd 0xABCD
+    s_mockJson = R"([{"target_hwnd":"0xABCD","type":"HostClass","children":[
+        {"type":"PluginButton","name":"OK","width":80,"height":30,"offsetX":10,"offsetY":20}
+    ]}])";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    bool ok = enrich_with_plugin(root, nullptr, 0, fw);
+    EXPECT_TRUE(ok);
+
+    // The child at hwnd 0xABCD should now have a plugin child
+    auto& host = root.children[0];
+    ASSERT_EQ(host.children.size(), 1);
+    EXPECT_EQ(host.children[0].type, "PluginButton");
+    EXPECT_EQ(host.children[0].framework, "mock");
+    EXPECT_EQ(host.children[0].text, "OK");
+    EXPECT_EQ(host.children[0].bounds.width, 80);
+    EXPECT_EQ(host.children[0].bounds.height, 30);
+    // Coordinates are host base + offset
+    EXPECT_EQ(host.children[0].bounds.x, 110);  // 100 + 10
+    EXPECT_EQ(host.children[0].bounds.y, 220);  // 200 + 20
+}
+
+TEST(PluginGraft, GraftUnderRootWhenNoMatch) {
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+    root.bounds = {0, 0, 800, 600};
+
+    // Plugin returns JSON with a target_hwnd that doesn't exist
+    s_mockJson = R"([{"target_hwnd":"0xDEAD","type":"Orphan","children":[
+        {"type":"Child"}
+    ]}])";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    bool ok = enrich_with_plugin(root, nullptr, 0, fw);
+    EXPECT_TRUE(ok);
+
+    // Should graft under root since no match
+    ASSERT_EQ(root.children.size(), 1);
+    EXPECT_EQ(root.children[0].type, "Orphan");
+    EXPECT_EQ(root.children[0].framework, "mock");
+}
+
+TEST(PluginGraft, GraftMultipleRoots) {
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+
+    Element h1, h2;
+    h1.type = "Window"; h1.framework = "win32"; h1.properties["hwnd"] = "0x1111";
+    h1.bounds = {10, 20, 100, 100};
+    h2.type = "Window"; h2.framework = "win32"; h2.properties["hwnd"] = "0x2222";
+    h2.bounds = {200, 300, 100, 100};
+    root.children = {h1, h2};
+
+    s_mockJson = R"([
+        {"target_hwnd":"0x1111","type":"Host1","children":[{"type":"A"}]},
+        {"target_hwnd":"0x2222","type":"Host2","children":[{"type":"B"}]}
+    ])";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    enrich_with_plugin(root, nullptr, 0, fw);
+
+    ASSERT_EQ(root.children[0].children.size(), 1);
+    EXPECT_EQ(root.children[0].children[0].type, "A");
+    ASSERT_EQ(root.children[1].children.size(), 1);
+    EXPECT_EQ(root.children[1].children[0].type, "B");
+}
+
+TEST(PluginGraft, NestedChildren) {
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+    root.properties["hwnd"] = "0x1000";
+    root.bounds = {0, 0, 800, 600};
+
+    s_mockJson = R"([{"target_hwnd":"0x1000","type":"Root","children":[
+        {"type":"Parent","children":[
+            {"type":"Child1","name":"hello"},
+            {"type":"Child2","name":"world"}
+        ]}
+    ]}])";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    enrich_with_plugin(root, nullptr, 0, fw);
+
+    ASSERT_EQ(root.children.size(), 1);
+    auto& parent = root.children[0];
+    EXPECT_EQ(parent.type, "Parent");
+    ASSERT_EQ(parent.children.size(), 2);
+    EXPECT_EQ(parent.children[0].text, "hello");
+    EXPECT_EQ(parent.children[1].text, "world");
+}
+
+TEST(PluginGraft, PropertiesCopied) {
+    Element root;
+    root.type = "Window";
+    root.properties["hwnd"] = "0x1000";
+    root.bounds = {0, 0, 100, 100};
+
+    s_mockJson = R"([{"target_hwnd":"0x1000","type":"Root","children":[
+        {"type":"Item","properties":{"visible":"true","role":"button"}}
+    ]}])";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    enrich_with_plugin(root, nullptr, 0, fw);
+
+    ASSERT_EQ(root.children.size(), 1);
+    EXPECT_EQ(root.children[0].properties["visible"], "true");
+    EXPECT_EQ(root.children[0].properties["role"], "button");
+}
+
+TEST(PluginGraft, EmptyJsonReturnsFailure) {
+    Element root;
+    root.type = "Window";
+
+    s_mockJson = nullptr;  // enrich returns 0
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    bool ok = enrich_with_plugin(root, nullptr, 0, fw);
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(root.children.empty());
+}
+
+TEST(PluginGraft, InvalidJsonReturnsFailure) {
+    Element root;
+    root.type = "Window";
+
+    s_mockJson = "this is not json{{{";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    bool ok = enrich_with_plugin(root, nullptr, 0, fw);
+    EXPECT_FALSE(ok);
+    EXPECT_TRUE(root.children.empty());
+}
+
+TEST(PluginGraft, DeepHwndMatch) {
+    // target_hwnd is on a deeply nested element
+    Element root;
+    root.type = "Window"; root.framework = "win32";
+    Element a, b, c;
+    a.type = "A"; a.framework = "win32";
+    b.type = "B"; b.framework = "win32";
+    c.type = "C"; c.framework = "win32"; c.properties["hwnd"] = "0xDEEP";
+    c.bounds = {50, 60, 200, 200};
+    b.children.push_back(c);
+    a.children.push_back(b);
+    root.children.push_back(a);
+
+    s_mockJson = R"([{"target_hwnd":"0xDEEP","type":"DeepHost","children":[
+        {"type":"Leaf","name":"found it"}
+    ]}])";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    enrich_with_plugin(root, nullptr, 0, fw);
+
+    // Navigate to the deeply nested C element
+    auto& leaf = root.children[0].children[0].children[0];
+    EXPECT_EQ(leaf.type, "C");
+    ASSERT_EQ(leaf.children.size(), 1);
+    EXPECT_EQ(leaf.children[0].type, "Leaf");
+    EXPECT_EQ(leaf.children[0].text, "found it");
 }

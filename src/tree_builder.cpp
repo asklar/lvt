@@ -5,6 +5,7 @@
 #include "providers/xaml_provider.h"
 #include "providers/winui3_provider.h"
 #include "providers/wpf_provider.h"
+#include "plugin_loader.h"
 #include <algorithm>
 #include <memory>
 
@@ -62,6 +63,20 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         case Framework::Wpf: {
             WpfProvider wpf;
             wpf.enrich(root, hwnd, pid);
+            break;
+        }
+        case Framework::Plugin: {
+            // Look up the plugin by name and enrich
+            for (auto& p : get_plugins()) {
+                if (p.info && p.info->name && fi.name == p.info->name) {
+                    PluginFrameworkInfo pf;
+                    pf.name = fi.name;
+                    pf.version = fi.version;
+                    pf.plugin = &p;
+                    enrich_with_plugin(root, hwnd, pid, pf);
+                    break;
+                }
+            }
             break;
         }
         default:

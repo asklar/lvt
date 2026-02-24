@@ -1,4 +1,5 @@
 #include "framework_detector.h"
+#include "plugin_loader.h"
 #include <wil/resource.h>
 #include <Psapi.h>
 
@@ -13,8 +14,14 @@ std::string framework_to_string(Framework f) {
     case Framework::Xaml:   return "xaml";
     case Framework::WinUI3: return "winui3";
     case Framework::Wpf:    return "wpf";
+    case Framework::Plugin: return "plugin";
     }
     return "unknown";
+}
+
+std::string framework_display_name(const FrameworkInfo& fi) {
+    if (!fi.name.empty()) return fi.name;
+    return framework_to_string(fi.type);
 }
 
 static const wchar_t* comctl_classes[] = {
@@ -190,6 +197,12 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
         result.push_back({Framework::Xaml, {}});
     if (!detectedWpf && data.hasWpf)
         result.push_back({Framework::Wpf, {}});
+
+    // Plugin-provided framework detection
+    auto pluginFws = detect_plugin_frameworks(hwnd, pid);
+    for (auto& pf : pluginFws) {
+        result.push_back({Framework::Plugin, pf.version, pf.name});
+    }
 
     return result;
 }

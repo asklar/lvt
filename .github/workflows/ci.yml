@@ -27,7 +27,7 @@ jobs:
         run: cmake --preset default
 
       - name: Build managed WPF assembly
-        run: msbuild src/tap_wpf/LvtWpfTap.csproj /p:Configuration=Release /restore /v:minimal
+        run: msbuild src/tap_wpf/LvtWpfTap.csproj /p:Configuration=Release /p:Platform=AnyCPU /restore /v:minimal
 
       - name: Build
         run: cmake --build build
