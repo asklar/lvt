@@ -225,54 +225,13 @@ bool inject_and_collect_wpf_tree(Element& root, HWND /*hwnd*/, DWORD pid) {
     ConnectNamedPipe(pipe, &ov);
     DWORD connectErr = GetLastError();
 
-    // Check if the TAP DLL is already loaded in the target (from a previous run).
-    // If so, signal the trigger event instead of re-injecting.
-    bool alreadyLoaded = false;
-    {
-        wil::unique_handle checkProc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
-        if (checkProc) {
-            HMODULE modules[1024];
-            DWORD needed = 0;
-            if (EnumProcessModulesEx(checkProc.get(), modules, sizeof(modules), &needed, LIST_MODULES_ALL)) {
-                // Extract TAP DLL filename for comparison
-                auto slashPos = tapDll.find_last_of(L"\\/");
-                std::wstring tapName = (slashPos != std::wstring::npos) ? tapDll.substr(slashPos + 1) : tapDll;
-                for (DWORD i = 0; i < needed / sizeof(HMODULE); i++) {
-                    wchar_t name[MAX_PATH]{};
-                    if (GetModuleBaseNameW(checkProc.get(), modules[i], name, MAX_PATH)) {
-                        if (_wcsicmp(name, tapName.c_str()) == 0) {
-                            alreadyLoaded = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if (alreadyLoaded) {
-        // Signal the trigger event — the monitor thread in the TAP DLL will spawn a worker
-        wchar_t eventName[64];
-        swprintf_s(eventName, L"Local\\lvt_wpf_trigger_%lu", pid);
-        HANDLE hEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName);
-        if (hEvent) {
-            if (g_debug)
-                fprintf(stderr, "lvt: WPF TAP DLL already loaded, signaling trigger event\n");
-            SetEvent(hEvent);
-            CloseHandle(hEvent);
-        } else {
-            if (g_debug)
-                fprintf(stderr, "lvt: trigger event not found (error %lu), re-injecting\n", GetLastError());
-            inject_dll(pid, tapDll);
-        }
-    } else {
-        // First injection
-        if (!inject_dll(pid, tapDll)) {
-            CancelIo(pipe);
-            CloseHandle(ov.hEvent);
-            CloseHandle(pipe);
-            return false;
-        }
+    // Inject TAP DLL. Since the TAP DLL calls FreeLibraryAndExitThread after
+    // collection, it unloads itself, so each run is a fresh injection.
+    if (!inject_dll(pid, tapDll)) {
+        CancelIo(pipe);
+        CloseHandle(ov.hEvent);
+        CloseHandle(pipe);
+        return false;
     }
 
     if (g_debug)

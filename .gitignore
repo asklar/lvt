@@ -1,5 +1,7 @@
 # Build output
 build/
+build-x86/
+build-arm64/
 
 # IDE files
 .vs/

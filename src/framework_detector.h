@@ -11,14 +11,19 @@ enum class Framework {
     Xaml,
     WinUI3,
     Wpf,
+    Plugin,  // Plugin-provided framework (name in FrameworkInfo::name)
 };
 
 struct FrameworkInfo {
     Framework type;
     std::string version; // e.g. "3.1.7.2602" for WinUI3, "6.10" for comctl
+    std::string name;    // Plugin-provided name (empty for built-in frameworks)
 };
 
 std::string framework_to_string(Framework f);
+
+// Returns the display name for a FrameworkInfo (uses name field if set).
+std::string framework_display_name(const FrameworkInfo& fi);
 
 // Detect which UI frameworks are in use for the given window/process.
 std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid);

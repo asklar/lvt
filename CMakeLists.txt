@@ -14,6 +14,7 @@ add_executable(lvt
     src/tree_builder.cpp
     src/json_serializer.cpp
     src/screenshot.cpp
+    src/plugin_loader.cpp
     src/providers/win32_provider.cpp
     src/providers/comctl_provider.cpp
     src/providers/xaml_provider.cpp
@@ -104,6 +105,7 @@ add_executable(lvt_unit_tests
     src/json_serializer.cpp
     src/framework_detector.cpp
     src/target.cpp
+    src/plugin_loader.cpp
     src/providers/win32_provider.cpp
     src/providers/comctl_provider.cpp
     src/providers/xaml_provider.cpp
