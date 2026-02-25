@@ -9,7 +9,7 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 ## What it does
 
 - Targets any running Windows app by HWND, PID, process name, or window title
-- Detects UI frameworks in use: Win32, ComCtl, Windows XAML (UWP), WinUI 3
+- Detects UI frameworks in use: Win32, ComCtl, Windows XAML (UWP), WinUI 3, WPF
 - Outputs a unified element tree as JSON or XML markup
 - Captures annotated PNG screenshots with element IDs overlaid
 - Elements get stable IDs (`e0`, `e1`, …) so AI agents can reference specific parts of the UI
@@ -144,6 +144,7 @@ Framework providers:
 - **ComCtlProvider** — enriches ComCtl32 controls (ListView items, TreeView nodes, etc.)
 - **XamlProvider** — injects TAP DLL to walk Windows XAML visual trees
 - **WinUI3Provider** — injects TAP DLL to walk WinUI 3 visual trees
+- **WpfProvider** — walks WPF visual trees via plugin
 
 See [docs/architecture.md](docs/architecture.md) for details.
 
@@ -167,10 +168,17 @@ build\lvt_integration_tests.exe
 ctest --test-dir build
 ```
 
+## Plugin system
+
+lvt supports a plugin architecture for adding new framework providers. Plugins are DLLs that implement a simple C interface and are loaded automatically from `%USERPROFILE%\.lvt\plugins\`.
+
+See [src/plugin.h](src/plugin.h) for the plugin interface.
+
 ## Future work
 
 - WinForms provider
 - WebView2 provider
+- MAUI provider
 - Element property querying (`--query <id> <property>`)
 - Accessibility tree correlation
 - Watch mode for live tree diffing
