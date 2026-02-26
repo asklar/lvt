@@ -29,6 +29,9 @@ jobs:
       - name: Build managed WPF assembly
         run: msbuild src/tap_wpf/LvtWpfTap.csproj /p:Configuration=Release /p:Platform=AnyCPU /restore /v:minimal
 
+      - name: Build managed Avalonia tree walker
+        run: dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj -c Release
+
       - name: Build
         run: cmake --build build
 
@@ -55,3 +58,4 @@ jobs:
             build/lvt_tap_x64.dll
             build/lvt_wpf_tap_x64.dll
             build/LvtWpfTap.dll
+            build/plugins/
