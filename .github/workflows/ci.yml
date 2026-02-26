@@ -38,6 +38,9 @@ jobs:
       - name: Unit tests
         run: build\lvt_unit_tests.exe --gtest_output=xml:build\unit_test_results.xml
 
+      - name: Chromium plugin tests
+        run: build\lvt_chromium_tests.exe --gtest_output=xml:build\chromium_test_results.xml
+
       - name: Integration tests
         run: build\lvt_integration_tests.exe --gtest_output=xml:build\integration_test_results.xml
 
@@ -47,7 +50,6 @@ jobs:
         with:
           name: test-results
           path: build\*_test_results.xml
-
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         if: always()

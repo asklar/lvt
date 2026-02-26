@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "LVT - Live Visual Tree",
+  "version": "1.0.0",
+  "description": "Exposes the DOM tree of browser tabs to the LVT CLI tool for AI-powered UI inspection.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAg2amT6+n68/syIKGL+QwK0pkveIxgGX+9TTCFLr7RInxjsnh3vZGGIjaowfdPDfxruijJL8LMgHxASOBBjuUCWqBMPQOHw9LCLbULunNY8ahXxjZjocas1UhSQVwf7Hk990XdBzrwyqjE49F3wGR3Wbdvmg5FKHhuiLpDVzRKy6U5pKmyPb4bU6yrVgWefOSFfJdzPCir6vs6RyExy745+SUmwWz0eHCnPpNSdEInZ+LyzDGvkhPkfYXC2A2VfF+cK04cj9i+5+5K8Xnopt9g9/PkdSm+i257jhg5tlVUaekGzFtm8EyCAfETMUna4kYqKXH62u6Fui4nqpAXbH8AQIDAQAB",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "nativeMessaging",
+    "activeTab"
+  ],
+  "background": {
+    "service_worker": "service-worker.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "minimum_chrome_version": "110"
+}

@@ -9,7 +9,7 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 ## What it does
 
 - Targets any running Windows app by HWND, PID, process name, or window title
-- Detects UI frameworks in use: Win32, ComCtl, Windows XAML (UWP), WinUI 3, WPF, [Avalonia](docs/avalonia-plugin.md)
+- Detects UI frameworks in use: Win32, ComCtl, Windows XAML (UWP), WinUI 3, WPF, [Avalonia](docs/avalonia-plugin.md), [Chrome/Edge](docs/chromium-plugin.md)
 - Outputs a unified element tree as JSON or XML markup
 - Captures annotated PNG screenshots with element IDs overlaid
 - Elements get stable IDs (`e0`, `e1`, …) so AI agents can reference specific parts of the UI
@@ -180,6 +180,7 @@ See [src/plugin.h](src/plugin.h) for the plugin interface.
 | Plugin | Framework | Docs |
 |--------|-----------|------|
 | **Avalonia** | [Avalonia UI](https://avaloniaui.net/) desktop apps | [docs/avalonia-plugin.md](docs/avalonia-plugin.md) |
+| **Chromium** | Chrome/Edge browser DOM trees | [docs/chromium-plugin.md](docs/chromium-plugin.md) |
 
 These plugins are built from source alongside lvt and deployed to `%USERPROFILE%\.lvt\plugins\`. See each plugin's documentation for installation and usage details.
 
