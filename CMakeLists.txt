@@ -121,14 +121,15 @@ set_target_properties(lvt_avalonia_tap PROPERTIES
 
 # Build managed Avalonia tree walker assembly and copy to output
 # Pre-build with: dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj -c Release
+# The csproj sets AppendTargetFrameworkToOutputPath=false so output is bin/Release/,
+# but as a fallback we also build via a custom command that publishes to a known location.
 add_custom_command(TARGET lvt_avalonia_tap POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/bin/Release/LvtAvaloniaTreeWalker.dll"
-        "$<TARGET_FILE_DIR:lvt>/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
+    COMMAND dotnet publish "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj"
+        -c Release -o "$<TARGET_FILE_DIR:lvt>/plugins/avalonia" --no-restore
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
         "$<TARGET_FILE_DIR:lvt>/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
-    COMMENT "Copying managed Avalonia tree walker assembly"
+    COMMENT "Publishing managed Avalonia tree walker assembly"
 )
 
 # --- Tests ---
