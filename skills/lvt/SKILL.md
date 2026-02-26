@@ -16,7 +16,7 @@ Use `lvt` whenever you need to understand the visual content or structure of a r
 - **UI verification** — confirm that a UI change was applied correctly (e.g. a button label changed, a dialog appeared)
 - **Finding UI elements** — locate a specific control, menu item, or text field in an app's visual tree
 - **Screenshot capture** — take an annotated screenshot of an app with element IDs overlaid
-- **Framework detection** — determine which UI frameworks an app uses (Win32, ComCtl, XAML, WinUI 3, WPF)
+- **Framework detection** — determine which UI frameworks an app uses (Win32, ComCtl, XAML, WinUI 3, WPF, Chromium)
 - **Automated UI interaction planning** — get element IDs and bounds to plan mouse clicks or keyboard input
 
 ## Prerequisites
@@ -118,7 +118,7 @@ Every element gets a stable ID like `e0`, `e1`, `e2`, etc., assigned in depth-fi
 |----------|-------------|
 | `id` | Stable element ID (e.g. `e0`) |
 | `type` | Element type name (e.g. `Window`, `Button`, `TextBlock`) |
-| `framework` | Which framework owns this element (`win32`, `comctl`, `xaml`, `winui3`, `wpf`) |
+| `framework` | Which framework owns this element (`win32`, `comctl`, `xaml`, `winui3`, `wpf`, `chromium`) |
 | `className` | Win32 window class name (Win32/ComCtl elements) |
 | `text` | Visible text content or window title |
 | `bounds` | Screen-relative bounding rectangle `{x, y, width, height}` |
@@ -169,3 +169,22 @@ Every element gets a stable ID like `e0`, `e1`, `e2`, etc., assigned in depth-fi
 - For XAML/WinUI 3 apps, lvt injects a helper DLL into the target — this is safe and non-destructive but means `lvt_tap_{arch}.dll` must be next to `lvt.exe`
 - For WPF apps, lvt injects `lvt_wpf_tap_{arch}.dll` and the managed `LvtWpfTap.dll` — both must be next to `lvt.exe`
 - lvt.exe must match the target process architecture (x64, x86, or ARM64) — a clear error is shown on mismatch. Use `lvt-x86.exe` for 32-bit WPF apps.
+
+## Chrome/Edge DOM inspection (optional one-time setup)
+
+lvt can dump the DOM tree of web pages in Chrome and Edge. This requires a one-time setup:
+
+```powershell
+$lvtDir = "$env:USERPROFILE\.lvt"
+
+# 1. Register the native messaging host for Chrome and Edge
+& "$lvtDir\plugins\chromium\lvt_chromium_host.exe" --register
+
+# 2. Load the browser extension in Chrome or Edge:
+#    - Open chrome://extensions (or edge://extensions)
+#    - Enable "Developer mode"
+#    - Click "Load unpacked" → select the extension folder:
+Start-Process "$lvtDir\plugins\chromium\extension"
+```
+
+After setup, `lvt --name chrome` or `lvt --name msedge` will include the DOM tree of the active tab. If the extension is not installed, lvt still works for all other frameworks — it just won't show web content.
