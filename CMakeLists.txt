@@ -94,6 +94,43 @@ add_custom_command(TARGET lvt_wpf_tap POST_BUILD
     COMMENT "Copying managed WPF tree walker assembly"
 )
 
+# Avalonia plugin DLL — runtime-loaded plugin for Avalonia UI framework support
+add_library(lvt_avalonia_plugin SHARED
+    src/plugin_avalonia/lvt_avalonia_plugin.cpp
+)
+target_compile_definitions(lvt_avalonia_plugin PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(lvt_avalonia_plugin PRIVATE src)
+target_link_libraries(lvt_avalonia_plugin PRIVATE ole32 version)
+set_target_properties(lvt_avalonia_plugin PROPERTIES
+    OUTPUT_NAME "lvt_avalonia_plugin"
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>/plugins
+)
+
+# Avalonia TAP DLL — injected into Avalonia target process
+# Uses static CRT (/MT) to avoid CRT version conflicts in the target process
+add_library(lvt_avalonia_tap SHARED
+    src/plugin_avalonia/avalonia_tap_native.cpp
+    src/plugin_avalonia/avalonia_tap_native.def
+)
+target_compile_definitions(lvt_avalonia_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+set_property(TARGET lvt_avalonia_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_target_properties(lvt_avalonia_tap PROPERTIES
+    OUTPUT_NAME "lvt_avalonia_tap_${TAP_ARCH_SUFFIX}"
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>/plugins/avalonia
+)
+
+# Build managed Avalonia tree walker assembly and copy to output
+# Pre-build with: dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj -c Release
+add_custom_command(TARGET lvt_avalonia_tap POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/bin/Release/LvtAvaloniaTreeWalker.dll"
+        "$<TARGET_FILE_DIR:lvt>/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
+        "$<TARGET_FILE_DIR:lvt>/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+    COMMENT "Copying managed Avalonia tree walker assembly"
+)
+
 # --- Tests ---
 enable_testing()
 find_package(GTest CONFIG REQUIRED)
