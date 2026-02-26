@@ -55,6 +55,9 @@ jobs:
       - name: Build managed WPF assembly
         run: msbuild src/tap_wpf/LvtWpfTap.csproj /p:Configuration=Release /p:Platform=AnyCPU /restore /v:minimal
 
+      - name: Build managed Avalonia tree walker
+        run: dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj -c Release
+
       - name: Build
         run: cmake --build ${{ matrix.build_dir }}
 
@@ -76,6 +79,9 @@ jobs:
           }
           if (Test-Path ${{ matrix.build_dir }}\LvtWpfTap.dll) {
             Copy-Item ${{ matrix.build_dir }}\LvtWpfTap.dll release\
+          }
+          if (Test-Path ${{ matrix.build_dir }}\plugins) {
+            Copy-Item -Recurse ${{ matrix.build_dir }}\plugins release\plugins
           }
           New-Item -ItemType Directory -Path release\skills\lvt -Force
           Copy-Item .github\skills\lvt\SKILL.md release\skills\lvt\
