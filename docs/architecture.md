@@ -34,6 +34,8 @@ Enumerates modules loaded in the target process via `EnumProcessModules` and che
 | ComCtl | Child window with known ComCtl class name | `comctl32.dll` file version |
 | XAML | `Windows.UI.Xaml.dll` loaded | DLL file version |
 | WinUI3 | `Microsoft.UI.Xaml.dll` loaded | DLL file version |
+| WPF | `PresentationFramework.dll` or `wpfgfx_*.dll` loaded | DLL file version |
+| Avalonia | `Avalonia.Base.dll` loaded (via plugin) | DLL file version |
 
 ComCtl detection uses `EnumChildWindows` and checks against a list of known class names (`SysListView32`, `SysTreeView32`, `ToolbarWindow32`, etc.).
 

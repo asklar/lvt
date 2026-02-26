@@ -9,7 +9,7 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 ## What it does
 
 - Targets any running Windows app by HWND, PID, process name, or window title
-- Detects UI frameworks in use: Win32, ComCtl, Windows XAML (UWP), WinUI 3, WPF
+- Detects UI frameworks in use: Win32, ComCtl, Windows XAML (UWP), WinUI 3, WPF, [Avalonia](docs/avalonia-plugin.md)
 - Outputs a unified element tree as JSON or XML markup
 - Captures annotated PNG screenshots with element IDs overlaid
 - Elements get stable IDs (`e0`, `e1`, …) so AI agents can reference specific parts of the UI
@@ -144,7 +144,8 @@ Framework providers:
 - **ComCtlProvider** — enriches ComCtl32 controls (ListView items, TreeView nodes, etc.)
 - **XamlProvider** — injects TAP DLL to walk Windows XAML visual trees
 - **WinUI3Provider** — injects TAP DLL to walk WinUI 3 visual trees
-- **WpfProvider** — walks WPF visual trees via plugin
+- **WpfProvider** — walks WPF visual trees via managed DLL injection
+- **Plugins** — extensible framework support (e.g. [Avalonia](avalonia-plugin.md)) via C ABI plugin interface
 
 See [docs/architecture.md](docs/architecture.md) for details.
 
@@ -173,6 +174,14 @@ ctest --test-dir build
 lvt supports a plugin architecture for adding new framework providers. Plugins are DLLs that implement a simple C interface and are loaded automatically from `%USERPROFILE%\.lvt\plugins\`.
 
 See [src/plugin.h](src/plugin.h) for the plugin interface.
+
+### Optional plugins
+
+| Plugin | Framework | Docs |
+|--------|-----------|------|
+| **Avalonia** | [Avalonia UI](https://avaloniaui.net/) desktop apps | [docs/avalonia-plugin.md](docs/avalonia-plugin.md) |
+
+These plugins are built from source alongside lvt and deployed to `%USERPROFILE%\.lvt\plugins\`. See each plugin's documentation for installation and usage details.
 
 ## Future work
 
