@@ -132,6 +132,36 @@ add_custom_command(TARGET lvt_avalonia_tap POST_BUILD
     COMMENT "Publishing managed Avalonia tree walker assembly"
 )
 
+# Chromium plugin DLL — runtime-loaded plugin for Chrome/Edge DOM tree support
+add_library(lvt_chromium_plugin SHARED
+    src/plugin_chromium/lvt_chromium_plugin.cpp
+)
+target_compile_definitions(lvt_chromium_plugin PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(lvt_chromium_plugin PRIVATE src)
+target_link_libraries(lvt_chromium_plugin PRIVATE nlohmann_json::nlohmann_json ole32 version)
+set_target_properties(lvt_chromium_plugin PROPERTIES
+    OUTPUT_NAME "lvt_chromium_plugin"
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>/plugins
+)
+
+# Chromium native messaging host — relay between Chrome extension and lvt
+add_executable(lvt_chromium_host
+    src/plugin_chromium/chromium_host.cpp
+)
+target_compile_definitions(lvt_chromium_host PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(lvt_chromium_host PRIVATE advapi32)
+set_target_properties(lvt_chromium_host PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>/plugins/chromium
+)
+
+# Copy Chromium extension files to output
+add_custom_command(TARGET lvt_chromium_plugin POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_SOURCE_DIR}/src/plugin_chromium/extension"
+        "$<TARGET_FILE_DIR:lvt>/plugins/chromium/extension"
+    COMMENT "Copying Chromium extension files"
+)
+
 # --- Tests ---
 enable_testing()
 find_package(GTest CONFIG REQUIRED)
@@ -172,3 +202,15 @@ target_link_libraries(lvt_integration_tests PRIVATE
     WIL::WIL nlohmann_json::nlohmann_json
 )
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
+
+# Chromium plugin tests — DOM JSON format and native messaging protocol
+add_executable(lvt_chromium_tests
+    tests/chromium_tests.cpp
+)
+target_include_directories(lvt_chromium_tests PRIVATE src)
+target_compile_definitions(lvt_chromium_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(lvt_chromium_tests PRIVATE
+    GTest::gtest GTest::gtest_main
+    nlohmann_json::nlohmann_json
+)
+add_test(NAME chromium_tests COMMAND lvt_chromium_tests)
