@@ -4,6 +4,7 @@
 #include "xaml_diag_common.h"
 #include "../tap/tap_clsid.h"
 #include "../debug.h"
+#include "../bounds_util.h"
 
 #include "../target.h"
 
@@ -15,8 +16,6 @@
 #include <xamlOM.h>
 #include <nlohmann/json.hpp>
 #include <cstdio>
-#include <cmath>
-#include <climits>
 #include <string>
 
 #pragma comment(lib, "userenv.lib")
@@ -132,14 +131,6 @@ static void collect_bridges(Element& el, std::vector<Element*>& bridges) {
     for (auto& child : el.children) {
         collect_bridges(child, bridges);
     }
-}
-
-// Safe double-to-int conversion: clamp to int range and reject non-finite values.
-static int safe_double_to_int(double v) {
-    if (!std::isfinite(v)) return 0;
-    if (v >= static_cast<double>(INT_MAX)) return INT_MAX;
-    if (v <= static_cast<double>(INT_MIN)) return INT_MIN;
-    return static_cast<int>(v);
 }
 
 // Recursively graft JSON tree nodes into an Element tree.

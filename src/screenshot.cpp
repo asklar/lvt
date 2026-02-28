@@ -215,8 +215,8 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
         if (el->bounds.width <= 0 || el->bounds.height <= 0) continue;
         // Use long long for intermediate arithmetic to avoid int overflow
         // when element bounds contain extreme values.
-        long long lx = static_cast<long long>(el->bounds.x) - winRect.left;
-        long long ly = static_cast<long long>(el->bounds.y) - winRect.top;
+        long long lx = static_cast<long long>(el->bounds.x) - static_cast<long long>(winRect.left);
+        long long ly = static_cast<long long>(el->bounds.y) - static_cast<long long>(winRect.top);
         long long lw = el->bounds.width;
         long long lh = el->bounds.height;
         if (lx + lw <= 0 || ly + lh <= 0 || lx >= bmpWidth || ly >= bmpHeight) continue;

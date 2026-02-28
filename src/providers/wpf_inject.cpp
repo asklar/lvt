@@ -6,6 +6,7 @@
 #include "wpf_inject.h"
 #include "../debug.h"
 #include "../target.h"
+#include "../bounds_util.h"
 
 #include <Windows.h>
 #include <objbase.h>
@@ -16,7 +17,6 @@
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cmath>
-#include <climits>
 #include <string>
 #include <fstream>
 
@@ -52,14 +52,6 @@ static std::string sanitize(const std::string& s) {
             r += c;
     }
     return r;
-}
-
-// Safe double-to-int conversion: clamp to int range and reject non-finite values.
-static int safe_double_to_int(double v) {
-    if (!std::isfinite(v)) return 0;
-    if (v >= static_cast<double>(INT_MAX)) return INT_MAX;
-    if (v <= static_cast<double>(INT_MIN)) return INT_MIN;
-    return static_cast<int>(v);
 }
 
 // Recursively graft JSON tree nodes into an Element tree.
