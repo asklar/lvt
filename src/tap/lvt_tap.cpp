@@ -11,6 +11,7 @@
 #include <map>
 #include <vector>
 #include <cstdio>
+#include <cmath>
 
 // GUIDs only forward-declared in xamlOM.h (no .lib provides them)
 const IID IID_IVisualTreeServiceCallback =
@@ -301,13 +302,23 @@ private:
             std::wstring name = props[i].PropertyName ? props[i].PropertyName : L"";
             std::wstring value = props[i].Value ? props[i].Value : L"";
             if (name == L"ActualWidth" && !value.empty()) {
-                node.width = _wtof(value.c_str());
-                hasWidth = true;
+                double v = _wtof(value.c_str());
+                if (std::isfinite(v)) {
+                    node.width = v;
+                    hasWidth = true;
+                }
             } else if (name == L"ActualHeight" && !value.empty()) {
-                node.height = _wtof(value.c_str());
-                hasHeight = true;
+                double v = _wtof(value.c_str());
+                if (std::isfinite(v)) {
+                    node.height = v;
+                    hasHeight = true;
+                }
             } else if (name == L"ActualOffset" && !value.empty()) {
-                ParseOffset(value, node.offsetX, node.offsetY);
+                double ox = 0, oy = 0;
+                if (ParseOffset(value, ox, oy) && std::isfinite(ox) && std::isfinite(oy)) {
+                    node.offsetX = ox;
+                    node.offsetY = oy;
+                }
             }
             if (props[i].Type) SysFreeString(props[i].Type);
             if (props[i].DeclaringType) SysFreeString(props[i].DeclaringType);

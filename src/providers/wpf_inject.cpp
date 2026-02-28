@@ -15,6 +15,8 @@
 #include <wil/resource.h>
 #include <nlohmann/json.hpp>
 #include <cstdio>
+#include <cmath>
+#include <climits>
 #include <string>
 #include <fstream>
 
@@ -52,6 +54,14 @@ static std::string sanitize(const std::string& s) {
     return r;
 }
 
+// Safe double-to-int conversion: clamp to int range and reject non-finite values.
+static int safe_double_to_int(double v) {
+    if (!std::isfinite(v)) return 0;
+    if (v >= static_cast<double>(INT_MAX)) return INT_MAX;
+    if (v <= static_cast<double>(INT_MIN)) return INT_MIN;
+    return static_cast<int>(v);
+}
+
 // Recursively graft JSON tree nodes into an Element tree.
 static void graft_json_node(const json& j, Element& parent, const std::string& framework) {
     Element el;
@@ -70,11 +80,12 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     double h = j.value("height", 0.0);
     double ox = j.value("offsetX", 0.0);
     double oy = j.value("offsetY", 0.0);
-    if (w > 0 && h > 0) {
-        el.bounds.x = static_cast<int>(ox);
-        el.bounds.y = static_cast<int>(oy);
-        el.bounds.width = static_cast<int>(w);
-        el.bounds.height = static_cast<int>(h);
+    if (w > 0 && h > 0 && std::isfinite(w) && std::isfinite(h)
+        && std::isfinite(ox) && std::isfinite(oy)) {
+        el.bounds.x = safe_double_to_int(ox);
+        el.bounds.y = safe_double_to_int(oy);
+        el.bounds.width = safe_double_to_int(w);
+        el.bounds.height = safe_double_to_int(h);
     }
 
     // Visibility/enabled as properties

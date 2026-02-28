@@ -15,6 +15,8 @@
 #include <xamlOM.h>
 #include <nlohmann/json.hpp>
 #include <cstdio>
+#include <cmath>
+#include <climits>
 #include <string>
 
 #pragma comment(lib, "userenv.lib")
@@ -132,6 +134,14 @@ static void collect_bridges(Element& el, std::vector<Element*>& bridges) {
     }
 }
 
+// Safe double-to-int conversion: clamp to int range and reject non-finite values.
+static int safe_double_to_int(double v) {
+    if (!std::isfinite(v)) return 0;
+    if (v >= static_cast<double>(INT_MAX)) return INT_MAX;
+    if (v <= static_cast<double>(INT_MIN)) return INT_MIN;
+    return static_cast<int>(v);
+}
+
 // Recursively graft JSON tree nodes into an Element tree.
 // parentOffsetX/Y accumulate offsets from the XAML root for screen coordinate computation.
 static void graft_json_node(const json& j, Element& parent, const std::string& framework,
@@ -150,13 +160,14 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     double oy = j.value("offsetY", 0.0);
     double w = j.value("width", 0.0);
     double h = j.value("height", 0.0);
-    double absX = parentOffsetX + ox;
-    double absY = parentOffsetY + oy;
-    if (w > 0 && h > 0) {
-        el.bounds.x = static_cast<int>(absX);
-        el.bounds.y = static_cast<int>(absY);
-        el.bounds.width = static_cast<int>(w);
-        el.bounds.height = static_cast<int>(h);
+    double absX = std::isfinite(ox) ? parentOffsetX + ox : parentOffsetX;
+    double absY = std::isfinite(oy) ? parentOffsetY + oy : parentOffsetY;
+    if (w > 0 && h > 0 && std::isfinite(w) && std::isfinite(h)
+        && std::isfinite(absX) && std::isfinite(absY)) {
+        el.bounds.x = safe_double_to_int(absX);
+        el.bounds.y = safe_double_to_int(absY);
+        el.bounds.width = safe_double_to_int(w);
+        el.bounds.height = safe_double_to_int(h);
     }
 
     if (j.contains("children") && j["children"].is_array()) {

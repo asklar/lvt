@@ -213,11 +213,17 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
 
     for (auto* el : elements) {
         if (el->bounds.width <= 0 || el->bounds.height <= 0) continue;
-        int x = el->bounds.x - winRect.left;
-        int y = el->bounds.y - winRect.top;
-        int w = el->bounds.width;
-        int h = el->bounds.height;
-        if (x + w <= 0 || y + h <= 0 || x >= bmpWidth || y >= bmpHeight) continue;
+        // Use long long for intermediate arithmetic to avoid int overflow
+        // when element bounds contain extreme values.
+        long long lx = static_cast<long long>(el->bounds.x) - winRect.left;
+        long long ly = static_cast<long long>(el->bounds.y) - winRect.top;
+        long long lw = el->bounds.width;
+        long long lh = el->bounds.height;
+        if (lx + lw <= 0 || ly + lh <= 0 || lx >= bmpWidth || ly >= bmpHeight) continue;
+        int x = static_cast<int>(lx);
+        int y = static_cast<int>(ly);
+        int w = static_cast<int>(lw);
+        int h = static_cast<int>(lh);
 
         Rectangle(memDC, x, y, x + w, y + h);
 
