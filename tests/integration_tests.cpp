@@ -353,8 +353,9 @@ TEST_F(NotepadFixture, RootBoundsNonZero) {
     EXPECT_GT(b["height"].get<int>(), 0) << "Root height should be positive";
 }
 
-// ---- Annotation verification ----
+// ---- Annotation verification (DEBUG builds only) ----
 
+#ifndef NDEBUG
 TEST_F(NotepadFixture, AnnotationsJsonOutput) {
     // The --annotations-json flag should produce structured annotation data
     auto lvt = get_lvt_path();
@@ -428,6 +429,7 @@ TEST_F(NotepadFixture, AnnotationsMatchTreeElements) {
 
     fs::remove(annFile);
 }
+#endif
 
 // ---- Framework-specific bounds (WinUI3/XAML) ----
 

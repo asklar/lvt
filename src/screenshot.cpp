@@ -396,6 +396,7 @@ bool capture_screenshot(HWND hwnd, const std::string& outputPath,
     return ok;
 }
 
+#ifndef NDEBUG
 std::vector<AnnotationInfo> collect_annotations(HWND hwnd, const Element* tree) {
     std::vector<AnnotationInfo> result;
     if (!tree) return result;
@@ -430,5 +431,6 @@ std::vector<AnnotationInfo> collect_annotations(HWND hwnd, const Element* tree) 
 
     return result;
 }
+#endif
 
 } // namespace lvt
