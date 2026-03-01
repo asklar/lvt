@@ -404,6 +404,8 @@ std::vector<AnnotationInfo> collect_annotations(HWND hwnd, const Element* tree) 
     if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &winRect, sizeof(winRect)) != S_OK) {
         GetWindowRect(hwnd, &winRect);
     }
+    int winW = winRect.right - winRect.left;
+    int winH = winRect.bottom - winRect.top;
 
     std::vector<const Element*> elements;
     collect_elements(*tree, elements);
@@ -414,8 +416,8 @@ std::vector<AnnotationInfo> collect_annotations(HWND hwnd, const Element* tree) 
         long long ly = static_cast<long long>(el->bounds.y) - static_cast<long long>(winRect.top);
         long long lw = el->bounds.width;
         long long lh = el->bounds.height;
-        // Skip elements entirely outside reasonable screen bounds
-        if (lx + lw <= 0 || ly + lh <= 0 || lx > 100000 || ly > 100000) continue;
+        // Same clipping as annotate_pixels: skip elements entirely outside window
+        if (lx + lw <= 0 || ly + lh <= 0 || lx >= winW || ly >= winH) continue;
 
         AnnotationInfo info;
         info.id = el->id;

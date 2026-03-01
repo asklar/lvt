@@ -294,6 +294,11 @@ TEST(LvtCli, UnknownArg) {
 
 // ---- Bounds validation (Win32) ----
 
+// Reasonable screen coordinate range covering multi-monitor setups.
+static constexpr int kMinReasonableCoord = -10000;
+static constexpr int kMaxReasonableCoord = 50000;
+static constexpr int kMaxReasonableSize  = 50000;
+
 // Recursively collect all elements from JSON tree
 static void collect_json_elements(const json& el, std::vector<const json*>& out) {
     out.push_back(&el);
@@ -325,15 +330,14 @@ TEST_F(NotepadFixture, Win32BoundsReasonable) {
         std::string id = el->value("id", "?");
 
         // No element should have bounds outside a generous screen range.
-        // -10000..+50000 covers multi-monitor setups.
-        EXPECT_GT(x, -10000) << "Element " << id << " has extreme x=" << x;
-        EXPECT_LT(x, 50000)  << "Element " << id << " has extreme x=" << x;
-        EXPECT_GT(y, -10000) << "Element " << id << " has extreme y=" << y;
-        EXPECT_LT(y, 50000)  << "Element " << id << " has extreme y=" << y;
+        EXPECT_GT(x, kMinReasonableCoord) << "Element " << id << " has extreme x=" << x;
+        EXPECT_LT(x, kMaxReasonableCoord) << "Element " << id << " has extreme x=" << x;
+        EXPECT_GT(y, kMinReasonableCoord) << "Element " << id << " has extreme y=" << y;
+        EXPECT_LT(y, kMaxReasonableCoord) << "Element " << id << " has extreme y=" << y;
         EXPECT_GE(w, 0) << "Element " << id << " has negative width=" << w;
         EXPECT_GE(h, 0) << "Element " << id << " has negative height=" << h;
-        EXPECT_LT(w, 50000) << "Element " << id << " has extreme width=" << w;
-        EXPECT_LT(h, 50000) << "Element " << id << " has extreme height=" << h;
+        EXPECT_LT(w, kMaxReasonableSize) << "Element " << id << " has extreme width=" << w;
+        EXPECT_LT(h, kMaxReasonableSize) << "Element " << id << " has extreme height=" << h;
     }
 }
 
@@ -458,10 +462,10 @@ TEST_F(NotepadFixture, WinUI3BoundsIfDetected) {
 
         // WinUI3 elements should never have INT_MIN/INT_MAX bounds
         // (the bug this PR fixes)
-        EXPECT_GT(x, -100000) << "WinUI3 element " << id << " has extreme x";
-        EXPECT_LT(x, 100000)  << "WinUI3 element " << id << " has extreme x";
-        EXPECT_GT(y, -100000) << "WinUI3 element " << id << " has extreme y";
-        EXPECT_LT(y, 100000)  << "WinUI3 element " << id << " has extreme y";
+        EXPECT_GT(x, kMinReasonableCoord) << "WinUI3 element " << id << " has extreme x";
+        EXPECT_LT(x, kMaxReasonableCoord) << "WinUI3 element " << id << " has extreme x";
+        EXPECT_GT(y, kMinReasonableCoord) << "WinUI3 element " << id << " has extreme y";
+        EXPECT_LT(y, kMaxReasonableCoord) << "WinUI3 element " << id << " has extreme y";
         EXPECT_GE(w, 0) << "WinUI3 element " << id << " has negative width";
         EXPECT_GE(h, 0) << "WinUI3 element " << id << " has negative height";
     }
@@ -496,10 +500,10 @@ TEST_F(NotepadFixture, XamlBoundsIfDetected) {
         int h = b["height"].get<int>();
         std::string id = el->value("id", "?");
 
-        EXPECT_GT(x, -100000) << "XAML element " << id << " has extreme x";
-        EXPECT_LT(x, 100000)  << "XAML element " << id << " has extreme x";
-        EXPECT_GT(y, -100000) << "XAML element " << id << " has extreme y";
-        EXPECT_LT(y, 100000)  << "XAML element " << id << " has extreme y";
+        EXPECT_GT(x, kMinReasonableCoord) << "XAML element " << id << " has extreme x";
+        EXPECT_LT(x, kMaxReasonableCoord) << "XAML element " << id << " has extreme x";
+        EXPECT_GT(y, kMinReasonableCoord) << "XAML element " << id << " has extreme y";
+        EXPECT_LT(y, kMaxReasonableCoord) << "XAML element " << id << " has extreme y";
         EXPECT_GE(w, 0) << "XAML element " << id << " has negative width";
         EXPECT_GE(h, 0) << "XAML element " << id << " has negative height";
     }
