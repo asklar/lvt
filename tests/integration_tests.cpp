@@ -390,6 +390,7 @@ TEST_F(NotepadFixture, AnnotationsJsonOutput) {
         EXPECT_GT(h, 0) << "Annotation " << a["id"] << " has non-positive height";
     }
 
+    f.close();
     fs::remove(annFile);
 }
 
@@ -428,6 +429,7 @@ TEST_F(NotepadFixture, AnnotationsMatchTreeElements) {
             << "Annotated element " << id << " not found in tree";
     }
 
+    f.close();
     fs::remove(annFile);
 }
 #endif
@@ -708,6 +710,7 @@ TEST_F(KnownWindowFixture, AnnotationsIncludeKnownControls) {
             << "Annotation " << a["id"] << " has non-positive height";
     }
 
+    f.close();
     fs::remove(annFile);
 }
 #endif
