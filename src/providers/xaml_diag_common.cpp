@@ -355,28 +355,77 @@ bool inject_and_collect_xaml_tree(
 
     // Graft XAML elements into corresponding bridge windows.
     // Each DesktopWindowXamlSource root maps 1:1 to a DesktopChildSiteBridge HWND.
-    // We match them by order since both lists are enumerated in the same order.
-    // XAML element offsets are relative to the XAML root; we add the bridge window's
-    // screen position to convert to screen coordinates for annotation.
+    // We match by best-fit size: the XAML root's first child dimensions are compared
+    // against each bridge's window bounds to find the most compatible match.
+    // This is more robust than order-based matching since Win32 HWND enumeration order
+    // may differ from XAML tree root enumeration order.
     if (treeJson.is_array()) {
         std::vector<Element*> bridges;
         collect_bridges(root, bridges);
+        std::vector<bool> bridgeUsed(bridges.size(), false);
 
-        size_t bridgeIdx = 0;
         for (auto& node : treeJson) {
             std::string typeName = sanitize(node.value("type", ""));
-            // Try to graft DesktopWindowXamlSource roots into matching bridges
-            if (typeName.find("DesktopWindowXamlSource") != std::string::npos
-                && bridgeIdx < bridges.size()) {
-                auto* bridge = bridges[bridgeIdx];
-                // Use bridge window's screen bounds as coordinate origin for XAML elements
+            if (typeName.find("DesktopWindowXamlSource") == std::string::npos) {
+                graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
+                continue;
+            }
+
+            // Get the XAML content dimensions from descendants with bounds
+            double contentW = 0, contentH = 0;
+            std::function<void(const json&)> findContentSize = [&](const json& n) {
+                double w = n.value("width", 0.0);
+                double h = n.value("height", 0.0);
+                if (w > contentW) contentW = w;
+                if (h > contentH) contentH = h;
+                if (n.contains("children") && n["children"].is_array()) {
+                    for (auto& child : n["children"]) {
+                        findContentSize(child);
+                        if (contentW > 0 && contentH > 0) return; // found, stop early
+                    }
+                }
+            };
+            if (node.contains("children") && node["children"].is_array()) {
+                for (auto& child : node["children"]) {
+                    findContentSize(child);
+                }
+            }
+
+            // Skip bridge matching for roots with no measurable content
+            if (contentW <= 0 && contentH <= 0) {
+                graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
+                continue;
+            }
+
+            if (g_debug) {
+                fprintf(stderr, "lvt: XAML root contentW=%.0f contentH=%.0f\n",
+                        contentW, contentH);
+            }
+
+            // Find the best-matching bridge by size similarity
+            int bestIdx = -1;
+            double bestScore = 1e18;
+            for (size_t i = 0; i < bridges.size(); i++) {
+                if (bridgeUsed[i]) continue;
+                double bw = bridges[i]->bounds.width;
+                double bh = bridges[i]->bounds.height;
+                // Score: prefer bridges whose dimensions best accommodate the content
+                double wDiff = std::abs(bw - contentW);
+                double hDiff = std::abs(bh - contentH);
+                double score = wDiff + hDiff;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestIdx = static_cast<int>(i);
+                }
+            }
+
+            if (bestIdx >= 0) {
+                bridgeUsed[bestIdx] = true;
+                auto* bridge = bridges[bestIdx];
                 double baseX = bridge->bounds.x;
                 double baseY = bridge->bounds.y;
                 graft_json_node(node, *bridge, frameworkLabel, baseX, baseY);
-                bridgeIdx++;
             } else {
-                // Non-bridge XAML root (e.g. UWP CoreWindow): graft under root,
-                // using root's screen bounds as coordinate base
                 graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
             }
         }
