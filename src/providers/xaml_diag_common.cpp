@@ -4,6 +4,7 @@
 #include "xaml_diag_common.h"
 #include "../tap/tap_clsid.h"
 #include "../debug.h"
+#include "../bounds_util.h"
 
 #include "../target.h"
 
@@ -150,13 +151,19 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     double oy = j.value("offsetY", 0.0);
     double w = j.value("width", 0.0);
     double h = j.value("height", 0.0);
-    double absX = parentOffsetX + ox;
-    double absY = parentOffsetY + oy;
+    double absX = std::isfinite(ox) ? parentOffsetX + ox : parentOffsetX;
+    double absY = std::isfinite(oy) ? parentOffsetY + oy : parentOffsetY;
     if (w > 0 && h > 0) {
-        el.bounds.x = static_cast<int>(absX);
-        el.bounds.y = static_cast<int>(absY);
-        el.bounds.width = static_cast<int>(w);
-        el.bounds.height = static_cast<int>(h);
+        auto sx = safe_double_to_int(absX);
+        auto sy = safe_double_to_int(absY);
+        auto sw = safe_double_to_int(w);
+        auto sh = safe_double_to_int(h);
+        if (sx && sy && sw && sh) {
+            el.bounds.x = *sx;
+            el.bounds.y = *sy;
+            el.bounds.width = *sw;
+            el.bounds.height = *sh;
+        }
     }
 
     if (j.contains("children") && j["children"].is_array()) {

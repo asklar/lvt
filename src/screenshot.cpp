@@ -213,11 +213,17 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
 
     for (auto* el : elements) {
         if (el->bounds.width <= 0 || el->bounds.height <= 0) continue;
-        int x = el->bounds.x - winRect.left;
-        int y = el->bounds.y - winRect.top;
-        int w = el->bounds.width;
-        int h = el->bounds.height;
-        if (x + w <= 0 || y + h <= 0 || x >= bmpWidth || y >= bmpHeight) continue;
+        // Use long long for intermediate arithmetic to avoid int overflow
+        // when element bounds contain extreme values.
+        long long lx = static_cast<long long>(el->bounds.x) - static_cast<long long>(winRect.left);
+        long long ly = static_cast<long long>(el->bounds.y) - static_cast<long long>(winRect.top);
+        long long lw = el->bounds.width;
+        long long lh = el->bounds.height;
+        if (lx + lw <= 0 || ly + lh <= 0 || lx >= bmpWidth || ly >= bmpHeight) continue;
+        int x = static_cast<int>(lx);
+        int y = static_cast<int>(ly);
+        int w = static_cast<int>(lw);
+        int h = static_cast<int>(lh);
 
         Rectangle(memDC, x, y, x + w, y + h);
 
@@ -389,5 +395,42 @@ bool capture_screenshot(HWND hwnd, const std::string& outputPath,
     }
     return ok;
 }
+
+#ifndef NDEBUG
+std::vector<AnnotationInfo> collect_annotations(HWND hwnd, const Element* tree) {
+    std::vector<AnnotationInfo> result;
+    if (!tree) return result;
+
+    RECT winRect{};
+    if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &winRect, sizeof(winRect)) != S_OK) {
+        GetWindowRect(hwnd, &winRect);
+    }
+    int winW = winRect.right - winRect.left;
+    int winH = winRect.bottom - winRect.top;
+
+    std::vector<const Element*> elements;
+    collect_elements(*tree, elements);
+
+    for (auto* el : elements) {
+        if (el->bounds.width <= 0 || el->bounds.height <= 0) continue;
+        long long lx = static_cast<long long>(el->bounds.x) - static_cast<long long>(winRect.left);
+        long long ly = static_cast<long long>(el->bounds.y) - static_cast<long long>(winRect.top);
+        long long lw = el->bounds.width;
+        long long lh = el->bounds.height;
+        // Same clipping as annotate_pixels: skip elements entirely outside window
+        if (lx + lw <= 0 || ly + lh <= 0 || lx >= winW || ly >= winH) continue;
+
+        AnnotationInfo info;
+        info.id = el->id;
+        info.x = static_cast<int>(lx);
+        info.y = static_cast<int>(ly);
+        info.width = static_cast<int>(lw);
+        info.height = static_cast<int>(lh);
+        result.push_back(std::move(info));
+    }
+
+    return result;
+}
+#endif
 
 } // namespace lvt

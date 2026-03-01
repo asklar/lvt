@@ -1,4 +1,4 @@
-// Integration tests for LVT — require lvt.exe and a running Notepad instance
+// Integration tests for LVT
 // Run: ctest --test-dir build -R integration
 
 #include <gtest/gtest.h>
@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <string>
 #include <array>
+#include <map>
+#include <set>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -290,3 +292,422 @@ TEST(LvtCli, UnknownArg) {
     auto ret = system(("\"" + lvt + "\" --bogus >nul").c_str());
     EXPECT_NE(ret, 0) << "Should fail with unknown argument";
 }
+
+// ---- Bounds validation (Win32) ----
+
+// Reasonable screen coordinate range covering multi-monitor setups.
+static constexpr int kMinReasonableCoord = -10000;
+static constexpr int kMaxReasonableCoord = 50000;
+static constexpr int kMaxReasonableSize  = 50000;
+
+// Recursively collect all elements from JSON tree
+static void collect_json_elements(const json& el, std::vector<const json*>& out) {
+    out.push_back(&el);
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            collect_json_elements(child, out);
+        }
+    }
+}
+
+TEST_F(NotepadFixture, Win32BoundsReasonable) {
+    // Every element in the Win32 tree should have reasonable (non-extreme) bounds
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+    ASSERT_GT(elements.size(), 0u);
+
+    for (auto* el : elements) {
+        if (!el->contains("bounds")) continue;
+        auto& b = (*el)["bounds"];
+        int x = b["x"].get<int>();
+        int y = b["y"].get<int>();
+        int w = b["width"].get<int>();
+        int h = b["height"].get<int>();
+        std::string id = el->value("id", "?");
+
+        // No element should have bounds outside a generous screen range.
+        EXPECT_GT(x, kMinReasonableCoord) << "Element " << id << " has extreme x=" << x;
+        EXPECT_LT(x, kMaxReasonableCoord) << "Element " << id << " has extreme x=" << x;
+        EXPECT_GT(y, kMinReasonableCoord) << "Element " << id << " has extreme y=" << y;
+        EXPECT_LT(y, kMaxReasonableCoord) << "Element " << id << " has extreme y=" << y;
+        EXPECT_GE(w, 0) << "Element " << id << " has negative width=" << w;
+        EXPECT_GE(h, 0) << "Element " << id << " has negative height=" << h;
+        EXPECT_LT(w, kMaxReasonableSize) << "Element " << id << " has extreme width=" << w;
+        EXPECT_LT(h, kMaxReasonableSize) << "Element " << id << " has extreme height=" << h;
+    }
+}
+
+TEST_F(NotepadFixture, RootBoundsNonZero) {
+    // The root window should have meaningful non-zero bounds
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    auto& b = j["root"]["bounds"];
+    EXPECT_GT(b["width"].get<int>(), 0) << "Root width should be positive";
+    EXPECT_GT(b["height"].get<int>(), 0) << "Root height should be positive";
+}
+
+// ---- Annotation verification (DEBUG builds only) ----
+
+#ifndef NDEBUG
+TEST_F(NotepadFixture, AnnotationsJsonOutput) {
+    // The --annotations-json flag should produce structured annotation data
+    auto lvt = get_lvt_path();
+    auto annFile = fs::path(lvt).parent_path() / "lvt_test_annotations.json";
+    fs::remove(annFile);
+
+    run_command(make_cmd(lvt,
+        get_pid_arg() + " --annotations-json " + annFile.string()));
+
+    ASSERT_TRUE(fs::exists(annFile)) << "Annotations file was not created";
+    std::ifstream f(annFile);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto aj = json::parse(content, nullptr, false);
+    ASSERT_FALSE(aj.is_discarded()) << "Annotations file is not valid JSON";
+    ASSERT_TRUE(aj.is_array());
+
+    // Notepad should have at least a few annotated elements (root + children)
+    EXPECT_GT(aj.size(), 0u) << "Should annotate at least one element";
+
+    // Every annotation should have an id and reasonable pixel-space bounds
+    for (auto& a : aj) {
+        EXPECT_TRUE(a.contains("id"));
+        EXPECT_TRUE(a.contains("x"));
+        EXPECT_TRUE(a.contains("y"));
+        EXPECT_TRUE(a.contains("width"));
+        EXPECT_TRUE(a.contains("height"));
+
+        int w = a["width"].get<int>();
+        int h = a["height"].get<int>();
+        EXPECT_GT(w, 0) << "Annotation " << a["id"] << " has non-positive width";
+        EXPECT_GT(h, 0) << "Annotation " << a["id"] << " has non-positive height";
+    }
+
+    fs::remove(annFile);
+}
+
+TEST_F(NotepadFixture, AnnotationsMatchTreeElements) {
+    // Annotated element IDs should be a subset of the tree's element IDs
+    auto lvt = get_lvt_path();
+    auto annFile = fs::path(lvt).parent_path() / "lvt_test_ann_match.json";
+    fs::remove(annFile);
+
+    auto output = run_command(make_cmd(lvt,
+        get_pid_arg() + " --dump --annotations-json " + annFile.string()));
+
+    auto tree = json::parse(output, nullptr, false);
+    ASSERT_FALSE(tree.is_discarded());
+
+    // Collect all element IDs from the tree
+    std::vector<const json*> treeElements;
+    collect_json_elements(tree["root"], treeElements);
+    std::set<std::string> treeIds;
+    for (auto* el : treeElements) {
+        if (el->contains("id"))
+            treeIds.insert((*el)["id"].get<std::string>());
+    }
+
+    // Read annotations
+    ASSERT_TRUE(fs::exists(annFile));
+    std::ifstream f(annFile);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto annotations = json::parse(content, nullptr, false);
+    ASSERT_FALSE(annotations.is_discarded());
+
+    // Every annotated ID must exist in the tree
+    for (auto& a : annotations) {
+        std::string id = a["id"].get<std::string>();
+        EXPECT_TRUE(treeIds.count(id) > 0)
+            << "Annotated element " << id << " not found in tree";
+    }
+
+    fs::remove(annFile);
+}
+#endif
+
+// ---- Framework-specific bounds (WinUI3/XAML) ----
+
+TEST_F(NotepadFixture, WinUI3BoundsIfDetected) {
+    // If WinUI3 framework is detected, verify XAML element bounds are reasonable
+    auto lvt = get_lvt_path();
+    auto fwOutput = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
+    if (fwOutput.find("winui3") == std::string::npos) {
+        GTEST_SKIP() << "WinUI3 not detected for this Notepad instance";
+    }
+
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+
+    int winui3Count = 0;
+    for (auto* el : elements) {
+        if (!el->contains("framework")) continue;
+        if ((*el)["framework"].get<std::string>() != "winui3") continue;
+        winui3Count++;
+
+        if (!el->contains("bounds")) continue;
+        auto& b = (*el)["bounds"];
+        int x = b["x"].get<int>();
+        int y = b["y"].get<int>();
+        int w = b["width"].get<int>();
+        int h = b["height"].get<int>();
+        std::string id = el->value("id", "?");
+
+        // WinUI3 elements should never have INT_MIN/INT_MAX bounds
+        // (the bug this PR fixes)
+        EXPECT_GT(x, kMinReasonableCoord) << "WinUI3 element " << id << " has extreme x";
+        EXPECT_LT(x, kMaxReasonableCoord) << "WinUI3 element " << id << " has extreme x";
+        EXPECT_GT(y, kMinReasonableCoord) << "WinUI3 element " << id << " has extreme y";
+        EXPECT_LT(y, kMaxReasonableCoord) << "WinUI3 element " << id << " has extreme y";
+        EXPECT_GE(w, 0) << "WinUI3 element " << id << " has negative width";
+        EXPECT_GE(h, 0) << "WinUI3 element " << id << " has negative height";
+    }
+
+    EXPECT_GT(winui3Count, 0) << "WinUI3 detected but no WinUI3 elements in tree";
+}
+
+TEST_F(NotepadFixture, XamlBoundsIfDetected) {
+    // If XAML framework is detected (UWP), verify element bounds are reasonable
+    auto lvt = get_lvt_path();
+    auto fwOutput = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
+    if (fwOutput.find("xaml") == std::string::npos) {
+        GTEST_SKIP() << "XAML (UWP) not detected for this Notepad instance";
+    }
+
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+
+    for (auto* el : elements) {
+        if (!el->contains("framework")) continue;
+        if ((*el)["framework"].get<std::string>() != "xaml") continue;
+
+        if (!el->contains("bounds")) continue;
+        auto& b = (*el)["bounds"];
+        int x = b["x"].get<int>();
+        int y = b["y"].get<int>();
+        int w = b["width"].get<int>();
+        int h = b["height"].get<int>();
+        std::string id = el->value("id", "?");
+
+        EXPECT_GT(x, kMinReasonableCoord) << "XAML element " << id << " has extreme x";
+        EXPECT_LT(x, kMaxReasonableCoord) << "XAML element " << id << " has extreme x";
+        EXPECT_GT(y, kMinReasonableCoord) << "XAML element " << id << " has extreme y";
+        EXPECT_LT(y, kMaxReasonableCoord) << "XAML element " << id << " has extreme y";
+        EXPECT_GE(w, 0) << "XAML element " << id << " has negative width";
+        EXPECT_GE(h, 0) << "XAML element " << id << " has negative height";
+    }
+}
+
+// ---- Controlled Win32 window tests ----
+// Creates a window with known child controls and verifies structure, bounds, and annotations.
+
+class KnownWindowFixture : public ::testing::Test {
+protected:
+    void SetUp() override {
+        WNDCLASSEXW wc = {sizeof(WNDCLASSEXW)};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.lpszClassName = L"LvtTestWindow";
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        RegisterClassExW(&wc);
+
+        // Create parent window
+        parentHwnd_ = CreateWindowExW(0, L"LvtTestWindow", L"LVT Test Window",
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            100, 100, 400, 300,
+            nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+        ASSERT_NE(parentHwnd_, nullptr) << "Failed to create test window";
+
+        // Child controls at known client-area positions
+        buttonHwnd_ = CreateWindowExW(0, L"Button", L"Click Me",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            10, 10, 100, 30,
+            parentHwnd_, nullptr, GetModuleHandle(nullptr), nullptr);
+        ASSERT_NE(buttonHwnd_, nullptr);
+
+        editHwnd_ = CreateWindowExW(0, L"Edit", L"Hello",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_LEFT,
+            10, 50, 200, 25,
+            parentHwnd_, nullptr, GetModuleHandle(nullptr), nullptr);
+        ASSERT_NE(editHwnd_, nullptr);
+
+        staticHwnd_ = CreateWindowExW(0, L"Static", L"Label Text",
+            WS_CHILD | WS_VISIBLE,
+            10, 90, 150, 20,
+            parentHwnd_, nullptr, GetModuleHandle(nullptr), nullptr);
+        ASSERT_NE(staticHwnd_, nullptr);
+
+        UpdateWindow(parentHwnd_);
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+
+    void TearDown() override {
+        if (parentHwnd_) DestroyWindow(parentHwnd_);
+        UnregisterClassW(L"LvtTestWindow", GetModuleHandle(nullptr));
+    }
+
+    std::string get_hwnd_arg() const {
+        char buf[64];
+        sprintf_s(buf, "--hwnd 0x%llX", (unsigned long long)(uintptr_t)parentHwnd_);
+        return buf;
+    }
+
+    HWND parentHwnd_ = nullptr;
+    HWND buttonHwnd_ = nullptr;
+    HWND editHwnd_ = nullptr;
+    HWND staticHwnd_ = nullptr;
+};
+
+TEST_F(KnownWindowFixture, TreeStructure) {
+    // Verify root and 3 children with correct class names, types, and text
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_hwnd_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded()) << "Output is not valid JSON";
+
+    auto& root = j["root"];
+    EXPECT_EQ(root["id"], "e0");
+    EXPECT_EQ(root["framework"], "win32");
+    EXPECT_EQ(root["className"], "LvtTestWindow");
+    EXPECT_EQ(root["text"], "LVT Test Window");
+    EXPECT_EQ(root["type"], "Window");
+
+    ASSERT_TRUE(root.contains("children"));
+    ASSERT_EQ(root["children"].size(), 3u) << "Expected exactly 3 child controls";
+
+    // Match children by className (order may vary)
+    std::map<std::string, const json*> byClass;
+    for (auto& child : root["children"]) {
+        byClass[child["className"].get<std::string>()] = &child;
+    }
+
+    ASSERT_TRUE(byClass.count("Button"));
+    EXPECT_EQ((*byClass["Button"])["type"], "Button");
+    EXPECT_EQ((*byClass["Button"])["text"], "Click Me");
+    EXPECT_EQ((*byClass["Button"])["framework"], "win32");
+
+    ASSERT_TRUE(byClass.count("Edit"));
+    EXPECT_EQ((*byClass["Edit"])["type"], "Edit");
+    EXPECT_EQ((*byClass["Edit"])["text"], "Hello");
+    EXPECT_EQ((*byClass["Edit"])["framework"], "win32");
+
+    ASSERT_TRUE(byClass.count("Static"));
+    EXPECT_EQ((*byClass["Static"])["type"], "Static");
+    EXPECT_EQ((*byClass["Static"])["text"], "Label Text");
+    EXPECT_EQ((*byClass["Static"])["framework"], "win32");
+}
+
+TEST_F(KnownWindowFixture, ChildBoundsMatchWin32) {
+    // Verify each control's bounds match the Win32 GetWindowRect values
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_hwnd_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    struct ControlCheck {
+        HWND hwnd;
+        std::string className;
+    };
+    ControlCheck controls[] = {
+        {parentHwnd_, "LvtTestWindow"},
+        {buttonHwnd_, "Button"},
+        {editHwnd_,   "Edit"},
+        {staticHwnd_, "Static"},
+    };
+
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+
+    for (auto& ctrl : controls) {
+        RECT expected{};
+        GetWindowRect(ctrl.hwnd, &expected);
+        int ex = expected.left;
+        int ey = expected.top;
+        int ew = expected.right - expected.left;
+        int eh = expected.bottom - expected.top;
+
+        // Find element by className
+        const json* found = nullptr;
+        for (auto* el : elements) {
+            if (el->value("className", "") == ctrl.className) {
+                found = el;
+                break;
+            }
+        }
+        ASSERT_NE(found, nullptr) << ctrl.className << " not found in tree";
+
+        auto& b = (*found)["bounds"];
+        EXPECT_EQ(b["x"].get<int>(), ex) << ctrl.className << " x mismatch";
+        EXPECT_EQ(b["y"].get<int>(), ey) << ctrl.className << " y mismatch";
+        EXPECT_EQ(b["width"].get<int>(), ew) << ctrl.className << " width mismatch";
+        EXPECT_EQ(b["height"].get<int>(), eh) << ctrl.className << " height mismatch";
+    }
+}
+
+#ifndef NDEBUG
+TEST_F(KnownWindowFixture, AnnotationsIncludeKnownControls) {
+    // Verify that annotations include each known control with positive bounds
+    auto lvt = get_lvt_path();
+    auto annFile = fs::path(lvt).parent_path() / "lvt_test_known_ann.json";
+    fs::remove(annFile);
+
+    auto output = run_command(make_cmd(lvt,
+        get_hwnd_arg() + " --dump --annotations-json " + annFile.string()));
+    auto tree = json::parse(output, nullptr, false);
+    ASSERT_FALSE(tree.is_discarded());
+
+    ASSERT_TRUE(fs::exists(annFile));
+    std::ifstream f(annFile);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto annotations = json::parse(content, nullptr, false);
+    ASSERT_FALSE(annotations.is_discarded());
+    ASSERT_TRUE(annotations.is_array());
+
+    // Build set of annotated IDs
+    std::set<std::string> annotatedIds;
+    for (auto& a : annotations) {
+        annotatedIds.insert(a["id"].get<std::string>());
+    }
+
+    // Map tree element IDs to classNames
+    std::vector<const json*> elements;
+    collect_json_elements(tree["root"], elements);
+
+    for (auto* el : elements) {
+        std::string cn = el->value("className", "");
+        if (cn == "Button" || cn == "Edit" || cn == "Static" || cn == "LvtTestWindow") {
+            std::string id = (*el)["id"].get<std::string>();
+            EXPECT_TRUE(annotatedIds.count(id) > 0)
+                << cn << " (id=" << id << ") should be annotated";
+        }
+    }
+
+    // Every annotation must have positive dimensions
+    for (auto& a : annotations) {
+        EXPECT_GT(a["width"].get<int>(), 0)
+            << "Annotation " << a["id"] << " has non-positive width";
+        EXPECT_GT(a["height"].get<int>(), 0)
+            << "Annotation " << a["id"] << " has non-positive height";
+    }
+
+    fs::remove(annFile);
+}
+#endif

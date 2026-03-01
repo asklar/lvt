@@ -660,3 +660,74 @@ TEST(PluginGraft, DeepHwndMatch) {
     EXPECT_EQ(leaf.children[0].type, "Leaf");
     EXPECT_EQ(leaf.children[0].text, "found it");
 }
+
+// ---- Bounds validation edge cases ----
+
+TEST(PluginGraft, ZeroWidthHeightNoBounds) {
+    // Elements with zero width or height should not have bounds set
+    Element root;
+    root.type = "Window";
+    root.properties["hwnd"] = "0x1000";
+    root.bounds = {0, 0, 800, 600};
+
+    s_mockJson = R"([{"target_hwnd":"0x1000","type":"Root","children":[
+        {"type":"Collapsed","name":"hidden","width":0,"height":0,"offsetX":10,"offsetY":20}
+    ]}])";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    enrich_with_plugin(root, nullptr, 0, fw);
+
+    ASSERT_EQ(root.children.size(), 1);
+    EXPECT_EQ(root.children[0].bounds.width, 0);
+    EXPECT_EQ(root.children[0].bounds.height, 0);
+    EXPECT_EQ(root.children[0].bounds.x, 0);
+    EXPECT_EQ(root.children[0].bounds.y, 0);
+}
+
+TEST(PluginGraft, VeryLargeOffsetsClamped) {
+    // Very large double offsets should be clamped to int range, not cause UB
+    Element root;
+    root.type = "Window";
+    root.properties["hwnd"] = "0x1000";
+    root.bounds = {0, 0, 800, 600};
+
+    s_mockJson = R"([{"target_hwnd":"0x1000","type":"Root","children":[
+        {"type":"Item","width":100,"height":50,"offsetX":3000000000.0,"offsetY":-3000000000.0}
+    ]}])";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    enrich_with_plugin(root, nullptr, 0, fw);
+
+    ASSERT_EQ(root.children.size(), 1);
+    auto& child = root.children[0];
+    // Bounds should be set (width/height > 0) and values should be valid int range
+    EXPECT_EQ(child.bounds.width, 100);
+    EXPECT_EQ(child.bounds.height, 50);
+    // The large offsets should be clamped, not undefined behavior
+    EXPECT_TRUE(child.bounds.x > 0);   // clamped to INT_MAX
+    EXPECT_TRUE(child.bounds.y < 0);   // clamped to INT_MIN
+}
+
+TEST(PluginGraft, NormalBoundsStillWork) {
+    // Normal values should work exactly as before
+    Element root;
+    root.type = "Window";
+    root.properties["hwnd"] = "0x1000";
+    root.bounds = {100, 200, 800, 600};
+
+    s_mockJson = R"([{"target_hwnd":"0x1000","type":"Root","children":[
+        {"type":"Button","name":"OK","width":80,"height":30,"offsetX":10,"offsetY":20}
+    ]}])";
+
+    auto lp = make_mock_plugin();
+    auto fw = make_mock_fw(&lp);
+    enrich_with_plugin(root, nullptr, 0, fw);
+
+    ASSERT_EQ(root.children.size(), 1);
+    EXPECT_EQ(root.children[0].bounds.x, 110);   // 100 + 10
+    EXPECT_EQ(root.children[0].bounds.y, 220);    // 200 + 20
+    EXPECT_EQ(root.children[0].bounds.width, 80);
+    EXPECT_EQ(root.children[0].bounds.height, 30);
+}

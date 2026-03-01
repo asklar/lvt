@@ -6,6 +6,7 @@
 #include "wpf_inject.h"
 #include "../debug.h"
 #include "../target.h"
+#include "../bounds_util.h"
 
 #include <Windows.h>
 #include <objbase.h>
@@ -15,6 +16,7 @@
 #include <wil/resource.h>
 #include <nlohmann/json.hpp>
 #include <cstdio>
+#include <cmath>
 #include <string>
 #include <fstream>
 
@@ -71,10 +73,16 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     double ox = j.value("offsetX", 0.0);
     double oy = j.value("offsetY", 0.0);
     if (w > 0 && h > 0) {
-        el.bounds.x = static_cast<int>(ox);
-        el.bounds.y = static_cast<int>(oy);
-        el.bounds.width = static_cast<int>(w);
-        el.bounds.height = static_cast<int>(h);
+        auto sx = safe_double_to_int(ox);
+        auto sy = safe_double_to_int(oy);
+        auto sw = safe_double_to_int(w);
+        auto sh = safe_double_to_int(h);
+        if (sx && sy && sw && sh) {
+            el.bounds.x = *sx;
+            el.bounds.y = *sy;
+            el.bounds.width = *sw;
+            el.bounds.height = *sh;
+        }
     }
 
     // Visibility/enabled as properties
