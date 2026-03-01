@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <string>
 #include <array>
+#include <set>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -289,4 +290,217 @@ TEST(LvtCli, UnknownArg) {
     auto lvt = get_lvt_path();
     auto ret = system(("\"" + lvt + "\" --bogus >nul").c_str());
     EXPECT_NE(ret, 0) << "Should fail with unknown argument";
+}
+
+// ---- Bounds validation (Win32) ----
+
+// Recursively collect all elements from JSON tree
+static void collect_json_elements(const json& el, std::vector<const json*>& out) {
+    out.push_back(&el);
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            collect_json_elements(child, out);
+        }
+    }
+}
+
+TEST_F(NotepadFixture, Win32BoundsReasonable) {
+    // Every element in the Win32 tree should have reasonable (non-extreme) bounds
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+    ASSERT_GT(elements.size(), 0u);
+
+    for (auto* el : elements) {
+        if (!el->contains("bounds")) continue;
+        auto& b = (*el)["bounds"];
+        int x = b["x"].get<int>();
+        int y = b["y"].get<int>();
+        int w = b["width"].get<int>();
+        int h = b["height"].get<int>();
+        std::string id = el->value("id", "?");
+
+        // No element should have bounds outside a generous screen range.
+        // -10000..+50000 covers multi-monitor setups.
+        EXPECT_GT(x, -10000) << "Element " << id << " has extreme x=" << x;
+        EXPECT_LT(x, 50000)  << "Element " << id << " has extreme x=" << x;
+        EXPECT_GT(y, -10000) << "Element " << id << " has extreme y=" << y;
+        EXPECT_LT(y, 50000)  << "Element " << id << " has extreme y=" << y;
+        EXPECT_GE(w, 0) << "Element " << id << " has negative width=" << w;
+        EXPECT_GE(h, 0) << "Element " << id << " has negative height=" << h;
+        EXPECT_LT(w, 50000) << "Element " << id << " has extreme width=" << w;
+        EXPECT_LT(h, 50000) << "Element " << id << " has extreme height=" << h;
+    }
+}
+
+TEST_F(NotepadFixture, RootBoundsNonZero) {
+    // The root window should have meaningful non-zero bounds
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    auto& b = j["root"]["bounds"];
+    EXPECT_GT(b["width"].get<int>(), 0) << "Root width should be positive";
+    EXPECT_GT(b["height"].get<int>(), 0) << "Root height should be positive";
+}
+
+// ---- Annotation verification ----
+
+TEST_F(NotepadFixture, AnnotationsJsonOutput) {
+    // The --annotations-json flag should produce structured annotation data
+    auto lvt = get_lvt_path();
+    auto annFile = fs::path(lvt).parent_path() / "lvt_test_annotations.json";
+    fs::remove(annFile);
+
+    run_command(make_cmd(lvt,
+        get_pid_arg() + " --annotations-json " + annFile.string()));
+
+    ASSERT_TRUE(fs::exists(annFile)) << "Annotations file was not created";
+    std::ifstream f(annFile);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto aj = json::parse(content, nullptr, false);
+    ASSERT_FALSE(aj.is_discarded()) << "Annotations file is not valid JSON";
+    ASSERT_TRUE(aj.is_array());
+
+    // Notepad should have at least a few annotated elements (root + children)
+    EXPECT_GT(aj.size(), 0u) << "Should annotate at least one element";
+
+    // Every annotation should have an id and reasonable pixel-space bounds
+    for (auto& a : aj) {
+        EXPECT_TRUE(a.contains("id"));
+        EXPECT_TRUE(a.contains("x"));
+        EXPECT_TRUE(a.contains("y"));
+        EXPECT_TRUE(a.contains("width"));
+        EXPECT_TRUE(a.contains("height"));
+
+        int w = a["width"].get<int>();
+        int h = a["height"].get<int>();
+        EXPECT_GT(w, 0) << "Annotation " << a["id"] << " has non-positive width";
+        EXPECT_GT(h, 0) << "Annotation " << a["id"] << " has non-positive height";
+    }
+
+    fs::remove(annFile);
+}
+
+TEST_F(NotepadFixture, AnnotationsMatchTreeElements) {
+    // Annotated element IDs should be a subset of the tree's element IDs
+    auto lvt = get_lvt_path();
+    auto annFile = fs::path(lvt).parent_path() / "lvt_test_ann_match.json";
+    fs::remove(annFile);
+
+    auto output = run_command(make_cmd(lvt,
+        get_pid_arg() + " --dump --annotations-json " + annFile.string()));
+
+    auto tree = json::parse(output, nullptr, false);
+    ASSERT_FALSE(tree.is_discarded());
+
+    // Collect all element IDs from the tree
+    std::vector<const json*> treeElements;
+    collect_json_elements(tree["root"], treeElements);
+    std::set<std::string> treeIds;
+    for (auto* el : treeElements) {
+        if (el->contains("id"))
+            treeIds.insert((*el)["id"].get<std::string>());
+    }
+
+    // Read annotations
+    ASSERT_TRUE(fs::exists(annFile));
+    std::ifstream f(annFile);
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto annotations = json::parse(content, nullptr, false);
+    ASSERT_FALSE(annotations.is_discarded());
+
+    // Every annotated ID must exist in the tree
+    for (auto& a : annotations) {
+        std::string id = a["id"].get<std::string>();
+        EXPECT_TRUE(treeIds.count(id) > 0)
+            << "Annotated element " << id << " not found in tree";
+    }
+
+    fs::remove(annFile);
+}
+
+// ---- Framework-specific bounds (WinUI3/XAML) ----
+
+TEST_F(NotepadFixture, WinUI3BoundsIfDetected) {
+    // If WinUI3 framework is detected, verify XAML element bounds are reasonable
+    auto lvt = get_lvt_path();
+    auto fwOutput = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
+    if (fwOutput.find("winui3") == std::string::npos) {
+        GTEST_SKIP() << "WinUI3 not detected for this Notepad instance";
+    }
+
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+
+    int winui3Count = 0;
+    for (auto* el : elements) {
+        if (!el->contains("framework")) continue;
+        if ((*el)["framework"].get<std::string>() != "winui3") continue;
+        winui3Count++;
+
+        if (!el->contains("bounds")) continue;
+        auto& b = (*el)["bounds"];
+        int x = b["x"].get<int>();
+        int y = b["y"].get<int>();
+        int w = b["width"].get<int>();
+        int h = b["height"].get<int>();
+        std::string id = el->value("id", "?");
+
+        // WinUI3 elements should never have INT_MIN/INT_MAX bounds
+        // (the bug this PR fixes)
+        EXPECT_GT(x, -100000) << "WinUI3 element " << id << " has extreme x";
+        EXPECT_LT(x, 100000)  << "WinUI3 element " << id << " has extreme x";
+        EXPECT_GT(y, -100000) << "WinUI3 element " << id << " has extreme y";
+        EXPECT_LT(y, 100000)  << "WinUI3 element " << id << " has extreme y";
+        EXPECT_GE(w, 0) << "WinUI3 element " << id << " has negative width";
+        EXPECT_GE(h, 0) << "WinUI3 element " << id << " has negative height";
+    }
+
+    EXPECT_GT(winui3Count, 0) << "WinUI3 detected but no WinUI3 elements in tree";
+}
+
+TEST_F(NotepadFixture, XamlBoundsIfDetected) {
+    // If XAML framework is detected (UWP), verify element bounds are reasonable
+    auto lvt = get_lvt_path();
+    auto fwOutput = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
+    if (fwOutput.find("xaml") == std::string::npos) {
+        GTEST_SKIP() << "XAML (UWP) not detected for this Notepad instance";
+    }
+
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+
+    for (auto* el : elements) {
+        if (!el->contains("framework")) continue;
+        if ((*el)["framework"].get<std::string>() != "xaml") continue;
+
+        if (!el->contains("bounds")) continue;
+        auto& b = (*el)["bounds"];
+        int x = b["x"].get<int>();
+        int y = b["y"].get<int>();
+        int w = b["width"].get<int>();
+        int h = b["height"].get<int>();
+        std::string id = el->value("id", "?");
+
+        EXPECT_GT(x, -100000) << "XAML element " << id << " has extreme x";
+        EXPECT_LT(x, 100000)  << "XAML element " << id << " has extreme x";
+        EXPECT_GT(y, -100000) << "XAML element " << id << " has extreme y";
+        EXPECT_LT(y, 100000)  << "XAML element " << id << " has extreme y";
+        EXPECT_GE(w, 0) << "XAML element " << id << " has negative width";
+        EXPECT_GE(h, 0) << "XAML element " << id << " has negative height";
+    }
 }

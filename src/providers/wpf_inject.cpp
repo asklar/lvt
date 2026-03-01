@@ -72,12 +72,17 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     double h = j.value("height", 0.0);
     double ox = j.value("offsetX", 0.0);
     double oy = j.value("offsetY", 0.0);
-    if (w > 0 && h > 0 && std::isfinite(w) && std::isfinite(h)
-        && std::isfinite(ox) && std::isfinite(oy)) {
-        el.bounds.x = safe_double_to_int(ox);
-        el.bounds.y = safe_double_to_int(oy);
-        el.bounds.width = safe_double_to_int(w);
-        el.bounds.height = safe_double_to_int(h);
+    if (w > 0 && h > 0) {
+        auto sx = safe_double_to_int(ox);
+        auto sy = safe_double_to_int(oy);
+        auto sw = safe_double_to_int(w);
+        auto sh = safe_double_to_int(h);
+        if (sx && sy && sw && sh) {
+            el.bounds.x = *sx;
+            el.bounds.y = *sy;
+            el.bounds.width = *sw;
+            el.bounds.height = *sh;
+        }
     }
 
     // Visibility/enabled as properties

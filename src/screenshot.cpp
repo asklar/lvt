@@ -396,4 +396,37 @@ bool capture_screenshot(HWND hwnd, const std::string& outputPath,
     return ok;
 }
 
+std::vector<AnnotationInfo> collect_annotations(HWND hwnd, const Element* tree) {
+    std::vector<AnnotationInfo> result;
+    if (!tree) return result;
+
+    RECT winRect{};
+    if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &winRect, sizeof(winRect)) != S_OK) {
+        GetWindowRect(hwnd, &winRect);
+    }
+
+    std::vector<const Element*> elements;
+    collect_elements(*tree, elements);
+
+    for (auto* el : elements) {
+        if (el->bounds.width <= 0 || el->bounds.height <= 0) continue;
+        long long lx = static_cast<long long>(el->bounds.x) - static_cast<long long>(winRect.left);
+        long long ly = static_cast<long long>(el->bounds.y) - static_cast<long long>(winRect.top);
+        long long lw = el->bounds.width;
+        long long lh = el->bounds.height;
+        // Skip elements entirely outside reasonable screen bounds
+        if (lx + lw <= 0 || ly + lh <= 0 || lx > 100000 || ly > 100000) continue;
+
+        AnnotationInfo info;
+        info.id = el->id;
+        info.x = static_cast<int>(lx);
+        info.y = static_cast<int>(ly);
+        info.width = static_cast<int>(lw);
+        info.height = static_cast<int>(lh);
+        result.push_back(std::move(info));
+    }
+
+    return result;
+}
+
 } // namespace lvt

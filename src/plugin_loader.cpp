@@ -147,12 +147,17 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     double h = j.value("height", 0.0);
     double absX = std::isfinite(ox) ? parentOffsetX + ox : parentOffsetX;
     double absY = std::isfinite(oy) ? parentOffsetY + oy : parentOffsetY;
-    if (w > 0 && h > 0 && std::isfinite(w) && std::isfinite(h)
-        && std::isfinite(absX) && std::isfinite(absY)) {
-        el.bounds.x = safe_double_to_int(absX);
-        el.bounds.y = safe_double_to_int(absY);
-        el.bounds.width = safe_double_to_int(w);
-        el.bounds.height = safe_double_to_int(h);
+    if (w > 0 && h > 0) {
+        auto sx = safe_double_to_int(absX);
+        auto sy = safe_double_to_int(absY);
+        auto sw = safe_double_to_int(w);
+        auto sh = safe_double_to_int(h);
+        if (sx && sy && sw && sh) {
+            el.bounds.x = *sx;
+            el.bounds.y = *sy;
+            el.bounds.width = *sw;
+            el.bounds.height = *sh;
+        }
     }
 
     // Copy additional properties if present
