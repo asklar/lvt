@@ -61,10 +61,6 @@ struct TreeNode {
     double width = 0, height = 0;
     double offsetX = 0, offsetY = 0;
     bool hasBounds = false;
-    // Layout info for offset computation
-    int orientation = -1; // -1=unknown, 0=vertical, 1=horizontal (StackPanel)
-    double spacing = 0;
-    double marginLeft = 0, marginTop = 0, marginRight = 0, marginBottom = 0;
 };
 
 class LvtTap;
@@ -84,7 +80,6 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
 
 public:
     IVisualTreeService* m_vts = nullptr;
-    IVisualTreeService2* m_vts2 = nullptr;
     static constexpr UINT WM_COLLECT_BOUNDS = WM_USER + 100;
 
 public:
@@ -170,14 +165,7 @@ public:
             return S_OK;
         }
 
-        // Try to get IVisualTreeService2 for GetPropertyIndex/GetProperty (Vector3 workaround)
-        hr = m_vts->QueryInterface(__uuidof(IVisualTreeService2), (void**)&m_vts2);
-        if (FAILED(hr)) {
-            LogMsg("QI for IVisualTreeService2 failed (non-fatal): 0x%08X", hr);
-            m_vts2 = nullptr;
-        }
-
-        m_diag = diag; // Keep reference for GetIInspectableFromHandle
+        m_diag = diag;
 
         // Create a message-only window on the UI thread for dispatching
         // GetPropertyValuesChain calls (which have thread affinity).
@@ -232,9 +220,8 @@ public:
                     SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS, 0,
                                  reinterpret_cast<LPARAM>(self));
                 }
-                // Compute layout-based offsets for Panel children (workaround for
-                // WinUI3 ActualOffset serialization returning "0" for Vector3 types)
-                self->ComputeLayoutOffsets();
+                // Apply DPI scaling (XAML logical pixels → physical pixels)
+                self->ApplyDpiScaling();
                 self->SerializeAndSend();
                 self->m_vts->UnadviseVisualTreeChange(cb);
             }
@@ -302,7 +289,7 @@ private:
     }
 
     // Collect bounds for a single node — isolated for SEH compatibility
-    static void CollectBoundsForNode(IVisualTreeService* vts, IVisualTreeService2* /*vts2*/,
+    static void CollectBoundsForNode(IVisualTreeService* vts,
                                      TreeNode& node, InstanceHandle handle,
                                      bool logDetail) {
         if (logDetail) LogMsg("  CollectBoundsForNode ENTER handle=%llu", (unsigned long long)handle);
@@ -339,19 +326,6 @@ private:
                     foundOffset = true;
                 }
             }
-            // Collect layout properties for offset computation
-            // Only take the first value (most specific in the property chain)
-            if (name == L"Orientation" && !value.empty() && node.orientation < 0) {
-                node.orientation = _wtoi(value.c_str());
-            } else if (name == L"Spacing" && !value.empty() && node.spacing == 0) {
-                node.spacing = _wtof(value.c_str());
-            } else if (name == L"Margin" && !value.empty()) {
-                double l = 0, t = 0, r = 0, b = 0;
-                if (swscanf_s(value.c_str(), L"%lf,%lf,%lf,%lf", &l, &t, &r, &b) >= 2) {
-                    node.marginLeft = l; node.marginTop = t;
-                    node.marginRight = r; node.marginBottom = b;
-                }
-            }
             if (props[i].Type) SysFreeString(props[i].Type);
             if (props[i].DeclaringType) SysFreeString(props[i].DeclaringType);
             if (props[i].ValueType) SysFreeString(props[i].ValueType);
@@ -368,11 +342,11 @@ private:
     }
 
     // SEH wrapper for single-node bounds collection (cannot use __try with C++ objects)
-    static int CollectBoundsForNodeSEH(IVisualTreeService* vts, IVisualTreeService2* vts2,
+    static int CollectBoundsForNodeSEH(IVisualTreeService* vts,
                                        TreeNode& node, InstanceHandle handle,
                                        bool logDetail) {
         __try {
-            CollectBoundsForNode(vts, vts2, node, handle, logDetail);
+            CollectBoundsForNode(vts, node, handle, logDetail);
             return 0;
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             return GetExceptionCode();
@@ -386,7 +360,7 @@ private:
         int idx = 0;
         for (auto& [handle, node] : m_nodes) {
             bool logDetail = false; // Set to true for debugging
-            int code = CollectBoundsForNodeSEH(vts, m_vts2, node, handle, logDetail);
+            int code = CollectBoundsForNodeSEH(vts, node, handle, logDetail);
             if (code != 0) {
                 LogMsg("GetPropertyValuesChain crashed for handle %llu: 0x%08X",
                        (unsigned long long)handle, code);
@@ -397,58 +371,34 @@ private:
         LogMsg("CollectBounds: collected bounds for %d/%zu nodes", collected, m_nodes.size());
     }
 
-    // Compute layout-based offsets for children of StackPanel/Panel containers.
-    // WinUI3's XAML diagnostics can't serialize Vector3 ActualOffset values, so we
-    // approximate child positions by accumulating widths (horizontal) or heights (vertical)
-    // along the stacking axis of the parent container.
-    void ComputeLayoutOffsets() {
-        int computed = 0;
+    // Apply DPI scaling to XAML element dimensions.
+    // XAML ActualWidth/ActualHeight are in logical pixels; bridge positions from
+    // GetWindowRect are in physical pixels. Scale dimensions to match.
+    void ApplyDpiScaling() {
+        HWND hwnd = nullptr;
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(h, &pid);
+            if (pid == GetCurrentProcessId() && IsWindowVisible(h)) {
+                *reinterpret_cast<HWND*>(lp) = h;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&hwnd));
+
+        if (!hwnd) return;
+        UINT dpi = GetDpiForWindow(hwnd);
+        if (dpi == 0 || dpi == 96) return;
+
+        double scale = static_cast<double>(dpi) / 96.0;
+        LogMsg("ApplyDpiScaling: DPI=%u scale=%.2f", dpi, scale);
         for (auto& [handle, node] : m_nodes) {
-            if (node.childHandles.empty()) continue;
-            // Determine orientation: StackPanel has explicit Orientation,
-            // other Panels (CommandBar, MenuBar, etc.) may default to horizontal
-            int orient = node.orientation;
-            if (orient < 0) {
-                // Heuristic: types containing "Bar", "Toolbar", "CommandBar" → horizontal
-                // "StackPanel" with no explicit orientation → vertical (default)
-                auto& t = node.type;
-                if (t.find(L"StackPanel") != std::wstring::npos) {
-                    orient = 0; // vertical by default
-                } else if (t.find(L"Bar") != std::wstring::npos ||
-                           t.find(L"Toolbar") != std::wstring::npos) {
-                    orient = 1; // horizontal
-                }
-            }
-            if (orient < 0) continue; // unknown container, skip
-
-            double cursor = 0;
-            for (size_t ci = 0; ci < node.childHandles.size(); ci++) {
-                auto cit = m_nodes.find(node.childHandles[ci]);
-                if (cit == m_nodes.end()) continue;
-                auto& child = cit->second;
-                if (!child.hasBounds) continue;
-
-                // Only set offset if not already computed
-                if (child.offsetX == 0 && child.offsetY == 0) {
-                    if (orient == 1) { // horizontal
-                        child.offsetX = cursor + child.marginLeft;
-                        child.offsetY = child.marginTop;
-                    } else { // vertical
-                        child.offsetX = child.marginLeft;
-                        child.offsetY = cursor + child.marginTop;
-                    }
-                    computed++;
-                }
-
-                // Advance cursor
-                if (orient == 1) {
-                    cursor += child.marginLeft + child.width + child.marginRight + node.spacing;
-                } else {
-                    cursor += child.marginTop + child.height + child.marginBottom + node.spacing;
-                }
-            }
+            if (!node.hasBounds) continue;
+            node.width *= scale;
+            node.height *= scale;
+            node.offsetX *= scale;
+            node.offsetY *= scale;
         }
-        LogMsg("ComputeLayoutOffsets: computed %d offsets", computed);
     }
 
     // Called on the UI thread via SendMessage from the worker thread
@@ -540,7 +490,6 @@ private:
 
     ~LvtTap() {
         if (m_msgWnd) DestroyWindow(m_msgWnd);
-        if (m_vts2) m_vts2->Release();
         if (m_vts) m_vts->Release();
         if (m_diag) m_diag->Release();
         if (m_site) m_site->Release();
