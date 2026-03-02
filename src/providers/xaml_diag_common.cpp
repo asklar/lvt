@@ -186,15 +186,16 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
             }
         }
     }
-    // Set display text from the most meaningful available property
-    if (el.properties.count("Text"))
-        el.text = el.properties["Text"];
-    else if (el.properties.count("Content"))
-        el.text = el.properties["Content"];
-    else if (el.properties.count("Header"))
-        el.text = el.properties["Header"];
-    else if (el.properties.count("AutomationProperties.Name"))
-        el.text = el.properties["AutomationProperties.Name"];
+    // Set display text from text-content properties only (not automation names).
+    // Remove the source property to avoid duplication in the output (text= vs Text=).
+    for (const char* prop : {"Text", "Content", "Header"}) {
+        auto it = el.properties.find(prop);
+        if (it != el.properties.end() && !it->second.empty()) {
+            el.text = it->second;
+            el.properties.erase(it);
+            break;
+        }
+    }
 
     if (j.contains("children") && j["children"].is_array()) {
         for (auto& child : j["children"]) {
