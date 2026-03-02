@@ -217,6 +217,25 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
 
     for (auto* el : elements) {
         if (el->bounds.width <= 0 || el->bounds.height <= 0) continue;
+
+        // Skip pure layout containers — only annotate interactive controls,
+        // elements with text, or leaf elements that represent visible content.
+        bool hasText = !el->text.empty();
+        bool hasAutomationName = el->properties.count("AutomationProperties.Name") > 0;
+        static const char* skipTypes[] = {
+            "Grid", "StackPanel", "Border", "ContentPresenter", "ContentControl",
+            "ItemsPresenter", "ScrollContentPresenter", "ItemsStackPanel",
+            "Popup", "PopupRoot", "Canvas", "Viewbox", "Panel",
+            "RootScrollViewer", "ScrollViewer", "Rectangle", "Path",
+            "DesktopWindowXamlSource", "DesktopChildSiteBridge",
+            "InputNonClientPointerSource", "InputSite", "Window",
+        };
+        bool isSkippable = false;
+        for (auto* skip : skipTypes) {
+            if (el->type == skip) { isSkippable = true; break; }
+        }
+        if (isSkippable && !hasText && !hasAutomationName) continue;
+
         // Convert element screen coords to bitmap-relative coords, applying DPI scale
         long long lx = static_cast<long long>(el->bounds.x) - static_cast<long long>(winRect.left);
         long long ly = static_cast<long long>(el->bounds.y) - static_cast<long long>(winRect.top);
@@ -235,8 +254,24 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
             std::wstring label(el->id.begin(), el->id.end());
             SIZE textSize{};
             GetTextExtentPoint32W(memDC, label.c_str(), static_cast<int>(label.size()), &textSize);
-            RECT labelRect = {x, y - textSize.cy - 2, x + textSize.cx + 4, y};
-            if (labelRect.top < 0) { labelRect.top = y; labelRect.bottom = y + textSize.cy + 2; }
+            int labelW = textSize.cx + 4;
+            int labelH = textSize.cy + 2;
+
+            // Place label inside the box if it fits, otherwise above/below.
+            // Alternate vertical placement based on element index to reduce overlap.
+            RECT labelRect;
+            bool fitsInside = (labelW <= w && labelH <= h);
+            if (fitsInside) {
+                // Inside top-left corner
+                labelRect = {x + 1, y + 1, x + 1 + labelW, y + 1 + labelH};
+            } else if (y - labelH >= 0) {
+                // Above the box
+                labelRect = {x, y - labelH, x + labelW, y};
+            } else {
+                // Below the box
+                labelRect = {x, y + h, x + labelW, y + h + labelH};
+            }
+
             HBRUSH bgBrush = CreateSolidBrush(RGB(255, 255, 220));
             FillRect(memDC, &labelRect, bgBrush);
             DeleteObject(bgBrush);
