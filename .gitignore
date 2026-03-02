@@ -16,3 +16,5 @@ Desktop.ini
 *.png
 !docs/*.png
 _codeql_detected_source_root
+
+src/tap/winui3/

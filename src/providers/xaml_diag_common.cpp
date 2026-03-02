@@ -140,7 +140,12 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     Element el;
     el.framework = framework;
     el.className = sanitize(j.value("type", ""));
-    el.text = sanitize(j.value("name", ""));
+
+    // x:Name is a developer identifier, not user-visible text — store as property
+    std::string xname = sanitize(j.value("name", ""));
+    if (!xname.empty()) {
+        el.properties["name"] = xname;
+    }
 
     // Simplify type name: "Windows.UI.Xaml.Controls.Button" -> "Button"
     auto lastDot = el.className.rfind('.');
@@ -177,14 +182,19 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
         for (auto& [key, val] : j["properties"].items()) {
             if (val.is_string()) {
                 std::string v = sanitize(val.get<std::string>());
-                // Use Text/Content/Header as the element's display text if not already set
-                if (el.text.empty() && (key == "Text" || key == "Content" || key == "Header")) {
-                    el.text = v;
-                }
-                el.properties[key] = std::move(v);
+                el.properties[key] = v;
             }
         }
     }
+    // Set display text from the most meaningful available property
+    if (el.properties.count("Text"))
+        el.text = el.properties["Text"];
+    else if (el.properties.count("Content"))
+        el.text = el.properties["Content"];
+    else if (el.properties.count("Header"))
+        el.text = el.properties["Header"];
+    else if (el.properties.count("AutomationProperties.Name"))
+        el.text = el.properties["AutomationProperties.Name"];
 
     if (j.contains("children") && j["children"].is_array()) {
         for (auto& child : j["children"]) {

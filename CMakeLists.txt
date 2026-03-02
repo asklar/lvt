@@ -57,8 +57,8 @@ add_library(lvt_tap SHARED
     src/tap/lvt_tap.cpp
     src/tap/lvt_tap.def
 )
-target_compile_definitions(lvt_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(lvt_tap PRIVATE src)
+target_compile_definitions(lvt_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN)
+target_include_directories(lvt_tap PRIVATE src src/tap/winui3)
 target_link_libraries(lvt_tap PRIVATE ole32)
 set_property(TARGET lvt_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 

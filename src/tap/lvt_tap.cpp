@@ -12,6 +12,19 @@
 #include <vector>
 #include <cstdio>
 #include <cmath>
+#include <unknwn.h>
+
+// C++/WinRT projected types for WinUI3 (generated from Microsoft.UI.Xaml.winmd)
+#include <winrt/Microsoft.UI.Xaml.h>
+#include <winrt/Microsoft.UI.Xaml.Media.h>
+#include <winrt/Microsoft.UI.Xaml.Controls.h>
+#include <winrt/Windows.Foundation.h>
+
+// Stub for C++/WinRT error origination (avoid linking windowsapp.lib)
+extern "C" int32_t __stdcall WINRT_IMPL_RoOriginateLanguageException(
+    int32_t error, void* message, void* exception) noexcept {
+    return error;
+}
 
 // GUIDs only forward-declared in xamlOM.h (no .lib provides them)
 const IID IID_IVisualTreeServiceCallback =
@@ -414,66 +427,53 @@ private:
     }
 
     // Use TransformToVisual to get each element's position relative to the XAML island root.
-    // This bypasses the broken ActualOffset property serialization in WinUI3.
-    void CollectPositionsViaTransformToVisual() {
-        // IUIElement IID from Microsoft.UI.Xaml.winmd (WinUI3)
-        static const IID IID_MUX_IUIElement =
-            {0xC3C01020, 0x320C, 0x5CF6, {0x9D, 0x24, 0xD3, 0x96, 0xBB, 0xFA, 0x4D, 0x8B}};
-
-        // TransformToVisual is method 211 on IUIElement (vtable slot 217)
-        // TransformPoint is method 1 on IGeneralTransform (vtable slot 7)
-        constexpr int kTransformToVisualSlot = 217;
-        constexpr int kTransformPointSlot = 7;
-
-        struct WF_Point { float X; float Y; };
-        typedef HRESULT(STDMETHODCALLTYPE* TransformToVisualFn)(void*, IInspectable*, IInspectable**);
-        typedef HRESULT(STDMETHODCALLTYPE* TransformPointFn)(void*, WF_Point, WF_Point*);
+    // Also reads Text property from TextBlock/TextBox elements.
+    // Uses C++/WinRT projected types from the Windows App SDK.
+    void CollectPositionsAndText() {
+        namespace MUX = winrt::Microsoft::UI::Xaml;
+        namespace MUXC = winrt::Microsoft::UI::Xaml::Controls;
 
         if (!m_diag) return;
 
-        int collected = 0;
+        int positioned = 0, textsRead = 0;
         for (auto& [handle, node] : m_nodes) {
             if (!node.hasBounds) continue;
 
-            IInspectable* inspectable = nullptr;
-            HRESULT hr = m_diag->GetIInspectableFromHandle(handle, &inspectable);
-            if (FAILED(hr) || !inspectable) continue;
+            ::IInspectable* raw = nullptr;
+            HRESULT hr = m_diag->GetIInspectableFromHandle(handle, &raw);
+            if (FAILED(hr) || !raw) continue;
 
-            IInspectable* uiElement = nullptr;
-            hr = inspectable->QueryInterface(IID_MUX_IUIElement, (void**)&uiElement);
-            inspectable->Release();
-            if (FAILED(hr) || !uiElement) continue;
+            try {
+                winrt::Windows::Foundation::IInspectable inspectable;
+                winrt::copy_from_abi(inspectable, raw);
+                raw = nullptr; // ownership transferred
 
-            void** vtable = *reinterpret_cast<void***>(uiElement);
-            IInspectable* transform = nullptr;
-            bool ok = false;
-            __try {
-                auto fn = reinterpret_cast<TransformToVisualFn>(vtable[kTransformToVisualSlot]);
-                hr = fn(uiElement, nullptr, &transform);
-            } __except(EXCEPTION_EXECUTE_HANDLER) {
-                hr = E_FAIL;
-            }
-
-            if (SUCCEEDED(hr) && transform) {
-                void** tVtable = *reinterpret_cast<void***>(transform);
-                WF_Point inPt = {0.0f, 0.0f};
-                WF_Point outPt = {};
-                __try {
-                    auto tFn = reinterpret_cast<TransformPointFn>(tVtable[kTransformPointSlot]);
-                    hr = tFn(transform, inPt, &outPt);
-                    if (SUCCEEDED(hr) && std::isfinite(outPt.X) && std::isfinite(outPt.Y)) {
-                        node.offsetX = static_cast<double>(outPt.X);
-                        node.offsetY = static_cast<double>(outPt.Y);
-                        ok = true;
+                // Position via TransformToVisual
+                if (auto uiElem = inspectable.try_as<MUX::UIElement>()) {
+                    auto transform = uiElem.TransformToVisual(nullptr);
+                    auto pt = transform.TransformPoint({0, 0});
+                    if (std::isfinite(pt.X) && std::isfinite(pt.Y)) {
+                        node.offsetX = static_cast<double>(pt.X);
+                        node.offsetY = static_cast<double>(pt.Y);
+                        positioned++;
                     }
-                } __except(EXCEPTION_EXECUTE_HANDLER) { }
-                transform->Release();
+                }
+
+                // Text from TextBlock
+                if (auto tb = inspectable.try_as<MUXC::TextBlock>()) {
+                    auto text = tb.Text();
+                    if (!text.empty()) {
+                        node.properties.emplace_back(L"Text", std::wstring(text));
+                        textsRead++;
+                    }
+                }
+            } catch (...) {
+                // Swallow WinRT exceptions — element may be in an invalid state
             }
 
-            uiElement->Release();
-            if (ok) collected++;
+            if (raw) raw->Release();
         }
-        LogMsg("CollectPositionsViaTransformToVisual: %d/%zu elements positioned", collected, m_nodes.size());
+        LogMsg("CollectPositionsAndText: %d positioned, %d texts", positioned, textsRead);
     }
 
     // Called on the UI thread via SendMessage from the worker thread
@@ -482,7 +482,7 @@ public:
         CollectBounds(m_vts);
     }
     void CollectPositionsOnUIThread() {
-        CollectPositionsViaTransformToVisual();
+        CollectPositionsAndText();
     }
 private:
 
