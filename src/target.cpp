@@ -153,6 +153,14 @@ static BOOL CALLBACK enum_all_windows_proc(HWND hwnd, LPARAM lParam) {
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
 
+    // Skip windows belonging to our own process or our console host.
+    // This avoids matching the terminal window whose title contains the
+    // lvt command line (e.g. "lvt --title Notepad" in the title bar).
+    if (pid == GetCurrentProcessId()) return TRUE;
+    DWORD consolePid = 0;
+    if (GetWindowThreadProcessId(GetConsoleWindow(), &consolePid) && pid == consolePid)
+        return TRUE;
+
     WindowMatch m;
     m.hwnd = hwnd;
     m.pid = pid;

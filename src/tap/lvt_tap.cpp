@@ -220,8 +220,6 @@ public:
                     SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS, 0,
                                  reinterpret_cast<LPARAM>(self));
                 }
-                // Apply DPI scaling (XAML logical pixels → physical pixels)
-                self->ApplyDpiScaling();
                 self->SerializeAndSend();
                 self->m_vts->UnadviseVisualTreeChange(cb);
             }
@@ -371,36 +369,6 @@ private:
         LogMsg("CollectBounds: collected bounds for %d/%zu nodes", collected, m_nodes.size());
     }
 
-    // Apply DPI scaling to XAML element dimensions.
-    // XAML ActualWidth/ActualHeight are in logical pixels; bridge positions from
-    // GetWindowRect are in physical pixels. Scale dimensions to match.
-    void ApplyDpiScaling() {
-        HWND hwnd = nullptr;
-        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
-            DWORD pid = 0;
-            GetWindowThreadProcessId(h, &pid);
-            if (pid == GetCurrentProcessId() && IsWindowVisible(h)) {
-                *reinterpret_cast<HWND*>(lp) = h;
-                return FALSE;
-            }
-            return TRUE;
-        }, reinterpret_cast<LPARAM>(&hwnd));
-
-        if (!hwnd) return;
-        UINT dpi = GetDpiForWindow(hwnd);
-        if (dpi == 0 || dpi == 96) return;
-
-        double scale = static_cast<double>(dpi) / 96.0;
-        LogMsg("ApplyDpiScaling: DPI=%u scale=%.2f", dpi, scale);
-        for (auto& [handle, node] : m_nodes) {
-            if (!node.hasBounds) continue;
-            node.width *= scale;
-            node.height *= scale;
-            node.offsetX *= scale;
-            node.offsetY *= scale;
-        }
-    }
-
     // Called on the UI thread via SendMessage from the worker thread
 public:
     void CollectBoundsOnUIThread() {
@@ -436,12 +404,18 @@ private:
         j += L",\"handle\":" + std::to_wstring(n.handle);
 
         if (n.hasBounds) {
-            // Use snprintf for consistent decimal formatting
+            // Always include width/height for tree dump consumers.
+            // Only include offsetX/offsetY when non-zero — WinUI3's XAML diagnostics
+            // serializes ActualOffset (Vector3) as "0", so zero offsets are unreliable.
             char buf[128];
-            snprintf(buf, sizeof(buf), ",\"width\":%.1f,\"height\":%.1f,\"offsetX\":%.1f,\"offsetY\":%.1f",
-                     n.width, n.height, n.offsetX, n.offsetY);
-            // Convert to wide string
+            snprintf(buf, sizeof(buf), ",\"width\":%.1f,\"height\":%.1f",
+                     n.width, n.height);
             for (const char* p = buf; *p; p++) j += static_cast<wchar_t>(*p);
+            if (n.offsetX != 0.0 || n.offsetY != 0.0) {
+                snprintf(buf, sizeof(buf), ",\"offsetX\":%.1f,\"offsetY\":%.1f",
+                         n.offsetX, n.offsetY);
+                for (const char* p = buf; *p; p++) j += static_cast<wchar_t>(*p);
+            }
         }
 
         if (!n.childHandles.empty()) {

@@ -146,14 +146,19 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     auto lastDot = el.className.rfind('.');
     el.type = (lastDot != std::string::npos) ? el.className.substr(lastDot + 1) : el.className;
 
-    // Parse bounds from TAP DLL data
+    // Parse bounds from TAP DLL data.
+    // Only set positioned screen bounds when explicit offset data is available.
+    // WinUI3's ActualOffset serialization is broken (returns "0" for Vector3),
+    // so most XAML elements lack offset data; they still appear in the tree
+    // with width/height but won't be annotated in screenshots.
     double ox = j.value("offsetX", 0.0);
     double oy = j.value("offsetY", 0.0);
     double w = j.value("width", 0.0);
     double h = j.value("height", 0.0);
+    bool hasOffsetData = j.contains("offsetX") || j.contains("offsetY");
     double absX = std::isfinite(ox) ? parentOffsetX + ox : parentOffsetX;
     double absY = std::isfinite(oy) ? parentOffsetY + oy : parentOffsetY;
-    if (w > 0 && h > 0) {
+    if (w > 0 && h > 0 && hasOffsetData) {
         auto sx = safe_double_to_int(absX);
         auto sy = safe_double_to_int(absY);
         auto sw = safe_double_to_int(w);
