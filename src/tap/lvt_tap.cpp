@@ -220,6 +220,12 @@ public:
                     SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS, 0,
                                  reinterpret_cast<LPARAM>(self));
                 }
+                // Get element positions via TransformToVisual (works around broken
+                // ActualOffset serialization in WinUI3). Must run on the UI thread.
+                if (self->m_msgWnd) {
+                    SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS + 1, 0,
+                                 reinterpret_cast<LPARAM>(self));
+                }
                 self->SerializeAndSend();
                 self->m_vts->UnadviseVisualTreeChange(cb);
             }
@@ -357,7 +363,7 @@ private:
         int collected = 0;
         int idx = 0;
         for (auto& [handle, node] : m_nodes) {
-            bool logDetail = false; // Set to true for debugging
+            bool logDetail = false;
             int code = CollectBoundsForNodeSEH(vts, node, handle, logDetail);
             if (code != 0) {
                 LogMsg("GetPropertyValuesChain crashed for handle %llu: 0x%08X",
@@ -369,10 +375,76 @@ private:
         LogMsg("CollectBounds: collected bounds for %d/%zu nodes", collected, m_nodes.size());
     }
 
+    // Use TransformToVisual to get each element's position relative to the XAML island root.
+    // This bypasses the broken ActualOffset property serialization in WinUI3.
+    void CollectPositionsViaTransformToVisual() {
+        // IUIElement IID from Microsoft.UI.Xaml.winmd (WinUI3)
+        static const IID IID_MUX_IUIElement =
+            {0xC3C01020, 0x320C, 0x5CF6, {0x9D, 0x24, 0xD3, 0x96, 0xBB, 0xFA, 0x4D, 0x8B}};
+
+        // TransformToVisual is method 211 on IUIElement (vtable slot 217)
+        // TransformPoint is method 1 on IGeneralTransform (vtable slot 7)
+        constexpr int kTransformToVisualSlot = 217;
+        constexpr int kTransformPointSlot = 7;
+
+        struct WF_Point { float X; float Y; };
+        typedef HRESULT(STDMETHODCALLTYPE* TransformToVisualFn)(void*, IInspectable*, IInspectable**);
+        typedef HRESULT(STDMETHODCALLTYPE* TransformPointFn)(void*, WF_Point, WF_Point*);
+
+        if (!m_diag) return;
+
+        int collected = 0;
+        for (auto& [handle, node] : m_nodes) {
+            if (!node.hasBounds) continue;
+
+            IInspectable* inspectable = nullptr;
+            HRESULT hr = m_diag->GetIInspectableFromHandle(handle, &inspectable);
+            if (FAILED(hr) || !inspectable) continue;
+
+            IInspectable* uiElement = nullptr;
+            hr = inspectable->QueryInterface(IID_MUX_IUIElement, (void**)&uiElement);
+            inspectable->Release();
+            if (FAILED(hr) || !uiElement) continue;
+
+            void** vtable = *reinterpret_cast<void***>(uiElement);
+            IInspectable* transform = nullptr;
+            bool ok = false;
+            __try {
+                auto fn = reinterpret_cast<TransformToVisualFn>(vtable[kTransformToVisualSlot]);
+                hr = fn(uiElement, nullptr, &transform);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                hr = E_FAIL;
+            }
+
+            if (SUCCEEDED(hr) && transform) {
+                void** tVtable = *reinterpret_cast<void***>(transform);
+                WF_Point inPt = {0.0f, 0.0f};
+                WF_Point outPt = {};
+                __try {
+                    auto tFn = reinterpret_cast<TransformPointFn>(tVtable[kTransformPointSlot]);
+                    hr = tFn(transform, inPt, &outPt);
+                    if (SUCCEEDED(hr) && std::isfinite(outPt.X) && std::isfinite(outPt.Y)) {
+                        node.offsetX = static_cast<double>(outPt.X);
+                        node.offsetY = static_cast<double>(outPt.Y);
+                        ok = true;
+                    }
+                } __except(EXCEPTION_EXECUTE_HANDLER) { }
+                transform->Release();
+            }
+
+            uiElement->Release();
+            if (ok) collected++;
+        }
+        LogMsg("CollectPositionsViaTransformToVisual: %d/%zu elements positioned", collected, m_nodes.size());
+    }
+
     // Called on the UI thread via SendMessage from the worker thread
 public:
     void CollectBoundsOnUIThread() {
         CollectBounds(m_vts);
+    }
+    void CollectPositionsOnUIThread() {
+        CollectPositionsViaTransformToVisual();
     }
 private:
 
@@ -476,6 +548,13 @@ static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         auto* self = reinterpret_cast<LvtTap*>(lParam);
         if (self) {
             self->CollectBoundsOnUIThread();
+        }
+        return 0;
+    }
+    if (msg == LvtTap::WM_COLLECT_BOUNDS + 1) {
+        auto* self = reinterpret_cast<LvtTap*>(lParam);
+        if (self) {
+            self->CollectPositionsOnUIThread();
         }
         return 0;
     }

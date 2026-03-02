@@ -192,9 +192,13 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
     HGDIOBJ old = SelectObject(memDC, hBitmap);
 
     RECT winRect{};
-    if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &winRect, sizeof(winRect)) != S_OK) {
-        GetWindowRect(hwnd, &winRect);
-    }
+    GetWindowRect(hwnd, &winRect);
+    int winW = winRect.right - winRect.left;
+    int winH = winRect.bottom - winRect.top;
+    // Captured bitmap is in physical pixels; GetWindowRect returns logical pixels
+    // (DPI-virtualized). Scale annotations to match the bitmap coordinate space.
+    double scaleX = (winW > 0) ? static_cast<double>(bmpWidth) / winW : 1.0;
+    double scaleY = (winH > 0) ? static_cast<double>(bmpHeight) / winH : 1.0;
 
     std::vector<const Element*> elements;
     collect_elements(*tree, elements);
@@ -213,17 +217,17 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
 
     for (auto* el : elements) {
         if (el->bounds.width <= 0 || el->bounds.height <= 0) continue;
-        // Use long long for intermediate arithmetic to avoid int overflow
-        // when element bounds contain extreme values.
+        // Convert element screen coords to bitmap-relative coords, applying DPI scale
         long long lx = static_cast<long long>(el->bounds.x) - static_cast<long long>(winRect.left);
         long long ly = static_cast<long long>(el->bounds.y) - static_cast<long long>(winRect.top);
         long long lw = el->bounds.width;
         long long lh = el->bounds.height;
-        if (lx + lw <= 0 || ly + lh <= 0 || lx >= bmpWidth || ly >= bmpHeight) continue;
-        int x = static_cast<int>(lx);
-        int y = static_cast<int>(ly);
-        int w = static_cast<int>(lw);
-        int h = static_cast<int>(lh);
+        // Scale to physical bitmap pixels
+        int x = static_cast<int>(lx * scaleX);
+        int y = static_cast<int>(ly * scaleY);
+        int w = static_cast<int>(lw * scaleX);
+        int h = static_cast<int>(lh * scaleY);
+        if (x + w <= 0 || y + h <= 0 || x >= bmpWidth || y >= bmpHeight) continue;
 
         Rectangle(memDC, x, y, x + w, y + h);
 
