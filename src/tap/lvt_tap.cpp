@@ -14,23 +14,29 @@
 #include <cmath>
 #include <unknwn.h>
 
-// C++/WinRT projected types for WinUI3 (generated from Microsoft.UI.Xaml.winmd).
-// Optional: if headers aren't available, position/text reading is disabled.
+// C++/WinRT projected types for XAML element inspection.
+// System XAML (Windows.UI.Xaml) headers are always available from the Windows SDK.
+// WinUI3 (Microsoft.UI.Xaml) headers are generated from the Windows App SDK winmd.
+#include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.Foundation.h>
+#define LVT_HAS_XAML_PROJECTION 1
+
 #if __has_include(<winrt/Microsoft.UI.Xaml.h>)
 #define LVT_HAS_WINUI3_PROJECTION 1
 #include <winrt/Microsoft.UI.Xaml.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
-#include <winrt/Windows.Foundation.h>
+#else
+#define LVT_HAS_WINUI3_PROJECTION 0
+#endif
 
 // Stub for C++/WinRT error origination (avoid linking windowsapp.lib)
 extern "C" int32_t __stdcall WINRT_IMPL_RoOriginateLanguageException(
     int32_t error, void* message, void* exception) noexcept {
     return error;
 }
-#else
-#define LVT_HAS_WINUI3_PROJECTION 0
-#endif
 
 // GUIDs only forward-declared in xamlOM.h (no .lib provides them)
 const IID IID_IVisualTreeServiceCallback =
@@ -241,7 +247,7 @@ public:
                 }
                 // Get element positions via TransformToVisual (works around broken
                 // ActualOffset serialization in WinUI3). Must run on the UI thread.
-#if LVT_HAS_WINUI3_PROJECTION
+#if LVT_HAS_XAML_PROJECTION
                 if (self->m_msgWnd) {
                     SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS + 1, 0,
                                  reinterpret_cast<LPARAM>(self));
@@ -434,13 +440,13 @@ private:
         LogMsg("CollectBounds: collected bounds for %d/%zu nodes", collected, m_nodes.size());
     }
 
-#if LVT_HAS_WINUI3_PROJECTION
+#if LVT_HAS_XAML_PROJECTION
     // Use TransformToVisual to get each element's position relative to the XAML island root.
-    // Also reads Text property from TextBlock/TextBox elements.
-    // Uses C++/WinRT projected types from the Windows App SDK.
+    // Also reads Text property from TextBlock elements.
+    // Tries both WinUI3 (Microsoft.UI.Xaml) and system XAML (Windows.UI.Xaml) interfaces.
     void CollectPositionsAndText() {
-        namespace MUX = winrt::Microsoft::UI::Xaml;
-        namespace MUXC = winrt::Microsoft::UI::Xaml::Controls;
+        namespace WUX = winrt::Windows::UI::Xaml;
+        namespace WUXC = winrt::Windows::UI::Xaml::Controls;
 
         if (!m_diag) return;
 
@@ -457,24 +463,43 @@ private:
                 winrt::copy_from_abi(inspectable, raw);
                 raw = nullptr; // ownership transferred
 
-                // Position via TransformToVisual
-                if (auto uiElem = inspectable.try_as<MUX::UIElement>()) {
-                    auto transform = uiElem.TransformToVisual(nullptr);
-                    auto pt = transform.TransformPoint({0, 0});
+                // Position via TransformToVisual — try WinUI3 first, then system XAML
+                bool gotPosition = false;
+#if LVT_HAS_WINUI3_PROJECTION
+                if (auto uiElem = inspectable.try_as<winrt::Microsoft::UI::Xaml::UIElement>()) {
+                    auto pt = uiElem.TransformToVisual(nullptr).TransformPoint({0, 0});
                     if (std::isfinite(pt.X) && std::isfinite(pt.Y)) {
                         node.offsetX = static_cast<double>(pt.X);
                         node.offsetY = static_cast<double>(pt.Y);
-                        positioned++;
+                        gotPosition = true;
                     }
                 }
-
-                // Text from TextBlock
-                if (auto tb = inspectable.try_as<MUXC::TextBlock>()) {
-                    auto text = tb.Text();
-                    if (!text.empty()) {
-                        node.properties.emplace_back(L"Text", std::wstring(text));
-                        textsRead++;
+#endif
+                if (!gotPosition) {
+                    if (auto uiElem = inspectable.try_as<WUX::UIElement>()) {
+                        auto pt = uiElem.TransformToVisual(nullptr).TransformPoint({0, 0});
+                        if (std::isfinite(pt.X) && std::isfinite(pt.Y)) {
+                            node.offsetX = static_cast<double>(pt.X);
+                            node.offsetY = static_cast<double>(pt.Y);
+                            gotPosition = true;
+                        }
                     }
+                }
+                if (gotPosition) positioned++;
+
+                // Text from TextBlock — try WinUI3 first, then system XAML
+                winrt::hstring text;
+#if LVT_HAS_WINUI3_PROJECTION
+                if (auto tb = inspectable.try_as<winrt::Microsoft::UI::Xaml::Controls::TextBlock>())
+                    text = tb.Text();
+#endif
+                if (text.empty()) {
+                    if (auto tb = inspectable.try_as<WUXC::TextBlock>())
+                        text = tb.Text();
+                }
+                if (!text.empty()) {
+                    node.properties.emplace_back(L"Text", std::wstring(text));
+                    textsRead++;
                 }
             } catch (...) {
                 // Swallow WinRT exceptions — element may be in an invalid state
@@ -491,7 +516,7 @@ public:
     void CollectBoundsOnUIThread() {
         CollectBounds(m_vts);
     }
-#if LVT_HAS_WINUI3_PROJECTION
+#if LVT_HAS_XAML_PROJECTION
     void CollectPositionsOnUIThread() {
         CollectPositionsAndText();
     }
@@ -612,7 +637,7 @@ static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         return 0;
     }
     if (msg == LvtTap::WM_COLLECT_BOUNDS + 1) {
-#if LVT_HAS_WINUI3_PROJECTION
+#if LVT_HAS_XAML_PROJECTION
         auto* self = reinterpret_cast<LvtTap*>(lParam);
         if (self) {
             self->CollectPositionsOnUIThread();
