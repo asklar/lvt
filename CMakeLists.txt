@@ -53,6 +53,78 @@ endif()
 
 # TAP DLL — injected into target process for XAML diagnostics
 # Uses static CRT (/MT) to avoid CRT version conflicts in the target process
+
+# Generate C++/WinRT projected headers from the Windows App SDK winmd.
+# These are needed for TransformToVisual / TextBlock.Text in the TAP DLL.
+set(WINUI3_CPPWINRT_DIR "${CMAKE_SOURCE_DIR}/src/tap/winui3")
+set(WINUI3_CPPWINRT_STAMP "${WINUI3_CPPWINRT_DIR}/winrt/Microsoft.UI.Xaml.h")
+if(NOT EXISTS "${WINUI3_CPPWINRT_STAMP}")
+    # Find cppwinrt.exe from Windows SDK
+    find_program(CPPWINRT_EXE cppwinrt
+        HINTS "$ENV{WindowsSdkDir}/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+              "$ENV{WindowsSdkDir}/bin/10.0.22621.0/x64"
+              "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64"
+    )
+    if(NOT CPPWINRT_EXE)
+        # Fallback: search PATH
+        find_program(CPPWINRT_EXE cppwinrt)
+    endif()
+
+    # Find Windows App SDK NuGet package (winmd files).
+    # Search NuGet global cache and local packages/ dir (CI installs here).
+    set(WASDK_WINMD_DIR "")
+    file(GLOB _wasdk_candidates
+        "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk/*/lib/uap10.0"
+        "$ENV{NUGET_PACKAGES}/microsoft.windowsappsdk/*/lib/uap10.0"
+        "${CMAKE_SOURCE_DIR}/packages/Microsoft.WindowsAppSDK.*/lib/uap10.0"
+    )
+    foreach(_candidate ${_wasdk_candidates})
+        if(EXISTS "${_candidate}/Microsoft.UI.Xaml.winmd")
+            set(WASDK_WINMD_DIR "${_candidate}")
+            break()
+        endif()
+    endforeach()
+
+    # Find Windows.winmd for system type references
+    set(WIN_UNION_WINMD "")
+    if(DEFINED ENV{WindowsSdkDir})
+        file(GLOB _union "$ENV{WindowsSdkDir}/UnionMetadata/*/Windows.winmd")
+        if(_union)
+            list(SORT _union ORDER DESCENDING)
+            list(GET _union 0 WIN_UNION_WINMD)
+        endif()
+    endif()
+    if(NOT WIN_UNION_WINMD)
+        file(GLOB _union "C:/Program Files (x86)/Windows Kits/10/UnionMetadata/*/Windows.winmd")
+        if(_union)
+            list(SORT _union ORDER DESCENDING)
+            list(GET _union 0 WIN_UNION_WINMD)
+        endif()
+    endif()
+
+    if(CPPWINRT_EXE AND WASDK_WINMD_DIR AND WIN_UNION_WINMD)
+        message(STATUS "Generating WinUI3 C++/WinRT headers from ${WASDK_WINMD_DIR}")
+        file(GLOB WASDK_ALL_WINMDS "${WASDK_WINMD_DIR}/*.winmd")
+        # Also include other winmd directories in the package
+        get_filename_component(_wasdk_root "${WASDK_WINMD_DIR}/../.." ABSOLUTE)
+        file(GLOB_RECURSE _extra_winmds "${_wasdk_root}/*.winmd")
+        list(APPEND WASDK_ALL_WINMDS ${_extra_winmds})
+        list(REMOVE_DUPLICATES WASDK_ALL_WINMDS)
+        execute_process(
+            COMMAND "${CPPWINRT_EXE}" -in ${WASDK_ALL_WINMDS} -ref "${WIN_UNION_WINMD}" -out "${WINUI3_CPPWINRT_DIR}"
+            RESULT_VARIABLE _cppwinrt_result
+        )
+        if(_cppwinrt_result EQUAL 0)
+            message(STATUS "WinUI3 C++/WinRT headers generated in ${WINUI3_CPPWINRT_DIR}")
+        else()
+            message(WARNING "cppwinrt failed (${_cppwinrt_result}); TAP DLL WinUI3 features will be limited")
+        endif()
+    else()
+        message(WARNING "Cannot generate WinUI3 C++/WinRT headers:"
+            " cppwinrt=${CPPWINRT_EXE} winmd_dir=${WASDK_WINMD_DIR} union=${WIN_UNION_WINMD}")
+    endif()
+endif()
+
 add_library(lvt_tap SHARED
     src/tap/lvt_tap.cpp
     src/tap/lvt_tap.def

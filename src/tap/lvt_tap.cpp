@@ -14,7 +14,10 @@
 #include <cmath>
 #include <unknwn.h>
 
-// C++/WinRT projected types for WinUI3 (generated from Microsoft.UI.Xaml.winmd)
+// C++/WinRT projected types for WinUI3 (generated from Microsoft.UI.Xaml.winmd).
+// Optional: if headers aren't available, position/text reading is disabled.
+#if __has_include(<winrt/Microsoft.UI.Xaml.h>)
+#define LVT_HAS_WINUI3_PROJECTION 1
 #include <winrt/Microsoft.UI.Xaml.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
@@ -25,6 +28,9 @@ extern "C" int32_t __stdcall WINRT_IMPL_RoOriginateLanguageException(
     int32_t error, void* message, void* exception) noexcept {
     return error;
 }
+#else
+#define LVT_HAS_WINUI3_PROJECTION 0
+#endif
 
 // GUIDs only forward-declared in xamlOM.h (no .lib provides them)
 const IID IID_IVisualTreeServiceCallback =
@@ -235,10 +241,12 @@ public:
                 }
                 // Get element positions via TransformToVisual (works around broken
                 // ActualOffset serialization in WinUI3). Must run on the UI thread.
+#if LVT_HAS_WINUI3_PROJECTION
                 if (self->m_msgWnd) {
                     SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS + 1, 0,
                                  reinterpret_cast<LPARAM>(self));
                 }
+#endif
                 self->SerializeAndSend();
                 self->m_vts->UnadviseVisualTreeChange(cb);
             }
@@ -426,6 +434,7 @@ private:
         LogMsg("CollectBounds: collected bounds for %d/%zu nodes", collected, m_nodes.size());
     }
 
+#if LVT_HAS_WINUI3_PROJECTION
     // Use TransformToVisual to get each element's position relative to the XAML island root.
     // Also reads Text property from TextBlock/TextBox elements.
     // Uses C++/WinRT projected types from the Windows App SDK.
@@ -475,15 +484,18 @@ private:
         }
         LogMsg("CollectPositionsAndText: %d positioned, %d texts", positioned, textsRead);
     }
+#endif
 
     // Called on the UI thread via SendMessage from the worker thread
 public:
     void CollectBoundsOnUIThread() {
         CollectBounds(m_vts);
     }
+#if LVT_HAS_WINUI3_PROJECTION
     void CollectPositionsOnUIThread() {
         CollectPositionsAndText();
     }
+#endif
 private:
 
     static std::wstring Escape(const std::wstring& s) {
@@ -600,10 +612,12 @@ static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         return 0;
     }
     if (msg == LvtTap::WM_COLLECT_BOUNDS + 1) {
+#if LVT_HAS_WINUI3_PROJECTION
         auto* self = reinterpret_cast<LvtTap*>(lParam);
         if (self) {
             self->CollectPositionsOnUIThread();
         }
+#endif
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
