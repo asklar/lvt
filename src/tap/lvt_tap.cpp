@@ -11,6 +11,32 @@
 #include <map>
 #include <vector>
 #include <cstdio>
+#include <cmath>
+#include <unknwn.h>
+
+// C++/WinRT projected types for XAML element inspection.
+// System XAML (Windows.UI.Xaml) headers are always available from the Windows SDK.
+// WinUI3 (Microsoft.UI.Xaml) headers are generated from the Windows App SDK winmd.
+#include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.Foundation.h>
+#define LVT_HAS_XAML_PROJECTION 1
+
+#if __has_include(<winrt/Microsoft.UI.Xaml.h>)
+#define LVT_HAS_WINUI3_PROJECTION 1
+#include <winrt/Microsoft.UI.Xaml.h>
+#include <winrt/Microsoft.UI.Xaml.Media.h>
+#include <winrt/Microsoft.UI.Xaml.Controls.h>
+#else
+#define LVT_HAS_WINUI3_PROJECTION 0
+#endif
+
+// Stub for C++/WinRT error origination (avoid linking windowsapp.lib)
+extern "C" int32_t __stdcall WINRT_IMPL_RoOriginateLanguageException(
+    int32_t error, void* message, void* exception) noexcept {
+    return error;
+}
 
 // GUIDs only forward-declared in xamlOM.h (no .lib provides them)
 const IID IID_IVisualTreeServiceCallback =
@@ -164,7 +190,7 @@ public:
             return S_OK;
         }
 
-        m_diag = diag; // Keep reference for GetIInspectableFromHandle
+        m_diag = diag;
 
         // Create a message-only window on the UI thread for dispatching
         // GetPropertyValuesChain calls (which have thread affinity).
@@ -219,6 +245,14 @@ public:
                     SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS, 0,
                                  reinterpret_cast<LPARAM>(self));
                 }
+                // Get element positions via TransformToVisual (works around broken
+                // ActualOffset serialization in WinUI3). Must run on the UI thread.
+#if LVT_HAS_XAML_PROJECTION
+                if (self->m_msgWnd) {
+                    SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS + 1, 0,
+                                 reinterpret_cast<LPARAM>(self));
+                }
+#endif
                 self->SerializeAndSend();
                 self->m_vts->UnadviseVisualTreeChange(cb);
             }
@@ -286,8 +320,10 @@ private:
     }
 
     // Collect bounds for a single node — isolated for SEH compatibility
-    static void CollectBoundsForNode(IVisualTreeService* vts, TreeNode& node, InstanceHandle handle,
-                                     bool /*logDetail*/) {
+    static void CollectBoundsForNode(IVisualTreeService* vts,
+                                     TreeNode& node, InstanceHandle handle,
+                                     bool logDetail) {
+        if (logDetail) LogMsg("  CollectBoundsForNode ENTER handle=%llu", (unsigned long long)handle);
         unsigned int srcCount = 0, propCount = 0;
         PropertyChainSource* sources = nullptr;
         PropertyChainValue* props = nullptr;
@@ -297,17 +333,67 @@ private:
             return;
         }
         bool hasWidth = false, hasHeight = false;
+        bool foundOffset = false;
         for (unsigned int i = 0; i < propCount; i++) {
             std::wstring name = props[i].PropertyName ? props[i].PropertyName : L"";
             std::wstring value = props[i].Value ? props[i].Value : L"";
             if (name == L"ActualWidth" && !value.empty()) {
-                node.width = _wtof(value.c_str());
-                hasWidth = true;
+                double v = _wtof(value.c_str());
+                if (std::isfinite(v)) {
+                    node.width = v;
+                    hasWidth = true;
+                }
             } else if (name == L"ActualHeight" && !value.empty()) {
-                node.height = _wtof(value.c_str());
-                hasHeight = true;
+                double v = _wtof(value.c_str());
+                if (std::isfinite(v)) {
+                    node.height = v;
+                    hasHeight = true;
+                }
             } else if (name == L"ActualOffset" && !value.empty()) {
-                ParseOffset(value, node.offsetX, node.offsetY);
+                double ox = 0, oy = 0;
+                if (ParseOffset(value, ox, oy) && std::isfinite(ox) && std::isfinite(oy)) {
+                    node.offsetX = ox;
+                    node.offsetY = oy;
+                    foundOffset = true;
+                }
+            }
+            // Extract important XAML properties for the tree dump.
+            // Only capture the first occurrence of each (most-specific in the chain).
+            // For text-like properties, check ValueType to avoid handle references
+            // (XAML serializes reference types as numeric handle IDs).
+            std::wstring valueType = props[i].ValueType ? props[i].ValueType : L"";
+            bool isTextProp = (name == L"Text" || name == L"Content" ||
+                               name == L"Header" || name == L"PlaceholderText" ||
+                               name == L"Description" || name == L"Title" ||
+                               name == L"Glyph");
+            // Heuristic: if value looks like a numeric handle (all digits, > 10 chars),
+            // it's a reference to a string object, not the string itself.
+            bool looksLikeHandle = value.size() > 10;
+            if (looksLikeHandle) {
+                bool allDigits = true;
+                for (wchar_t c : value) { if (c < L'0' || c > L'9') { allDigits = false; break; } }
+                looksLikeHandle = allDigits;
+            }
+            bool isStateProp = (name == L"AutomationProperties.Name" ||
+                                name == L"AutomationProperties.AutomationId" ||
+                                name == L"AutomationProperties.HelpText" ||
+                                name == L"IsEnabled" || name == L"Visibility" ||
+                                name == L"IsChecked" || name == L"IsSelected" ||
+                                name == L"IsOn" || name == L"Orientation" ||
+                                name == L"Source" || name == L"Tag");
+            bool isStringValue = valueType == L"String" || valueType == L"" ||
+                                 valueType == L"Boolean" || valueType == L"Int32" ||
+                                 valueType == L"Double" || valueType == L"Enum";
+            if (!value.empty() && value != L"0" && !looksLikeHandle &&
+                ((isTextProp && isStringValue) || isStateProp)) {
+                // Only store if not already present (first = most-specific)
+                bool found = false;
+                for (auto& p : node.properties) {
+                    if (p.first == name) { found = true; break; }
+                }
+                if (!found) {
+                    node.properties.emplace_back(name, value);
+                }
             }
             if (props[i].Type) SysFreeString(props[i].Type);
             if (props[i].DeclaringType) SysFreeString(props[i].DeclaringType);
@@ -325,7 +411,8 @@ private:
     }
 
     // SEH wrapper for single-node bounds collection (cannot use __try with C++ objects)
-    static int CollectBoundsForNodeSEH(IVisualTreeService* vts, TreeNode& node, InstanceHandle handle,
+    static int CollectBoundsForNodeSEH(IVisualTreeService* vts,
+                                       TreeNode& node, InstanceHandle handle,
                                        bool logDetail) {
         __try {
             CollectBoundsForNode(vts, node, handle, logDetail);
@@ -341,7 +428,7 @@ private:
         int collected = 0;
         int idx = 0;
         for (auto& [handle, node] : m_nodes) {
-            bool logDetail = (idx < 3); // Log details for first 3 nodes
+            bool logDetail = false;
             int code = CollectBoundsForNodeSEH(vts, node, handle, logDetail);
             if (code != 0) {
                 LogMsg("GetPropertyValuesChain crashed for handle %llu: 0x%08X",
@@ -353,11 +440,87 @@ private:
         LogMsg("CollectBounds: collected bounds for %d/%zu nodes", collected, m_nodes.size());
     }
 
+#if LVT_HAS_XAML_PROJECTION
+    // Use TransformToVisual to get each element's position relative to the XAML island root.
+    // Also reads Text property from TextBlock elements.
+    // Tries both WinUI3 (Microsoft.UI.Xaml) and system XAML (Windows.UI.Xaml) interfaces.
+    void CollectPositionsAndText() {
+        namespace WUX = winrt::Windows::UI::Xaml;
+        namespace WUXC = winrt::Windows::UI::Xaml::Controls;
+
+        if (!m_diag) return;
+
+        int positioned = 0, textsRead = 0;
+        for (auto& [handle, node] : m_nodes) {
+            if (!node.hasBounds) continue;
+
+            ::IInspectable* raw = nullptr;
+            HRESULT hr = m_diag->GetIInspectableFromHandle(handle, &raw);
+            if (FAILED(hr) || !raw) continue;
+
+            try {
+                winrt::Windows::Foundation::IInspectable inspectable;
+                winrt::copy_from_abi(inspectable, raw);
+                raw = nullptr; // ownership transferred
+
+                // Position via TransformToVisual — try WinUI3 first, then system XAML
+                bool gotPosition = false;
+#if LVT_HAS_WINUI3_PROJECTION
+                if (auto uiElem = inspectable.try_as<winrt::Microsoft::UI::Xaml::UIElement>()) {
+                    auto pt = uiElem.TransformToVisual(nullptr).TransformPoint({0, 0});
+                    if (std::isfinite(pt.X) && std::isfinite(pt.Y)) {
+                        node.offsetX = static_cast<double>(pt.X);
+                        node.offsetY = static_cast<double>(pt.Y);
+                        gotPosition = true;
+                    }
+                }
+#endif
+                if (!gotPosition) {
+                    if (auto uiElem = inspectable.try_as<WUX::UIElement>()) {
+                        auto pt = uiElem.TransformToVisual(nullptr).TransformPoint({0, 0});
+                        if (std::isfinite(pt.X) && std::isfinite(pt.Y)) {
+                            node.offsetX = static_cast<double>(pt.X);
+                            node.offsetY = static_cast<double>(pt.Y);
+                            gotPosition = true;
+                        }
+                    }
+                }
+                if (gotPosition) positioned++;
+
+                // Text from TextBlock — try WinUI3 first, then system XAML
+                winrt::hstring text;
+#if LVT_HAS_WINUI3_PROJECTION
+                if (auto tb = inspectable.try_as<winrt::Microsoft::UI::Xaml::Controls::TextBlock>())
+                    text = tb.Text();
+#endif
+                if (text.empty()) {
+                    if (auto tb = inspectable.try_as<WUXC::TextBlock>())
+                        text = tb.Text();
+                }
+                if (!text.empty()) {
+                    node.properties.emplace_back(L"Text", std::wstring(text));
+                    textsRead++;
+                }
+            } catch (...) {
+                // Swallow WinRT exceptions — element may be in an invalid state
+            }
+
+            if (raw) raw->Release();
+        }
+        LogMsg("CollectPositionsAndText: %d positioned, %d texts", positioned, textsRead);
+    }
+#endif
+
     // Called on the UI thread via SendMessage from the worker thread
 public:
     void CollectBoundsOnUIThread() {
         CollectBounds(m_vts);
     }
+#if LVT_HAS_XAML_PROJECTION
+    void CollectPositionsOnUIThread() {
+        CollectPositionsAndText();
+    }
+#endif
 private:
 
     static std::wstring Escape(const std::wstring& s) {
@@ -388,12 +551,28 @@ private:
         j += L",\"handle\":" + std::to_wstring(n.handle);
 
         if (n.hasBounds) {
-            // Use snprintf for consistent decimal formatting
+            // Always include width/height for tree dump consumers.
+            // Only include offsetX/offsetY when non-zero — WinUI3's XAML diagnostics
+            // serializes ActualOffset (Vector3) as "0", so zero offsets are unreliable.
             char buf[128];
-            snprintf(buf, sizeof(buf), ",\"width\":%.1f,\"height\":%.1f,\"offsetX\":%.1f,\"offsetY\":%.1f",
-                     n.width, n.height, n.offsetX, n.offsetY);
-            // Convert to wide string
+            snprintf(buf, sizeof(buf), ",\"width\":%.1f,\"height\":%.1f",
+                     n.width, n.height);
             for (const char* p = buf; *p; p++) j += static_cast<wchar_t>(*p);
+            if (n.offsetX != 0.0 || n.offsetY != 0.0) {
+                snprintf(buf, sizeof(buf), ",\"offsetX\":%.1f,\"offsetY\":%.1f",
+                         n.offsetX, n.offsetY);
+                for (const char* p = buf; *p; p++) j += static_cast<wchar_t>(*p);
+            }
+        }
+
+        // Serialize extracted properties
+        if (!n.properties.empty()) {
+            j += L",\"properties\":{";
+            for (size_t i = 0; i < n.properties.size(); i++) {
+                if (i) j += L",";
+                j += L"\"" + Escape(n.properties[i].first) + L"\":\"" + Escape(n.properties[i].second) + L"\"";
+            }
+            j += L"}";
         }
 
         if (!n.childHandles.empty()) {
@@ -455,6 +634,15 @@ static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         if (self) {
             self->CollectBoundsOnUIThread();
         }
+        return 0;
+    }
+    if (msg == LvtTap::WM_COLLECT_BOUNDS + 1) {
+#if LVT_HAS_XAML_PROJECTION
+        auto* self = reinterpret_cast<LvtTap*>(lParam);
+        if (self) {
+            self->CollectPositionsOnUIThread();
+        }
+#endif
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);

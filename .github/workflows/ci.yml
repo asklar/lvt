@@ -23,6 +23,9 @@ jobs:
         with:
           vcpkgGitCommitId: b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01
 
+      - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
+        run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
+
       - name: Configure
         run: cmake --preset default
 

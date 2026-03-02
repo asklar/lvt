@@ -11,6 +11,7 @@
 #include <cstring>
 #include <string>
 #include <fstream>
+#include <nlohmann/json.hpp>
 
 static void print_usage() {
     fprintf(stderr,
@@ -30,6 +31,9 @@ static void print_usage() {
         "  --output <file>      Write output to file instead of stdout\n"
         "  --format <fmt>       Output format: json (default) or xml\n"
         "  --screenshot <file>  Capture annotated screenshot to PNG\n"
+#ifndef NDEBUG
+        "  --annotations-json <file>  Write annotation rectangles as JSON (test hook)\n"
+#endif
         "  --dump               Output the tree (default; implied unless --screenshot)\n"
         "  --element <id>       Scope to a specific element subtree\n"
         "  --frameworks         Just detect and list frameworks\n"
@@ -47,6 +51,9 @@ struct Args {
     std::string outputFile;
     std::string format = "json";
     std::string screenshotFile;
+#ifndef NDEBUG
+    std::string annotationsFile;
+#endif
     std::string elementId;
     int depth = -1;
     bool frameworksOnly = false;
@@ -75,6 +82,10 @@ static Args parse_args(int argc, char* argv[]) {
             args.format = argv[++i];
         } else if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
             args.screenshotFile = argv[++i];
+#ifndef NDEBUG
+        } else if (strcmp(argv[i], "--annotations-json") == 0 && i + 1 < argc) {
+            args.annotationsFile = argv[++i];
+#endif
         } else if (strcmp(argv[i], "--element") == 0 && i + 1 < argc) {
             args.elementId = argv[++i];
         } else if (strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
@@ -264,6 +275,25 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "lvt: saved screenshot to %s\n", args.screenshotFile.c_str());
         }
     }
+
+#ifndef NDEBUG
+    // Annotations JSON — test hook for verifying which elements are annotated
+    if (!args.annotationsFile.empty()) {
+        auto annotations = lvt::collect_annotations(target.hwnd, &tree);
+        nlohmann::json aj = nlohmann::json::array();
+        for (auto& a : annotations) {
+            aj.push_back({{"id", a.id}, {"x", a.x}, {"y", a.y},
+                          {"width", a.width}, {"height", a.height}});
+        }
+        std::ofstream out(args.annotationsFile);
+        if (out) {
+            out << aj.dump(2) << "\n";
+            if (lvt::g_debug)
+                fprintf(stderr, "lvt: wrote %zu annotations to %s\n",
+                        annotations.size(), args.annotationsFile.c_str());
+        }
+    }
+#endif
 
     lvt::unload_plugins();
     return 0;

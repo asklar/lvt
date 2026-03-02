@@ -4,6 +4,7 @@
 #include "xaml_diag_common.h"
 #include "../tap/tap_clsid.h"
 #include "../debug.h"
+#include "../bounds_util.h"
 
 #include "../target.h"
 
@@ -139,29 +140,68 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     Element el;
     el.framework = framework;
     el.className = sanitize(j.value("type", ""));
-    el.text = sanitize(j.value("name", ""));
+
+    // x:Name is a developer identifier, not user-visible text — store as property
+    std::string xname = sanitize(j.value("name", ""));
+    if (!xname.empty()) {
+        el.properties["name"] = xname;
+    }
 
     // Simplify type name: "Windows.UI.Xaml.Controls.Button" -> "Button"
     auto lastDot = el.className.rfind('.');
     el.type = (lastDot != std::string::npos) ? el.className.substr(lastDot + 1) : el.className;
 
-    // Parse bounds from TAP DLL data
+    // Parse bounds from TAP DLL data.
+    // offsetX/offsetY from TransformToVisual are absolute positions within the
+    // XAML island, relative to the island root. parentOffsetX/Y is the bridge's
+    // screen position, so absX/Y = bridge position + element offset within island.
     double ox = j.value("offsetX", 0.0);
     double oy = j.value("offsetY", 0.0);
     double w = j.value("width", 0.0);
     double h = j.value("height", 0.0);
+    bool hasOffsetData = j.contains("offsetX") || j.contains("offsetY");
+    // TransformToVisual returns absolute position within the island,
+    // so use parentOffsetX/Y only as the bridge base (not accumulated).
     double absX = parentOffsetX + ox;
     double absY = parentOffsetY + oy;
-    if (w > 0 && h > 0) {
-        el.bounds.x = static_cast<int>(absX);
-        el.bounds.y = static_cast<int>(absY);
-        el.bounds.width = static_cast<int>(w);
-        el.bounds.height = static_cast<int>(h);
+    if (w > 0 && h > 0 && hasOffsetData) {
+        auto sx = safe_double_to_int(absX);
+        auto sy = safe_double_to_int(absY);
+        auto sw = safe_double_to_int(w);
+        auto sh = safe_double_to_int(h);
+        if (sx && sy && sw && sh) {
+            el.bounds.x = *sx;
+            el.bounds.y = *sy;
+            el.bounds.width = *sw;
+            el.bounds.height = *sh;
+        }
+    }
+
+    // Copy additional properties if present in TAP DLL output
+    if (j.contains("properties") && j["properties"].is_object()) {
+        for (auto& [key, val] : j["properties"].items()) {
+            if (val.is_string()) {
+                std::string v = sanitize(val.get<std::string>());
+                el.properties[key] = v;
+            }
+        }
+    }
+    // Set display text from text-content properties only (not automation names).
+    // Remove the source property to avoid duplication in the output (text= vs Text=).
+    for (const char* prop : {"Text", "Content", "Header"}) {
+        auto it = el.properties.find(prop);
+        if (it != el.properties.end() && !it->second.empty()) {
+            el.text = it->second;
+            el.properties.erase(it);
+            break;
+        }
     }
 
     if (j.contains("children") && j["children"].is_array()) {
         for (auto& child : j["children"]) {
-            graft_json_node(child, el, framework, absX, absY);
+            // Pass bridge base (parentOffsetX/Y) — not accumulated — since
+            // TransformToVisual offsets are already absolute within the island
+            graft_json_node(child, el, framework, parentOffsetX, parentOffsetY);
         }
     }
 
@@ -348,28 +388,77 @@ bool inject_and_collect_xaml_tree(
 
     // Graft XAML elements into corresponding bridge windows.
     // Each DesktopWindowXamlSource root maps 1:1 to a DesktopChildSiteBridge HWND.
-    // We match them by order since both lists are enumerated in the same order.
-    // XAML element offsets are relative to the XAML root; we add the bridge window's
-    // screen position to convert to screen coordinates for annotation.
+    // We match by best-fit size: the XAML root's first child dimensions are compared
+    // against each bridge's window bounds to find the most compatible match.
+    // This is more robust than order-based matching since Win32 HWND enumeration order
+    // may differ from XAML tree root enumeration order.
     if (treeJson.is_array()) {
         std::vector<Element*> bridges;
         collect_bridges(root, bridges);
+        std::vector<bool> bridgeUsed(bridges.size(), false);
 
-        size_t bridgeIdx = 0;
         for (auto& node : treeJson) {
             std::string typeName = sanitize(node.value("type", ""));
-            // Try to graft DesktopWindowXamlSource roots into matching bridges
-            if (typeName.find("DesktopWindowXamlSource") != std::string::npos
-                && bridgeIdx < bridges.size()) {
-                auto* bridge = bridges[bridgeIdx];
-                // Use bridge window's screen bounds as coordinate origin for XAML elements
+            if (typeName.find("DesktopWindowXamlSource") == std::string::npos) {
+                graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
+                continue;
+            }
+
+            // Get the XAML content dimensions from descendants with bounds
+            double contentW = 0, contentH = 0;
+            std::function<void(const json&)> findContentSize = [&](const json& n) {
+                double w = n.value("width", 0.0);
+                double h = n.value("height", 0.0);
+                if (w > contentW) contentW = w;
+                if (h > contentH) contentH = h;
+                if (n.contains("children") && n["children"].is_array()) {
+                    for (auto& child : n["children"]) {
+                        findContentSize(child);
+                        if (contentW > 0 && contentH > 0) return; // found, stop early
+                    }
+                }
+            };
+            if (node.contains("children") && node["children"].is_array()) {
+                for (auto& child : node["children"]) {
+                    findContentSize(child);
+                }
+            }
+
+            // Skip bridge matching for roots with no measurable content
+            if (contentW <= 0 && contentH <= 0) {
+                graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
+                continue;
+            }
+
+            if (g_debug) {
+                fprintf(stderr, "lvt: XAML root contentW=%.0f contentH=%.0f\n",
+                        contentW, contentH);
+            }
+
+            // Find the best-matching bridge by size similarity
+            int bestIdx = -1;
+            double bestScore = 1e18;
+            for (size_t i = 0; i < bridges.size(); i++) {
+                if (bridgeUsed[i]) continue;
+                double bw = bridges[i]->bounds.width;
+                double bh = bridges[i]->bounds.height;
+                // Score: prefer bridges whose dimensions best accommodate the content
+                double wDiff = std::abs(bw - contentW);
+                double hDiff = std::abs(bh - contentH);
+                double score = wDiff + hDiff;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestIdx = static_cast<int>(i);
+                }
+            }
+
+            if (bestIdx >= 0) {
+                bridgeUsed[bestIdx] = true;
+                auto* bridge = bridges[bestIdx];
                 double baseX = bridge->bounds.x;
                 double baseY = bridge->bounds.y;
                 graft_json_node(node, *bridge, frameworkLabel, baseX, baseY);
-                bridgeIdx++;
             } else {
-                // Non-bridge XAML root (e.g. UWP CoreWindow): graft under root,
-                // using root's screen bounds as coordinate base
                 graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
             }
         }
