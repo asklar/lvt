@@ -172,6 +172,20 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
         }
     }
 
+    // Copy additional properties if present in TAP DLL output
+    if (j.contains("properties") && j["properties"].is_object()) {
+        for (auto& [key, val] : j["properties"].items()) {
+            if (val.is_string()) {
+                std::string v = sanitize(val.get<std::string>());
+                // Use Text/Content/Header as the element's display text if not already set
+                if (el.text.empty() && (key == "Text" || key == "Content" || key == "Header")) {
+                    el.text = v;
+                }
+                el.properties[key] = std::move(v);
+            }
+        }
+    }
+
     if (j.contains("children") && j["children"].is_array()) {
         for (auto& child : j["children"]) {
             // Pass bridge base (parentOffsetX/Y) — not accumulated — since

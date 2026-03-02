@@ -330,6 +330,44 @@ private:
                     foundOffset = true;
                 }
             }
+            // Extract important XAML properties for the tree dump.
+            // Only capture the first occurrence of each (most-specific in the chain).
+            // For text-like properties, check ValueType to avoid handle references
+            // (XAML serializes reference types as numeric handle IDs).
+            std::wstring valueType = props[i].ValueType ? props[i].ValueType : L"";
+            bool isTextProp = (name == L"Text" || name == L"Content" ||
+                               name == L"Header" || name == L"PlaceholderText" ||
+                               name == L"Description" || name == L"Title" ||
+                               name == L"Glyph");
+            // Heuristic: if value looks like a numeric handle (all digits, > 10 chars),
+            // it's a reference to a string object, not the string itself.
+            bool looksLikeHandle = value.size() > 10;
+            if (looksLikeHandle) {
+                bool allDigits = true;
+                for (wchar_t c : value) { if (c < L'0' || c > L'9') { allDigits = false; break; } }
+                looksLikeHandle = allDigits;
+            }
+            bool isStateProp = (name == L"AutomationProperties.Name" ||
+                                name == L"AutomationProperties.AutomationId" ||
+                                name == L"AutomationProperties.HelpText" ||
+                                name == L"IsEnabled" || name == L"Visibility" ||
+                                name == L"IsChecked" || name == L"IsSelected" ||
+                                name == L"IsOn" || name == L"Orientation" ||
+                                name == L"Source" || name == L"Tag");
+            bool isStringValue = valueType == L"String" || valueType == L"" ||
+                                 valueType == L"Boolean" || valueType == L"Int32" ||
+                                 valueType == L"Double" || valueType == L"Enum";
+            if (!value.empty() && value != L"0" && !looksLikeHandle &&
+                ((isTextProp && isStringValue) || isStateProp)) {
+                // Only store if not already present (first = most-specific)
+                bool found = false;
+                for (auto& p : node.properties) {
+                    if (p.first == name) { found = true; break; }
+                }
+                if (!found) {
+                    node.properties.emplace_back(name, value);
+                }
+            }
             if (props[i].Type) SysFreeString(props[i].Type);
             if (props[i].DeclaringType) SysFreeString(props[i].DeclaringType);
             if (props[i].ValueType) SysFreeString(props[i].ValueType);
@@ -488,6 +526,16 @@ private:
                          n.offsetX, n.offsetY);
                 for (const char* p = buf; *p; p++) j += static_cast<wchar_t>(*p);
             }
+        }
+
+        // Serialize extracted properties
+        if (!n.properties.empty()) {
+            j += L",\"properties\":{";
+            for (size_t i = 0; i < n.properties.size(); i++) {
+                if (i) j += L",";
+                j += L"\"" + Escape(n.properties[i].first) + L"\":\"" + Escape(n.properties[i].second) + L"\"";
+            }
+            j += L"}";
         }
 
         if (!n.childHandles.empty()) {
