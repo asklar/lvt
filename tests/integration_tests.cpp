@@ -422,6 +422,16 @@ static bool frameworks_contain_avalonia(const json& j) {
     return false;
 }
 
+static bool frameworks_contain_winforms(const json& j) {
+    if (!j.contains("frameworks") || !j["frameworks"].is_array())
+        return false;
+    for (auto& fw : j["frameworks"]) {
+        if (fw.is_string() && fw.get<std::string>().starts_with("winforms"))
+            return true;
+    }
+    return false;
+}
+
 static bool has_winui3_descendant(const json& el) {
     if (el.value("framework", "") == "winui3")
         return true;
@@ -735,6 +745,181 @@ TEST_F(AvaloniaFixture, DurableKeysAndQueryRoundTrip) {
     ASSERT_FALSE(buttonKey.empty());
     auto queriedName = query_prop_until(lvt, pid_arg(), buttonKey, "name", "ClickButton");
     EXPECT_EQ(trim_crlf(queriedName), "ClickButton");
+}
+
+class WinFormsSampleFixture : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        s_sample_exe = WINFORMS_SAMPLE_EXE_PATH;
+        if (!fs::exists(s_sample_exe)) {
+            s_skip_reason = "WinForms sample app not found: " + s_sample_exe;
+            return;
+        }
+
+        STARTUPINFOA si = {sizeof(si)};
+        s_pi = {};
+        auto workdir = fs::path(s_sample_exe).parent_path().string();
+        std::string cmd = "\"" + s_sample_exe + "\"";
+        if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                            nullptr, workdir.c_str(), &si, &s_pi)) {
+            s_skip_reason = "Failed to launch WinForms sample app";
+            return;
+        }
+        s_pid = s_pi.dwProcessId;
+        if (s_pi.hProcess) {
+            WaitForInputIdle(s_pi.hProcess, 5000);
+        }
+
+        auto lvt = get_lvt_path();
+        auto winformsReady = [](const json& j) {
+            return frameworks_contain_winforms(j) &&
+                   j.contains("root") &&
+                   json_tree_has_named_control(j["root"], "okButton") &&
+                   json_tree_has_named_control(j["root"], "inputTextBox") &&
+                   json_tree_has_named_control(j["root"], "messageLabel");
+        };
+        auto readyDump = dump_ready_tree(lvt, get_pid_arg(), winformsReady, 50);
+        if (winformsReady(readyDump)) {
+            s_ready = true;
+            return;
+        }
+
+        s_skip_reason = "WinForms sample app never became ready with framework and named controls";
+    }
+
+    static void TearDownTestSuite() {
+        if (s_pi.hProcess) {
+            TerminateProcess(s_pi.hProcess, 0);
+            CloseHandle(s_pi.hProcess);
+            CloseHandle(s_pi.hThread);
+        }
+    }
+
+    static void SkipIfNotReady() {
+        if (!s_ready)
+            GTEST_SKIP() << s_skip_reason;
+    }
+
+    static std::string get_pid_arg() {
+        return "--pid " + std::to_string(s_pid);
+    }
+
+    static PROCESS_INFORMATION s_pi;
+    static DWORD s_pid;
+    static bool s_ready;
+    static std::string s_sample_exe;
+    static std::string s_skip_reason;
+};
+
+PROCESS_INFORMATION WinFormsSampleFixture::s_pi = {};
+DWORD WinFormsSampleFixture::s_pid = 0;
+bool WinFormsSampleFixture::s_ready = false;
+std::string WinFormsSampleFixture::s_sample_exe;
+std::string WinFormsSampleFixture::s_skip_reason;
+
+TEST_F(WinFormsSampleFixture, DetectsWinFormsFramework) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
+    ASSERT_FALSE(output.empty());
+    EXPECT_NE(output.find("winforms"), std::string::npos);
+}
+
+TEST_F(WinFormsSampleFixture, EnrichesControlsWithManagedNameAndType) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto winformsReady = [](const json& j) {
+        return frameworks_contain_winforms(j) &&
+               j.contains("root") &&
+               json_tree_has_named_control(j["root"], "okButton") &&
+               json_tree_has_named_control(j["root"], "inputTextBox") &&
+               json_tree_has_named_control(j["root"], "messageLabel");
+    };
+    auto j = dump_ready_tree(lvt, get_pid_arg(), winformsReady, 50);
+    ASSERT_TRUE(winformsReady(j)) << "WinForms tree never became ready";
+
+    auto* okButton = find_named_control(j["root"], "okButton");
+    ASSERT_NE(okButton, nullptr);
+    EXPECT_EQ(okButton->value("framework", ""), "winforms");
+    EXPECT_EQ(okButton->value("type", ""), "Button");
+    EXPECT_EQ((*okButton)["properties"].value("winforms.type", ""), "System.Windows.Forms.Button");
+
+    auto* textBox = find_named_control(j["root"], "inputTextBox");
+    ASSERT_NE(textBox, nullptr);
+    EXPECT_EQ(textBox->value("type", ""), "TextBox");
+    EXPECT_EQ((*textBox)["properties"].value("winforms.type", ""), "System.Windows.Forms.TextBox");
+
+    auto* label = find_named_control(j["root"], "messageLabel");
+    ASSERT_NE(label, nullptr);
+    EXPECT_EQ(label->value("type", ""), "Label");
+
+    auto okKey = okButton->value("key", "");
+    ASSERT_FALSE(okKey.empty());
+    auto queried = query_element_until(lvt, get_pid_arg(), okKey, okKey);
+    ASSERT_FALSE(queried.is_discarded()) << "query for okButton key never resolved";
+    EXPECT_EQ(queried.value("framework", ""), "winforms");
+    EXPECT_EQ(queried.value("type", ""), "Button");
+    EXPECT_EQ(queried.value("name", ""), "okButton");
+
+    auto queriedType = query_prop_until(lvt, get_pid_arg(), okKey, "winforms.type",
+                                        "System.Windows.Forms.Button");
+    EXPECT_EQ(queriedType, "System.Windows.Forms.Button");
+}
+
+TEST_F(WinFormsSampleFixture, DurableKeyContract) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto winformsReady = [](const json& j) {
+        return frameworks_contain_winforms(j) &&
+               j.contains("root") &&
+               json_tree_has_named_control(j["root"], "okButton") &&
+               json_tree_has_named_control(j["root"], "inputTextBox") &&
+               json_tree_has_named_control(j["root"], "messageLabel");
+    };
+    auto j1 = dump_ready_tree(lvt, get_pid_arg(), winformsReady, 50);
+    auto j2 = dump_ready_tree(lvt, get_pid_arg(), winformsReady, 50);
+    ASSERT_TRUE(winformsReady(j1)) << "WinForms tree never became ready (dump 1)";
+    ASSERT_TRUE(winformsReady(j2)) << "WinForms tree never became ready (dump 2)";
+    ASSERT_TRUE(frameworks_contain_winforms(j1));
+
+    std::vector<const json*> elements;
+    collect_json_elements(j1["root"], elements);
+    ASSERT_GT(elements.size(), 0u);
+
+    std::set<std::string> keys;
+    for (auto* el : elements) {
+        auto key = el->value("key", "");
+        EXPECT_FALSE(key.empty()) << "Element " << el->value("id", "?") << " has empty durable key";
+        EXPECT_TRUE(keys.insert(key).second) << "Duplicate durable key: " << key;
+    }
+
+    std::map<std::string, std::string> firstMap;
+    std::map<std::string, std::string> secondMap;
+    collect_key_contract_map(j1["root"], "0", firstMap);
+    collect_key_contract_map(j2["root"], "0", secondMap);
+    EXPECT_EQ(firstMap, secondMap);
+
+    auto* okButton = find_named_control(j1["root"], "okButton");
+    ASSERT_NE(okButton, nullptr);
+    EXPECT_EQ(okButton->value("framework", ""), "winforms");
+    EXPECT_EQ(okButton->value("type", ""), "Button");
+    EXPECT_EQ((*okButton)["properties"].value("winforms.type", ""), "System.Windows.Forms.Button");
+
+    auto okKey = okButton->value("key", "");
+    ASSERT_FALSE(okKey.empty());
+    auto queried = query_element_until(lvt, get_pid_arg(), okKey, okKey);
+    ASSERT_FALSE(queried.is_discarded()) << "query for okButton key never resolved";
+    EXPECT_EQ(queried.value("key", ""), okKey);
+    EXPECT_EQ(queried.value("type", ""), "Button");
+    EXPECT_EQ(queried.value("framework", ""), "winforms");
+    EXPECT_EQ(queried.value("name", ""), "okButton");
+
+    auto queriedType = query_prop_until(lvt, get_pid_arg(), okKey, "winforms.type",
+                                        "System.Windows.Forms.Button");
+    EXPECT_EQ(queriedType, "System.Windows.Forms.Button");
 }
 
 class WpfSampleFixture : public ::testing::Test {

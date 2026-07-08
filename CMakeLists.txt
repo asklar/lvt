@@ -23,6 +23,8 @@ add_executable(lvt
     src/providers/winui3_provider.cpp
     src/providers/wpf_provider.cpp
     src/providers/wpf_inject.cpp
+    src/providers/winforms_provider.cpp
+    src/providers/winforms_inject.cpp
     src/providers/xaml_diag_common.cpp
 )
 
@@ -192,6 +194,46 @@ add_custom_command(TARGET lvt_wpf_tap POST_BUILD
     COMMENT "Copying managed WPF tree walker assembly"
 )
 
+# WinForms TAP DLL — native loader injected into WinForms target process
+add_library(lvt_winforms_tap SHARED
+    src/tap_winforms/winforms_tap_native.cpp
+    src/tap_winforms/winforms_tap_native.def
+)
+target_compile_definitions(lvt_winforms_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(lvt_winforms_tap PRIVATE src)
+target_link_libraries(lvt_winforms_tap PRIVATE ole32)
+set_property(TARGET lvt_winforms_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+set_target_properties(lvt_winforms_tap PROPERTIES
+    OUTPUT_NAME "lvt_winforms_tap_${TAP_ARCH_SUFFIX}"
+    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>
+)
+
+set(LVT_WINFORMS_MANAGED_DLL "${CMAKE_SOURCE_DIR}/src/tap_winforms/bin/Release/LvtWinFormsTap.dll")
+add_custom_command(
+    OUTPUT "${LVT_WINFORMS_MANAGED_DLL}"
+    COMMAND dotnet build "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.csproj" -c Release --nologo
+    DEPENDS
+        "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.csproj"
+        "${CMAKE_SOURCE_DIR}/src/tap_winforms/WinFormsTreeWalker.cs"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building managed WinForms tree walker assembly"
+    VERBATIM
+)
+add_custom_target(lvt_winforms_managed ALL
+    DEPENDS "${LVT_WINFORMS_MANAGED_DLL}"
+)
+add_dependencies(lvt_winforms_tap lvt_winforms_managed)
+add_custom_command(TARGET lvt_winforms_tap POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${LVT_WINFORMS_MANAGED_DLL}"
+        "$<TARGET_FILE_DIR:lvt>/LvtWinFormsTap.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.runtimeconfig.json"
+        "$<TARGET_FILE_DIR:lvt>/LvtWinFormsTap.runtimeconfig.json"
+    COMMENT "Copying managed WinForms tree walker assembly"
+)
+
 # Avalonia plugin DLL — runtime-loaded plugin for Avalonia UI framework support
 add_library(lvt_avalonia_plugin SHARED
     src/plugin_avalonia/lvt_avalonia_plugin.cpp
@@ -291,6 +333,8 @@ add_executable(lvt_unit_tests
     src/providers/winui3_provider.cpp
     src/providers/wpf_provider.cpp
     src/providers/wpf_inject.cpp
+    src/providers/winforms_provider.cpp
+    src/providers/winforms_inject.cpp
     src/providers/xaml_diag_common.cpp
 )
 target_include_directories(lvt_unit_tests PRIVATE src)
@@ -352,6 +396,18 @@ add_custom_target(avalonia_test_app ALL
 file(TO_NATIVE_PATH "${AVALONIA_SAMPLE_OUTPUT_DIR}/AvaloniaTestApp.exe" AVALONIA_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" AVALONIA_SAMPLE_EXE_ESCAPED "${AVALONIA_SAMPLE_EXE_NATIVE}")
 
+# WinForms sample app used by integration tests
+set(WINFORMS_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinFormsSample/WinFormsSample.csproj")
+set(WINFORMS_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinFormsSample")
+add_custom_target(winforms_sample_app ALL
+    COMMAND dotnet build "${WINFORMS_SAMPLE_PROJECT}" -c Release -o "${WINFORMS_SAMPLE_OUTPUT_DIR}" --nologo
+    BYPRODUCTS "${WINFORMS_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building WinForms sample app"
+)
+file(TO_NATIVE_PATH "${WINFORMS_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe" WINFORMS_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WINFORMS_SAMPLE_EXE_ESCAPED "${WINFORMS_SAMPLE_EXE_NATIVE}")
+
 # Integration tests — require a running Notepad instance
 add_executable(lvt_integration_tests
     tests/integration_tests.cpp
@@ -363,6 +419,7 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
     WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
     AVALONIA_SAMPLE_EXE_PATH="${AVALONIA_SAMPLE_EXE_ESCAPED}"
+    WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
 )
 target_link_libraries(lvt_integration_tests PRIVATE
     GTest::gtest GTest::gtest_main
@@ -372,12 +429,14 @@ target_link_libraries(lvt_integration_tests PRIVATE
 target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
 add_dependencies(lvt_integration_tests
     lvt
+    lvt_winforms_tap
     lvt_avalonia_plugin
     lvt_avalonia_tap
     lvt_avalonia_tree_walker
     avalonia_test_app
     wpf_sample_app
     winui3_sample_app
+    winforms_sample_app
 )
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
 

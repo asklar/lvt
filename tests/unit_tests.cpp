@@ -8,6 +8,7 @@
 #include "watch_diff.h"
 #include "framework_detector.h"
 #include "target.h"
+#include "providers/winforms_inject.h"
 #include <nlohmann/json.hpp>
 #include <string>
 
@@ -71,6 +72,7 @@ TEST(FrameworkToString, AllFrameworks) {
     EXPECT_EQ(framework_to_string(Framework::Xaml), "xaml");
     EXPECT_EQ(framework_to_string(Framework::WinUI3), "winui3");
     EXPECT_EQ(framework_to_string(Framework::Wpf), "wpf");
+    EXPECT_EQ(framework_to_string(Framework::WinForms), "winforms");
     EXPECT_EQ(framework_to_string(Framework::Plugin), "plugin");
 }
 
@@ -472,6 +474,53 @@ TEST(Element, TreeConstruction) {
     EXPECT_EQ(root.children.size(), 2);
     EXPECT_EQ(root.children[0].type, "Child1");
     EXPECT_EQ(root.children[1].type, "Child2");
+}
+
+// ---- WinForms enrichment ----
+
+TEST(WinFormsEnrichment, AppliesManagedPropertiesByHwnd) {
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+    root.nativeHandle = 0x100;
+
+    Element child;
+    child.type = "Button";
+    child.framework = "win32";
+    child.nativeHandle = 0x200;
+    child.properties["hwnd"] = "0x00000200";
+    root.children.push_back(child);
+
+    auto ok = apply_winforms_control_json(root,
+        R"([{"hwnd":"100","type":"System.Windows.Forms.Form","name":"MainForm","children":[)"
+        R"({"hwnd":"200","type":"System.Windows.Forms.Button","name":"okButton","text":"OK","enabled":true,"autoSize":false})"
+        R"(]}])");
+
+    ASSERT_TRUE(ok);
+    EXPECT_EQ(root.framework, "winforms");
+    EXPECT_EQ(root.type, "Form");
+    EXPECT_EQ(root.properties["winforms.type"], "System.Windows.Forms.Form");
+    EXPECT_EQ(root.properties["name"], "MainForm");
+
+    auto& enriched = root.children[0];
+    EXPECT_EQ(enriched.framework, "winforms");
+    EXPECT_EQ(enriched.type, "Button");
+    EXPECT_EQ(enriched.properties["winforms.type"], "System.Windows.Forms.Button");
+    EXPECT_EQ(enriched.properties["name"], "okButton");
+    EXPECT_EQ(enriched.properties["winforms.text"], "OK");
+    EXPECT_EQ(enriched.properties["winforms.enabled"], "true");
+    EXPECT_EQ(enriched.properties["autoSize"], "false");
+}
+
+TEST(WinFormsEnrichment, InvalidJsonDoesNotModifyTree) {
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+    root.nativeHandle = 0x100;
+
+    EXPECT_FALSE(apply_winforms_control_json(root, "{not json"));
+    EXPECT_EQ(root.framework, "win32");
+    EXPECT_EQ(root.type, "Window");
 }
 
 // ---- Watch diff ----

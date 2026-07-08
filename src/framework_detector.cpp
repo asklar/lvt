@@ -14,6 +14,7 @@ std::string framework_to_string(Framework f) {
     case Framework::Xaml:   return "xaml";
     case Framework::WinUI3: return "winui3";
     case Framework::Wpf:    return "wpf";
+    case Framework::WinForms: return "winforms";
     case Framework::Plugin: return "plugin";
     }
     return "unknown";
@@ -37,6 +38,7 @@ struct DetectData {
     bool hasWinUI3 = false;
     bool hasXaml = false;
     bool hasWpf = false;
+    bool hasWinForms = false;
 };
 
 static BOOL CALLBACK detect_child_proc(HWND hwnd, LPARAM lParam) {
@@ -64,6 +66,10 @@ static BOOL CALLBACK detect_child_proc(HWND hwnd, LPARAM lParam) {
 
     if (wcsstr(cls, L"HwndWrapper[")) {
         data->hasWpf = true;
+    }
+
+    if (wcsstr(cls, L"WindowsForms10.")) {
+        data->hasWinForms = true;
     }
 
     return TRUE;
@@ -143,6 +149,9 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
         if (wcsstr(topCls, L"HwndWrapper[")) {
             data.hasWpf = true;
         }
+        if (wcsstr(topCls, L"WindowsForms10.")) {
+            data.hasWinForms = true;
+        }
 
         EnumChildWindows(hwnd, detect_child_proc, reinterpret_cast<LPARAM>(&data));
         if (data.hasComCtl) {
@@ -168,6 +177,7 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
     bool detectedWinUI3 = false;
     bool detectedXaml = false;
     bool detectedWpf = false;
+    bool detectedWinForms = false;
     if (pid) {
         auto winui = detect_module(pid, L"Microsoft.UI.Xaml.dll");
         if (winui.found) {
@@ -188,6 +198,11 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
             result.push_back({Framework::Wpf, wpf.version});
             detectedWpf = true;
         }
+        auto winforms = detect_module(pid, L"System.Windows.Forms.dll");
+        if (winforms.found) {
+            result.push_back({Framework::WinForms, winforms.version});
+            detectedWinForms = true;
+        }
     }
 
     // Class-name fallback (works when module enumeration fails)
@@ -197,6 +212,8 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
         result.push_back({Framework::Xaml, {}});
     if (!detectedWpf && data.hasWpf)
         result.push_back({Framework::Wpf, {}});
+    if (!detectedWinForms && data.hasWinForms)
+        result.push_back({Framework::WinForms, {}});
 
     // Plugin-provided framework detection
     auto pluginFws = detect_plugin_frameworks(hwnd, pid);

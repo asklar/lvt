@@ -23,17 +23,23 @@ REM --- .NET projects (must build before CMake) ---
 echo.
 echo === Building .NET projects ===
 
-echo [1/2] LvtWpfTap (net48)...
+echo [1/3] LvtWpfTap (net48)...
 dotnet build src\tap_wpf\LvtWpfTap.csproj -c Release -v:q --nologo
 if errorlevel 1 (
     echo WARNING: LvtWpfTap build failed (WPF TAP will be unavailable)
 )
 
-echo [2/2] LvtAvaloniaTreeWalker (net8.0)...
+echo [2/3] LvtAvaloniaTreeWalker (net8.0)...
 dotnet restore src\plugin_avalonia\LvtAvaloniaTreeWalker\LvtAvaloniaTreeWalker.csproj -v:q --nologo
 dotnet publish src\plugin_avalonia\LvtAvaloniaTreeWalker\LvtAvaloniaTreeWalker.csproj -c Release -v:q --nologo
 if errorlevel 1 (
     echo WARNING: LvtAvaloniaTreeWalker build failed (Avalonia plugin will be unavailable)
+)
+
+echo [3/3] LvtWinFormsTap (net48)...
+dotnet build src\tap_winforms\LvtWinFormsTap.csproj -c Release -v:q --nologo
+if errorlevel 1 (
+    echo WARNING: LvtWinFormsTap build failed (WinForms enrichment will be unavailable)
 )
 
 REM --- CMake configure + build ---

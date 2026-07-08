@@ -11,6 +11,7 @@ enum class Framework {
     Xaml,
     WinUI3,
     Wpf,
+    WinForms,
     Plugin,  // Plugin-provided framework (name in FrameworkInfo::name)
 };
 
