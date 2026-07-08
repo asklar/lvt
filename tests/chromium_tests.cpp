@@ -18,6 +18,8 @@
 #include <vector>
 #include <cstring>
 
+#include "plugin_chromium/tab_selection.h"
+
 using json = nlohmann::json;
 
 namespace {
@@ -399,4 +401,68 @@ TEST(NativeMessaging, TruncatedFrame) {
     std::vector<uint8_t> frame = {0x0A, 0x00, 0x00, 0x00}; // claims 10 bytes, but no payload
     auto decoded = decode_native_message(frame);
     EXPECT_TRUE(decoded.empty());
+}
+
+TEST(ChromiumTabSelection, MatchByUrlSubstring) {
+    json targets = {
+        {"type", "tabs"},
+        {"tabs", json::array({
+            {{"id", 4}, {"url", "https://example.com/"}, {"title", "Example"}},
+            {{"id", 7}, {"url", "https://github.com/asklar/lvt/pull/1"}, {"title", "Pull Request"}}
+        })}
+    };
+
+    std::string error;
+    auto selected = select_chromium_tab_target(targets, "asklar/lvt", error);
+    ASSERT_TRUE(selected.has_value()) << error;
+    EXPECT_EQ(selected->tab_id, 7);
+}
+
+TEST(ChromiumTabSelection, MatchByTitleSubstring) {
+    json targets = json::array({
+        {{"id", 1}, {"url", "https://example.com/"}, {"title", "Example"}},
+        {{"id", 2}, {"url", "https://news.ycombinator.com/"}, {"title", "Hacker News"}}
+    });
+
+    std::string error;
+    auto selected = select_chromium_tab_target(targets, "title:hacker", error);
+    ASSERT_TRUE(selected.has_value()) << error;
+    EXPECT_EQ(selected->tab_id, 2);
+}
+
+TEST(ChromiumTabSelection, WildcardPattern) {
+    json targets = json::array({
+        {{"id", 11}, {"url", "https://learn.microsoft.com/windows/apps/"}, {"title", "Docs"}},
+        {{"id", 12}, {"url", "https://github.com/"}, {"title", "GitHub"}}
+    });
+
+    std::string error;
+    auto selected = select_chromium_tab_target(targets, "url:*microsoft.com/windows*", error);
+    ASSERT_TRUE(selected.has_value()) << error;
+    EXPECT_EQ(selected->tab_id, 11);
+}
+
+TEST(ChromiumTabSelection, NoMatchError) {
+    json targets = {
+        {"tabs", json::array({
+            {{"id", 1}, {"url", "https://example.com/"}, {"title", "Example"}}
+        })}
+    };
+
+    std::string error;
+    auto selected = select_chromium_tab_target(targets, "not-present", error);
+    EXPECT_FALSE(selected.has_value());
+    EXPECT_NE(error.find("No Chromium tab matches 'not-present'"), std::string::npos);
+}
+
+TEST(ChromiumTabSelection, IgnoresNonDebuggableTabs) {
+    json targets = json::array({
+        {{"id", 1}, {"url", "chrome://settings/"}, {"title", "Settings"}},
+        {{"id", 2}, {"url", "https://example.com/settings"}, {"title", "Settings"}}
+    });
+
+    std::string error;
+    auto selected = select_chromium_tab_target(targets, "settings", error);
+    ASSERT_TRUE(selected.has_value()) << error;
+    EXPECT_EQ(selected->tab_id, 2);
 }

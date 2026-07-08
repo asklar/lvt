@@ -11,8 +11,9 @@ lvt.exe → plugin DLL → named pipe → native host → Chrome extension → c
 1. **lvt** detects Chrome/Edge by checking for `chrome.dll` or `msedge.dll` in the target process
 2. The **plugin** connects to a named pipe served by the native messaging host
 3. The **native messaging host** relays the request to the browser extension
-4. The **extension** uses the `chrome.debugger` API (Chrome DevTools Protocol) to walk the DOM tree of the active tab
-5. The DOM tree is returned as an lvt element tree with bounds, properties, and text content
+4. The **plugin** can request the extension's tab list and select a tab by URL/title before the DOM walk
+5. The **extension** uses the `chrome.debugger` API (Chrome DevTools Protocol) to walk the DOM tree of the selected tab (or the active tab when no tab selector is provided)
+6. The DOM tree is returned as an lvt element tree with bounds, properties, and text content
 
 ## Prerequisites
 
@@ -52,7 +53,19 @@ lvt --name chrome --format xml
 
 # Capture screenshot with element annotations
 lvt --name chrome --screenshot page.png
+
+# Select a Chromium tab by URL or title substring while targeting the browser
+lvt --name chrome --title "github.com/asklar/lvt"
+
+# Prefix with url: or title: to restrict the match; * and ? wildcards are supported
+lvt --name msedge --title "title:Dashboard"
 ```
+
+When `--title` is the only target selector, it still selects a top-level window by
+title. When it is combined with `--name`, `--pid`, or `--hwnd` for a Chromium
+browser, the Chromium plugin also uses it to select the tab whose URL or title
+matches the provided substring/pattern. If no tab matches, lvt prints a clear
+`lvt-chromium: No Chromium tab matches '...'` error.
 
 ## Manual live E2E check
 
@@ -135,7 +148,7 @@ Framework name is reported as `"chromium (Chrome)"` or `"chromium (Edge)"`.
 
 ### Browser Extension (Manifest V3)
 
-- **Service worker** (`service-worker.js`): Connects to the native messaging host, dispatches DOM requests, uses `chrome.debugger` API for DOM walking
+- **Service worker** (`service-worker.js`): Connects to the native messaging host, dispatches tab-list and DOM requests, uses `chrome.debugger` API for DOM walking
 - Works on both Chrome and Edge (same Chromium extension format)
 - Uses `chrome.debugger.sendCommand("DOM.getDocument", {depth: -1, pierce: true})` for full DOM including shadow DOM
 - Gets element bounding boxes via `DOM.getBoxModel`
@@ -150,7 +163,7 @@ Framework name is reported as `"chromium (Chrome)"` or `"chromium (Edge)"`.
 
 - Implements the standard lvt plugin interface ([plugin.h](../src/plugin.h))
 - Detection: checks for `chrome.dll` or `msedge.dll` loaded in the target process
-- Enrichment: connects to the named pipe, sends a `getDOM` request, and parses the response
+- Enrichment: connects to the named pipe, optionally sends `listTabs` to select a tab by URL/title, sends a `getDOM` request, and parses the response
 
 ## Troubleshooting
 
@@ -178,14 +191,13 @@ lvt --name chrome
 
 ## Limitations
 
-- Only inspects the **active tab** (tab selection by URL/title is planned)
+- Inspects the **active tab** by default; pass `--title` together with `--name`, `--pid`, or `--hwnd` to select a tab by URL/title substring or wildcard pattern
 - `chrome://` and `edge://` internal pages cannot be inspected
 - The browser extension must be installed and the native host registered
 - Shadow DOM content is included when `pierce: true` is used (default)
 
 ## Future work
 
-- Tab selection by URL or title pattern
 - iframe support (separate DOM walks per frame)
 - WebView2 support (Chrome embedded in Win32 apps)
 - Lazy loading for very large DOM trees

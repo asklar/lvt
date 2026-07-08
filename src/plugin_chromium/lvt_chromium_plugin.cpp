@@ -4,6 +4,7 @@
 // relay to retrieve the DOM tree.
 
 #include "plugin.h"
+#include "tab_selection.h"
 
 #include <nlohmann/json.hpp>
 
@@ -233,7 +234,7 @@ __declspec(dllexport) int lvt_detect_framework(DWORD pid, HWND /*hwnd*/, LvtFram
 }
 
 __declspec(dllexport) int lvt_enrich_tree(HWND /*hwnd*/, DWORD /*pid*/,
-                                           const char* /*element_class_filter*/,
+                                           const char* element_class_filter,
                                            char** json_out)
 {
     if (!json_out) return 0;
@@ -260,9 +261,56 @@ __declspec(dllexport) int lvt_enrich_tree(HWND /*hwnd*/, DWORD /*pid*/,
 
     DebugLog("connected to native messaging host pipe");
 
+    auto selector = normalize_chromium_tab_selector(element_class_filter);
+    json request = {{"type", "getDOM"}, {"requestId", "1"}, {"tabId", "active"}};
+
+    if (!selector.empty()) {
+        json listRequest = {{"type", "listTabs"}, {"requestId", "1"}};
+        if (!write_pipe_message(pipe, listRequest.dump())) {
+            DebugLog("failed to send listTabs request");
+            CloseHandle(pipe);
+            return 0;
+        }
+
+        std::string listResponse;
+        if (!read_pipe_message(pipe, listResponse, 30000)) {
+            DebugLog("failed to read listTabs response");
+            CloseHandle(pipe);
+            return 0;
+        }
+
+        try {
+            auto tabsEnvelope = json::parse(listResponse);
+            if (tabsEnvelope.contains("type") && tabsEnvelope["type"] == "error") {
+                auto msg = tabsEnvelope.value("message", "unknown error");
+                DebugLog("extension returned error while listing tabs: %s", msg.c_str());
+                fprintf(stderr, "lvt-chromium: %s\n", msg.c_str());
+                CloseHandle(pipe);
+                return 0;
+            }
+
+            std::string error;
+            auto selected = select_chromium_tab_target(tabsEnvelope, selector, error);
+            if (!selected) {
+                DebugLog("%s", error.c_str());
+                fprintf(stderr, "lvt-chromium: %s\n", error.c_str());
+                CloseHandle(pipe);
+                return 0;
+            }
+            DebugLog("selected tab %d: %s (%s)",
+                     selected->tab_id, selected->title.c_str(), selected->url.c_str());
+            request["requestId"] = "2";
+            request["tabId"] = selected->tab_id;
+        } catch (const json::parse_error& e) {
+            DebugLog("failed to parse listTabs response JSON: %s", e.what());
+            CloseHandle(pipe);
+            return 0;
+        }
+    }
+
     // Send getDOM request
-    std::string request = "{\"type\":\"getDOM\",\"requestId\":\"1\",\"tabId\":\"active\"}";
-    if (!write_pipe_message(pipe, request)) {
+    std::string requestString = request.dump();
+    if (!write_pipe_message(pipe, requestString)) {
         DebugLog("failed to send getDOM request");
         CloseHandle(pipe);
         return 0;

@@ -45,7 +45,8 @@ static void print_usage() {
         "  --hwnd <handle>      Target window by HWND (hex, e.g. 0x1A0B3C)\n"
         "  --pid <pid>          Target process by PID (finds main window)\n"
         "  --name <exe>         Target by process name (e.g. notepad.exe)\n"
-        "  --title <text>       Target by window title substring\n"
+        "  --title <text>       Target by window title substring; with Chromium and\n"
+        "                       --name/--pid/--hwnd, select tab by URL/title substring\n"
         "  --output <file>      Write output to file instead of stdout\n"
         "  --format <fmt>       Output format: json (default) or xml\n"
         "  --screenshot <file>  Capture annotated screenshot to PNG\n"
@@ -78,6 +79,7 @@ struct Args {
     std::string elementId;
     std::string queryId;
     std::string queryProperty;
+    std::string pluginOption;
     int depth = -1;
     int intervalMs = 500;
     bool frameworksOnly = false;
@@ -222,7 +224,7 @@ static bool write_output(const std::string& outputFile, const std::string& conte
 static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
                               lvt::Element& outputTree) {
     auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
-    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks);
+    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption);
 
     lvt::Element* outputRoot = &tree;
     if (!args.elementId.empty()) {
@@ -286,6 +288,8 @@ int main(int argc, char* argv[]) {
     }
 
     auto args = parse_args(argc, argv);
+    bool hasNonTitleTarget = args.hwnd || args.pid || !args.processName.empty();
+    args.pluginOption = hasNonTitleTarget ? args.windowTitle : "";
 
     // Load plugins from %USERPROFILE%/.lvt/plugins/
     lvt::load_plugins();
@@ -399,7 +403,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Build full tree (no depth limit) so element IDs are stable
-    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks);
+    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption);
 
     // Scope to element if requested
     lvt::Element* outputRoot = &tree;

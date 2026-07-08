@@ -28,7 +28,18 @@ async function handleHostMessage(message) {
 
   if (message.type === "getDOM") {
     try {
-      const result = await getActiveTabDOM(message);
+      const result = await getTabDOM(message);
+      nativePort?.postMessage(result);
+    } catch (e) {
+      nativePort?.postMessage({
+        type: "error",
+        requestId: message.requestId,
+        message: e.message || String(e)
+      });
+    }
+  } else if (message.type === "listTabs") {
+    try {
+      const result = await listInspectableTabs(message);
       nativePort?.postMessage(result);
     } catch (e) {
       nativePort?.postMessage({
@@ -42,30 +53,57 @@ async function handleHostMessage(message) {
   }
 }
 
-async function getActiveTabDOM(request) {
-  // Find the active tab in the last focused window
-  let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+function isDebuggableTab(tab) {
+  return tab?.url && !tab.url.startsWith("chrome://") &&
+    !tab.url.startsWith("edge://") && !tab.url.startsWith("about:") &&
+    !tab.url.startsWith("chrome-extension://");
+}
 
-  // Filter out non-debuggable tabs (chrome://, edge://, about:, etc.)
-  tabs = tabs.filter(t => t.url && !t.url.startsWith("chrome://") &&
-    !t.url.startsWith("edge://") && !t.url.startsWith("about:") &&
-    !t.url.startsWith("chrome-extension://"));
+async function listInspectableTabs(request) {
+  const tabs = (await chrome.tabs.query({})).filter(isDebuggableTab);
+  return {
+    type: "tabs",
+    requestId: request.requestId,
+    tabs: tabs.map(t => ({
+      id: t.id,
+      url: t.url || "",
+      title: t.title || "",
+      active: !!t.active,
+      windowId: t.windowId
+    }))
+  };
+}
 
-  // If no debuggable active tab, try any active tab across all windows
-  if (!tabs.length) {
-    tabs = await chrome.tabs.query({ active: true });
-    tabs = tabs.filter(t => t.url && !t.url.startsWith("chrome://") &&
-      !t.url.startsWith("edge://") && !t.url.startsWith("about:") &&
-      !t.url.startsWith("chrome-extension://"));
+async function getTabDOM(request) {
+  let tab = null;
+
+  if (typeof request.tabId === "number") {
+    tab = await chrome.tabs.get(request.tabId);
+    if (!isDebuggableTab(tab)) {
+      throw new Error(`Tab ${request.tabId} is not debuggable (chrome:// and edge:// pages cannot be inspected)`);
+    }
+  } else {
+    // Find the active tab in the last focused window
+    let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+
+    // Filter out non-debuggable tabs (chrome://, edge://, about:, etc.)
+    tabs = tabs.filter(isDebuggableTab);
+
+    // If no debuggable active tab, try any active tab across all windows
+    if (!tabs.length) {
+      tabs = await chrome.tabs.query({ active: true });
+      tabs = tabs.filter(isDebuggableTab);
+    }
+
+    if (!tabs.length) {
+      throw new Error("No debuggable tab found (chrome:// and edge:// pages cannot be inspected)");
+    }
+
+    tab = tabs[0];
   }
 
-  if (!tabs.length) {
-    throw new Error("No debuggable tab found (chrome:// and edge:// pages cannot be inspected)");
-  }
-
-  const tab = tabs[0];
   if (!tab.id) {
-    throw new Error("Active tab has no ID");
+    throw new Error("Selected tab has no ID");
   }
 
   // Attach the debugger to the tab
