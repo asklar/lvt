@@ -59,12 +59,33 @@ endif()
 set(WINUI3_CPPWINRT_DIR "${CMAKE_SOURCE_DIR}/src/tap/winui3")
 set(WINUI3_CPPWINRT_STAMP "${WINUI3_CPPWINRT_DIR}/winrt/Microsoft.UI.Xaml.h")
 if(NOT EXISTS "${WINUI3_CPPWINRT_STAMP}")
-    # Find cppwinrt.exe from Windows SDK
-    find_program(CPPWINRT_EXE cppwinrt
-        HINTS "$ENV{WindowsSdkDir}/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
-              "$ENV{WindowsSdkDir}/bin/10.0.22621.0/x64"
-              "C:/Program Files (x86)/Windows Kits/10/bin/10.0.22621.0/x64"
-    )
+    # Find cppwinrt.exe from the *active* Windows SDK. The generated projection
+    # embeds the cppwinrt version and is checked (via static_assert) against the
+    # <winrt/base.h> on the compiler's INCLUDE path. Hardcoding an SDK version
+    # breaks on machines whose active/newest SDK differs from that version
+    # ("Mismatched C++/WinRT headers"), so prefer the SDK selected by the current
+    # developer command prompt and fall back to the newest installed SDK.
+    set(_cppwinrt_hints "")
+    # 1. Exact versioned bin dir of the active SDK (set by the VS dev prompt).
+    if(DEFINED ENV{WindowsSdkVerBinPath})
+        list(APPEND _cppwinrt_hints "$ENV{WindowsSdkVerBinPath}/x64")
+    endif()
+    # 2. Compose from WindowsSdkDir + WindowsSDKVersion (may have a trailing slash).
+    if(DEFINED ENV{WindowsSdkDir} AND DEFINED ENV{WindowsSDKVersion})
+        string(REGEX REPLACE "[\\/]+$" "" _lvt_sdk_ver "$ENV{WindowsSDKVersion}")
+        list(APPEND _cppwinrt_hints "$ENV{WindowsSdkDir}/bin/${_lvt_sdk_ver}/x64")
+    endif()
+    # 3. Fall back to the newest installed Windows 10/11 SDK bin dir.
+    file(GLOB _lvt_sdk_bin_dirs
+        "$ENV{WindowsSdkDir}/bin/10.*"
+        "C:/Program Files (x86)/Windows Kits/10/bin/10.*")
+    list(SORT _lvt_sdk_bin_dirs ORDER DESCENDING)
+    foreach(_lvt_bin ${_lvt_sdk_bin_dirs})
+        if(IS_DIRECTORY "${_lvt_bin}")
+            list(APPEND _cppwinrt_hints "${_lvt_bin}/x64")
+        endif()
+    endforeach()
+    find_program(CPPWINRT_EXE cppwinrt HINTS ${_cppwinrt_hints})
     if(NOT CPPWINRT_EXE)
         # Fallback: search PATH
         find_program(CPPWINRT_EXE cppwinrt)
