@@ -11,6 +11,7 @@
 #include <cstring>
 #include <string>
 #include <fstream>
+#include <sstream>
 #include <nlohmann/json.hpp>
 
 static void print_usage() {
@@ -36,6 +37,7 @@ static void print_usage() {
 #endif
         "  --dump               Output the tree (default; implied unless --screenshot)\n"
         "  --element <id>       Scope to a specific element subtree\n"
+        "  --query <id> [prop]  Output one element's properties or a single property\n"
         "  --frameworks         Just detect and list frameworks\n"
         "  --depth <n>          Max tree traversal depth (default: unlimited)\n"
         "  --debug              Show verbose diagnostic output\n"
@@ -55,6 +57,8 @@ struct Args {
     std::string annotationsFile;
 #endif
     std::string elementId;
+    std::string queryId;
+    std::string queryProperty;
     int depth = -1;
     bool frameworksOnly = false;
     bool dump = false;      // explicitly requested via --dump
@@ -88,6 +92,15 @@ static Args parse_args(int argc, char* argv[]) {
 #endif
         } else if (strcmp(argv[i], "--element") == 0 && i + 1 < argc) {
             args.elementId = argv[++i];
+        } else if (strcmp(argv[i], "--query") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "lvt: --query requires an element id\n");
+                exit(1);
+            }
+            args.queryId = argv[++i];
+            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
+                args.queryProperty = argv[++i];
+            }
         } else if (strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
             args.depth = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--frameworks") == 0) {
@@ -106,13 +119,68 @@ static Args parse_args(int argc, char* argv[]) {
     return args;
 }
 
-static lvt::Element* find_element(lvt::Element& root, const std::string& id) {
-    if (root.id == id) return &root;
-    for (auto& child : root.children) {
-        auto* found = find_element(child, id);
-        if (found) return found;
+static std::string xml_escape(const std::string& s) {
+    std::string r;
+    r.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+        case '&':  r += "&amp;";  break;
+        case '<':  r += "&lt;";   break;
+        case '>':  r += "&gt;";   break;
+        case '"':  r += "&quot;"; break;
+        case '\'': r += "&apos;"; break;
+        default:
+            if (static_cast<unsigned char>(c) >= 0x20)
+                r += c;
+        }
     }
-    return nullptr;
+    return r;
+}
+
+static nlohmann::json query_element_to_json(const lvt::Element& element) {
+    nlohmann::json j;
+    j["id"] = element.id;
+    j["type"] = element.type;
+    j["framework"] = element.framework;
+    j["className"] = element.className;
+    j["text"] = element.text;
+    j["bounds"] = lvt::get_element_property(element, "bounds").value();
+    for (auto& [key, value] : element.properties) {
+        j[key] = value;
+    }
+    return j;
+}
+
+static std::string query_element_to_xml(const lvt::Element& element) {
+    std::ostringstream out;
+    out << "<Element";
+    out << " id=\"" << xml_escape(element.id) << "\"";
+    out << " type=\"" << xml_escape(element.type) << "\"";
+    out << " framework=\"" << xml_escape(element.framework) << "\"";
+    out << " className=\"" << xml_escape(element.className) << "\"";
+    out << " text=\"" << xml_escape(element.text) << "\"";
+    out << " bounds=\"" << xml_escape(lvt::get_element_property(element, "bounds").value()) << "\"";
+    for (auto& [key, value] : element.properties) {
+        out << " " << xml_escape(key) << "=\"" << xml_escape(value) << "\"";
+    }
+    out << " />\n";
+    return out.str();
+}
+
+static bool write_output(const std::string& outputFile, const std::string& content) {
+    if (outputFile.empty()) {
+        printf("%s\n", content.c_str());
+        return true;
+    }
+    std::ofstream out(outputFile);
+    if (!out) {
+        fprintf(stderr, "lvt: cannot write to '%s'\n", outputFile.c_str());
+        return false;
+    }
+    out << content << "\n";
+    if (lvt::g_debug)
+        fprintf(stderr, "lvt: wrote output to %s\n", outputFile.c_str());
+    return true;
 }
 
 int main(int argc, char* argv[]) {
@@ -221,11 +289,41 @@ int main(int argc, char* argv[]) {
     // Scope to element if requested
     lvt::Element* outputRoot = &tree;
     if (!args.elementId.empty()) {
-        outputRoot = find_element(tree, args.elementId);
+        outputRoot = lvt::find_element_by_id(tree, args.elementId);
         if (!outputRoot) {
             fprintf(stderr, "lvt: element '%s' not found\n", args.elementId.c_str());
             return 1;
         }
+    }
+
+    if (!args.queryId.empty()) {
+        auto* queryElement = lvt::find_element_by_id(tree, args.queryId);
+        if (!queryElement) {
+            fprintf(stderr, "lvt: element '%s' not found\n", args.queryId.c_str());
+            return 1;
+        }
+
+        std::string queryOutput;
+        if (!args.queryProperty.empty()) {
+            auto value = lvt::get_element_property(*queryElement, args.queryProperty);
+            if (!value) {
+                fprintf(stderr, "lvt: property '%s' not found on element '%s'\n",
+                        args.queryProperty.c_str(), args.queryId.c_str());
+                return 1;
+            }
+            queryOutput = *value;
+        } else if (args.format == "xml") {
+            queryOutput = query_element_to_xml(*queryElement);
+            if (!queryOutput.empty() && queryOutput.back() == '\n')
+                queryOutput.pop_back();
+        } else {
+            queryOutput = query_element_to_json(*queryElement).dump(2);
+        }
+
+        if (!write_output(args.outputFile, queryOutput))
+            return 1;
+        lvt::unload_plugins();
+        return 0;
     }
 
     // Apply depth limit relative to the output root
@@ -253,18 +351,8 @@ int main(int argc, char* argv[]) {
                                                  target.processName, frameworkNames);
         }
 
-        if (args.outputFile.empty()) {
-            printf("%s\n", serialized.c_str());
-        } else {
-            std::ofstream out(args.outputFile);
-            if (!out) {
-                fprintf(stderr, "lvt: cannot write to '%s'\n", args.outputFile.c_str());
-                return 1;
-            }
-            out << serialized << "\n";
-            if (lvt::g_debug)
-                fprintf(stderr, "lvt: wrote tree to %s\n", args.outputFile.c_str());
-        }
+        if (!write_output(args.outputFile, serialized))
+            return 1;
     }
 
     // Screenshot

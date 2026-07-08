@@ -8,6 +8,7 @@
 #include "plugin_loader.h"
 #include <algorithm>
 #include <memory>
+#include <sstream>
 
 namespace lvt {
 
@@ -31,6 +32,42 @@ static void trim_to_depth_impl(Element& el, int currentDepth, int maxDepth) {
 void assign_element_ids(Element& root) {
     int counter = 0;
     assign_ids_recursive(root, counter);
+}
+
+Element* find_element_by_id(Element& root, const std::string& id) {
+    if (root.id == id) return &root;
+    for (auto& child : root.children) {
+        auto* found = find_element_by_id(child, id);
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+const Element* find_element_by_id(const Element& root, const std::string& id) {
+    if (root.id == id) return &root;
+    for (auto& child : root.children) {
+        auto* found = find_element_by_id(child, id);
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+std::optional<std::string> get_element_property(const Element& element, const std::string& property) {
+    if (property == "id") return element.id;
+    if (property == "type") return element.type;
+    if (property == "framework") return element.framework;
+    if (property == "className") return element.className;
+    if (property == "text") return element.text;
+    if (property == "bounds") {
+        std::ostringstream out;
+        out << element.bounds.x << "," << element.bounds.y << ","
+            << element.bounds.width << "," << element.bounds.height;
+        return out.str();
+    }
+
+    auto it = element.properties.find(property);
+    if (it != element.properties.end()) return it->second;
+    return std::nullopt;
 }
 
 void trim_to_depth(Element& root, int maxDepth) {

@@ -73,6 +73,9 @@ lvt --hwnd 0x1A0B3C --frameworks
 # Scope to a subtree
 lvt --name myapp --element e5 --depth 3
 
+# Query one element property
+lvt --name notepad --query e2 text
+
 # Screenshot + tree dump together
 lvt --name notepad --screenshot out.png --dump
 ```
@@ -90,6 +93,7 @@ lvt --name notepad --screenshot out.png --dump
 | `--screenshot <file>` | Capture annotated screenshot to PNG |
 | `--dump` | Output the tree (default unless `--screenshot` is used) |
 | `--element <id>` | Scope to a specific element subtree |
+| `--query <id> [property]` | Output one element's properties, or a single property value |
 | `--frameworks` | Just list detected frameworks |
 | `--depth <n>` | Max tree traversal depth |
 

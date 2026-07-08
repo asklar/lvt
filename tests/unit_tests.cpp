@@ -12,6 +12,8 @@
 using json = nlohmann::json;
 using namespace lvt;
 
+static Element make_test_tree();
+
 // ---- Element ID assignment ----
 
 TEST(AssignElementIds, SingleElement) {
@@ -59,6 +61,45 @@ TEST(AssignElementIds, DeepTree) {
     EXPECT_EQ(root.children[0].id, "e1");
     EXPECT_EQ(root.children[0].children[0].id, "e2");
     EXPECT_EQ(root.children[0].children[0].children[0].id, "e3");
+}
+
+TEST(ElementLookup, FindsElementById) {
+    auto root = make_test_tree();
+
+    auto* found = find_element_by_id(root, "e1");
+
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->type, "Button");
+    EXPECT_EQ(found->text, "OK");
+}
+
+TEST(ElementLookup, ReturnsNullForUnknownId) {
+    auto root = make_test_tree();
+
+    EXPECT_EQ(find_element_by_id(root, "missing"), nullptr);
+}
+
+TEST(ElementPropertyLookup, BuiltInProperties) {
+    auto root = make_test_tree();
+
+    EXPECT_EQ(get_element_property(root, "id"), "e0");
+    EXPECT_EQ(get_element_property(root, "type"), "Window");
+    EXPECT_EQ(get_element_property(root, "framework"), "win32");
+    EXPECT_EQ(get_element_property(root, "className"), "MyWindow");
+    EXPECT_EQ(get_element_property(root, "text"), "Hello");
+    EXPECT_EQ(get_element_property(root, "bounds"), "100,200,800,600");
+}
+
+TEST(ElementPropertyLookup, DynamicProperty) {
+    auto root = make_test_tree();
+
+    EXPECT_EQ(get_element_property(root, "visible"), "true");
+}
+
+TEST(ElementPropertyLookup, UnknownProperty) {
+    auto root = make_test_tree();
+
+    EXPECT_EQ(get_element_property(root, "missing"), std::nullopt);
 }
 
 // ---- framework_to_string ----
