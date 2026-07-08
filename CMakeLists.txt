@@ -13,6 +13,7 @@ add_executable(lvt
     src/framework_detector.cpp
     src/tree_builder.cpp
     src/json_serializer.cpp
+    src/watch_diff.cpp
     src/screenshot.cpp
     src/plugin_loader.cpp
     src/providers/win32_provider.cpp
@@ -264,6 +265,7 @@ add_executable(lvt_unit_tests
     tests/unit_tests.cpp
     src/tree_builder.cpp
     src/json_serializer.cpp
+    src/watch_diff.cpp
     src/framework_detector.cpp
     src/target.cpp
     src/plugin_loader.cpp

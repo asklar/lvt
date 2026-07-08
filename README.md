@@ -75,6 +75,9 @@ lvt --name myapp --element e5 --depth 3
 
 # Screenshot + tree dump together
 lvt --name notepad --screenshot out.png --dump
+
+# Watch for live tree changes as JSON diff events
+lvt --name notepad --watch --interval 250
 ```
 
 ### Options
@@ -89,11 +92,22 @@ lvt --name notepad --screenshot out.png --dump
 | `--format <fmt>` | `json` (default) or `xml` |
 | `--screenshot <file>` | Capture annotated screenshot to PNG |
 | `--dump` | Output the tree (default unless `--screenshot` is used) |
+| `--watch` | Emit live JSON tree diff events until Ctrl+C |
+| `--interval <ms>` | Polling interval for `--watch` (default: 500) |
 | `--element <id>` | Scope to a specific element subtree |
 | `--frameworks` | Just list detected frameworks |
 | `--depth <n>` | Max tree traversal depth |
 
 ## Output format
+
+### Watch mode
+
+`--watch` repeatedly rebuilds the target tree and writes newline-delimited JSON
+events to stdout. The first tick emits the current tree as `added` events; later
+ticks emit `added`, `removed`, and `changed` events with old/new field values.
+Element matching uses stable framework/type/class/path-derived keys instead of
+the positional `e0`, `e1`, ... ids, so unique moved elements are reported as
+`changed` events with a `path` field change.
 
 ### JSON
 

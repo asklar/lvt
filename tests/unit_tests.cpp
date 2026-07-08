@@ -4,6 +4,7 @@
 #include "element.h"
 #include "tree_builder.h"
 #include "json_serializer.h"
+#include "watch_diff.h"
 #include "framework_detector.h"
 #include "target.h"
 #include <nlohmann/json.hpp>
@@ -362,6 +363,97 @@ TEST(Element, TreeConstruction) {
     EXPECT_EQ(root.children.size(), 2);
     EXPECT_EQ(root.children[0].type, "Child1");
     EXPECT_EQ(root.children[1].type, "Child2");
+}
+
+// ---- Watch diff ----
+
+static Element diff_el(const std::string& type, const std::string& className,
+                       const std::string& text = "") {
+    Element el;
+    el.type = type;
+    el.framework = "win32";
+    el.className = className;
+    el.text = text;
+    return el;
+}
+
+TEST(WatchDiff, AddedElement) {
+    auto before = diff_el("Window", "Root");
+    auto after = before;
+    after.children.push_back(diff_el("Button", "Button", "OK"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 1);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Added);
+    EXPECT_EQ(events[0].path, "0.0");
+    EXPECT_EQ(events[0].element.text, "OK");
+}
+
+TEST(WatchDiff, RemovedElement) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Button", "Button", "OK"));
+    auto after = diff_el("Window", "Root");
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 1);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Removed);
+    EXPECT_EQ(events[0].path, "0.0");
+    EXPECT_EQ(events[0].element.text, "OK");
+}
+
+TEST(WatchDiff, ChangedElementFields) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Button", "Button", "OK"));
+    before.children[0].bounds = {1, 2, 3, 4};
+    before.children[0].properties["enabled"] = "true";
+
+    auto after = before;
+    after.children[0].text = "Cancel";
+    after.children[0].bounds = {5, 6, 7, 8};
+    after.children[0].properties["enabled"] = "false";
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 1);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Changed);
+    EXPECT_EQ(events[0].fields["text"].oldValue, "OK");
+    EXPECT_EQ(events[0].fields["text"].newValue, "Cancel");
+    EXPECT_EQ(events[0].fields["bounds"].oldValue, "1,2,3,4");
+    EXPECT_EQ(events[0].fields["bounds"].newValue, "5,6,7,8");
+    EXPECT_EQ(events[0].fields["properties.enabled"].oldValue, "true");
+    EXPECT_EQ(events[0].fields["properties.enabled"].newValue, "false");
+}
+
+TEST(WatchDiff, MovedElement) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Pane"));
+    before.children.push_back(diff_el("Button", "Button", "OK"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Pane"));
+    after.children[0].children.push_back(diff_el("Button", "Button", "OK"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 1);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Changed);
+    EXPECT_EQ(events[0].fields["path"].oldValue, "0.1");
+    EXPECT_EQ(events[0].fields["path"].newValue, "0.0.0");
+}
+
+TEST(WatchDiff, SerializeChangedEvent) {
+    ChangeEvent event;
+    event.type = ChangeEvent::Type::Changed;
+    event.key = "win32|Button|Button";
+    event.path = "0.0";
+    event.fields["text"] = {"OK", "Cancel"};
+
+    auto j = json::parse(serialize_change_event(event));
+    EXPECT_EQ(j["event"], "changed");
+    EXPECT_EQ(j["fields"]["text"]["old"], "OK");
+    EXPECT_EQ(j["fields"]["text"]["new"], "Cancel");
 }
 
 // ---- Large tree serialization ----
