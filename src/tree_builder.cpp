@@ -1,4 +1,5 @@
 #include "tree_builder.h"
+#include "element_key.h"
 #include "providers/provider.h"
 #include "providers/win32_provider.h"
 #include "providers/comctl_provider.h"
@@ -8,6 +9,8 @@
 #include "plugin_loader.h"
 #include <algorithm>
 #include <memory>
+#include <optional>
+#include <sstream>
 
 namespace lvt {
 
@@ -31,6 +34,73 @@ static void trim_to_depth_impl(Element& el, int currentDepth, int maxDepth) {
 void assign_element_ids(Element& root) {
     int counter = 0;
     assign_ids_recursive(root, counter);
+}
+
+Element* find_element_by_id(Element& root, const std::string& id) {
+    if (root.id == id) return &root;
+    for (auto& child : root.children) {
+        auto* found = find_element_by_id(child, id);
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+const Element* find_element_by_id(const Element& root, const std::string& id) {
+    if (root.id == id) return &root;
+    for (auto& child : root.children) {
+        auto* found = find_element_by_id(child, id);
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+Element* find_element_by_key(Element& root, const std::string& key) {
+    if (root.key == key) return &root;
+    for (auto& child : root.children) {
+        auto* found = find_element_by_key(child, key);
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+const Element* find_element_by_key(const Element& root, const std::string& key) {
+    if (root.key == key) return &root;
+    for (auto& child : root.children) {
+        auto* found = find_element_by_key(child, key);
+        if (found) return found;
+    }
+    return nullptr;
+}
+
+Element* find_element_by_ref(Element& root, const std::string& ref) {
+    if (auto* byId = find_element_by_id(root, ref))
+        return byId;
+    return find_element_by_key(root, ref);
+}
+
+const Element* find_element_by_ref(const Element& root, const std::string& ref) {
+    if (auto* byId = find_element_by_id(root, ref))
+        return byId;
+    return find_element_by_key(root, ref);
+}
+
+std::optional<std::string> get_element_property(const Element& element, const std::string& property) {
+    if (property == "id") return element.id;
+    if (property == "key") return element.key;
+    if (property == "type") return element.type;
+    if (property == "framework") return element.framework;
+    if (property == "className") return element.className;
+    if (property == "text") return element.text;
+    if (property == "bounds") {
+        std::ostringstream out;
+        out << element.bounds.x << "," << element.bounds.y << ","
+            << element.bounds.width << "," << element.bounds.height;
+        return out.str();
+    }
+
+    auto it = element.properties.find(property);
+    if (it != element.properties.end()) return it->second;
+    return std::nullopt;
 }
 
 void trim_to_depth(Element& root, int maxDepth) {
@@ -86,6 +156,7 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
 
     // Assign IDs on the full tree so that element IDs are stable regardless of --depth.
     assign_element_ids(root);
+    assign_element_keys(root);
 
     return root;
 }

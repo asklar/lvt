@@ -1,4 +1,5 @@
 #include "screenshot.h"
+#include "tree_builder.h"
 #include <wil/com.h>
 #include <wil/resource.h>
 
@@ -28,15 +29,6 @@ IDirect3DDxgiInterfaceAccess : public IUnknown {
 };
 
 namespace lvt {
-
-static const Element* find_element_by_id(const Element& root, const std::string& id) {
-    if (root.id == id) return &root;
-    for (auto& child : root.children) {
-        auto* found = find_element_by_id(child, id);
-        if (found) return found;
-    }
-    return nullptr;
-}
 
 static void collect_elements(const Element& el, std::vector<const Element*>& out) {
     out.push_back(&el);
@@ -413,7 +405,7 @@ bool capture_screenshot(HWND hwnd, const std::string& outputPath,
     RECT cropRect{};
     const RECT* cropPtr = nullptr;
     if (!elementId.empty() && tree) {
-        auto* el = find_element_by_id(*tree, elementId);
+        auto* el = find_element_by_ref(*tree, elementId);
         if (el && el->bounds.width > 0 && el->bounds.height > 0) {
             RECT winRect{};
             if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,

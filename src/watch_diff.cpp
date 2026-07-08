@@ -1,20 +1,12 @@
 #include "watch_diff.h"
+#include "element_key.h"
 #include <nlohmann/json.hpp>
-#include <algorithm>
 #include <map>
 #include <sstream>
-#include <unordered_map>
 
 namespace lvt {
 
 using json = nlohmann::json;
-
-struct IndexedElement {
-    const Element* element = nullptr;
-    std::string path;
-    std::string baseKey;
-    std::string key;
-};
 
 static std::string bounds_to_string(const Bounds& b) {
     return std::to_string(b.x) + "," + std::to_string(b.y) + "," +
@@ -23,73 +15,6 @@ static std::string bounds_to_string(const Bounds& b) {
 
 static json bounds_to_json(const Bounds& b) {
     return json{{"x", b.x}, {"y", b.y}, {"width", b.width}, {"height", b.height}};
-}
-
-static std::string escape_key_part(const std::string& value) {
-    std::string result;
-    result.reserve(value.size());
-    for (char c : value) {
-        if (c == '\\' || c == '|')
-            result += '\\';
-        result += c;
-    }
-    return result;
-}
-
-static std::string base_identity_key(const Element& el) {
-    return escape_key_part(el.framework) + "|" +
-           escape_key_part(el.type) + "|" +
-           escape_key_part(el.className);
-}
-
-static void collect_index(const Element& el, const std::string& path,
-                          std::vector<IndexedElement>& out,
-                          std::unordered_map<std::string, int>& counts) {
-    IndexedElement indexed;
-    indexed.element = &el;
-    indexed.path = path;
-    indexed.baseKey = base_identity_key(el);
-    out.push_back(indexed);
-    counts[indexed.baseKey]++;
-
-    for (size_t i = 0; i < el.children.size(); ++i) {
-        auto childPath = path.empty() ? std::to_string(i) : path + "." + std::to_string(i);
-        collect_index(el.children[i], childPath, out, counts);
-    }
-}
-
-static void assign_keys(std::vector<IndexedElement>& elements,
-                        const std::unordered_map<std::string, int>& counts) {
-    for (auto& indexed : elements) {
-        indexed.key = indexed.baseKey;
-        auto count = counts.find(indexed.baseKey);
-        if (count != counts.end() && count->second > 1)
-            indexed.key += "|@" + indexed.path;
-    }
-}
-
-static std::vector<IndexedElement> index_tree(const Element& root) {
-    std::vector<IndexedElement> elements;
-    std::unordered_map<std::string, int> counts;
-    collect_index(root, "0", elements, counts);
-    assign_keys(elements, counts);
-    return elements;
-}
-
-static void index_tree_pair(const Element& before, const Element& after,
-                            std::vector<IndexedElement>& beforeElements,
-                            std::vector<IndexedElement>& afterElements) {
-    std::unordered_map<std::string, int> beforeCounts;
-    std::unordered_map<std::string, int> afterCounts;
-    collect_index(before, "0", beforeElements, beforeCounts);
-    collect_index(after, "0", afterElements, afterCounts);
-
-    std::unordered_map<std::string, int> combinedCounts = beforeCounts;
-    for (const auto& [key, count] : afterCounts)
-        combinedCounts[key] = std::max(combinedCounts[key], count);
-
-    assign_keys(beforeElements, combinedCounts);
-    assign_keys(afterElements, combinedCounts);
 }
 
 static std::string property_string(const Element& el, const std::string& name) {
@@ -133,6 +58,7 @@ static std::map<std::string, FieldChange> diff_element_fields(const IndexedEleme
 static json element_to_json(const Element& el) {
     json j;
     j["id"] = el.id;
+    j["key"] = el.key;
     j["type"] = el.type;
     j["framework"] = el.framework;
     if (!el.className.empty()) j["className"] = el.className;

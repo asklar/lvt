@@ -15,6 +15,7 @@ struct Bounds {
 
 struct Element {
     std::string id;
+    std::string key;
     std::string type;
     std::string framework;
     std::string className;

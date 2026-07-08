@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include "element.h"
 #include "tree_builder.h"
+#include "element_key.h"
 #include "json_serializer.h"
 #include "watch_diff.h"
 #include "framework_detector.h"
@@ -108,6 +109,7 @@ static Element make_test_tree() {
     root.children.push_back(child);
 
     assign_element_ids(root);
+    assign_element_keys(root);
     return root;
 }
 
@@ -131,6 +133,7 @@ TEST(JsonSerializer, ElementFields) {
 
     auto& r = j["root"];
     EXPECT_EQ(r["id"], "e0");
+    EXPECT_FALSE(r["key"].get<std::string>().empty());
     EXPECT_EQ(r["type"], "Window");
     EXPECT_EQ(r["framework"], "win32");
     EXPECT_EQ(r["className"], "MyWindow");
@@ -343,6 +346,7 @@ TEST(Bounds, DefaultZero) {
 TEST(Element, DefaultValues) {
     Element el;
     EXPECT_TRUE(el.id.empty());
+    EXPECT_TRUE(el.key.empty());
     EXPECT_TRUE(el.type.empty());
     EXPECT_TRUE(el.framework.empty());
     EXPECT_TRUE(el.className.empty());
@@ -350,6 +354,111 @@ TEST(Element, DefaultValues) {
     EXPECT_TRUE(el.properties.empty());
     EXPECT_TRUE(el.children.empty());
     EXPECT_EQ(el.nativeHandle, 0u);
+}
+
+// ---- Durable element keys and lookup ----
+
+static Element key_el(const std::string& type, const std::string& name = "",
+                      uintptr_t hwnd = 0) {
+    Element el;
+    el.type = type;
+    el.framework = "win32";
+    el.className = type;
+    el.nativeHandle = hwnd;
+    if (!name.empty())
+        el.properties["Name"] = name;
+    return el;
+}
+
+TEST(ElementKeys, UniqueTypeUnaffectedByEarlierSiblingInsertion) {
+    Element root = key_el("Window");
+    root.children.push_back(key_el("Button"));
+    assign_element_keys(root);
+    auto buttonKey = root.children[0].key;
+
+    root.children.insert(root.children.begin(), key_el("Edit"));
+    assign_element_keys(root);
+
+    EXPECT_EQ(root.children[1].key, buttonKey);
+}
+
+TEST(ElementKeys, StableNameUnaffectedByEarlierDuplicateSiblingInsertion) {
+    Element root = key_el("Window");
+    root.children.push_back(key_el("Button", "Save"));
+    assign_element_keys(root);
+    auto saveKey = root.children[0].key;
+
+    root.children.insert(root.children.begin(), key_el("Button", "Cancel"));
+    assign_element_keys(root);
+
+    EXPECT_EQ(root.children[1].key, saveKey);
+    EXPECT_NE(root.children[0].key, root.children[1].key);
+}
+
+TEST(ElementKeys, DistinctNamesStayTiedAfterSwap) {
+    Element root = key_el("Window");
+    root.children.push_back(key_el("Button", "Save"));
+    root.children.push_back(key_el("Button", "Cancel"));
+    assign_element_keys(root);
+    auto saveKey = root.children[0].key;
+    auto cancelKey = root.children[1].key;
+
+    std::swap(root.children[0], root.children[1]);
+    assign_element_keys(root);
+
+    EXPECT_EQ(root.children[0].properties["Name"], "Cancel");
+    EXPECT_EQ(root.children[0].key, cancelKey);
+    EXPECT_EQ(root.children[1].properties["Name"], "Save");
+    EXPECT_EQ(root.children[1].key, saveKey);
+}
+
+TEST(ElementKeys, NativeHandlesStayTiedAfterSwap) {
+    Element root = key_el("Window");
+    root.children.push_back(key_el("Button", "", 0x1111));
+    root.children.push_back(key_el("Button", "", 0x2222));
+    assign_element_keys(root);
+    auto firstKey = root.children[0].key;
+    auto secondKey = root.children[1].key;
+
+    std::swap(root.children[0], root.children[1]);
+    assign_element_keys(root);
+
+    EXPECT_EQ(root.children[0].nativeHandle, 0x2222u);
+    EXPECT_EQ(root.children[0].key, secondKey);
+    EXPECT_EQ(root.children[1].nativeHandle, 0x1111u);
+    EXPECT_EQ(root.children[1].key, firstKey);
+}
+
+TEST(ElementLookup, ResolvesByIdAndDurableKey) {
+    Element root = key_el("Window");
+    root.children.push_back(key_el("Button", "Save"));
+    assign_element_ids(root);
+    assign_element_keys(root);
+    auto key = root.children[0].key;
+
+    EXPECT_EQ(find_element_by_ref(root, "e1"), &root.children[0]);
+    EXPECT_EQ(find_element_by_ref(root, key), &root.children[0]);
+    EXPECT_EQ(find_element_by_ref(root, "missing"), nullptr);
+}
+
+TEST(ElementLookup, GetElementPropertyBuiltinsAndDynamic) {
+    Element el = key_el("Button", "Save", 0x1234);
+    el.id = "e7";
+    el.key = "stable-key";
+    el.text = "Click";
+    el.bounds = {1, 2, 3, 4};
+    el.properties["custom"] = "value";
+
+    EXPECT_EQ(get_element_property(el, "id"), "e7");
+    EXPECT_EQ(get_element_property(el, "key"), "stable-key");
+    EXPECT_EQ(get_element_property(el, "type"), "Button");
+    EXPECT_EQ(get_element_property(el, "framework"), "win32");
+    EXPECT_EQ(get_element_property(el, "className"), "Button");
+    EXPECT_EQ(get_element_property(el, "text"), "Click");
+    EXPECT_EQ(get_element_property(el, "bounds"), "1,2,3,4");
+    EXPECT_EQ(get_element_property(el, "Name"), "Save");
+    EXPECT_EQ(get_element_property(el, "custom"), "value");
+    EXPECT_FALSE(get_element_property(el, "missing").has_value());
 }
 
 TEST(Element, TreeConstruction) {
