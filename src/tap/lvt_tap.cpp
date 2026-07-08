@@ -7,6 +7,7 @@
 #include <objbase.h>
 #include <ocidl.h>
 #include <xamlOM.h>
+#include <wil/com.h>
 #include <string>
 #include <map>
 #include <vector>
@@ -95,8 +96,8 @@ static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 
 class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     LONG m_refCount = 1;
-    IUnknown* m_site = nullptr;
-    IXamlDiagnostics* m_diag = nullptr;
+    wil::com_ptr<IUnknown> m_site;
+    wil::com_ptr<IXamlDiagnostics> m_diag;
     HWND m_msgWnd = nullptr; // Message-only window for UI thread dispatch
     std::map<InstanceHandle, TreeNode> m_nodes;
     std::vector<InstanceHandle> m_roots;
@@ -104,7 +105,7 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     bool m_collectProps = false;
 
 public:
-    IVisualTreeService* m_vts = nullptr;
+    wil::com_ptr<IVisualTreeService> m_vts;
     static constexpr UINT WM_COLLECT_BOUNDS = WM_USER + 100;
 
 public:
@@ -137,11 +138,17 @@ public:
     HRESULT STDMETHODCALLTYPE SetSite(IUnknown* pSite) override {
         LogMsg("SetSite called, pSite=%p", pSite);
 
-        if (m_site) { m_site->Release(); m_site = nullptr; }
-        if (m_vts) { m_vts->Release(); m_vts = nullptr; }
+        m_site.reset();
+        m_vts.reset();
+        m_diag.reset();
 
-        m_site = pSite;
-        if (m_site) m_site->AddRef();
+        if (pSite) {
+            HRESULT hr = pSite->QueryInterface(IID_PPV_ARGS(m_site.put()));
+            if (FAILED(hr)) {
+                LogMsg("QI for IUnknown failed: 0x%08X", hr);
+                return S_OK;
+            }
+        }
 
         if (!pSite) return S_OK;
 
@@ -159,8 +166,8 @@ public:
     }
 
     HRESULT SetSiteImpl(IUnknown* pSite) {
-        IXamlDiagnostics* diag = nullptr;
-        HRESULT hr = pSite->QueryInterface(__uuidof(IXamlDiagnostics), (void**)&diag);
+        wil::com_ptr<IXamlDiagnostics> diag;
+        HRESULT hr = pSite->QueryInterface(IID_PPV_ARGS(diag.put()));
         if (FAILED(hr) || !diag) {
             LogMsg("QI for IXamlDiagnostics failed: 0x%08X", hr);
             return S_OK;
@@ -183,14 +190,13 @@ public:
             LogMsg("Pipe name: %ls, collectProps: %d", m_pipeName.c_str(), m_collectProps);
         }
 
-        hr = diag->QueryInterface(__uuidof(IVisualTreeService), (void**)&m_vts);
+        hr = diag->QueryInterface(IID_PPV_ARGS(m_vts.put()));
         if (FAILED(hr) || !m_vts) {
             LogMsg("QI for IVisualTreeService failed: 0x%08X", hr);
-            diag->Release();
             return S_OK;
         }
 
-        m_diag = diag;
+        m_diag = std::move(diag);
 
         // Create a message-only window on the UI thread for dispatching
         // GetPropertyValuesChain calls (which have thread affinity).
@@ -209,58 +215,64 @@ public:
         // AdviseVisualTreeChange hangs if called on the SetSite thread.
         // Fire-and-forget a worker thread (same as Windhawk).
         AddRef();
-        HANDLE hThread = CreateThread(nullptr, 0, &AdviseThreadProc, this, 0, nullptr);
+        wil::com_ptr<LvtTap> threadSelf;
+        threadSelf.attach(this);
+        HANDLE hThread = CreateThread(nullptr, 0, &AdviseThreadProc, threadSelf.get(), 0, nullptr);
         if (hThread) {
+            (void)threadSelf.detach();
             CloseHandle(hThread); // Don't wait — return immediately to unblock UI thread
         } else {
             LogMsg("CreateThread failed: %lu", GetLastError());
-            Release();
         }
 
         return S_OK;
     }
 
     static DWORD WINAPI AdviseThreadProc(LPVOID param) {
-        auto* self = reinterpret_cast<LvtTap*>(param);
+        wil::com_ptr<LvtTap> self;
+        self.attach(reinterpret_cast<LvtTap*>(param));
+        return self->AdviseThreadProcImpl();
+    }
+
+    DWORD AdviseThreadProcImpl() {
         LogMsg("AdviseThread starting");
 
         __try {
             IVisualTreeServiceCallback* cb =
                 static_cast<IVisualTreeServiceCallback*>(
-                    static_cast<IVisualTreeServiceCallback2*>(self));
+                    static_cast<IVisualTreeServiceCallback2*>(this));
 
-            HRESULT hr = self->m_vts->AdviseVisualTreeChange(cb);
+            HRESULT hr = m_vts->AdviseVisualTreeChange(cb);
             LogMsg("AdviseVisualTreeChange returned 0x%08X, nodes=%zu, roots=%zu",
-                   hr, self->m_nodes.size(), self->m_roots.size());
+                   hr, m_nodes.size(), m_roots.size());
 
             if (SUCCEEDED(hr)) {
-                if (self->m_nodes.empty()) {
+                if (m_nodes.empty()) {
                     Sleep(500);
-                    LogMsg("After sleep: nodes=%zu", self->m_nodes.size());
+                    LogMsg("After sleep: nodes=%zu", m_nodes.size());
                 }
                 // Dispatch GetPropertyValuesChain to UI thread via message window.
                 // SendMessage blocks until the UI thread processes the message.
-                if (self->m_msgWnd) {
+                if (m_msgWnd) {
                     LogMsg("Dispatching CollectBounds to UI thread via SendMessage");
-                    SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS, 0,
-                                 reinterpret_cast<LPARAM>(self));
+                    SendMessageW(m_msgWnd, WM_COLLECT_BOUNDS, 0,
+                                 reinterpret_cast<LPARAM>(this));
                 }
                 // Get element positions via TransformToVisual (works around broken
                 // ActualOffset serialization in WinUI3). Must run on the UI thread.
 #if LVT_HAS_XAML_PROJECTION
-                if (self->m_msgWnd) {
-                    SendMessageW(self->m_msgWnd, WM_COLLECT_BOUNDS + 1, 0,
-                                 reinterpret_cast<LPARAM>(self));
+                if (m_msgWnd) {
+                    SendMessageW(m_msgWnd, WM_COLLECT_BOUNDS + 1, 0,
+                                 reinterpret_cast<LPARAM>(this));
                 }
 #endif
-                self->SerializeAndSend();
-                self->m_vts->UnadviseVisualTreeChange(cb);
+                SerializeAndSend();
+                m_vts->UnadviseVisualTreeChange(cb);
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             LogMsg("AdviseThread crashed: 0x%08X", GetExceptionCode());
         }
 
-        self->Release();
         return 0;
     }
 
@@ -454,6 +466,7 @@ private:
         for (auto& [handle, node] : m_nodes) {
             if (!node.hasBounds) continue;
 
+            // Keep raw to preserve XAML diagnostics' existing ABI lifetime behavior.
             ::IInspectable* raw = nullptr;
             HRESULT hr = m_diag->GetIInspectableFromHandle(handle, &raw);
             if (FAILED(hr) || !raw) continue;
@@ -514,7 +527,7 @@ private:
     // Called on the UI thread via SendMessage from the worker thread
 public:
     void CollectBoundsOnUIThread() {
-        CollectBounds(m_vts);
+        CollectBounds(m_vts.get());
     }
 #if LVT_HAS_XAML_PROJECTION
     void CollectPositionsOnUIThread() {
@@ -621,9 +634,6 @@ private:
 
     ~LvtTap() {
         if (m_msgWnd) DestroyWindow(m_msgWnd);
-        if (m_vts) m_vts->Release();
-        if (m_diag) m_diag->Release();
-        if (m_site) m_site->Release();
     }
 };
 
@@ -670,11 +680,10 @@ public:
     }
     HRESULT STDMETHODCALLTYPE CreateInstance(IUnknown* pOuter, REFIID riid, void** ppv) override {
         if (pOuter) return CLASS_E_NOAGGREGATION;
-        auto* tap = new (std::nothrow) LvtTap();
+        wil::com_ptr<LvtTap> tap;
+        tap.attach(new (std::nothrow) LvtTap());
         if (!tap) return E_OUTOFMEMORY;
-        HRESULT hr = tap->QueryInterface(riid, ppv);
-        tap->Release();
-        return hr;
+        return tap->QueryInterface(riid, ppv);
     }
     HRESULT STDMETHODCALLTYPE LockServer(BOOL) override { return S_OK; }
 };
@@ -684,11 +693,10 @@ extern "C" {
 HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* ppv) {
     LogMsg("DllGetClassObject called");
     if (rclsid != CLSID_LvtTap) return CLASS_E_CLASSNOTAVAILABLE;
-    auto* factory = new (std::nothrow) LvtTapFactory();
+    wil::com_ptr<LvtTapFactory> factory;
+    factory.attach(new (std::nothrow) LvtTapFactory());
     if (!factory) return E_OUTOFMEMORY;
-    HRESULT hr = factory->QueryInterface(riid, ppv);
-    factory->Release();
-    return hr;
+    return factory->QueryInterface(riid, ppv);
 }
 
 HRESULT STDAPICALLTYPE DllCanUnloadNow() { return S_FALSE; }
