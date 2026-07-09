@@ -317,10 +317,10 @@ add_custom_target(winui3_sample_app ALL
         -o "${WINUI3_SAMPLE_OUTPUT_DIR}"
         ${WINUI3_SAMPLE_MSBUILD_ARGS}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net8.0-windows10.0.19041.0/win-x64/App.xbf"
+        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net10.0-windows10.0.19041.0/win-x64/App.xbf"
         "${WINUI3_SAMPLE_OUTPUT_DIR}/App.xbf"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net8.0-windows10.0.19041.0/win-x64/MainWindow.xbf"
+        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net10.0-windows10.0.19041.0/win-x64/MainWindow.xbf"
         "${WINUI3_SAMPLE_OUTPUT_DIR}/MainWindow.xbf"
     BYPRODUCTS "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
