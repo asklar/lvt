@@ -36,7 +36,7 @@ This creates registry entries for both Chrome and Edge and writes a `com.lvt.chr
 3. Click **Load unpacked**
 4. Select the `build/plugins/chromium/extension/` directory
 
-The extension icon should appear in the toolbar. The extension will automatically connect to the native messaging host.
+The extension icon should appear in the toolbar. The shipped extension includes `icons/icon16.png`, `icons/icon48.png`, and `icons/icon128.png`, so Chrome/Edge should load it without "Could not load icon" errors. The extension will automatically connect to the native messaging host.
 
 ## Usage
 
@@ -53,6 +53,22 @@ lvt --name chrome --format xml
 # Capture screenshot with element annotations
 lvt --name chrome --screenshot page.png
 ```
+
+## Manual live E2E check
+
+From the build output directory:
+
+```powershell
+build\plugins\chromium\lvt_chromium_host.exe --register
+```
+
+Then open Microsoft Edge, go to `edge://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `build\plugins\chromium\extension`. Open a normal web page in the active tab and run:
+
+```powershell
+build\lvt.exe --name msedge
+```
+
+The output should include Chromium DOM elements from the active tab. Use `--format xml` or `--screenshot page.png` for alternate verification.
 
 ## What you get
 
