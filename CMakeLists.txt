@@ -303,11 +303,17 @@ add_test(NAME integration_tests COMMAND lvt_integration_tests)
 # Chromium plugin tests — DOM JSON format and native messaging protocol
 add_executable(lvt_chromium_tests
     tests/chromium_tests.cpp
+    src/element_key.cpp
 )
 target_include_directories(lvt_chromium_tests PRIVATE src)
-target_compile_definitions(lvt_chromium_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_definitions(lvt_chromium_tests PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX
+    "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
+    "LVT_CHROMIUM_EXTENSION_OUTPUT_DIR=\"$<TARGET_FILE_DIR:lvt>/plugins/chromium/extension\""
+)
 target_link_libraries(lvt_chromium_tests PRIVATE
     GTest::gtest GTest::gtest_main
     nlohmann_json::nlohmann_json
 )
+add_dependencies(lvt_chromium_tests lvt_chromium_plugin)
 add_test(NAME chromium_tests COMMAND lvt_chromium_tests)
