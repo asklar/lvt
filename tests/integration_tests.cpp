@@ -49,6 +49,17 @@ static std::string make_cmd(const std::string& lvt, const std::string& args) {
     return "\"" + lvt + "\" " + args;
 }
 
+static std::string cmd_escape_arg(std::string arg) {
+    std::string escaped;
+    escaped.reserve(arg.size());
+    for (char c : arg) {
+        if (c == '|' || c == '&' || c == '<' || c == '>' || c == '^')
+            escaped += '^';
+        escaped += c;
+    }
+    return escaped;
+}
+
 // Launch a dedicated Notepad instance for testing
 class NotepadFixture : public ::testing::Test {
 protected:
@@ -310,6 +321,23 @@ static void collect_json_elements(const json& el, std::vector<const json*>& out)
     }
 }
 
+static void collect_stable_win32_map(const json& el, const std::string& path,
+                                     std::map<std::string, std::string>& out) {
+    if (el.value("framework", "") == "win32") {
+        auto key = el.value("key", "");
+        if (!key.empty()) {
+            out[key] = el.value("framework", "") + "|" +
+                       el.value("type", "") + "|" +
+                       el.value("className", "") + "|" + path;
+        }
+    }
+
+    if (el.contains("children") && el["children"].is_array()) {
+        for (size_t i = 0; i < el["children"].size(); ++i) {
+            collect_stable_win32_map(el["children"][i], path + "." + std::to_string(i), out);
+        }
+    }
+}
 TEST_F(NotepadFixture, Win32BoundsReasonable) {
     // Every element in the Win32 tree should have reasonable (non-extreme) bounds
     auto lvt = get_lvt_path();
@@ -352,6 +380,45 @@ TEST_F(NotepadFixture, RootBoundsNonZero) {
     auto& b = j["root"]["bounds"];
     EXPECT_GT(b["width"].get<int>(), 0) << "Root width should be positive";
     EXPECT_GT(b["height"].get<int>(), 0) << "Root height should be positive";
+}
+
+TEST_F(NotepadFixture, DurableKeysDeterministicAcrossTwoRuns) {
+    auto lvt = get_lvt_path();
+    auto first = run_command(make_cmd(lvt, get_pid_arg()));
+    auto second = run_command(make_cmd(lvt, get_pid_arg()));
+    ASSERT_FALSE(first.empty());
+    ASSERT_FALSE(second.empty());
+
+    auto j1 = json::parse(first, nullptr, false);
+    auto j2 = json::parse(second, nullptr, false);
+    ASSERT_FALSE(j1.is_discarded());
+    ASSERT_FALSE(j2.is_discarded());
+
+    std::map<std::string, std::string> firstMap;
+    std::map<std::string, std::string> secondMap;
+    collect_stable_win32_map(j1["root"], "0", firstMap);
+    collect_stable_win32_map(j2["root"], "0", secondMap);
+    if (firstMap.empty() || secondMap.empty())
+        GTEST_SKIP() << "No stable Win32 elements found for deterministic key comparison";
+
+    EXPECT_EQ(firstMap, secondMap);
+}
+
+TEST_F(NotepadFixture, QueryByIdAndDurableKey) {
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    auto rootKey = j["root"].value("key", "");
+    ASSERT_FALSE(rootKey.empty());
+
+    auto byId = run_command(make_cmd(lvt, get_pid_arg() + " --query e0 type"));
+    EXPECT_EQ(byId.substr(0, byId.find_last_not_of("\r\n") + 1),
+              j["root"].value("type", ""));
+
+    auto byKey = run_command(make_cmd(lvt, get_pid_arg() + " --query " + cmd_escape_arg(rootKey) + " id"));
+    EXPECT_EQ(byKey.substr(0, byKey.find_last_not_of("\r\n") + 1), "e0");
 }
 
 // ---- Annotation verification (DEBUG builds only) ----

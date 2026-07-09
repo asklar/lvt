@@ -12,6 +12,7 @@ add_executable(lvt
     src/target.cpp
     src/framework_detector.cpp
     src/tree_builder.cpp
+    src/element_key.cpp
     src/json_serializer.cpp
     src/watch_diff.cpp
     src/screenshot.cpp
@@ -264,6 +265,7 @@ find_package(GTest CONFIG REQUIRED)
 add_executable(lvt_unit_tests
     tests/unit_tests.cpp
     src/tree_builder.cpp
+    src/element_key.cpp
     src/json_serializer.cpp
     src/watch_diff.cpp
     src/framework_detector.cpp

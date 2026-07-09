@@ -135,8 +135,11 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     el.framework = framework;
     el.className = sanitize(j.value("type", ""));
     el.text = sanitize(j.value("text", ""));
+    auto name = sanitize(j.value("name", ""));
+    if (!name.empty())
+        el.properties["name"] = name;
     if (el.text.empty())
-        el.text = sanitize(j.value("name", ""));
+        el.text = name;
 
     auto lastDot = el.className.rfind('.');
     el.type = (lastDot != std::string::npos) ? el.className.substr(lastDot + 1) : el.className;

@@ -73,6 +73,9 @@ lvt --hwnd 0x1A0B3C --frameworks
 # Scope to a subtree
 lvt --name myapp --element e5 --depth 3
 
+# Query an element by durable key or eN id
+lvt --name myapp --query "win32|Window|MyWindow/win32|Button|Button|Name:OK" text
+
 # Screenshot + tree dump together
 lvt --name notepad --screenshot out.png --dump
 
@@ -94,7 +97,8 @@ lvt --name notepad --watch --interval 250
 | `--dump` | Output the tree (default unless `--screenshot` is used) |
 | `--watch` | Emit live JSON tree diff events until Ctrl+C |
 | `--interval <ms>` | Polling interval for `--watch` (default: 500) |
-| `--element <id>` | Scope to a specific element subtree |
+| `--element <ref>` | Scope to a specific element subtree by positional `eN` id or durable key |
+| `--query <ref> [prop]` | Output an element, or one property, by positional `eN` id or durable key |
 | `--frameworks` | Just list detected frameworks |
 | `--depth <n>` | Max tree traversal depth |
 

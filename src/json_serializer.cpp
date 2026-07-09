@@ -24,6 +24,7 @@ static json element_to_json(const Element& el) {
         return r;
     };
     j["id"] = el.id;
+    j["key"] = el.key;
     j["type"] = sanitize(el.type);
     j["framework"] = el.framework;
     if (!el.className.empty()) j["className"] = sanitize(el.className);
@@ -109,6 +110,7 @@ static void element_to_xml(const Element& el, std::ostringstream& out, int inden
 
     out << pad << "<" << tag;
     out << " id=\"" << xml_escape(el.id) << "\"";
+    out << " key=\"" << xml_escape(el.key) << "\"";
     out << " framework=\"" << xml_escape(el.framework) << "\"";
     if (!el.className.empty() && el.className != el.type)
         out << " className=\"" << xml_escape(el.className) << "\"";

@@ -16,6 +16,7 @@
 #include <xamlOM.h>
 #include <nlohmann/json.hpp>
 #include <cstdio>
+#include <set>
 #include <string>
 
 #pragma comment(lib, "userenv.lib")
@@ -133,11 +134,19 @@ static void collect_bridges(Element& el, std::vector<Element*>& bridges) {
     }
 }
 
+static std::string bridge_identity(const Element& el) {
+    if (el.nativeHandle != 0)
+        return std::to_string(el.nativeHandle);
+    auto it = el.properties.find("hwnd");
+    return it == el.properties.end() ? std::string() : it->second;
+}
+
 // Recursively graft JSON tree nodes into an Element tree.
 // parentOffsetX/Y accumulate offsets from the XAML root for screen coordinate computation.
 static void graft_json_node(const json& j, Element& parent, const std::string& framework,
                             double parentOffsetX = 0, double parentOffsetY = 0) {
-    Element el;
+    parent.children.emplace_back();
+    Element& el = parent.children.back();
     el.framework = framework;
     el.className = sanitize(j.value("type", ""));
 
@@ -205,7 +214,6 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
         }
     }
 
-    parent.children.push_back(std::move(el));
 }
 
 bool inject_and_collect_xaml_tree(
@@ -393,9 +401,7 @@ bool inject_and_collect_xaml_tree(
     // This is more robust than order-based matching since Win32 HWND enumeration order
     // may differ from XAML tree root enumeration order.
     if (treeJson.is_array()) {
-        std::vector<Element*> bridges;
-        collect_bridges(root, bridges);
-        std::vector<bool> bridgeUsed(bridges.size(), false);
+        std::set<std::string> usedBridges;
 
         for (auto& node : treeJson) {
             std::string typeName = sanitize(node.value("type", ""));
@@ -436,10 +442,13 @@ bool inject_and_collect_xaml_tree(
             }
 
             // Find the best-matching bridge by size similarity
+            std::vector<Element*> bridges;
+            collect_bridges(root, bridges);
             int bestIdx = -1;
             double bestScore = 1e18;
             for (size_t i = 0; i < bridges.size(); i++) {
-                if (bridgeUsed[i]) continue;
+                auto identity = bridge_identity(*bridges[i]);
+                if (!identity.empty() && usedBridges.count(identity)) continue;
                 double bw = bridges[i]->bounds.width;
                 double bh = bridges[i]->bounds.height;
                 // Score: prefer bridges whose dimensions best accommodate the content
@@ -453,8 +462,10 @@ bool inject_and_collect_xaml_tree(
             }
 
             if (bestIdx >= 0) {
-                bridgeUsed[bestIdx] = true;
                 auto* bridge = bridges[bestIdx];
+                auto identity = bridge_identity(*bridge);
+                if (!identity.empty())
+                    usedBridges.insert(identity);
                 double baseX = bridge->bounds.x;
                 double baseY = bridge->bounds.y;
                 graft_json_node(node, *bridge, frameworkLabel, baseX, baseY);
