@@ -3,7 +3,8 @@
     "tfm": "net8.0",
     "framework": {
       "name": "Microsoft.NETCore.App",
-      "version": "8.0.0"
+      "version": "8.0.0",
+      "rollForward": "Major"
     }
   }
 }

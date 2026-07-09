@@ -4,8 +4,8 @@
         Title="LVT Avalonia Test"
         Width="400" Height="300">
     <StackPanel Margin="20" Spacing="10">
-        <TextBlock Name="HelloText" Text="Hello World" FontSize="24" />
-        <Button Name="ClickButton" Content="Click Me" />
-        <TextBox Name="InputBox" Watermark="Type here..." />
+        <TextBlock x:Name="HelloText" Text="Hello World" FontSize="24" />
+        <Button x:Name="ClickButton" Content="Click Me" />
+        <TextBox x:Name="InputBox" Watermark="Type here..." />
     </StackPanel>
 </Window>
