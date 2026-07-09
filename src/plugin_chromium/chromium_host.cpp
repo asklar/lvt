@@ -8,6 +8,7 @@
 
 #include <Windows.h>
 #include <sddl.h>
+#include <wil/resource.h>
 #include <io.h>
 #include <fcntl.h>
 #include <cstdio>
@@ -62,15 +63,18 @@ static bool write_native_message(const std::string& msg) {
 
 // ---------- Named pipe server ----------
 
-static HANDLE create_pipe() {
+static wil::unique_hfile create_pipe() {
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = FALSE;
     // Allow all users to connect (lvt.exe may run as different user context)
+    PSECURITY_DESCRIPTOR rawSd = nullptr;
     ConvertStringSecurityDescriptorToSecurityDescriptorA(
-        "D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
+        "D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &rawSd, nullptr);
+    wil::unique_hlocal securityDescriptor(rawSd);
+    sa.lpSecurityDescriptor = securityDescriptor.get();
 
-    HANDLE pipe = CreateNamedPipeA(
+    return wil::unique_hfile(CreateNamedPipeA(
         PIPE_NAME,
         PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -78,10 +82,7 @@ static HANDLE create_pipe() {
         64 * 1024,     // out buffer
         4 * 1024 * 1024, // in buffer (DOM trees can be large)
         0,
-        &sa);
-
-    LocalFree(sa.lpSecurityDescriptor);
-    return pipe;
+        &sa));
 }
 
 // Read a length-prefixed message from the named pipe
@@ -90,21 +91,19 @@ static bool read_pipe_message(HANDLE pipe, std::string& out) {
     uint32_t len = 0;
     DWORD bytesRead = 0;
     OVERLAPPED ov = {};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    wil::unique_event event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ov.hEvent = event.get();
 
     BOOL ok = ReadFile(pipe, &len, 4, &bytesRead, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
         if (WaitForSingleObject(ov.hEvent, 30000) != WAIT_OBJECT_0) {
             CancelIo(pipe);
-            CloseHandle(ov.hEvent);
             return false;
         }
         if (!GetOverlappedResult(pipe, &ov, &bytesRead, FALSE)) {
-            CloseHandle(ov.hEvent);
             return false;
         }
     }
-    CloseHandle(ov.hEvent);
     if (bytesRead != 4 || len == 0 || len > 4 * 1024 * 1024)
         return false;
 
@@ -112,20 +111,18 @@ static bool read_pipe_message(HANDLE pipe, std::string& out) {
     DWORD totalRead = 0;
     while (totalRead < len) {
         ov = {};
-        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        wil::unique_event loopEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        ov.hEvent = loopEvent.get();
         ok = ReadFile(pipe, out.data() + totalRead, len - totalRead, &bytesRead, &ov);
         if (!ok && GetLastError() == ERROR_IO_PENDING) {
             if (WaitForSingleObject(ov.hEvent, 30000) != WAIT_OBJECT_0) {
                 CancelIo(pipe);
-                CloseHandle(ov.hEvent);
                 return false;
             }
             if (!GetOverlappedResult(pipe, &ov, &bytesRead, FALSE)) {
-                CloseHandle(ov.hEvent);
                 return false;
             }
         }
-        CloseHandle(ov.hEvent);
         if (bytesRead == 0) return false;
         totalRead += bytesRead;
     }
@@ -137,18 +134,18 @@ static bool write_pipe_message(HANDLE pipe, const std::string& msg) {
     uint32_t len = static_cast<uint32_t>(msg.size());
     DWORD bytesWritten = 0;
     OVERLAPPED ov = {};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    wil::unique_event event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ov.hEvent = event.get();
 
     // Write length prefix
     BOOL ok = WriteFile(pipe, &len, 4, &bytesWritten, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
         WaitForSingleObject(ov.hEvent, 5000);
         if (!GetOverlappedResult(pipe, &ov, &bytesWritten, FALSE)) {
-            CloseHandle(ov.hEvent);
             return false;
         }
     }
-    if (bytesWritten != 4) { CloseHandle(ov.hEvent); return false; }
+    if (bytesWritten != 4) { return false; }
 
     // Write message body
     ResetEvent(ov.hEvent);
@@ -156,12 +153,10 @@ static bool write_pipe_message(HANDLE pipe, const std::string& msg) {
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
         WaitForSingleObject(ov.hEvent, 30000);
         if (!GetOverlappedResult(pipe, &ov, &bytesWritten, FALSE)) {
-            CloseHandle(ov.hEvent);
             return false;
         }
     }
 
-    CloseHandle(ov.hEvent);
     return bytesWritten == len;
 }
 
@@ -226,19 +221,18 @@ static bool register_host() {
 
     bool ok = true;
     for (auto regPath : regPaths) {
-        HKEY key;
+        wil::unique_hkey key;
         LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, regPath, 0, nullptr,
-                                          0, KEY_SET_VALUE, nullptr, &key, nullptr);
+                                          0, KEY_SET_VALUE, nullptr, key.put(), nullptr);
         if (status != ERROR_SUCCESS) {
             fprintf(stderr, "Failed to create registry key: %ls (error %ld)\n", regPath, status);
             ok = false;
             continue;
         }
 
-        status = RegSetValueExW(key, nullptr, 0, REG_SZ,
+        status = RegSetValueExW(key.get(), nullptr, 0, REG_SZ,
                                 reinterpret_cast<const BYTE*>(manifestPathW.c_str()),
                                 static_cast<DWORD>((manifestPathW.size() + 1) * sizeof(wchar_t)));
-        RegCloseKey(key);
 
         if (status != ERROR_SUCCESS) {
             fprintf(stderr, "Failed to set registry value (error %ld)\n", status);
@@ -262,8 +256,8 @@ static void run_relay() {
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 
-    HANDLE pipe = create_pipe();
-    if (pipe == INVALID_HANDLE_VALUE) {
+    wil::unique_hfile pipe = create_pipe();
+    if (!pipe) {
         // Pipe may already exist from another host instance — not fatal,
         // but we can't relay without it.
         write_native_message("{\"type\":\"error\",\"message\":\"Failed to create named pipe\"}");
@@ -278,8 +272,9 @@ static void run_relay() {
         while (g_running) {
             // Wait for lvt to connect
             OVERLAPPED ov = {};
-            ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-            ConnectNamedPipe(pipe, &ov);
+            wil::unique_event event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+            ov.hEvent = event.get();
+            ConnectNamedPipe(pipe.get(), &ov);
             DWORD err = GetLastError();
 
             if (err == ERROR_IO_PENDING) {
@@ -289,28 +284,25 @@ static void run_relay() {
                         break;
                 }
                 if (!g_running) {
-                    CancelIo(pipe);
-                    CloseHandle(ov.hEvent);
+                    CancelIo(pipe.get());
                     break;
                 }
             } else if (err != ERROR_PIPE_CONNECTED && err != 0) {
-                CloseHandle(ov.hEvent);
                 Sleep(1000);
                 continue;
             }
-            CloseHandle(ov.hEvent);
 
             // lvt is connected — relay messages
             while (g_running) {
                 std::string msg;
-                if (!read_pipe_message(pipe, msg))
+                if (!read_pipe_message(pipe.get(), msg))
                     break;
                 // Forward lvt's request to the extension
                 if (!write_native_message(msg))
                     break;
             }
 
-            DisconnectNamedPipe(pipe);
+            DisconnectNamedPipe(pipe.get());
         }
     });
 
@@ -322,14 +314,12 @@ static void run_relay() {
             break;
         }
         // Forward extension's response to lvt via pipe
-        write_pipe_message(pipe, msg);
+        write_pipe_message(pipe.get(), msg);
     }
 
     g_running = false;
     if (pipeReader.joinable())
         pipeReader.join();
-
-    CloseHandle(pipe);
 }
 
 // ---------- Entry point ----------

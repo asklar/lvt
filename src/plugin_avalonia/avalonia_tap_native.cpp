@@ -3,6 +3,7 @@
 // Avalonia apps are always .NET Core/.NET 5+, so only the hostfxr path is needed.
 
 #include <Windows.h>
+#include <wil/resource.h>
 #include <string>
 #include <cstdio>
 
@@ -44,17 +45,16 @@ static std::wstring ReadPipeName() {
     std::wstring dir = GetDllDirectory();
     std::wstring path = dir + L"\\lvt_avalonia_pipe.txt";
 
-    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, 0, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
+    wil::unique_hfile hFile(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, 0, nullptr));
+    if (!hFile) {
         LogMsg("Failed to open pipe name file: %lu", GetLastError());
         return {};
     }
 
     char buf[256]{};
     DWORD bytesRead = 0;
-    ReadFile(hFile, buf, sizeof(buf) - 1, &bytesRead, nullptr);
-    CloseHandle(hFile);
+    ReadFile(hFile.get(), buf, sizeof(buf) - 1, &bytesRead, nullptr);
 
     int wlen = MultiByteToWideChar(CP_UTF8, 0, buf, bytesRead, nullptr, 0);
     std::wstring result(wlen, L'\0');
@@ -80,6 +80,7 @@ using hostfxr_close_fn = int(STDMETHODCALLTYPE*)(void* host_context_handle);
 
 static bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pipeName) {
     HMODULE hHostfxr = GetModuleHandleW(L"hostfxr.dll");
+    wil::unique_hmodule loadedHostfxr;
     if (!hHostfxr) {
         LogMsg("hostfxr.dll not loaded, trying to find it");
         wchar_t progFiles[MAX_PATH];
@@ -87,19 +88,19 @@ static bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pip
         std::wstring dotnetDir = std::wstring(progFiles) + L"\\dotnet\\host\\fxr";
 
         WIN32_FIND_DATAW fd;
-        HANDLE hFind = FindFirstFileW((dotnetDir + L"\\*").c_str(), &fd);
+        wil::unique_hfind hFind(FindFirstFileW((dotnetDir + L"\\*").c_str(), &fd));
         std::wstring latestFxr;
-        if (hFind != INVALID_HANDLE_VALUE) {
+        if (hFind) {
             do {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY && fd.cFileName[0] != L'.') {
                     latestFxr = dotnetDir + L"\\" + fd.cFileName + L"\\hostfxr.dll";
                 }
-            } while (FindNextFileW(hFind, &fd));
-            FindClose(hFind);
+            } while (FindNextFileW(hFind.get(), &fd));
         }
 
         if (!latestFxr.empty()) {
-            hHostfxr = LoadLibraryW(latestFxr.c_str());
+            loadedHostfxr.reset(LoadLibraryW(latestFxr.c_str()));
+            hHostfxr = loadedHostfxr.get();
             LogMsg("Loaded hostfxr from: %ls -> %p", latestFxr.c_str(), hHostfxr);
         }
     }
@@ -218,8 +219,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(hMod);
         LogMsg("DllMain: DLL_PROCESS_ATTACH");
 
-        HANDLE hThread = CreateThread(nullptr, 0, WorkerThread, reinterpret_cast<LPVOID>(hMod), 0, nullptr);
-        if (hThread) CloseHandle(hThread);
+        wil::unique_handle hThread(CreateThread(nullptr, 0, WorkerThread, reinterpret_cast<LPVOID>(hMod), 0, nullptr));
     }
     return TRUE;
 }
