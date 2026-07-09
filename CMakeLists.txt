@@ -288,19 +288,35 @@ target_link_libraries(lvt_unit_tests PRIVATE
 )
 add_test(NAME unit_tests COMMAND lvt_unit_tests)
 
+# WPF sample app used by integration tests
+set(WPF_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WpfSample/WpfSample.csproj")
+set(WPF_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WpfSample")
+add_custom_target(wpf_sample_app ALL
+    COMMAND dotnet build "${WPF_SAMPLE_PROJECT}" -c Release -o "${WPF_SAMPLE_OUTPUT_DIR}"
+    BYPRODUCTS "${WPF_SAMPLE_OUTPUT_DIR}/WpfSample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building WPF sample app"
+)
+file(TO_NATIVE_PATH "${WPF_SAMPLE_OUTPUT_DIR}/WpfSample.exe" WPF_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WPF_SAMPLE_EXE_ESCAPED "${WPF_SAMPLE_EXE_NATIVE}")
+
 # Integration tests — require a running Notepad instance
 add_executable(lvt_integration_tests
     tests/integration_tests.cpp
     tests/lvt_integration_tests.rc
 )
 target_include_directories(lvt_integration_tests PRIVATE src)
-target_compile_definitions(lvt_integration_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN UNICODE _UNICODE)
+target_compile_definitions(lvt_integration_tests PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN UNICODE _UNICODE
+    WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
+)
 target_link_libraries(lvt_integration_tests PRIVATE
     GTest::gtest GTest::gtest_main
     WIL::WIL nlohmann_json::nlohmann_json
     comctl32
 )
 target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
+add_dependencies(lvt_integration_tests wpf_sample_app)
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
 
 # Chromium plugin tests — DOM JSON format and native messaging protocol
