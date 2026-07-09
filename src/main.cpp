@@ -2,6 +2,7 @@
 #include "framework_detector.h"
 #include "tree_builder.h"
 #include "json_serializer.h"
+#include "watch_diff.h"
 #include "screenshot.h"
 #include "plugin_loader.h"
 #include "debug.h"
@@ -12,6 +13,22 @@
 #include <string>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
+
+static std::atomic_bool g_watchStop = false;
+
+static BOOL WINAPI console_ctrl_handler(DWORD ctrlType) {
+    if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT ||
+        ctrlType == CTRL_CLOSE_EVENT || ctrlType == CTRL_LOGOFF_EVENT ||
+        ctrlType == CTRL_SHUTDOWN_EVENT) {
+        g_watchStop = true;
+        return TRUE;
+    }
+    return FALSE;
+}
 
 static void print_usage() {
     fprintf(stderr,
@@ -35,6 +52,8 @@ static void print_usage() {
         "  --annotations-json <file>  Write annotation rectangles as JSON (test hook)\n"
 #endif
         "  --dump               Output the tree (default; implied unless --screenshot)\n"
+        "  --watch              Emit live JSON tree diff events until Ctrl+C\n"
+        "  --interval <ms>      Watch polling interval (default: 500)\n"
         "  --element <id>       Scope to a specific element subtree\n"
         "  --frameworks         Just detect and list frameworks\n"
         "  --depth <n>          Max tree traversal depth (default: unlimited)\n"
@@ -56,9 +75,11 @@ struct Args {
 #endif
     std::string elementId;
     int depth = -1;
+    int intervalMs = 500;
     bool frameworksOnly = false;
     bool dump = false;      // explicitly requested via --dump
     bool dumpSet = false;   // true if --dump was passed on command line
+    bool watch = false;
 };
 
 static Args parse_args(int argc, char* argv[]) {
@@ -90,6 +111,10 @@ static Args parse_args(int argc, char* argv[]) {
             args.elementId = argv[++i];
         } else if (strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
             args.depth = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--watch") == 0) {
+            args.watch = true;
+        } else if (strcmp(argv[i], "--interval") == 0 && i + 1 < argc) {
+            args.intervalMs = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--frameworks") == 0) {
             args.frameworksOnly = true;
         } else if (strcmp(argv[i], "--dump") == 0) {
@@ -115,6 +140,78 @@ static lvt::Element* find_element(lvt::Element& root, const std::string& id) {
     return nullptr;
 }
 
+static std::vector<std::string> framework_names(const std::vector<lvt::FrameworkInfo>& frameworks) {
+    std::vector<std::string> names;
+    for (auto& fi : frameworks) {
+        auto name = lvt::framework_display_name(fi);
+        if (fi.version.empty())
+            names.push_back(name);
+        else
+            names.push_back(name + " " + fi.version);
+    }
+    return names;
+}
+
+static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
+                              lvt::Element& outputTree) {
+    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks);
+
+    lvt::Element* outputRoot = &tree;
+    if (!args.elementId.empty()) {
+        outputRoot = find_element(tree, args.elementId);
+        if (!outputRoot) {
+            fprintf(stderr, "lvt: element '%s' not found\n", args.elementId.c_str());
+            return false;
+        }
+    }
+
+    if (args.depth >= 0)
+        lvt::trim_to_depth(*outputRoot, args.depth);
+
+    outputTree = *outputRoot;
+    return true;
+}
+
+static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+
+    lvt::Element previous;
+    if (!build_output_tree(target, args, previous))
+        return 1;
+
+    for (const auto& event : lvt::snapshot_added_events(previous))
+        printf("%s\n", lvt::serialize_change_event(event).c_str());
+    fflush(stdout);
+
+    while (!g_watchStop) {
+        auto sleepUntil = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(args.intervalMs);
+        while (!g_watchStop && std::chrono::steady_clock::now() < sleepUntil) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (g_watchStop)
+            break;
+
+        if (!IsWindow(target.hwnd)) {
+            fprintf(stderr, "lvt: target window closed\n");
+            break;
+        }
+
+        lvt::Element current;
+        if (!build_output_tree(target, args, current))
+            return 1;
+
+        for (const auto& event : lvt::diff_trees(previous, current))
+            printf("%s\n", lvt::serialize_change_event(event).c_str());
+        fflush(stdout);
+        previous = std::move(current);
+    }
+
+    SetConsoleCtrlHandler(console_ctrl_handler, FALSE);
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage();
@@ -129,6 +226,15 @@ int main(int argc, char* argv[]) {
     // --dump is default unless --screenshot is specified without --dump
     if (!args.dumpSet)
         args.dump = args.screenshotFile.empty();
+
+    if (args.intervalMs <= 0) {
+        fprintf(stderr, "lvt: --interval must be greater than 0\n");
+        return 1;
+    }
+    if (args.watch && args.format != "json") {
+        fprintf(stderr, "lvt: --watch emits JSON events; --format must be json\n");
+        return 1;
+    }
 
     if (!args.hwnd && !args.pid && args.processName.empty() && args.windowTitle.empty()) {
         fprintf(stderr, "lvt: must specify --hwnd, --pid, --name, or --title\n");
@@ -215,6 +321,12 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (args.watch) {
+        auto result = run_watch_loop(target, args);
+        lvt::unload_plugins();
+        return result;
+    }
+
     // Build full tree (no depth limit) so element IDs are stable
     auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks);
 
@@ -235,15 +347,7 @@ int main(int argc, char* argv[]) {
 
     // Serialize and output tree (unless suppressed by --screenshot without --dump)
     if (args.dump) {
-        std::vector<std::string> frameworkNames;
-        for (auto& fi : frameworks) {
-            auto name = lvt::framework_display_name(fi);
-            if (fi.version.empty())
-                frameworkNames.push_back(name);
-            else
-                frameworkNames.push_back(name + " " + fi.version);
-        }
-
+        auto frameworkNames = framework_names(frameworks);
         std::string serialized;
         if (args.format == "xml") {
             serialized = lvt::serialize_to_xml(*outputRoot, target.hwnd, target.pid,
