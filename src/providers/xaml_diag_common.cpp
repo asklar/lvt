@@ -84,12 +84,13 @@ static std::wstring stage_tap_dll_for_appcontainer(const std::wstring& srcDll) {
     }
 
     // Grant ALL_APPLICATION_PACKAGES read+execute access to the directory and DLL
-    PSECURITY_DESCRIPTOR sd = nullptr;
+    PSECURITY_DESCRIPTOR rawSd = nullptr;
     if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:(A;;GRGX;;;AC)(A;;GRGX;;;WD)", SDDL_REVISION_1, &sd, nullptr)) {
+            L"D:(A;;GRGX;;;AC)(A;;GRGX;;;WD)", SDDL_REVISION_1, &rawSd, nullptr)) {
+        wil::unique_hlocal sd(rawSd);
         PACL dacl = nullptr;
         BOOL daclPresent = FALSE, daclDefaulted = FALSE;
-        if (GetSecurityDescriptorDacl(sd, &daclPresent, &dacl, &daclDefaulted) && daclPresent) {
+        if (GetSecurityDescriptorDacl(sd.get(), &daclPresent, &dacl, &daclDefaulted) && daclPresent) {
             SetNamedSecurityInfoW(const_cast<LPWSTR>(destDir.c_str()),
                                   SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
                                   nullptr, nullptr, dacl, nullptr);
@@ -97,7 +98,6 @@ static std::wstring stage_tap_dll_for_appcontainer(const std::wstring& srcDll) {
                                   SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
                                   nullptr, nullptr, dacl, nullptr);
         }
-        LocalFree(sd);
     }
 
     if (g_debug)
@@ -240,41 +240,40 @@ bool inject_and_collect_xaml_tree(
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = FALSE;
+    PSECURITY_DESCRIPTOR rawPipeSd = nullptr;
     ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
+        L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &rawPipeSd, nullptr);
+    wil::unique_hlocal pipeSecurityDescriptor(rawPipeSd);
+    sa.lpSecurityDescriptor = pipeSecurityDescriptor.get();
 
-    HANDLE pipe = CreateNamedPipeW(
+    wil::unique_hfile pipe(CreateNamedPipeW(
         pipeName.c_str(),
         PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1, 0, 1024 * 1024, 10000, &sa);
-    LocalFree(sa.lpSecurityDescriptor);
+        1, 0, 1024 * 1024, 10000, &sa));
 
-    if (pipe == INVALID_HANDLE_VALUE) {
+    if (!pipe) {
         fprintf(stderr, "lvt: failed to create named pipe (error %lu)\n", GetLastError());
         return false;
     }
 
     // Load InitializeXamlDiagnosticsEx from the specified DLL.
     // This function runs in OUR process but injects into the target.
-    HMODULE hXaml = LoadLibraryExW(initDllPath.c_str(), nullptr,
-        LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    wil::unique_hmodule hXaml(LoadLibraryExW(initDllPath.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS));
     if (!hXaml) {
-        hXaml = LoadLibraryW(initDllPath.c_str());
+        hXaml.reset(LoadLibraryW(initDllPath.c_str()));
     }
     if (!hXaml) {
         fprintf(stderr, "lvt: failed to load %ls (error %lu)\n", initDllPath.c_str(), GetLastError());
-        CloseHandle(pipe);
         return false;
     }
 
     using FnInit = HRESULT(WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, CLSID, LPCWSTR);
     auto pInit = reinterpret_cast<FnInit>(
-        GetProcAddress(hXaml, "InitializeXamlDiagnosticsEx"));
+        GetProcAddress(hXaml.get(), "InitializeXamlDiagnosticsEx"));
     if (!pInit) {
         fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx not found in %ls\n", initDllPath.c_str());
-        FreeLibrary(hXaml);
-        CloseHandle(pipe);
         return false;
     }
 
@@ -284,8 +283,9 @@ bool inject_and_collect_xaml_tree(
     // synchronously and the TAP DLL can connect+write+close before we'd
     // otherwise reach ConnectNamedPipe, causing a missed connection.
     OVERLAPPED ov = {};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    ConnectNamedPipe(pipe, &ov);
+    wil::unique_event connectEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ov.hEvent = connectEvent.get();
+    ConnectNamedPipe(pipe.get(), &ov);
     DWORD connectErr = GetLastError();
 
     HRESULT hr = E_FAIL;
@@ -308,13 +308,11 @@ bool inject_and_collect_xaml_tree(
             break;
     }
 
-    FreeLibrary(hXaml);
+    hXaml.reset();
 
     if (FAILED(hr)) {
         fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx failed (0x%08lX)\n", hr);
-        CancelIo(pipe);
-        CloseHandle(ov.hEvent);
-        CloseHandle(pipe);
+        CancelIo(pipe.get());
         return false;
     }
 
@@ -326,36 +324,32 @@ bool inject_and_collect_xaml_tree(
         DWORD waitResult = WaitForSingleObject(ov.hEvent, 15000);
         if (waitResult != WAIT_OBJECT_0) {
             fprintf(stderr, "lvt: TAP DLL did not connect (timeout)\n");
-            CancelIo(pipe);
-            CloseHandle(ov.hEvent);
-            CloseHandle(pipe);
+            CancelIo(pipe.get());
             return false;
         }
     } else if (connectErr != ERROR_PIPE_CONNECTED) {
         fprintf(stderr, "lvt: ConnectNamedPipe failed (error %lu)\n", connectErr);
-        CloseHandle(ov.hEvent);
-        CloseHandle(pipe);
         return false;
     }
-    CloseHandle(ov.hEvent);
 
     // Read all data from pipe (overlapped with timeout)
     std::string data;
     char buf[4096];
     DWORD bytesRead = 0;
     OVERLAPPED readOv = {};
-    readOv.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    wil::unique_event readEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    readOv.hEvent = readEvent.get();
     for (;;) {
         ResetEvent(readOv.hEvent);
-        BOOL ok = ReadFile(pipe, buf, sizeof(buf), &bytesRead, &readOv);
+        BOOL ok = ReadFile(pipe.get(), buf, sizeof(buf), &bytesRead, &readOv);
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
                 if (WaitForSingleObject(readOv.hEvent, 15000) != WAIT_OBJECT_0) {
-                    CancelIo(pipe);
+                    CancelIo(pipe.get());
                     break;
                 }
-                if (!GetOverlappedResult(pipe, &readOv, &bytesRead, FALSE) || bytesRead == 0)
+                if (!GetOverlappedResult(pipe.get(), &readOv, &bytesRead, FALSE) || bytesRead == 0)
                     break;
             } else {
                 break;
@@ -365,8 +359,6 @@ bool inject_and_collect_xaml_tree(
         }
         data.append(buf, bytesRead);
     }
-    CloseHandle(readOv.hEvent);
-    CloseHandle(pipe);
 
     if (g_debug)
         fprintf(stderr, "lvt: received %zu bytes of XAML tree data\n", data.size());

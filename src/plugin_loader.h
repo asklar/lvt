@@ -4,11 +4,12 @@
 #include <string>
 #include <vector>
 #include <Windows.h>
+#include <wil/resource.h>
 
 namespace lvt {
 
 struct LoadedPlugin {
-    HMODULE module;
+    wil::unique_hmodule module;
     LvtPluginInfo* info;
     LvtDetectFrameworkFn detect;
     LvtEnrichTreeFn enrich;

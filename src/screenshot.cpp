@@ -175,13 +175,14 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
     bmi.bmiHeader.biCompression = BI_RGB;
 
     void* dibBits = nullptr;
-    HDC memDC = CreateCompatibleDC(nullptr);
-    HBITMAP hBitmap = CreateDIBSection(memDC, &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0);
-    if (!hBitmap || !dibBits) { DeleteDC(memDC); return; }
+    wil::unique_hdc memDC(CreateCompatibleDC(nullptr));
+    if (!memDC) return;
+    wil::unique_hbitmap hBitmap(CreateDIBSection(memDC.get(), &bmi, DIB_RGB_COLORS, &dibBits, nullptr, 0));
+    if (!hBitmap || !dibBits) return;
 
     // Copy pixels into the DIB
     memcpy(dibBits, pixels, bmpWidth * bmpHeight * 4);
-    HGDIOBJ old = SelectObject(memDC, hBitmap);
+    HGDIOBJ old = SelectObject(memDC.get(), hBitmap.get());
 
     RECT winRect{};
     GetWindowRect(hwnd, &winRect);
@@ -195,17 +196,17 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
     std::vector<const Element*> elements;
     collect_elements(*tree, elements);
 
-    HPEN pen = CreatePen(PS_SOLID, 2, RGB(255, 50, 50));
+    wil::unique_hpen pen(CreatePen(PS_SOLID, 2, RGB(255, 50, 50)));
     HBRUSH brush = static_cast<HBRUSH>(GetStockObject(NULL_BRUSH));
-    HGDIOBJ oldPen = SelectObject(memDC, pen);
-    HGDIOBJ oldBrush = SelectObject(memDC, brush);
-    SetBkMode(memDC, TRANSPARENT);
-    SetTextColor(memDC, RGB(255, 50, 50));
+    HGDIOBJ oldPen = SelectObject(memDC.get(), pen.get());
+    HGDIOBJ oldBrush = SelectObject(memDC.get(), brush);
+    SetBkMode(memDC.get(), TRANSPARENT);
+    SetTextColor(memDC.get(), RGB(255, 50, 50));
 
-    HFONT font = CreateFontW(-12, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Consolas");
-    HGDIOBJ oldFont = SelectObject(memDC, font);
+    wil::unique_hfont font(CreateFontW(-12, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Consolas"));
+    HGDIOBJ oldFont = SelectObject(memDC.get(), font.get());
 
     for (auto* el : elements) {
         if (el->bounds.width <= 0 || el->bounds.height <= 0) continue;
@@ -240,12 +241,12 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
         int h = static_cast<int>(lh * scaleY);
         if (x + w <= 0 || y + h <= 0 || x >= bmpWidth || y >= bmpHeight) continue;
 
-        Rectangle(memDC, x, y, x + w, y + h);
+        Rectangle(memDC.get(), x, y, x + w, y + h);
 
         if (!el->id.empty()) {
             std::wstring label(el->id.begin(), el->id.end());
             SIZE textSize{};
-            GetTextExtentPoint32W(memDC, label.c_str(), static_cast<int>(label.size()), &textSize);
+            GetTextExtentPoint32W(memDC.get(), label.c_str(), static_cast<int>(label.size()), &textSize);
             int labelW = textSize.cx + 4;
             int labelH = textSize.cy + 2;
 
@@ -264,20 +265,17 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
                 labelRect = {x, y + h, x + labelW, y + h + labelH};
             }
 
-            HBRUSH bgBrush = CreateSolidBrush(RGB(255, 255, 220));
-            FillRect(memDC, &labelRect, bgBrush);
-            DeleteObject(bgBrush);
-            TextOutW(memDC, labelRect.left + 2, labelRect.top + 1,
+            wil::unique_hbrush bgBrush(CreateSolidBrush(RGB(255, 255, 220)));
+            FillRect(memDC.get(), &labelRect, bgBrush.get());
+            TextOutW(memDC.get(), labelRect.left + 2, labelRect.top + 1,
                      label.c_str(), static_cast<int>(label.size()));
         }
     }
 
-    SelectObject(memDC, oldFont);
-    SelectObject(memDC, oldBrush);
-    SelectObject(memDC, oldPen);
-    SelectObject(memDC, old);
-    DeleteObject(font);
-    DeleteObject(pen);
+    SelectObject(memDC.get(), oldFont);
+    SelectObject(memDC.get(), oldBrush);
+    SelectObject(memDC.get(), oldPen);
+    SelectObject(memDC.get(), old);
 
     // Copy annotated pixels back
     memcpy(pixels, dibBits, bmpWidth * bmpHeight * 4);
@@ -288,8 +286,6 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
         pixels[i] = 255;
     }
 
-    DeleteObject(hBitmap);
-    DeleteDC(memDC);
 }
 
 // Save BGRA pixels to PNG using WIC

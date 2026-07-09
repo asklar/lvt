@@ -206,33 +206,34 @@ bool inject_and_collect_wpf_tree(Element& root, HWND /*hwnd*/, DWORD pid) {
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = FALSE;
+    PSECURITY_DESCRIPTOR rawSd = nullptr;
     ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
+        L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &rawSd, nullptr);
+    wil::unique_hlocal securityDescriptor(rawSd);
+    sa.lpSecurityDescriptor = securityDescriptor.get();
 
-    HANDLE pipe = CreateNamedPipeW(
+    wil::unique_hfile pipe(CreateNamedPipeW(
         pipeName.c_str(),
         PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1, 0, 1024 * 1024, 10000, &sa);
-    LocalFree(sa.lpSecurityDescriptor);
+        1, 0, 1024 * 1024, 10000, &sa));
 
-    if (pipe == INVALID_HANDLE_VALUE) {
+    if (!pipe) {
         fprintf(stderr, "lvt: failed to create named pipe (error %lu)\n", GetLastError());
         return false;
     }
 
     // Start overlapped connect before injection
     OVERLAPPED ov = {};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    ConnectNamedPipe(pipe, &ov);
+    wil::unique_event connectEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ov.hEvent = connectEvent.get();
+    ConnectNamedPipe(pipe.get(), &ov);
     DWORD connectErr = GetLastError();
 
     // Inject TAP DLL. Since the TAP DLL calls FreeLibraryAndExitThread after
     // collection, it unloads itself, so each run is a fresh injection.
     if (!inject_dll(pid, tapDll)) {
-        CancelIo(pipe);
-        CloseHandle(ov.hEvent);
-        CloseHandle(pipe);
+        CancelIo(pipe.get());
         return false;
     }
 
@@ -243,36 +244,32 @@ bool inject_and_collect_wpf_tree(Element& root, HWND /*hwnd*/, DWORD pid) {
     if (connectErr == ERROR_IO_PENDING) {
         if (WaitForSingleObject(ov.hEvent, 15000) != WAIT_OBJECT_0) {
             fprintf(stderr, "lvt: WPF TAP DLL did not connect (timeout)\n");
-            CancelIo(pipe);
-            CloseHandle(ov.hEvent);
-            CloseHandle(pipe);
+            CancelIo(pipe.get());
             return false;
         }
     } else if (connectErr != ERROR_PIPE_CONNECTED) {
         fprintf(stderr, "lvt: WPF ConnectNamedPipe failed (error %lu)\n", connectErr);
-        CloseHandle(ov.hEvent);
-        CloseHandle(pipe);
         return false;
     }
-    CloseHandle(ov.hEvent);
 
     // Read all data
     std::string data;
     char buf[4096];
     DWORD bytesRead = 0;
     OVERLAPPED readOv = {};
-    readOv.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    wil::unique_event readEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    readOv.hEvent = readEvent.get();
     for (;;) {
         ResetEvent(readOv.hEvent);
-        BOOL ok = ReadFile(pipe, buf, sizeof(buf), &bytesRead, &readOv);
+        BOOL ok = ReadFile(pipe.get(), buf, sizeof(buf), &bytesRead, &readOv);
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
                 if (WaitForSingleObject(readOv.hEvent, 15000) != WAIT_OBJECT_0) {
-                    CancelIo(pipe);
+                    CancelIo(pipe.get());
                     break;
                 }
-                if (!GetOverlappedResult(pipe, &readOv, &bytesRead, FALSE) || bytesRead == 0)
+                if (!GetOverlappedResult(pipe.get(), &readOv, &bytesRead, FALSE) || bytesRead == 0)
                     break;
             } else {
                 break;
@@ -282,8 +279,6 @@ bool inject_and_collect_wpf_tree(Element& root, HWND /*hwnd*/, DWORD pid) {
         }
         data.append(buf, bytesRead);
     }
-    CloseHandle(readOv.hEvent);
-    CloseHandle(pipe);
 
     // Clean up sidecar file
     DeleteFileW((exeDir + L"\\lvt_wpf_pipe.txt").c_str());
