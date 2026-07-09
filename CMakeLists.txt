@@ -156,7 +156,7 @@ add_library(lvt_tap SHARED
 )
 target_compile_definitions(lvt_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN)
 target_include_directories(lvt_tap PRIVATE src src/tap/winui3)
-target_link_libraries(lvt_tap PRIVATE ole32)
+target_link_libraries(lvt_tap PRIVATE WIL::WIL ole32)
 set_property(TARGET lvt_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Place lvt_tap_{arch}.dll next to lvt.exe
@@ -173,7 +173,7 @@ add_library(lvt_wpf_tap SHARED
 )
 target_compile_definitions(lvt_wpf_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(lvt_wpf_tap PRIVATE src)
-target_link_libraries(lvt_wpf_tap PRIVATE ole32)
+target_link_libraries(lvt_wpf_tap PRIVATE WIL::WIL ole32)
 set_property(TARGET lvt_wpf_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set_target_properties(lvt_wpf_tap PROPERTIES
@@ -201,7 +201,7 @@ add_library(lvt_winforms_tap SHARED
 )
 target_compile_definitions(lvt_winforms_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(lvt_winforms_tap PRIVATE src)
-target_link_libraries(lvt_winforms_tap PRIVATE ole32)
+target_link_libraries(lvt_winforms_tap PRIVATE WIL::WIL ole32)
 set_property(TARGET lvt_winforms_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set_target_properties(lvt_winforms_tap PROPERTIES

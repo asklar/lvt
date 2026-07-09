@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 #include <metahost.h>
+#include <wil/com.h>
 #include <string>
 #include <cstdio>
 
@@ -87,8 +88,8 @@ static bool TryNetFramework(const std::wstring& assemblyPath, const std::wstring
         return false;
     }
 
-    ICLRMetaHost* metaHost = nullptr;
-    HRESULT hr = pCLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (void**)&metaHost);
+    wil::com_ptr<ICLRMetaHost> metaHost;
+    HRESULT hr = pCLRCreateInstance(CLSID_CLRMetaHost, IID_PPV_ARGS(metaHost.put()));
     if (FAILED(hr)) {
         LogMsg("CLRCreateInstance failed: 0x%08X", hr);
         FreeLibrary(hMscoree);
@@ -96,27 +97,24 @@ static bool TryNetFramework(const std::wstring& assemblyPath, const std::wstring
     }
 
     // Enumerate loaded runtimes to find the one already running
-    IEnumUnknown* pEnum = nullptr;
-    hr = metaHost->EnumerateLoadedRuntimes(GetCurrentProcess(), &pEnum);
+    wil::com_ptr<IEnumUnknown> pEnum;
+    hr = metaHost->EnumerateLoadedRuntimes(GetCurrentProcess(), pEnum.put());
     if (FAILED(hr)) {
         LogMsg("EnumerateLoadedRuntimes failed: 0x%08X", hr);
-        metaHost->Release();
         return false;
     }
 
-    ICLRRuntimeInfo* runtimeInfo = nullptr;
-    IUnknown* pUnk = nullptr;
+    wil::com_ptr<ICLRRuntimeInfo> runtimeInfo;
+    wil::com_ptr<IUnknown> pUnk;
     ULONG fetched = 0;
-    while (pEnum->Next(1, &pUnk, &fetched) == S_OK) {
-        hr = pUnk->QueryInterface(IID_ICLRRuntimeInfo, (void**)&runtimeInfo);
-        pUnk->Release();
+    while (pEnum->Next(1, pUnk.put(), &fetched) == S_OK) {
+        hr = pUnk->QueryInterface(IID_PPV_ARGS(runtimeInfo.put()));
         if (SUCCEEDED(hr)) break;
+        pUnk.reset();
     }
-    pEnum->Release();
 
     if (!runtimeInfo) {
         LogMsg("No loaded CLR runtime found");
-        metaHost->Release();
         return false;
     }
 
@@ -125,10 +123,8 @@ static bool TryNetFramework(const std::wstring& assemblyPath, const std::wstring
     runtimeInfo->GetVersionString(version, &versionLen);
     LogMsg("Found CLR runtime: %ls", version);
 
-    ICLRRuntimeHost* runtimeHost = nullptr;
-    hr = runtimeInfo->GetInterface(CLSID_CLRRuntimeHost, IID_ICLRRuntimeHost, (void**)&runtimeHost);
-    runtimeInfo->Release();
-    metaHost->Release();
+    wil::com_ptr<ICLRRuntimeHost> runtimeHost;
+    hr = runtimeInfo->GetInterface(CLSID_CLRRuntimeHost, IID_PPV_ARGS(runtimeHost.put()));
 
     if (FAILED(hr) || !runtimeHost) {
         LogMsg("GetInterface for ICLRRuntimeHost failed: 0x%08X", hr);
@@ -144,8 +140,6 @@ static bool TryNetFramework(const std::wstring& assemblyPath, const std::wstring
         L"CollectTree",
         pipeName.c_str(),
         &retVal);
-
-    runtimeHost->Release();
 
     LogMsg("ExecuteInDefaultAppDomain returned 0x%08X, retVal=%lu", hr, retVal);
     return SUCCEEDED(hr);
