@@ -9,6 +9,7 @@
 #include <array>
 #include <map>
 #include <set>
+#include <vector>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -363,6 +364,44 @@ static void collect_key_contract_map(const json& el, const std::string& path,
     }
 }
 
+static bool json_tree_has_named_control(const json& el, const std::string& name) {
+    if (el.contains("properties") && el["properties"].is_object() &&
+        el["properties"].value("name", "") == name) {
+        return true;
+    }
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            if (json_tree_has_named_control(child, name))
+                return true;
+        }
+    }
+    return false;
+}
+
+static const json* find_named_control(const json& el, const std::string& name) {
+    if (el.contains("properties") && el["properties"].is_object() &&
+        el["properties"].value("name", "") == name) {
+        return &el;
+    }
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            if (auto* found = find_named_control(child, name))
+                return found;
+        }
+    }
+    return nullptr;
+}
+
+static bool frameworks_contain_wpf(const json& j) {
+    if (!j.contains("frameworks") || !j["frameworks"].is_array())
+        return false;
+    for (auto& fw : j["frameworks"]) {
+        if (fw.is_string() && fw.get<std::string>().starts_with("wpf"))
+            return true;
+    }
+    return false;
+}
+
 static const json* find_element_by_type_property(const json& el,
                                                  const std::string& type,
                                                  const std::string& property,
@@ -382,6 +421,124 @@ static const json* find_element_by_type_property(const json& el,
     return nullptr;
 }
 
+class WpfSampleFixture : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        s_sample_exe = WPF_SAMPLE_EXE_PATH;
+        if (!fs::exists(s_sample_exe)) {
+            s_skip_reason = "WPF sample app not found: " + s_sample_exe;
+            return;
+        }
+
+        STARTUPINFOA si = {sizeof(si)};
+        s_pi = {};
+        auto workdir = fs::path(s_sample_exe).parent_path().string();
+        std::string cmd = "\"" + s_sample_exe + "\"";
+        if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                            nullptr, workdir.c_str(), &si, &s_pi)) {
+            s_skip_reason = "Failed to launch WPF sample app";
+            return;
+        }
+        s_pid = s_pi.dwProcessId;
+        if (s_pi.hProcess) {
+            WaitForInputIdle(s_pi.hProcess, 5000);
+        }
+
+        auto lvt = get_lvt_path();
+        for (int attempt = 0; attempt < 30; ++attempt) {
+            auto output = run_command(make_cmd(lvt, get_pid_arg()));
+            auto j = json::parse(output, nullptr, false);
+            if (!j.is_discarded() && frameworks_contain_wpf(j) &&
+                j.contains("root") &&
+                json_tree_has_named_control(j["root"], "OkButton") &&
+                json_tree_has_named_control(j["root"], "NameBox") &&
+                json_tree_has_named_control(j["root"], "AgreeCheck")) {
+                s_ready = true;
+                return;
+            }
+            Sleep(1000);
+        }
+
+        s_skip_reason = "WPF sample app never became ready with WPF framework and named controls";
+    }
+
+    static void TearDownTestSuite() {
+        if (s_pi.hProcess) {
+            TerminateProcess(s_pi.hProcess, 0);
+            CloseHandle(s_pi.hProcess);
+            CloseHandle(s_pi.hThread);
+        }
+    }
+
+    static void SkipIfNotReady() {
+        if (!s_ready)
+            GTEST_SKIP() << s_skip_reason;
+    }
+
+    static std::string get_pid_arg() {
+        return "--pid " + std::to_string(s_pid);
+    }
+
+    static PROCESS_INFORMATION s_pi;
+    static DWORD s_pid;
+    static bool s_ready;
+    static std::string s_sample_exe;
+    static std::string s_skip_reason;
+};
+
+PROCESS_INFORMATION WpfSampleFixture::s_pi = {};
+DWORD WpfSampleFixture::s_pid = 0;
+bool WpfSampleFixture::s_ready = false;
+std::string WpfSampleFixture::s_sample_exe;
+std::string WpfSampleFixture::s_skip_reason;
+
+TEST_F(WpfSampleFixture, DurableKeyContract) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto first = run_command(make_cmd(lvt, get_pid_arg()));
+    auto second = run_command(make_cmd(lvt, get_pid_arg()));
+    ASSERT_FALSE(first.empty());
+    ASSERT_FALSE(second.empty());
+
+    auto j1 = json::parse(first, nullptr, false);
+    auto j2 = json::parse(second, nullptr, false);
+    ASSERT_FALSE(j1.is_discarded());
+    ASSERT_FALSE(j2.is_discarded());
+    ASSERT_TRUE(frameworks_contain_wpf(j1));
+
+    std::vector<const json*> elements;
+    collect_json_elements(j1["root"], elements);
+    ASSERT_GT(elements.size(), 0u);
+
+    std::set<std::string> keys;
+    for (auto* el : elements) {
+        auto key = el->value("key", "");
+        EXPECT_FALSE(key.empty()) << "Element " << el->value("id", "?") << " has empty durable key";
+        EXPECT_TRUE(keys.insert(key).second) << "Duplicate durable key: " << key;
+    }
+
+    std::map<std::string, std::string> firstMap;
+    std::map<std::string, std::string> secondMap;
+    collect_key_contract_map(j1["root"], "0", firstMap);
+    collect_key_contract_map(j2["root"], "0", secondMap);
+    EXPECT_EQ(firstMap, secondMap);
+
+    auto* okButton = find_named_control(j1["root"], "OkButton");
+    ASSERT_NE(okButton, nullptr);
+    EXPECT_EQ(okButton->value("framework", ""), "wpf");
+    EXPECT_EQ(okButton->value("type", ""), "Button");
+
+    auto okKey = okButton->value("key", "");
+    ASSERT_FALSE(okKey.empty());
+    auto queryOutput = run_command(make_cmd(lvt, get_pid_arg() + " --query " + cmd_escape_arg(okKey)));
+    auto queried = json::parse(queryOutput, nullptr, false);
+    ASSERT_FALSE(queried.is_discarded()) << queryOutput;
+    EXPECT_EQ(queried.value("key", ""), okKey);
+    EXPECT_EQ(queried.value("type", ""), "Button");
+    EXPECT_EQ(queried.value("framework", ""), "wpf");
+    EXPECT_EQ(queried.value("name", ""), "OkButton");
+}
 TEST_F(NotepadFixture, Win32BoundsReasonable) {
     // Every element in the Win32 tree should have reasonable (non-extreme) bounds
     auto lvt = get_lvt_path();
