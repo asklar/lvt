@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <Windows.h>
 #include <CommCtrl.h>
+#include <wil/resource.h>
 #include <cstdio>
 #include <string>
 #include <array>
@@ -85,6 +86,8 @@ protected:
         std::string cmd = "notepad.exe \"" + s_temp_file + "\"";
         CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE,
                       0, nullptr, nullptr, &si, &s_pi);
+        s_process.reset(s_pi.hProcess);
+        s_thread.reset(s_pi.hThread);
         if (s_pi.hProcess) {
             WaitForInputIdle(s_pi.hProcess, 5000);
         }
@@ -118,8 +121,10 @@ protected:
     static void TearDownTestSuite() {
         if (s_pi.hProcess) {
             TerminateProcess(s_pi.hProcess, 0);
-            CloseHandle(s_pi.hProcess);
-            CloseHandle(s_pi.hThread);
+            s_process.reset();
+            s_thread.reset();
+            s_pi.hProcess = nullptr;
+            s_pi.hThread = nullptr;
         }
         fs::remove(s_temp_file);
     }
@@ -136,12 +141,16 @@ protected:
 
     static std::string s_temp_file;
     static PROCESS_INFORMATION s_pi;
+    static wil::unique_handle s_process;
+    static wil::unique_handle s_thread;
     static DWORD s_pid;
     static HWND s_hwnd;
 };
 
 std::string NotepadFixture::s_temp_file;
 PROCESS_INFORMATION NotepadFixture::s_pi = {};
+wil::unique_handle NotepadFixture::s_process;
+wil::unique_handle NotepadFixture::s_thread;
 DWORD NotepadFixture::s_pid = 0;
 HWND NotepadFixture::s_hwnd = nullptr;
 
@@ -668,6 +677,8 @@ protected:
         ASSERT_TRUE(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE,
                                    0, nullptr, workdir.c_str(), &si, &pi_))
             << "Failed to launch " << appExe.string() << " (error " << GetLastError() << ")";
+        process_.reset(pi_.hProcess);
+        thread_.reset(pi_.hThread);
         if (pi_.hProcess)
             WaitForInputIdle(pi_.hProcess, 5000);
 
@@ -692,8 +703,10 @@ protected:
     void TearDown() override {
         if (pi_.hProcess) {
             TerminateProcess(pi_.hProcess, 0);
-            CloseHandle(pi_.hProcess);
-            CloseHandle(pi_.hThread);
+            process_.reset();
+            thread_.reset();
+            pi_.hProcess = nullptr;
+            pi_.hThread = nullptr;
         }
     }
 
@@ -702,6 +715,8 @@ protected:
     }
 
     PROCESS_INFORMATION pi_{};
+    wil::unique_handle process_;
+    wil::unique_handle thread_;
     json initialDump_;
 };
 
@@ -766,6 +781,8 @@ protected:
             return;
         }
         s_pid = s_pi.dwProcessId;
+        s_process.reset(s_pi.hProcess);
+        s_thread.reset(s_pi.hThread);
         if (s_pi.hProcess) {
             WaitForInputIdle(s_pi.hProcess, 5000);
         }
@@ -790,8 +807,10 @@ protected:
     static void TearDownTestSuite() {
         if (s_pi.hProcess) {
             TerminateProcess(s_pi.hProcess, 0);
-            CloseHandle(s_pi.hProcess);
-            CloseHandle(s_pi.hThread);
+            s_process.reset();
+            s_thread.reset();
+            s_pi.hProcess = nullptr;
+            s_pi.hThread = nullptr;
         }
     }
 
@@ -805,6 +824,8 @@ protected:
     }
 
     static PROCESS_INFORMATION s_pi;
+    static wil::unique_handle s_process;
+    static wil::unique_handle s_thread;
     static DWORD s_pid;
     static bool s_ready;
     static std::string s_sample_exe;
@@ -812,6 +833,8 @@ protected:
 };
 
 PROCESS_INFORMATION WinFormsSampleFixture::s_pi = {};
+wil::unique_handle WinFormsSampleFixture::s_process;
+wil::unique_handle WinFormsSampleFixture::s_thread;
 DWORD WinFormsSampleFixture::s_pid = 0;
 bool WinFormsSampleFixture::s_ready = false;
 std::string WinFormsSampleFixture::s_sample_exe;
@@ -941,6 +964,8 @@ protected:
             return;
         }
         s_pid = s_pi.dwProcessId;
+        s_process.reset(s_pi.hProcess);
+        s_thread.reset(s_pi.hThread);
         if (s_pi.hProcess) {
             WaitForInputIdle(s_pi.hProcess, 5000);
         }
@@ -966,8 +991,10 @@ protected:
     static void TearDownTestSuite() {
         if (s_pi.hProcess) {
             TerminateProcess(s_pi.hProcess, 0);
-            CloseHandle(s_pi.hProcess);
-            CloseHandle(s_pi.hThread);
+            s_process.reset();
+            s_thread.reset();
+            s_pi.hProcess = nullptr;
+            s_pi.hThread = nullptr;
         }
     }
 
@@ -981,6 +1008,8 @@ protected:
     }
 
     static PROCESS_INFORMATION s_pi;
+    static wil::unique_handle s_process;
+    static wil::unique_handle s_thread;
     static DWORD s_pid;
     static bool s_ready;
     static std::string s_sample_exe;
@@ -988,6 +1017,8 @@ protected:
 };
 
 PROCESS_INFORMATION WpfSampleFixture::s_pi = {};
+wil::unique_handle WpfSampleFixture::s_process;
+wil::unique_handle WpfSampleFixture::s_thread;
 DWORD WpfSampleFixture::s_pid = 0;
 bool WpfSampleFixture::s_ready = false;
 std::string WpfSampleFixture::s_sample_exe;
@@ -1058,6 +1089,8 @@ protected:
             return;
         }
         s_pid = s_pi.dwProcessId;
+        s_process.reset(s_pi.hProcess);
+        s_thread.reset(s_pi.hThread);
         if (s_pi.hProcess) {
             WaitForInputIdle(s_pi.hProcess, 10000);
         }
@@ -1088,8 +1121,10 @@ protected:
     static void TearDownTestSuite() {
         if (s_pi.hProcess) {
             TerminateProcess(s_pi.hProcess, 0);
-            CloseHandle(s_pi.hProcess);
-            CloseHandle(s_pi.hThread);
+            s_process.reset();
+            s_thread.reset();
+            s_pi.hProcess = nullptr;
+            s_pi.hThread = nullptr;
         }
     }
 
@@ -1103,6 +1138,8 @@ protected:
     }
 
     static PROCESS_INFORMATION s_pi;
+    static wil::unique_handle s_process;
+    static wil::unique_handle s_thread;
     static DWORD s_pid;
     static bool s_ready;
     static std::string s_sample_exe;
@@ -1110,6 +1147,8 @@ protected:
 };
 
 PROCESS_INFORMATION WinUI3SampleFixture::s_pi = {};
+wil::unique_handle WinUI3SampleFixture::s_process;
+wil::unique_handle WinUI3SampleFixture::s_thread;
 DWORD WinUI3SampleFixture::s_pid = 0;
 bool WinUI3SampleFixture::s_ready = false;
 std::string WinUI3SampleFixture::s_sample_exe;
@@ -1330,13 +1369,13 @@ protected:
         INITCOMMONCONTROLSEX icc{sizeof(INITCOMMONCONTROLSEX), ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES};
         ASSERT_TRUE(InitCommonControlsEx(&icc)) << "InitCommonControlsEx failed";
 
-        readyEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        readyEvent_.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
         ASSERT_NE(readyEvent_, nullptr);
 
-        thread_ = CreateThread(nullptr, 0, &ComCtlWindowFixture::thread_proc, this, 0, nullptr);
+        thread_.reset(CreateThread(nullptr, 0, &ComCtlWindowFixture::thread_proc, this, 0, nullptr));
         ASSERT_NE(thread_, nullptr);
 
-        ASSERT_EQ(WaitForSingleObject(readyEvent_, 5000), WAIT_OBJECT_0)
+        ASSERT_EQ(WaitForSingleObject(readyEvent_.get(), 5000), WAIT_OBJECT_0)
             << "Timed out creating ComCtl test window";
         ASSERT_NE(parentHwnd_, nullptr);
         ASSERT_NE(listViewHwnd_, nullptr);
@@ -1349,11 +1388,10 @@ protected:
         if (parentHwnd_)
             PostMessageW(parentHwnd_, WM_APP + 1, 0, 0);
         if (thread_) {
-            WaitForSingleObject(thread_, 5000);
-            CloseHandle(thread_);
+            WaitForSingleObject(thread_.get(), 5000);
+            thread_.reset();
         }
-        if (readyEvent_)
-            CloseHandle(readyEvent_);
+        readyEvent_.reset();
     }
 
     std::string get_hwnd_arg() const {
@@ -1370,6 +1408,7 @@ private:
 
     static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (msg == WM_APP + 1) {
+            // Window proc owns the HWND lifetime; close on the UI thread.
             DestroyWindow(hwnd);
             return 0;
         }
@@ -1396,7 +1435,7 @@ private:
             120, 120, 520, 360,
             nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
         if (!parentHwnd_) {
-            SetEvent(readyEvent_);
+            SetEvent(readyEvent_.get());
             return;
         }
 
@@ -1418,7 +1457,7 @@ private:
 
         UpdateWindow(parentHwnd_);
         pump_pending_messages();
-        SetEvent(readyEvent_);
+        SetEvent(readyEvent_.get());
 
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -1517,8 +1556,8 @@ protected:
     HWND parentHwnd_ = nullptr;
     HWND listViewHwnd_ = nullptr;
     HWND treeViewHwnd_ = nullptr;
-    HANDLE readyEvent_ = nullptr;
-    HANDLE thread_ = nullptr;
+    wil::unique_event readyEvent_;
+    wil::unique_handle thread_;
     bool listTextOk_ = false;
     bool treeTextOk_ = false;
 };
@@ -1703,10 +1742,11 @@ protected:
         RegisterClassExW(&wc);
 
         // Create parent window
-        parentHwnd_ = CreateWindowExW(0, L"LvtTestWindow", L"LVT Test Window",
+        parentWindow_.reset(CreateWindowExW(0, L"LvtTestWindow", L"LVT Test Window",
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             100, 100, 400, 300,
-            nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+            nullptr, nullptr, GetModuleHandle(nullptr), nullptr));
+        parentHwnd_ = parentWindow_.get();
         ASSERT_NE(parentHwnd_, nullptr) << "Failed to create test window";
 
         // Child controls at known client-area positions
@@ -1737,7 +1777,8 @@ protected:
     }
 
     void TearDown() override {
-        if (parentHwnd_) DestroyWindow(parentHwnd_);
+        parentWindow_.reset();
+        parentHwnd_ = nullptr;
         UnregisterClassW(L"LvtTestWindow", GetModuleHandle(nullptr));
     }
 
@@ -1747,6 +1788,7 @@ protected:
         return buf;
     }
 
+    wil::unique_hwnd parentWindow_;
     HWND parentHwnd_ = nullptr;
     HWND buttonHwnd_ = nullptr;
     HWND editHwnd_ = nullptr;
