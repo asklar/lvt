@@ -186,6 +186,9 @@ add_custom_command(TARGET lvt_wpf_tap POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/Release/LvtWpfTap.dll"
         "$<TARGET_FILE_DIR:lvt>/LvtWpfTap.dll"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.runtimeconfig.json"
+        "$<TARGET_FILE_DIR:lvt>/LvtWpfTap.runtimeconfig.json"
     COMMENT "Copying managed WPF tree walker assembly"
 )
 

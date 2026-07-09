@@ -247,7 +247,8 @@ static bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pip
             fprintf(f, "{\n  \"runtimeOptions\": {\n"
                        "    \"framework\": {\n"
                        "      \"name\": \"Microsoft.WindowsDesktop.App\",\n"
-                       "      \"version\": \"8.0.0\"\n"
+                       "      \"version\": \"8.0.0\",\n"
+                       "      \"rollForward\": \"LatestMajor\"\n"
                        "    }\n  }\n}\n");
             fclose(f);
             LogMsg("Created runtimeconfig.json");
