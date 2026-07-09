@@ -169,7 +169,6 @@ static bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pip
     // Find hostfxr.dll - it should be loadable if .NET is installed
     // First check if it's already loaded in the process
     HMODULE hHostfxr = GetModuleHandleW(L"hostfxr.dll");
-    wil::unique_hmodule loadedHostfxr;
     if (!hHostfxr) {
         // Try to load it from the .NET installation
         // Use nethost to find it
@@ -192,8 +191,11 @@ static bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pip
         }
 
         if (!latestFxr.empty()) {
-            loadedHostfxr.reset(LoadLibraryW(latestFxr.c_str()));
-            hHostfxr = loadedHostfxr.get();
+            // Intentionally kept resident (raw, not scope-owned): hostfxr pins the
+            // hosted CoreCLR resolver for the lifetime of this injected process.
+            // Freeing it on scope exit would diverge from the original behavior and
+            // risk unloading a host library out from under the running runtime.
+            hHostfxr = LoadLibraryW(latestFxr.c_str());
             LogMsg("Loaded hostfxr from: %ls -> %p", latestFxr.c_str(), hHostfxr);
         }
     }
