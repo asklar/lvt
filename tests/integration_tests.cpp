@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 #include <Windows.h>
+#include <CommCtrl.h>
 #include <cstdio>
 #include <string>
 #include <array>
@@ -58,6 +59,13 @@ static std::string cmd_escape_arg(std::string arg) {
         escaped += c;
     }
     return escaped;
+}
+
+static std::string trim_crlf(const std::string& value) {
+    auto end = value.find_last_not_of("\r\n");
+    if (end == std::string::npos)
+        return {};
+    return value.substr(0, end + 1);
 }
 
 // Launch a dedicated Notepad instance for testing
@@ -338,6 +346,42 @@ static void collect_stable_win32_map(const json& el, const std::string& path,
         }
     }
 }
+
+static void collect_key_contract_map(const json& el, const std::string& path,
+                                     std::map<std::string, std::string>& out) {
+    auto key = el.value("key", "");
+    if (!key.empty()) {
+        out[key] = el.value("framework", "") + "|" +
+                   el.value("type", "") + "|" +
+                   el.value("className", "") + "|" + path;
+    }
+
+    if (el.contains("children") && el["children"].is_array()) {
+        for (size_t i = 0; i < el["children"].size(); ++i) {
+            collect_key_contract_map(el["children"][i], path + "." + std::to_string(i), out);
+        }
+    }
+}
+
+static const json* find_element_by_type_property(const json& el,
+                                                 const std::string& type,
+                                                 const std::string& property,
+                                                 const std::string& value) {
+    if (el.value("type", "") == type &&
+        el.contains("properties") &&
+        el["properties"].value(property, "") == value) {
+        return &el;
+    }
+
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            if (auto* found = find_element_by_type_property(child, type, property, value))
+                return found;
+        }
+    }
+    return nullptr;
+}
+
 TEST_F(NotepadFixture, Win32BoundsReasonable) {
     // Every element in the Win32 tree should have reasonable (non-extreme) bounds
     auto lvt = get_lvt_path();
@@ -414,11 +458,10 @@ TEST_F(NotepadFixture, QueryByIdAndDurableKey) {
     ASSERT_FALSE(rootKey.empty());
 
     auto byId = run_command(make_cmd(lvt, get_pid_arg() + " --query e0 type"));
-    EXPECT_EQ(byId.substr(0, byId.find_last_not_of("\r\n") + 1),
-              j["root"].value("type", ""));
+    EXPECT_EQ(trim_crlf(byId), j["root"].value("type", ""));
 
     auto byKey = run_command(make_cmd(lvt, get_pid_arg() + " --query " + cmd_escape_arg(rootKey) + " id"));
-    EXPECT_EQ(byKey.substr(0, byKey.find_last_not_of("\r\n") + 1), "e0");
+    EXPECT_EQ(trim_crlf(byKey), "e0");
 }
 
 // ---- Annotation verification (DEBUG builds only) ----
@@ -500,6 +543,293 @@ TEST_F(NotepadFixture, AnnotationsMatchTreeElements) {
     fs::remove(annFile);
 }
 #endif
+
+// ---- Controlled Common Controls tests ----
+
+class ComCtlWindowFixture : public ::testing::Test {
+protected:
+    void SetUp() override {
+        INITCOMMONCONTROLSEX icc{sizeof(INITCOMMONCONTROLSEX), ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES};
+        ASSERT_TRUE(InitCommonControlsEx(&icc)) << "InitCommonControlsEx failed";
+
+        readyEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ASSERT_NE(readyEvent_, nullptr);
+
+        thread_ = CreateThread(nullptr, 0, &ComCtlWindowFixture::thread_proc, this, 0, nullptr);
+        ASSERT_NE(thread_, nullptr);
+
+        ASSERT_EQ(WaitForSingleObject(readyEvent_, 5000), WAIT_OBJECT_0)
+            << "Timed out creating ComCtl test window";
+        ASSERT_NE(parentHwnd_, nullptr);
+        ASSERT_NE(listViewHwnd_, nullptr);
+        ASSERT_NE(treeViewHwnd_, nullptr);
+        ASSERT_TRUE(listTextOk_) << "ListView text was not populated";
+        ASSERT_TRUE(treeTextOk_) << "TreeView text was not populated";
+    }
+
+    void TearDown() override {
+        if (parentHwnd_)
+            PostMessageW(parentHwnd_, WM_APP + 1, 0, 0);
+        if (thread_) {
+            WaitForSingleObject(thread_, 5000);
+            CloseHandle(thread_);
+        }
+        if (readyEvent_)
+            CloseHandle(readyEvent_);
+    }
+
+    std::string get_hwnd_arg() const {
+        char buf[64];
+        sprintf_s(buf, "--hwnd 0x%llX", (unsigned long long)(uintptr_t)parentHwnd_);
+        return buf;
+    }
+
+private:
+    static DWORD WINAPI thread_proc(void* param) {
+        static_cast<ComCtlWindowFixture*>(param)->run_ui_thread();
+        return 0;
+    }
+
+    static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+        if (msg == WM_APP + 1) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (msg == WM_DESTROY) {
+            PostQuitMessage(0);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    void run_ui_thread() {
+        INITCOMMONCONTROLSEX icc{sizeof(INITCOMMONCONTROLSEX), ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES};
+        InitCommonControlsEx(&icc);
+
+        WNDCLASSEXW wc = {sizeof(WNDCLASSEXW)};
+        wc.lpfnWndProc = wnd_proc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.lpszClassName = L"LvtComCtlTestWindow";
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        RegisterClassExW(&wc);
+
+        parentHwnd_ = CreateWindowExW(0, L"LvtComCtlTestWindow", L"LVT ComCtl Test Window",
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            120, 120, 520, 360,
+            nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+        if (!parentHwnd_) {
+            SetEvent(readyEvent_);
+            return;
+        }
+
+        listViewHwnd_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
+            10, 10, 480, 130,
+            parentHwnd_, reinterpret_cast<HMENU>(1001), GetModuleHandle(nullptr), nullptr);
+
+        treeViewHwnd_ = CreateWindowExW(WS_EX_CLIENTEDGE, WC_TREEVIEWW, L"",
+            WS_CHILD | WS_VISIBLE | TVS_HASLINES | TVS_LINESATROOT | TVS_HASBUTTONS,
+            10, 155, 480, 130,
+            parentHwnd_, reinterpret_cast<HMENU>(1002), GetModuleHandle(nullptr), nullptr);
+
+        if (listViewHwnd_)
+            populate_listview();
+        if (treeViewHwnd_)
+            populate_treeview();
+        verify_control_text();
+
+        UpdateWindow(parentHwnd_);
+        pump_pending_messages();
+        SetEvent(readyEvent_);
+
+        MSG msg;
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        parentHwnd_ = nullptr;
+        listViewHwnd_ = nullptr;
+        treeViewHwnd_ = nullptr;
+        UnregisterClassW(L"LvtComCtlTestWindow", GetModuleHandle(nullptr));
+    }
+
+    void populate_listview() {
+        ListView_SetExtendedListViewStyle(listViewHwnd_, LVS_EX_FULLROWSELECT);
+
+        LVCOLUMNW col{};
+        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+        col.cx = 160;
+        col.pszText = const_cast<LPWSTR>(L"Name");
+        col.iSubItem = 0;
+        SendMessageW(listViewHwnd_, LVM_INSERTCOLUMNW, 0, reinterpret_cast<LPARAM>(&col));
+
+        col.cx = 120;
+        col.pszText = const_cast<LPWSTR>(L"Value");
+        col.iSubItem = 1;
+        SendMessageW(listViewHwnd_, LVM_INSERTCOLUMNW, 1, reinterpret_cast<LPARAM>(&col));
+
+        insert_listview_item(0, L"Alpha", L"One");
+        insert_listview_item(1, L"Beta", L"Two");
+        insert_listview_item(2, L"Gamma", L"Three");
+    }
+
+    void insert_listview_item(int index, const wchar_t* name, const wchar_t* value) {
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = index;
+        item.iSubItem = 0;
+        item.pszText = const_cast<LPWSTR>(name);
+        SendMessageW(listViewHwnd_, LVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&item));
+
+        LVITEMW subitem{};
+        subitem.iSubItem = 1;
+        subitem.pszText = const_cast<LPWSTR>(value);
+        SendMessageW(listViewHwnd_, LVM_SETITEMTEXTW, index, reinterpret_cast<LPARAM>(&subitem));
+    }
+
+    void populate_treeview() {
+        TVINSERTSTRUCTW insert{};
+        insert.hParent = TVI_ROOT;
+        insert.hInsertAfter = TVI_LAST;
+        insert.item.mask = TVIF_TEXT;
+        insert.item.pszText = const_cast<LPWSTR>(L"Root Node");
+        auto root = reinterpret_cast<HTREEITEM>(
+            SendMessageW(treeViewHwnd_, TVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&insert)));
+
+        insert.hParent = root;
+        insert.item.pszText = const_cast<LPWSTR>(L"Child One");
+        SendMessageW(treeViewHwnd_, TVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&insert));
+        insert.item.pszText = const_cast<LPWSTR>(L"Child Two");
+        SendMessageW(treeViewHwnd_, TVM_INSERTITEMW, 0, reinterpret_cast<LPARAM>(&insert));
+
+        SendMessageW(treeViewHwnd_, TVM_EXPAND, TVE_EXPAND, reinterpret_cast<LPARAM>(root));
+    }
+
+    static void pump_pending_messages() {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    void verify_control_text() {
+        wchar_t listText[64]{};
+        LVITEMW item{};
+        item.iSubItem = 0;
+        item.cchTextMax = static_cast<int>(_countof(listText));
+        item.pszText = listText;
+        SendMessageW(listViewHwnd_, LVM_GETITEMTEXTW, 0, reinterpret_cast<LPARAM>(&item));
+        listTextOk_ = wcscmp(listText, L"Alpha") == 0;
+
+        auto root = reinterpret_cast<HTREEITEM>(
+            SendMessageW(treeViewHwnd_, TVM_GETNEXTITEM, TVGN_ROOT, 0));
+        wchar_t treeText[64]{};
+        TVITEMW treeItem{};
+        treeItem.mask = TVIF_TEXT;
+        treeItem.hItem = root;
+        treeItem.pszText = treeText;
+        treeItem.cchTextMax = static_cast<int>(_countof(treeText));
+        SendMessageW(treeViewHwnd_, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&treeItem));
+        treeTextOk_ = wcscmp(treeText, L"Root Node") == 0;
+    }
+
+protected:
+    HWND parentHwnd_ = nullptr;
+    HWND listViewHwnd_ = nullptr;
+    HWND treeViewHwnd_ = nullptr;
+    HANDLE readyEvent_ = nullptr;
+    HANDLE thread_ = nullptr;
+    bool listTextOk_ = false;
+    bool treeTextOk_ = false;
+};
+
+TEST_F(ComCtlWindowFixture, DetectsComCtlAndEnrichesItems) {
+    auto lvt = get_lvt_path();
+    auto fwOutput = run_command(make_cmd(lvt, get_hwnd_arg() + " --frameworks"));
+    ASSERT_FALSE(fwOutput.empty());
+    EXPECT_NE(fwOutput.find("win32"), std::string::npos);
+    EXPECT_NE(fwOutput.find("comctl"), std::string::npos);
+
+    auto output = run_command(make_cmd(lvt, get_hwnd_arg()));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded()) << "Output is not valid JSON";
+
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+
+    const json* listView = nullptr;
+    const json* treeView = nullptr;
+    int listViewItemCount = 0;
+    int treeViewItemCount = 0;
+    for (auto* el : elements) {
+        if (el->value("className", "") == "SysListView32") {
+            listView = el;
+            EXPECT_EQ(el->value("framework", ""), "comctl");
+            EXPECT_EQ(el->value("type", ""), "ListView");
+        }
+        if (el->value("className", "") == "SysTreeView32") {
+            treeView = el;
+            EXPECT_EQ(el->value("framework", ""), "comctl");
+            EXPECT_EQ(el->value("type", ""), "TreeView");
+        }
+        if (el->value("type", "") == "ListViewItem")
+            listViewItemCount++;
+        if (el->value("type", "") == "TreeViewItem")
+            treeViewItemCount++;
+    }
+
+    ASSERT_NE(listView, nullptr);
+    ASSERT_NE(treeView, nullptr);
+    EXPECT_EQ((*listView)["properties"].value("itemCount", ""), "3");
+    EXPECT_EQ((*listView)["properties"].value("columnCount", ""), "2");
+    EXPECT_EQ((*listView)["properties"].value("viewMode", ""), "details");
+    EXPECT_EQ((*treeView)["properties"].value("itemCount", ""), "3");
+    EXPECT_EQ(listViewItemCount, 3);
+    EXPECT_GE(treeViewItemCount, 1);
+    ASSERT_NE(find_element_by_type_property(j["root"], "ListViewItem", "index", "0"), nullptr);
+    ASSERT_NE(find_element_by_type_property(j["root"], "ListViewItem", "index", "1"), nullptr);
+    ASSERT_NE(find_element_by_type_property(j["root"], "ListViewItem", "index", "2"), nullptr);
+}
+
+TEST_F(ComCtlWindowFixture, DurableKeysCoverFullStaticTreeAndQueryRoundTrips) {
+    auto lvt = get_lvt_path();
+    auto first = run_command(make_cmd(lvt, get_hwnd_arg()));
+    auto second = run_command(make_cmd(lvt, get_hwnd_arg()));
+    ASSERT_FALSE(first.empty());
+    ASSERT_FALSE(second.empty());
+
+    auto j1 = json::parse(first, nullptr, false);
+    auto j2 = json::parse(second, nullptr, false);
+    ASSERT_FALSE(j1.is_discarded());
+    ASSERT_FALSE(j2.is_discarded());
+
+    std::vector<const json*> elements;
+    collect_json_elements(j1["root"], elements);
+    ASSERT_GT(elements.size(), 0u);
+
+    std::set<std::string> keys;
+    for (auto* el : elements) {
+        auto key = el->value("key", "");
+        EXPECT_FALSE(key.empty()) << el->value("id", "?") << " has empty key";
+        EXPECT_TRUE(keys.insert(key).second) << "Duplicate key: " << key;
+    }
+
+    std::map<std::string, std::string> firstMap;
+    std::map<std::string, std::string> secondMap;
+    collect_key_contract_map(j1["root"], "0", firstMap);
+    collect_key_contract_map(j2["root"], "0", secondMap);
+    EXPECT_EQ(firstMap, secondMap);
+
+    auto* item = find_element_by_type_property(j1["root"], "ListViewItem", "index", "0");
+    ASSERT_NE(item, nullptr);
+    auto key = item->value("key", "");
+    ASSERT_FALSE(key.empty());
+
+    auto byKey = run_command(make_cmd(lvt, get_hwnd_arg() + " --query " + cmd_escape_arg(key) + " index"));
+    EXPECT_EQ(trim_crlf(byKey), "0");
+}
 
 // ---- Framework-specific bounds (WinUI3/XAML) ----
 
