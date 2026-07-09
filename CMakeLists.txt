@@ -230,6 +230,17 @@ add_custom_command(TARGET lvt_avalonia_tap POST_BUILD
     COMMENT "Publishing managed Avalonia tree walker assembly"
 )
 
+add_custom_target(lvt_avalonia_tree_walker
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:lvt>/plugins/avalonia"
+    COMMAND dotnet publish "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj"
+        -c Release -o "$<TARGET_FILE_DIR:lvt>/plugins/avalonia"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
+        "$<TARGET_FILE_DIR:lvt>/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Publishing managed Avalonia tree walker assembly"
+)
+
 # Chromium plugin DLL — runtime-loaded plugin for Chrome/Edge DOM tree support
 add_library(lvt_chromium_plugin SHARED
     src/plugin_chromium/lvt_chromium_plugin.cpp
@@ -329,6 +340,18 @@ add_custom_target(winui3_sample_app ALL
 file(TO_NATIVE_PATH "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe" WINUI3_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" WINUI3_SAMPLE_EXE_ESCAPED "${WINUI3_SAMPLE_EXE_NATIVE}")
 
+# Avalonia sample app used by integration tests
+set(AVALONIA_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/avalonia_test_app/AvaloniaTestApp.csproj")
+set(AVALONIA_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/avalonia_test_app")
+add_custom_target(avalonia_test_app ALL
+    COMMAND dotnet build "${AVALONIA_SAMPLE_PROJECT}" -c Release -o "${AVALONIA_SAMPLE_OUTPUT_DIR}"
+    BYPRODUCTS "${AVALONIA_SAMPLE_OUTPUT_DIR}/AvaloniaTestApp.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building Avalonia integration test app"
+)
+file(TO_NATIVE_PATH "${AVALONIA_SAMPLE_OUTPUT_DIR}/AvaloniaTestApp.exe" AVALONIA_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" AVALONIA_SAMPLE_EXE_ESCAPED "${AVALONIA_SAMPLE_EXE_NATIVE}")
+
 # Integration tests — require a running Notepad instance
 add_executable(lvt_integration_tests
     tests/integration_tests.cpp
@@ -339,6 +362,7 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN UNICODE _UNICODE
     WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
     WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
+    AVALONIA_SAMPLE_EXE_PATH="${AVALONIA_SAMPLE_EXE_ESCAPED}"
 )
 target_link_libraries(lvt_integration_tests PRIVATE
     GTest::gtest GTest::gtest_main
@@ -346,7 +370,15 @@ target_link_libraries(lvt_integration_tests PRIVATE
     comctl32
 )
 target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
-add_dependencies(lvt_integration_tests wpf_sample_app winui3_sample_app)
+add_dependencies(lvt_integration_tests
+    lvt
+    lvt_avalonia_plugin
+    lvt_avalonia_tap
+    lvt_avalonia_tree_walker
+    avalonia_test_app
+    wpf_sample_app
+    winui3_sample_app
+)
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
 
 # Chromium plugin tests — DOM JSON format and native messaging protocol

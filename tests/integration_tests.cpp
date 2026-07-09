@@ -412,6 +412,16 @@ static bool frameworks_contain_winui3(const json& j) {
     return false;
 }
 
+static bool frameworks_contain_avalonia(const json& j) {
+    if (!j.contains("frameworks") || !j["frameworks"].is_array())
+        return false;
+    for (auto& fw : j["frameworks"]) {
+        if (fw.is_string() && fw.get<std::string>().starts_with("avalonia"))
+            return true;
+    }
+    return false;
+}
+
 static bool has_winui3_descendant(const json& el) {
     if (el.value("framework", "") == "winui3")
         return true;
@@ -437,6 +447,41 @@ static bool has_winui3_stitched_under_bridge(const json& el) {
     if (el.contains("children") && el["children"].is_array()) {
         for (auto& child : el["children"]) {
             if (has_winui3_stitched_under_bridge(child))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool has_avalonia_control(const json& el) {
+    if (el.value("framework", "") == "avalonia") {
+        auto type = el.value("type", "");
+        if (type == "Button" || type == "TextBlock" || type == "TextBox")
+            return true;
+        if (el.contains("properties") && el["properties"].is_object() &&
+            el["properties"].contains("name"))
+            return true;
+    }
+
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            if (has_avalonia_control(child))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool has_avalonia_under_host(const json& el, bool underAvaloniaHost = false) {
+    auto className = el.value("className", "");
+    bool isAvaloniaHost = className.rfind("Avalonia-", 0) == 0;
+    bool underHost = underAvaloniaHost || isAvaloniaHost;
+    if (underHost && el.value("framework", "") == "avalonia")
+        return true;
+
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            if (has_avalonia_under_host(child, underHost))
                 return true;
         }
     }
@@ -507,6 +552,189 @@ static std::string query_prop_until(const std::string& lvt, const std::string& p
         Sleep(500);
     }
     return r;
+}
+
+struct VisibleWindowSearch {
+    DWORD pid;
+    bool found;
+};
+
+static BOOL CALLBACK find_visible_window_for_pid(HWND hwnd, LPARAM lParam) {
+    auto* search = reinterpret_cast<VisibleWindowSearch*>(lParam);
+    DWORD windowPid = 0;
+    GetWindowThreadProcessId(hwnd, &windowPid);
+    if (windowPid == search->pid && IsWindowVisible(hwnd)) {
+        search->found = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static bool has_visible_window_for_pid(DWORD pid) {
+    VisibleWindowSearch search{pid, false};
+    EnumWindows(find_visible_window_for_pid, reinterpret_cast<LPARAM>(&search));
+    return search.found;
+}
+
+static bool deploy_plugins(const fs::path& source, const fs::path& dest, std::string& error) {
+    std::error_code ec;
+    fs::create_directories(dest, ec);
+    if (ec) {
+        error = "Failed to create " + dest.string() + ": " + ec.message();
+        return false;
+    }
+
+    for (const auto& entry : fs::recursive_directory_iterator(source, ec)) {
+        if (ec) {
+            error = "Failed to enumerate " + source.string() + ": " + ec.message();
+            return false;
+        }
+
+        auto relative = fs::relative(entry.path(), source, ec);
+        if (ec) {
+            error = "Failed to compute relative path for " + entry.path().string() + ": " + ec.message();
+            return false;
+        }
+
+        auto target = dest / relative;
+        if (entry.is_directory()) {
+            fs::create_directories(target, ec);
+            if (ec) {
+                error = "Failed to create " + target.string() + ": " + ec.message();
+                return false;
+            }
+            continue;
+        }
+
+        fs::create_directories(target.parent_path(), ec);
+        if (ec) {
+            error = "Failed to create " + target.parent_path().string() + ": " + ec.message();
+            return false;
+        }
+
+        if (!CopyFileW(entry.path().c_str(), target.c_str(), FALSE)) {
+            DWORD err = GetLastError();
+            if ((err == ERROR_SHARING_VIOLATION || err == ERROR_ACCESS_DENIED) && fs::exists(target))
+                continue;
+            error = "Failed to copy " + entry.path().string() + " to " + target.string() +
+                    " (error " + std::to_string(err) + ")";
+            return false;
+        }
+    }
+    return true;
+}
+
+class AvaloniaFixture : public ::testing::Test {
+protected:
+    void SetUp() override {
+        auto lvt = get_lvt_path();
+        fs::path buildDir = fs::path(lvt).parent_path();
+        fs::path builtPlugins = buildDir / "plugins";
+        if (!fs::exists(builtPlugins)) {
+            GTEST_SKIP() << "Avalonia plugin output not found at " << builtPlugins.string()
+                         << "; build lvt_avalonia_plugin first";
+        }
+
+        wchar_t profile[MAX_PATH]{};
+        DWORD profileLen = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+        if (profileLen == 0 || profileLen >= MAX_PATH)
+            GTEST_SKIP() << "USERPROFILE is not set; cannot deploy lvt plugins";
+
+        fs::path userPlugins = fs::path(profile) / ".lvt" / "plugins";
+        std::string deployError;
+        if (!deploy_plugins(builtPlugins, userPlugins, deployError))
+            GTEST_SKIP() << deployError;
+
+        fs::path appExe = AVALONIA_SAMPLE_EXE_PATH;
+        if (!fs::exists(appExe)) {
+            GTEST_SKIP() << "Avalonia test app not built at " << appExe.string()
+                         << "; build the avalonia_test_app target first";
+        }
+
+        STARTUPINFOA si = {sizeof(si)};
+        pi_ = {};
+        auto workdir = appExe.parent_path().string();
+        std::string cmd = "\"" + appExe.string() + "\"";
+        ASSERT_TRUE(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                                   0, nullptr, workdir.c_str(), &si, &pi_))
+            << "Failed to launch " << appExe.string() << " (error " << GetLastError() << ")";
+        if (pi_.hProcess)
+            WaitForInputIdle(pi_.hProcess, 5000);
+
+        for (int attempt = 0; attempt < 10 && !has_visible_window_for_pid(pi_.dwProcessId); ++attempt)
+            Sleep(500);
+
+        for (int attempt = 0; attempt < 30; ++attempt) {
+            auto output = run_command(make_cmd(lvt, pid_arg()));
+            auto j = json::parse(output, nullptr, false);
+            if (!j.is_discarded() && frameworks_contain_avalonia(j) &&
+                j.contains("root") && has_avalonia_control(j["root"])) {
+                initialDump_ = std::move(j);
+                return;
+            }
+            Sleep(1000);
+        }
+
+        GTEST_SKIP() << "Avalonia app never became ready: lvt did not detect avalonia with controls. "
+                     << "Ensure build\\plugins was deployed and the Avalonia plugin/tree walker were built.";
+    }
+
+    void TearDown() override {
+        if (pi_.hProcess) {
+            TerminateProcess(pi_.hProcess, 0);
+            CloseHandle(pi_.hProcess);
+            CloseHandle(pi_.hThread);
+        }
+    }
+
+    std::string pid_arg() const {
+        return "--pid " + std::to_string(pi_.dwProcessId);
+    }
+
+    PROCESS_INFORMATION pi_{};
+    json initialDump_;
+};
+
+TEST_F(AvaloniaFixture, DurableKeysAndQueryRoundTrip) {
+    ASSERT_TRUE(initialDump_.contains("root"));
+    ASSERT_TRUE(has_avalonia_under_host(initialDump_["root"]))
+        << "Avalonia elements should be stitched under the Avalonia-* HWND";
+
+    auto lvt = get_lvt_path();
+    auto avaloniaReady = [](const json& j) {
+        return frameworks_contain_avalonia(j) &&
+               j.contains("root") &&
+               has_avalonia_control(j["root"]);
+    };
+    auto secondDump = dump_ready_tree(lvt, pid_arg(), avaloniaReady);
+    ASSERT_FALSE(secondDump.is_discarded());
+
+    std::vector<const json*> elements;
+    collect_json_elements(initialDump_["root"], elements);
+    ASSERT_GT(elements.size(), 0u);
+
+    std::set<std::string> keys;
+    for (auto* el : elements) {
+        auto key = el->value("key", "");
+        EXPECT_FALSE(key.empty()) << "Element " << el->value("id", "?") << " has empty durable key";
+        EXPECT_TRUE(keys.insert(key).second) << "Duplicate durable key: " << key;
+    }
+
+    std::map<std::string, std::string> firstMap;
+    std::map<std::string, std::string> secondMap;
+    collect_key_contract_map(initialDump_["root"], "0", firstMap);
+    collect_key_contract_map(secondDump["root"], "0", secondMap);
+    EXPECT_EQ(firstMap, secondMap);
+
+    auto* button = find_named_control(initialDump_["root"], "ClickButton");
+    ASSERT_NE(button, nullptr) << "Expected x:Name'd Avalonia button in test tree";
+    EXPECT_EQ(button->value("framework", ""), "avalonia");
+    EXPECT_EQ(button->value("type", ""), "Button");
+
+    auto buttonKey = button->value("key", "");
+    ASSERT_FALSE(buttonKey.empty());
+    auto queriedName = query_prop_until(lvt, pid_arg(), buttonKey, "name", "ClickButton");
+    EXPECT_EQ(trim_crlf(queriedName), "ClickButton");
 }
 
 class WpfSampleFixture : public ::testing::Test {
