@@ -462,6 +462,53 @@ static const json* find_element_by_type_property(const json& el,
     return nullptr;
 }
 
+// Injected framework providers (WPF/WinUI3/XAML) collect their trees asynchronously,
+// so an individual `lvt` dump can race and return an incomplete tree on slow/CI
+// machines (see issue #27). These helpers retry until the framework subtree is
+// present, making the injection-based fixtures deterministic.
+template <typename Ready>
+static json dump_ready_tree(const std::string& lvt, const std::string& pidArg,
+                            Ready ready, int attempts = 40) {
+    json j;
+    for (int i = 0; i < attempts; ++i) {
+        auto out = run_command(make_cmd(lvt, pidArg));
+        j = json::parse(out, nullptr, false);
+        if (!j.is_discarded() && j.contains("root") && ready(j))
+            return j;
+        Sleep(500);
+    }
+    return j;
+}
+
+// Retry `--query <ref>` (full element JSON) until it resolves to the expected key.
+static json query_element_until(const std::string& lvt, const std::string& pidArg,
+                                const std::string& ref, const std::string& expectedKey,
+                                int attempts = 40) {
+    json q;
+    for (int i = 0; i < attempts; ++i) {
+        auto out = run_command(make_cmd(lvt, pidArg + " --query " + cmd_escape_arg(ref)));
+        q = json::parse(out, nullptr, false);
+        if (!q.is_discarded() && q.value("key", "") == expectedKey)
+            return q;
+        Sleep(500);
+    }
+    return q;
+}
+
+// Retry `--query <ref> <prop>` until it returns the expected value.
+static std::string query_prop_until(const std::string& lvt, const std::string& pidArg,
+                                    const std::string& ref, const std::string& prop,
+                                    const std::string& expected, int attempts = 40) {
+    std::string r;
+    for (int i = 0; i < attempts; ++i) {
+        r = trim_crlf(run_command(make_cmd(lvt, pidArg + " --query " + cmd_escape_arg(ref) + " " + prop)));
+        if (r == expected)
+            return r;
+        Sleep(500);
+    }
+    return r;
+}
+
 class WpfSampleFixture : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
@@ -537,15 +584,14 @@ TEST_F(WpfSampleFixture, DurableKeyContract) {
     SkipIfNotReady();
 
     auto lvt = get_lvt_path();
-    auto first = run_command(make_cmd(lvt, get_pid_arg()));
-    auto second = run_command(make_cmd(lvt, get_pid_arg()));
-    ASSERT_FALSE(first.empty());
-    ASSERT_FALSE(second.empty());
-
-    auto j1 = json::parse(first, nullptr, false);
-    auto j2 = json::parse(second, nullptr, false);
-    ASSERT_FALSE(j1.is_discarded());
-    ASSERT_FALSE(j2.is_discarded());
+    auto wpfReady = [](const json& j) {
+        return frameworks_contain_wpf(j) &&
+               json_tree_has_named_control(j["root"], "OkButton");
+    };
+    auto j1 = dump_ready_tree(lvt, get_pid_arg(), wpfReady);
+    auto j2 = dump_ready_tree(lvt, get_pid_arg(), wpfReady);
+    ASSERT_TRUE(wpfReady(j1)) << "WPF tree never became ready (dump 1)";
+    ASSERT_TRUE(wpfReady(j2)) << "WPF tree never became ready (dump 2)";
     ASSERT_TRUE(frameworks_contain_wpf(j1));
 
     std::vector<const json*> elements;
@@ -572,9 +618,8 @@ TEST_F(WpfSampleFixture, DurableKeyContract) {
 
     auto okKey = okButton->value("key", "");
     ASSERT_FALSE(okKey.empty());
-    auto queryOutput = run_command(make_cmd(lvt, get_pid_arg() + " --query " + cmd_escape_arg(okKey)));
-    auto queried = json::parse(queryOutput, nullptr, false);
-    ASSERT_FALSE(queried.is_discarded()) << queryOutput;
+    auto queried = query_element_until(lvt, get_pid_arg(), okKey, okKey);
+    ASSERT_FALSE(queried.is_discarded()) << "query for OkButton key never resolved";
     EXPECT_EQ(queried.value("key", ""), okKey);
     EXPECT_EQ(queried.value("type", ""), "Button");
     EXPECT_EQ(queried.value("framework", ""), "wpf");
@@ -661,15 +706,15 @@ TEST_F(WinUI3SampleFixture, DurableKeysDeterministicAndQueryable) {
     SkipIfNotReady();
 
     auto lvt = get_lvt_path();
-    auto first = run_command(make_cmd(lvt, get_pid_arg()));
-    auto second = run_command(make_cmd(lvt, get_pid_arg()));
-    ASSERT_FALSE(first.empty());
-    ASSERT_FALSE(second.empty());
-
-    auto j1 = json::parse(first, nullptr, false);
-    auto j2 = json::parse(second, nullptr, false);
-    ASSERT_FALSE(j1.is_discarded());
-    ASSERT_FALSE(j2.is_discarded());
+    auto winui3Ready = [](const json& j) {
+        return frameworks_contain_winui3(j) &&
+               has_winui3_stitched_under_bridge(j["root"]) &&
+               json_tree_has_named_control(j["root"], "PrimaryButton");
+    };
+    auto j1 = dump_ready_tree(lvt, get_pid_arg(), winui3Ready);
+    auto j2 = dump_ready_tree(lvt, get_pid_arg(), winui3Ready);
+    ASSERT_TRUE(winui3Ready(j1)) << "WinUI3 tree never became ready (dump 1)";
+    ASSERT_TRUE(winui3Ready(j2)) << "WinUI3 tree never became ready (dump 2)";
     ASSERT_TRUE(frameworks_contain_winui3(j1));
     ASSERT_TRUE(has_winui3_stitched_under_bridge(j1["root"]))
         << "WinUI3 elements were not grafted under DesktopChildSiteBridge";
@@ -698,9 +743,8 @@ TEST_F(WinUI3SampleFixture, DurableKeysDeterministicAndQueryable) {
 
     auto buttonKey = button->value("key", "");
     ASSERT_FALSE(buttonKey.empty());
-    auto byKey = run_command(make_cmd(lvt, get_pid_arg() + " --query " +
-                                           cmd_escape_arg(buttonKey) + " name"));
-    EXPECT_EQ(trim_crlf(byKey), "PrimaryButton");
+    auto byKey = query_prop_until(lvt, get_pid_arg(), buttonKey, "name", "PrimaryButton");
+    EXPECT_EQ(byKey, "PrimaryButton");
 }
 
 TEST_F(NotepadFixture, Win32BoundsReasonable) {
