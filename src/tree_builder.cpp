@@ -6,6 +6,7 @@
 #include "providers/xaml_provider.h"
 #include "providers/winui3_provider.h"
 #include "providers/wpf_provider.h"
+#include "providers/winforms_provider.h"
 #include "plugin_loader.h"
 #include <algorithm>
 #include <memory>
@@ -134,6 +135,11 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         case Framework::Wpf: {
             WpfProvider wpf;
             wpf.enrich(root, hwnd, pid);
+            break;
+        }
+        case Framework::WinForms: {
+            WinFormsProvider winforms;
+            winforms.enrich(root, hwnd, pid);
             break;
         }
         case Framework::Plugin: {
