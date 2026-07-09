@@ -303,6 +303,32 @@ add_custom_target(wpf_sample_app ALL
 file(TO_NATIVE_PATH "${WPF_SAMPLE_OUTPUT_DIR}/WpfSample.exe" WPF_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" WPF_SAMPLE_EXE_ESCAPED "${WPF_SAMPLE_EXE_NATIVE}")
 
+# WinUI3 sample app used by integration tests
+set(WINUI3_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/WinUI3Sample.csproj")
+set(WINUI3_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinUI3Sample")
+set(WINUI3_SAMPLE_MSBUILD_ARGS "")
+if(DEFINED ENV{VSINSTALLDIR} AND EXISTS "$ENV{VSINSTALLDIR}/MSBuild/Microsoft/VisualStudio/v18.0/AppxPackage/Microsoft.Build.Packaging.Pri.Tasks.dll")
+    list(APPEND WINUI3_SAMPLE_MSBUILD_ARGS
+        "-p:MSBuildExtensionsPath=$ENV{VSINSTALLDIR}/MSBuild")
+endif()
+add_custom_target(winui3_sample_app ALL
+    COMMAND dotnet publish "${WINUI3_SAMPLE_PROJECT}"
+        -c Release -p:Platform=x64 -r win-x64 --self-contained true
+        -o "${WINUI3_SAMPLE_OUTPUT_DIR}"
+        ${WINUI3_SAMPLE_MSBUILD_ARGS}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net8.0-windows10.0.19041.0/win-x64/App.xbf"
+        "${WINUI3_SAMPLE_OUTPUT_DIR}/App.xbf"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net8.0-windows10.0.19041.0/win-x64/MainWindow.xbf"
+        "${WINUI3_SAMPLE_OUTPUT_DIR}/MainWindow.xbf"
+    BYPRODUCTS "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Publishing WinUI3 sample app"
+)
+file(TO_NATIVE_PATH "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe" WINUI3_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WINUI3_SAMPLE_EXE_ESCAPED "${WINUI3_SAMPLE_EXE_NATIVE}")
+
 # Integration tests — require a running Notepad instance
 add_executable(lvt_integration_tests
     tests/integration_tests.cpp
@@ -312,6 +338,7 @@ target_include_directories(lvt_integration_tests PRIVATE src)
 target_compile_definitions(lvt_integration_tests PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN UNICODE _UNICODE
     WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
+    WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
 )
 target_link_libraries(lvt_integration_tests PRIVATE
     GTest::gtest GTest::gtest_main
@@ -319,7 +346,7 @@ target_link_libraries(lvt_integration_tests PRIVATE
     comctl32
 )
 target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
-add_dependencies(lvt_integration_tests wpf_sample_app)
+add_dependencies(lvt_integration_tests wpf_sample_app winui3_sample_app)
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
 
 # Chromium plugin tests — DOM JSON format and native messaging protocol
