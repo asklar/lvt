@@ -402,6 +402,47 @@ static bool frameworks_contain_wpf(const json& j) {
     return false;
 }
 
+static bool frameworks_contain_winui3(const json& j) {
+    if (!j.contains("frameworks") || !j["frameworks"].is_array())
+        return false;
+    for (auto& fw : j["frameworks"]) {
+        if (fw.is_string() && fw.get<std::string>().starts_with("winui3"))
+            return true;
+    }
+    return false;
+}
+
+static bool has_winui3_descendant(const json& el) {
+    if (el.value("framework", "") == "winui3")
+        return true;
+
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            if (has_winui3_descendant(child))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool has_winui3_stitched_under_bridge(const json& el) {
+    if (el.value("className", "") == "Microsoft.UI.Content.DesktopChildSiteBridge" &&
+        el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            if (has_winui3_descendant(child))
+                return true;
+        }
+    }
+
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            if (has_winui3_stitched_under_bridge(child))
+                return true;
+        }
+    }
+    return false;
+}
+
 static const json* find_element_by_type_property(const json& el,
                                                  const std::string& type,
                                                  const std::string& property,
@@ -539,6 +580,129 @@ TEST_F(WpfSampleFixture, DurableKeyContract) {
     EXPECT_EQ(queried.value("framework", ""), "wpf");
     EXPECT_EQ(queried.value("name", ""), "OkButton");
 }
+
+class WinUI3SampleFixture : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        s_sample_exe = WINUI3_SAMPLE_EXE_PATH;
+        if (!fs::exists(s_sample_exe)) {
+            s_skip_reason = "WinUI3 sample app not found: " + s_sample_exe;
+            return;
+        }
+
+        STARTUPINFOA si = {sizeof(si)};
+        s_pi = {};
+        auto workdir = fs::path(s_sample_exe).parent_path().string();
+        std::string cmd = "\"" + s_sample_exe + "\"";
+        if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                            nullptr, workdir.c_str(), &si, &s_pi)) {
+            s_skip_reason = "Failed to launch WinUI3 sample app";
+            return;
+        }
+        s_pid = s_pi.dwProcessId;
+        if (s_pi.hProcess) {
+            WaitForInputIdle(s_pi.hProcess, 10000);
+        }
+
+        auto lvt = get_lvt_path();
+        for (int attempt = 0; attempt < 60; ++attempt) {
+            if (WaitForSingleObject(s_pi.hProcess, 0) == WAIT_OBJECT_0) {
+                s_skip_reason = "WinUI3 sample app exited before it became ready";
+                return;
+            }
+
+            auto output = run_command(make_cmd(lvt, get_pid_arg()));
+            auto j = json::parse(output, nullptr, false);
+            if (!j.is_discarded() && frameworks_contain_winui3(j) &&
+                j.contains("root") &&
+                json_tree_has_named_control(j["root"], "PrimaryButton") &&
+                json_tree_has_named_control(j["root"], "InputBox") &&
+                json_tree_has_named_control(j["root"], "ReadyCheckBox")) {
+                s_ready = true;
+                return;
+            }
+            Sleep(1000);
+        }
+
+        s_skip_reason = "WinUI3 sample app never became ready with WinUI3 framework and named controls";
+    }
+
+    static void TearDownTestSuite() {
+        if (s_pi.hProcess) {
+            TerminateProcess(s_pi.hProcess, 0);
+            CloseHandle(s_pi.hProcess);
+            CloseHandle(s_pi.hThread);
+        }
+    }
+
+    static void SkipIfNotReady() {
+        if (!s_ready)
+            GTEST_SKIP() << s_skip_reason;
+    }
+
+    static std::string get_pid_arg() {
+        return "--pid " + std::to_string(s_pid);
+    }
+
+    static PROCESS_INFORMATION s_pi;
+    static DWORD s_pid;
+    static bool s_ready;
+    static std::string s_sample_exe;
+    static std::string s_skip_reason;
+};
+
+PROCESS_INFORMATION WinUI3SampleFixture::s_pi = {};
+DWORD WinUI3SampleFixture::s_pid = 0;
+bool WinUI3SampleFixture::s_ready = false;
+std::string WinUI3SampleFixture::s_sample_exe;
+std::string WinUI3SampleFixture::s_skip_reason;
+
+TEST_F(WinUI3SampleFixture, DurableKeysDeterministicAndQueryable) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto first = run_command(make_cmd(lvt, get_pid_arg()));
+    auto second = run_command(make_cmd(lvt, get_pid_arg()));
+    ASSERT_FALSE(first.empty());
+    ASSERT_FALSE(second.empty());
+
+    auto j1 = json::parse(first, nullptr, false);
+    auto j2 = json::parse(second, nullptr, false);
+    ASSERT_FALSE(j1.is_discarded());
+    ASSERT_FALSE(j2.is_discarded());
+    ASSERT_TRUE(frameworks_contain_winui3(j1));
+    ASSERT_TRUE(has_winui3_stitched_under_bridge(j1["root"]))
+        << "WinUI3 elements were not grafted under DesktopChildSiteBridge";
+
+    std::vector<const json*> elements;
+    collect_json_elements(j1["root"], elements);
+    ASSERT_GT(elements.size(), 0u);
+
+    std::set<std::string> keys;
+    for (auto* el : elements) {
+        auto key = el->value("key", "");
+        EXPECT_FALSE(key.empty()) << "Element " << el->value("id", "?") << " has empty durable key";
+        EXPECT_TRUE(keys.insert(key).second) << "Duplicate durable key: " << key;
+    }
+
+    std::map<std::string, std::string> firstMap;
+    std::map<std::string, std::string> secondMap;
+    collect_key_contract_map(j1["root"], "0", firstMap);
+    collect_key_contract_map(j2["root"], "0", secondMap);
+    EXPECT_EQ(firstMap, secondMap);
+
+    auto* button = find_named_control(j1["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr);
+    EXPECT_EQ(button->value("framework", ""), "winui3");
+    EXPECT_EQ(button->value("type", ""), "Button");
+
+    auto buttonKey = button->value("key", "");
+    ASSERT_FALSE(buttonKey.empty());
+    auto byKey = run_command(make_cmd(lvt, get_pid_arg() + " --query " +
+                                           cmd_escape_arg(buttonKey) + " name"));
+    EXPECT_EQ(trim_crlf(byKey), "PrimaryButton");
+}
+
 TEST_F(NotepadFixture, Win32BoundsReasonable) {
     // Every element in the Win32 tree should have reasonable (non-extreme) bounds
     auto lvt = get_lvt_path();

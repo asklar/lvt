@@ -2,6 +2,8 @@
 build/
 build-x86/
 build-arm64/
+tests/apps/WinUI3Sample/bin/
+tests/apps/WinUI3Sample/obj/
 
 # IDE files
 .vs/
