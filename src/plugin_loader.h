@@ -36,6 +36,7 @@ std::vector<PluginFrameworkInfo> detect_plugin_frameworks(HWND hwnd, DWORD pid);
 // Ask the relevant plugin to enrich the tree for a plugin-detected framework.
 // Parses the JSON response and grafts elements under matching Win32 nodes.
 bool enrich_with_plugin(Element& root, HWND hwnd, DWORD pid,
-                        const PluginFrameworkInfo& pluginFw);
+                        const PluginFrameworkInfo& pluginFw,
+                        const std::string& pluginOption = {});
 
 } // namespace lvt

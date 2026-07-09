@@ -180,11 +180,14 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
 }
 
 bool enrich_with_plugin(Element& root, HWND hwnd, DWORD pid,
-                        const PluginFrameworkInfo& pluginFw) {
+                        const PluginFrameworkInfo& pluginFw,
+                        const std::string& pluginOption) {
     if (!pluginFw.plugin || !pluginFw.plugin->enrich) return false;
 
     char* jsonOut = nullptr;
-    int ok = pluginFw.plugin->enrich(hwnd, pid, nullptr, &jsonOut);
+    int ok = pluginFw.plugin->enrich(hwnd, pid,
+                                     pluginOption.empty() ? nullptr : pluginOption.c_str(),
+                                     &jsonOut);
     if (!ok || !jsonOut) return false;
 
     json treeJson;

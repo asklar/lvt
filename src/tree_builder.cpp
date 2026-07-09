@@ -107,7 +107,8 @@ void trim_to_depth(Element& root, int maxDepth) {
     trim_to_depth_impl(root, 0, maxDepth);
 }
 
-Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frameworks, int maxDepth) {
+Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frameworks,
+                   int maxDepth, const std::string& pluginOption) {
     // Start with the Win32 provider as the base — it always applies
     Win32Provider win32;
     Element root = win32.build(hwnd, maxDepth);
@@ -143,7 +144,7 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
                     pf.name = fi.name;
                     pf.version = fi.version;
                     pf.plugin = &p;
-                    enrich_with_plugin(root, hwnd, pid, pf);
+                    enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
                     break;
                 }
             }
