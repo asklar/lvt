@@ -291,13 +291,16 @@ add_test(NAME unit_tests COMMAND lvt_unit_tests)
 # Integration tests — require a running Notepad instance
 add_executable(lvt_integration_tests
     tests/integration_tests.cpp
+    tests/lvt_integration_tests.rc
 )
 target_include_directories(lvt_integration_tests PRIVATE src)
-target_compile_definitions(lvt_integration_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN)
+target_compile_definitions(lvt_integration_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN UNICODE _UNICODE)
 target_link_libraries(lvt_integration_tests PRIVATE
     GTest::gtest GTest::gtest_main
     WIL::WIL nlohmann_json::nlohmann_json
+    comctl32
 )
+target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
 
 # Chromium plugin tests — DOM JSON format and native messaging protocol
