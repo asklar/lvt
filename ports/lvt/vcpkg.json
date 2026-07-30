@@ -43,13 +43,15 @@
       "description": "WinForms support. The managed tree-walker assembly is not built here and must be deployed separately for full enrichment."
     },
     "winui3": {
-      "description": "WinUI 3 (Windows App SDK) support. Pure C++; downloads the Windows App SDK winmd to generate the C++/WinRT projection."
+      "description": "WinUI 3 (Windows App SDK) support. Pure C++; downloads the Windows App SDK winmd to generate the C++/WinRT projection.",
+      "dependencies": [ "cppwinrt" ]
     },
     "wpf": {
       "description": "WPF support. The managed tree-walker assembly is not built here and must be deployed separately for full enrichment."
     },
     "xaml": {
-      "description": "System XAML (UWP / DesktopWindowXamlSource) support"
+      "description": "System XAML (UWP / DesktopWindowXamlSource) support",
+      "dependencies": [ "cppwinrt" ]
     }
   }
 }

@@ -144,26 +144,49 @@ endif()
 
 # Generate C++/WinRT projected headers from the Windows App SDK winmd.
 # These are needed for TransformToVisual / TextBlock.Text in the TAP DLL.
+#
+# Only the Microsoft.* (Windows App SDK) half is generated here; winrt/base.h
+# and the Windows.* projection come from elsewhere on the include path. Those
+# two halves must be produced by the *same* cppwinrt version or the generated
+# code fails to compile against base.h's macros ("Mismatched C++/WinRT
+# headers"). Preferring vcpkg's cppwinrt port keeps them in lockstep, and lets
+# a consumer that already depends on cppwinrt dictate the single version used.
 set(WINUI3_CPPWINRT_DIR "${CMAKE_SOURCE_DIR}/src/tap/winui3")
-set(WINUI3_CPPWINRT_STAMP "${WINUI3_CPPWINRT_DIR}/winrt/Microsoft.UI.Xaml.h")
-if(LVT_ENABLE_WINUI3 AND NOT EXISTS "${WINUI3_CPPWINRT_STAMP}")
-    # Find cppwinrt.exe from the *active* Windows SDK. The generated projection
-    # embeds the cppwinrt version and is checked (via static_assert) against the
-    # <winrt/base.h> on the compiler's INCLUDE path. Hardcoding an SDK version
-    # breaks on machines whose active/newest SDK differs from that version
-    # ("Mismatched C++/WinRT headers"), so prefer the SDK selected by the current
-    # developer command prompt and fall back to the newest installed SDK.
+set(WINUI3_SIGNATURE_FILE "${WINUI3_CPPWINRT_DIR}/.cppwinrt-signature")
+
+set(LVT_WASDK_WINMD_DIR "" CACHE PATH
+    "Directory holding the Windows App SDK .winmd files (lib/uap10.0 of the nupkg)")
+
+if(LVT_ENABLE_WINUI3)
+    # --- cppwinrt.exe -------------------------------------------------------
+    # LVT_CPPWINRT_EXE may be pre-set (the vcpkg port does this), in which case
+    # find_program is a no-op.
     set(_cppwinrt_hints "")
-    # 1. Exact versioned bin dir of the active SDK (set by the VS dev prompt).
+
+    # 1. The cppwinrt vcpkg port, so the generator matches the base.h we build
+    #    against. This is the preferred source.
+    if(DEFINED VCPKG_INSTALLED_DIR)
+        set(_lvt_vcpkg_installed "${VCPKG_INSTALLED_DIR}")
+    elseif(DEFINED _VCPKG_INSTALLED_DIR)
+        set(_lvt_vcpkg_installed "${_VCPKG_INSTALLED_DIR}")
+    else()
+        set(_lvt_vcpkg_installed "")
+    endif()
+    if(_lvt_vcpkg_installed)
+        list(APPEND _cppwinrt_hints
+            "${_lvt_vcpkg_installed}/${VCPKG_TARGET_TRIPLET}/tools/cppwinrt"
+            "${_lvt_vcpkg_installed}/x64-windows/tools/cppwinrt")
+    endif()
+
+    # 2. Otherwise the active Windows SDK, preferring the one the developer
+    #    command prompt selected over the newest installed.
     if(DEFINED ENV{WindowsSdkVerBinPath})
         list(APPEND _cppwinrt_hints "$ENV{WindowsSdkVerBinPath}/x64")
     endif()
-    # 2. Compose from WindowsSdkDir + WindowsSDKVersion (may have a trailing slash).
     if(DEFINED ENV{WindowsSdkDir} AND DEFINED ENV{WindowsSDKVersion})
         string(REGEX REPLACE "[\\/]+$" "" _lvt_sdk_ver "$ENV{WindowsSDKVersion}")
         list(APPEND _cppwinrt_hints "$ENV{WindowsSdkDir}/bin/${_lvt_sdk_ver}/x64")
     endif()
-    # 3. Fall back to the newest installed Windows 10/11 SDK bin dir.
     file(GLOB _lvt_sdk_bin_dirs
         "$ENV{WindowsSdkDir}/bin/10.*"
         "C:/Program Files (x86)/Windows Kits/10/bin/10.*")
@@ -173,28 +196,28 @@ if(LVT_ENABLE_WINUI3 AND NOT EXISTS "${WINUI3_CPPWINRT_STAMP}")
             list(APPEND _cppwinrt_hints "${_lvt_bin}/x64")
         endif()
     endforeach()
-    find_program(CPPWINRT_EXE cppwinrt HINTS ${_cppwinrt_hints})
-    if(NOT CPPWINRT_EXE)
-        # Fallback: search PATH
-        find_program(CPPWINRT_EXE cppwinrt)
+
+    find_program(LVT_CPPWINRT_EXE NAMES cppwinrt HINTS ${_cppwinrt_hints})
+
+    # --- Windows App SDK winmds --------------------------------------------
+    # There is no vcpkg port for the Windows App SDK, so this always comes from
+    # a NuGet package: the vcpkg port downloads it and passes the directory in,
+    # otherwise fall back to the NuGet cache or a local packages/ dir.
+    if(NOT LVT_WASDK_WINMD_DIR)
+        file(GLOB _wasdk_candidates
+            "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk/*/lib/uap10.0"
+            "$ENV{NUGET_PACKAGES}/microsoft.windowsappsdk/*/lib/uap10.0"
+            "${CMAKE_SOURCE_DIR}/packages/Microsoft.WindowsAppSDK.*/lib/uap10.0"
+        )
+        foreach(_candidate ${_wasdk_candidates})
+            if(EXISTS "${_candidate}/Microsoft.UI.Xaml.winmd")
+                set(LVT_WASDK_WINMD_DIR "${_candidate}" CACHE PATH "" FORCE)
+                break()
+            endif()
+        endforeach()
     endif()
 
-    # Find Windows App SDK NuGet package (winmd files).
-    # Search NuGet global cache and local packages/ dir (CI installs here).
-    set(WASDK_WINMD_DIR "")
-    file(GLOB _wasdk_candidates
-        "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk/*/lib/uap10.0"
-        "$ENV{NUGET_PACKAGES}/microsoft.windowsappsdk/*/lib/uap10.0"
-        "${CMAKE_SOURCE_DIR}/packages/Microsoft.WindowsAppSDK.*/lib/uap10.0"
-    )
-    foreach(_candidate ${_wasdk_candidates})
-        if(EXISTS "${_candidate}/Microsoft.UI.Xaml.winmd")
-            set(WASDK_WINMD_DIR "${_candidate}")
-            break()
-        endif()
-    endforeach()
-
-    # Find Windows.winmd for system type references
+    # --- Windows.winmd, for resolving system type references ----------------
     set(WIN_UNION_WINMD "")
     if(DEFINED ENV{WindowsSdkDir})
         file(GLOB _union "$ENV{WindowsSdkDir}/UnionMetadata/10.*/Windows.winmd")
@@ -211,26 +234,54 @@ if(LVT_ENABLE_WINUI3 AND NOT EXISTS "${WINUI3_CPPWINRT_STAMP}")
         endif()
     endif()
 
-    if(CPPWINRT_EXE AND WASDK_WINMD_DIR AND WIN_UNION_WINMD)
-        message(STATUS "Generating WinUI3 C++/WinRT headers from ${WASDK_WINMD_DIR}")
-        file(GLOB WASDK_ALL_WINMDS "${WASDK_WINMD_DIR}/*.winmd")
-        # Also include other winmd directories in the package
-        get_filename_component(_wasdk_root "${WASDK_WINMD_DIR}/../.." ABSOLUTE)
-        file(GLOB_RECURSE _extra_winmds "${_wasdk_root}/*.winmd")
-        list(APPEND WASDK_ALL_WINMDS ${_extra_winmds})
-        list(REMOVE_DUPLICATES WASDK_ALL_WINMDS)
-        execute_process(
-            COMMAND "${CPPWINRT_EXE}" -in ${WASDK_ALL_WINMDS} -ref "${WIN_UNION_WINMD}" -out "${WINUI3_CPPWINRT_DIR}"
-            RESULT_VARIABLE _cppwinrt_result
-        )
-        if(_cppwinrt_result EQUAL 0)
-            message(STATUS "WinUI3 C++/WinRT headers generated in ${WINUI3_CPPWINRT_DIR}")
+    # --- Regenerate only when an input actually changed ----------------------
+    # Hashing the generator catches an upgraded SDK or a bumped cppwinrt port,
+    # which is what silently invalidates an already-generated projection.
+    set(_lvt_projection_signature "none")
+    if(LVT_CPPWINRT_EXE AND EXISTS "${LVT_CPPWINRT_EXE}")
+        file(SHA256 "${LVT_CPPWINRT_EXE}" _lvt_cppwinrt_hash)
+        set(_lvt_projection_signature "cppwinrt=${_lvt_cppwinrt_hash} wasdk=${LVT_WASDK_WINMD_DIR} union=${WIN_UNION_WINMD}")
+    endif()
+
+    set(_lvt_previous_signature "")
+    if(EXISTS "${WINUI3_SIGNATURE_FILE}")
+        file(READ "${WINUI3_SIGNATURE_FILE}" _lvt_previous_signature)
+    endif()
+
+    if(NOT _lvt_previous_signature STREQUAL _lvt_projection_signature)
+        if(LVT_CPPWINRT_EXE AND LVT_WASDK_WINMD_DIR AND WIN_UNION_WINMD)
+            if(_lvt_previous_signature)
+                message(STATUS "WinUI3 C++/WinRT projection is stale; regenerating")
+            endif()
+            message(STATUS "Generating WinUI3 C++/WinRT headers from ${LVT_WASDK_WINMD_DIR}")
+            message(STATUS "  using ${LVT_CPPWINRT_EXE}")
+
+            file(GLOB WASDK_ALL_WINMDS "${LVT_WASDK_WINMD_DIR}/*.winmd")
+            # Also include other winmd directories in the package
+            get_filename_component(_wasdk_root "${LVT_WASDK_WINMD_DIR}/../.." ABSOLUTE)
+            file(GLOB_RECURSE _extra_winmds "${_wasdk_root}/*.winmd")
+            list(APPEND WASDK_ALL_WINMDS ${_extra_winmds})
+            list(REMOVE_DUPLICATES WASDK_ALL_WINMDS)
+
+            # A stale projection must not be left behind on failure.
+            file(REMOVE_RECURSE "${WINUI3_CPPWINRT_DIR}")
+            execute_process(
+                COMMAND "${LVT_CPPWINRT_EXE}"
+                    -in ${WASDK_ALL_WINMDS}
+                    -ref "${WIN_UNION_WINMD}"
+                    -out "${WINUI3_CPPWINRT_DIR}"
+                RESULT_VARIABLE _cppwinrt_result
+            )
+            if(_cppwinrt_result EQUAL 0)
+                file(WRITE "${WINUI3_SIGNATURE_FILE}" "${_lvt_projection_signature}")
+                message(STATUS "WinUI3 C++/WinRT headers generated in ${WINUI3_CPPWINRT_DIR}")
+            else()
+                message(WARNING "cppwinrt failed (${_cppwinrt_result}); TAP DLL WinUI3 features will be limited")
+            endif()
         else()
-            message(WARNING "cppwinrt failed (${_cppwinrt_result}); TAP DLL WinUI3 features will be limited")
+            message(WARNING "Cannot generate WinUI3 C++/WinRT headers:"
+                " cppwinrt=${LVT_CPPWINRT_EXE} winmd_dir=${LVT_WASDK_WINMD_DIR} union=${WIN_UNION_WINMD}")
         endif()
-    else()
-        message(WARNING "Cannot generate WinUI3 C++/WinRT headers:"
-            " cppwinrt=${CPPWINRT_EXE} winmd_dir=${WASDK_WINMD_DIR} union=${WIN_UNION_WINMD}")
     endif()
 endif()
 

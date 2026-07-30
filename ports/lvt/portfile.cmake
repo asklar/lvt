@@ -19,9 +19,21 @@ vcpkg_check_features(
 )
 
 # WinUI 3 enrichment (TransformToVisual, TextBlock.Text) needs C++/WinRT headers
-# projected from the Windows App SDK winmd. There is no vcpkg port for it, so
-# fetch the NuGet package - a plain zip - and drop it where the build's glob
-# looks. Without this the build still succeeds, but WinUI 3 support is reduced.
+# projected from the Windows App SDK winmd. There is no vcpkg port for the
+# Windows App SDK, so fetch the NuGet package - a plain zip - and hand the build
+# the directory holding the .winmd files.
+#
+# The generator itself comes from the cppwinrt port rather than the Windows SDK,
+# so that the Microsoft.* projection we generate and the winrt/base.h we compile
+# it against are always produced by the same cppwinrt version. It also means a
+# consumer that already depends on cppwinrt picks the version for both, since
+# vcpkg installs only one version of a port per triplet.
+set(LVT_CPPWINRT_OPTIONS "")
+if("winui3" IN_LIST FEATURES OR "xaml" IN_LIST FEATURES)
+    list(APPEND LVT_CPPWINRT_OPTIONS
+        "-DLVT_CPPWINRT_EXE=${CURRENT_INSTALLED_DIR}/tools/cppwinrt/cppwinrt.exe")
+endif()
+
 if("winui3" IN_LIST FEATURES)
     set(WASDK_VERSION "1.5.240607001")
     vcpkg_download_distfile(WASDK_NUPKG
@@ -34,13 +46,15 @@ if("winui3" IN_LIST FEATURES)
         ARCHIVE "${WASDK_NUPKG}"
         NO_REMOVE_ONE_LEVEL
     )
-    file(COPY "${WASDK_DIR}/" DESTINATION "${SOURCE_PATH}/packages/Microsoft.WindowsAppSDK.${WASDK_VERSION}")
+    list(APPEND LVT_CPPWINRT_OPTIONS
+        "-DLVT_WASDK_WINMD_DIR=${WASDK_DIR}/lib/uap10.0")
 endif()
 
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
         ${FEATURE_OPTIONS}
+        ${LVT_CPPWINRT_OPTIONS}
         -DLVT_BUILD_TESTS=OFF
         # Every dotnet/msbuild invocation sits behind this. vcpkg builds have no
         # network access and no .NET SDK, so the managed tree-walker assemblies
@@ -49,6 +63,8 @@ vcpkg_cmake_configure(
         -DLVT_INSTALL_TOOLSDIR=tools/${PORT}
     MAYBE_UNUSED_VARIABLES
         LVT_INSTALL_TOOLSDIR
+        LVT_CPPWINRT_EXE
+        LVT_WASDK_WINMD_DIR
 )
 
 vcpkg_cmake_install()
