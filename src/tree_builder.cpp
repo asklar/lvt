@@ -1,12 +1,21 @@
 #include "tree_builder.h"
+#include "lvt_config.h"
 #include "element_key.h"
 #include "providers/provider.h"
 #include "providers/win32_provider.h"
 #include "providers/comctl_provider.h"
+#if LVT_ENABLE_XAML
 #include "providers/xaml_provider.h"
+#endif
+#if LVT_ENABLE_WINUI3
 #include "providers/winui3_provider.h"
+#endif
+#if LVT_ENABLE_WPF
 #include "providers/wpf_provider.h"
+#endif
+#if LVT_ENABLE_WINFORMS
 #include "providers/winforms_provider.h"
+#endif
 #include "plugin_loader.h"
 #include <algorithm>
 #include <memory>
@@ -123,23 +132,31 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
             break;
         }
         case Framework::Xaml: {
+#if LVT_ENABLE_XAML
             XamlProvider xaml;
             xaml.enrich(root, hwnd, pid);
+#endif
             break;
         }
         case Framework::WinUI3: {
+#if LVT_ENABLE_WINUI3
             WinUI3Provider winui3;
             winui3.enrich(root, hwnd, pid);
+#endif
             break;
         }
         case Framework::Wpf: {
+#if LVT_ENABLE_WPF
             WpfProvider wpf;
             wpf.enrich(root, hwnd, pid);
+#endif
             break;
         }
         case Framework::WinForms: {
+#if LVT_ENABLE_WINFORMS
             WinFormsProvider winforms;
             winforms.enrich(root, hwnd, pid);
+#endif
             break;
         }
         case Framework::Plugin: {

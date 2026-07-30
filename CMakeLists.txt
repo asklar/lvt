@@ -4,6 +4,42 @@ project(lvt LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# --- Options ---------------------------------------------------------------
+# Framework support is per-provider so that consumers (and package managers)
+# can drop the pieces they can't build. Win32 and ComCtl are always present:
+# they are the base layer every other provider enriches.
+#
+# XAML and WinUI 3 are pure C++ and need no .NET SDK. WPF, WinForms and
+# Avalonia have a native half that always builds, plus a managed helper
+# assembly gated behind LVT_BUILD_MANAGED, which is the only thing here that
+# shells out to `dotnet`.
+option(LVT_ENABLE_XAML     "System XAML (UWP / DesktopWindowXamlSource) support" ON)
+option(LVT_ENABLE_WINUI3   "WinUI 3 (Windows App SDK) support"                   ON)
+option(LVT_ENABLE_WPF      "WPF support"                                         ON)
+option(LVT_ENABLE_WINFORMS "WinForms support"                                    ON)
+option(LVT_ENABLE_AVALONIA "Avalonia plugin"                                     ON)
+option(LVT_ENABLE_CHROMIUM "Chromium (Chrome/Edge DOM) plugin"                   ON)
+
+option(LVT_BUILD_TOOL    "Build the lvt command-line tool"                     ON)
+option(LVT_BUILD_MANAGED "Build managed .NET assemblies (requires .NET SDK)"   ON)
+option(LVT_BUILD_TESTS   "Build lvt's tests"                                   ON)
+
+if(LVT_BUILD_MANAGED AND NOT (LVT_ENABLE_WPF OR LVT_ENABLE_WINFORMS OR LVT_ENABLE_AVALONIA))
+    message(STATUS "lvt: no managed-backed framework enabled; forcing LVT_BUILD_MANAGED=OFF")
+    set(LVT_BUILD_MANAGED OFF)
+endif()
+
+set(LVT_WITH_MANAGED ${LVT_BUILD_MANAGED})
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/lvt_config.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/include/lvt/lvt_config.h"
+    @ONLY
+)
+
+# The TAP DLLs and plugins must sit next to the consuming binary at runtime.
+# Keep this independent of the lvt target so they still build with LVT_BUILD_TOOL=OFF.
+set(LVT_RUNTIME_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}")
+
 find_package(wil CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
@@ -22,10 +58,11 @@ set(LVT_PUBLIC_HEADERS
     src/target.h
     src/tree_builder.h
     src/watch_diff.h
+    "${CMAKE_CURRENT_BINARY_DIR}/include/lvt/lvt_config.h"
 )
 
 # --- lvt_core: the reusable library behind the CLI ---
-add_library(lvt_core STATIC
+set(LVT_CORE_SOURCES
     src/target.cpp
     src/framework_detector.cpp
     src/tree_builder.cpp
@@ -37,18 +74,33 @@ add_library(lvt_core STATIC
     src/plugin_loader.cpp
     src/providers/win32_provider.cpp
     src/providers/comctl_provider.cpp
-    src/providers/xaml_provider.cpp
-    src/providers/winui3_provider.cpp
-    src/providers/wpf_provider.cpp
-    src/providers/wpf_inject.cpp
-    src/providers/winforms_provider.cpp
-    src/providers/winforms_inject.cpp
-    src/providers/xaml_diag_common.cpp
 )
+
+# xaml_diag_common backs both the XAML and WinUI 3 providers.
+if(LVT_ENABLE_XAML OR LVT_ENABLE_WINUI3)
+    list(APPEND LVT_CORE_SOURCES src/providers/xaml_diag_common.cpp)
+endif()
+if(LVT_ENABLE_XAML)
+    list(APPEND LVT_CORE_SOURCES src/providers/xaml_provider.cpp)
+endif()
+if(LVT_ENABLE_WINUI3)
+    list(APPEND LVT_CORE_SOURCES src/providers/winui3_provider.cpp)
+endif()
+if(LVT_ENABLE_WPF)
+    list(APPEND LVT_CORE_SOURCES src/providers/wpf_provider.cpp src/providers/wpf_inject.cpp)
+endif()
+if(LVT_ENABLE_WINFORMS)
+    list(APPEND LVT_CORE_SOURCES src/providers/winforms_provider.cpp src/providers/winforms_inject.cpp)
+endif()
+
+add_library(lvt_core STATIC ${LVT_CORE_SOURCES})
 add_library(lvt::core ALIAS lvt_core)
 
 target_include_directories(lvt_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include/lvt>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
+    $<INSTALL_INTERFACE:include>
     $<INSTALL_INTERFACE:include/lvt>
 )
 
@@ -70,8 +122,10 @@ target_compile_definitions(lvt_core PUBLIC
     WINRT_LEAN_AND_MEAN
 )
 
-add_executable(lvt src/main.cpp)
-target_link_libraries(lvt PRIVATE lvt_core WIL::WIL nlohmann_json::nlohmann_json)
+if(LVT_BUILD_TOOL)
+    add_executable(lvt src/main.cpp)
+    target_link_libraries(lvt PRIVATE lvt_core WIL::WIL nlohmann_json::nlohmann_json)
+endif()
 
 # Determine TAP DLL architecture suffix from vcpkg triplet
 if(VCPKG_TARGET_TRIPLET MATCHES "arm64")
@@ -89,7 +143,7 @@ endif()
 # These are needed for TransformToVisual / TextBlock.Text in the TAP DLL.
 set(WINUI3_CPPWINRT_DIR "${CMAKE_SOURCE_DIR}/src/tap/winui3")
 set(WINUI3_CPPWINRT_STAMP "${WINUI3_CPPWINRT_DIR}/winrt/Microsoft.UI.Xaml.h")
-if(NOT EXISTS "${WINUI3_CPPWINRT_STAMP}")
+if(LVT_ENABLE_WINUI3 AND NOT EXISTS "${WINUI3_CPPWINRT_STAMP}")
     # Find cppwinrt.exe from the *active* Windows SDK. The generated projection
     # embeds the cppwinrt version and is checked (via static_assert) against the
     # <winrt/base.h> on the compiler's INCLUDE path. Hardcoding an SDK version
@@ -177,6 +231,9 @@ if(NOT EXISTS "${WINUI3_CPPWINRT_STAMP}")
     endif()
 endif()
 
+# The XAML/WinUI 3 TAP DLL is pure C++ (no .NET SDK needed); it only wants the
+# Windows App SDK winmd projection above for the WinUI 3 specific enrichment.
+if(LVT_ENABLE_XAML OR LVT_ENABLE_WINUI3)
 add_library(lvt_tap SHARED
     src/tap/lvt_tap.cpp
     src/tap/lvt_tap.def
@@ -189,11 +246,14 @@ set_property(TARGET lvt_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONF
 # Place lvt_tap_{arch}.dll next to lvt.exe
 set_target_properties(lvt_tap PROPERTIES
     OUTPUT_NAME "lvt_tap_${TAP_ARCH_SUFFIX}"
-    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>
+    RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}
 )
+endif()
 
 # WPF TAP DLL — native loader injected into WPF target process
-# Hosts CLR and calls managed WpfTreeWalker assembly
+# Hosts CLR and calls managed WpfTreeWalker assembly.
+# The native half needs no .NET SDK; only the managed assembly below does.
+if(LVT_ENABLE_WPF)
 add_library(lvt_wpf_tap SHARED
     src/tap_wpf/wpf_tap_native.cpp
     src/tap_wpf/wpf_tap_native.def
@@ -205,23 +265,27 @@ set_property(TARGET lvt_wpf_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<
 
 set_target_properties(lvt_wpf_tap PROPERTIES
     OUTPUT_NAME "lvt_wpf_tap_${TAP_ARCH_SUFFIX}"
-    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>
+    RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}
 )
 
 # Build managed WPF tree walker assembly and copy to output
 # Pre-build with: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release
 # The managed DLL is AnyCPU so the same binary works for all architectures.
+if(LVT_BUILD_MANAGED)
 add_custom_command(TARGET lvt_wpf_tap POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/Release/LvtWpfTap.dll"
-        "$<TARGET_FILE_DIR:lvt>/LvtWpfTap.dll"
+        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.dll"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.runtimeconfig.json"
-        "$<TARGET_FILE_DIR:lvt>/LvtWpfTap.runtimeconfig.json"
+        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.runtimeconfig.json"
     COMMENT "Copying managed WPF tree walker assembly"
 )
+endif()
+endif()
 
 # WinForms TAP DLL — native loader injected into WinForms target process
+if(LVT_ENABLE_WINFORMS)
 add_library(lvt_winforms_tap SHARED
     src/tap_winforms/winforms_tap_native.cpp
     src/tap_winforms/winforms_tap_native.def
@@ -233,9 +297,10 @@ set_property(TARGET lvt_winforms_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreade
 
 set_target_properties(lvt_winforms_tap PROPERTIES
     OUTPUT_NAME "lvt_winforms_tap_${TAP_ARCH_SUFFIX}"
-    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>
+    RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}
 )
 
+if(LVT_BUILD_MANAGED)
 set(LVT_WINFORMS_MANAGED_DLL "${CMAKE_SOURCE_DIR}/src/tap_winforms/bin/Release/LvtWinFormsTap.dll")
 add_custom_command(
     OUTPUT "${LVT_WINFORMS_MANAGED_DLL}"
@@ -254,14 +319,17 @@ add_dependencies(lvt_winforms_tap lvt_winforms_managed)
 add_custom_command(TARGET lvt_winforms_tap POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${LVT_WINFORMS_MANAGED_DLL}"
-        "$<TARGET_FILE_DIR:lvt>/LvtWinFormsTap.dll"
+        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.dll"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.runtimeconfig.json"
-        "$<TARGET_FILE_DIR:lvt>/LvtWinFormsTap.runtimeconfig.json"
+        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.runtimeconfig.json"
     COMMENT "Copying managed WinForms tree walker assembly"
 )
+endif()
+endif()
 
 # Avalonia plugin DLL — runtime-loaded plugin for Avalonia UI framework support
+if(LVT_ENABLE_AVALONIA)
 add_library(lvt_avalonia_plugin SHARED
     src/plugin_avalonia/lvt_avalonia_plugin.cpp
 )
@@ -270,7 +338,7 @@ target_include_directories(lvt_avalonia_plugin PRIVATE src)
 target_link_libraries(lvt_avalonia_plugin PRIVATE ole32 version)
 set_target_properties(lvt_avalonia_plugin PROPERTIES
     OUTPUT_NAME "lvt_avalonia_plugin"
-    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>/plugins
+    RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins
 )
 
 # Avalonia TAP DLL — injected into Avalonia target process
@@ -283,34 +351,38 @@ target_compile_definitions(lvt_avalonia_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
 set_property(TARGET lvt_avalonia_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(lvt_avalonia_tap PROPERTIES
     OUTPUT_NAME "lvt_avalonia_tap_${TAP_ARCH_SUFFIX}"
-    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>/plugins/avalonia
+    RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia
 )
 
 # Build managed Avalonia tree walker assembly and copy to output
 # Pre-build with: dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj -c Release
 # The csproj sets AppendTargetFrameworkToOutputPath=false so output is bin/Release/,
 # but as a fallback we also build via a custom command that publishes to a known location.
+if(LVT_BUILD_MANAGED)
 add_custom_command(TARGET lvt_avalonia_tap POST_BUILD
     COMMAND dotnet publish "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj"
-        -c Release -o "$<TARGET_FILE_DIR:lvt>/plugins/avalonia" --no-restore
+        -c Release -o "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia" --no-restore
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
-        "$<TARGET_FILE_DIR:lvt>/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
     COMMENT "Publishing managed Avalonia tree walker assembly"
 )
 
 add_custom_target(lvt_avalonia_tree_walker
-    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:lvt>/plugins/avalonia"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
     COMMAND dotnet publish "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj"
-        -c Release -o "$<TARGET_FILE_DIR:lvt>/plugins/avalonia"
+        -c Release -o "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
-        "$<TARGET_FILE_DIR:lvt>/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Publishing managed Avalonia tree walker assembly"
 )
+endif()
+endif()
 
 # Chromium plugin DLL — runtime-loaded plugin for Chrome/Edge DOM tree support
+if(LVT_ENABLE_CHROMIUM)
 add_library(lvt_chromium_plugin SHARED
     src/plugin_chromium/lvt_chromium_plugin.cpp
 )
@@ -319,7 +391,7 @@ target_include_directories(lvt_chromium_plugin PRIVATE src)
 target_link_libraries(lvt_chromium_plugin PRIVATE nlohmann_json::nlohmann_json ole32 version)
 set_target_properties(lvt_chromium_plugin PROPERTIES
     OUTPUT_NAME "lvt_chromium_plugin"
-    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>/plugins
+    RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins
 )
 
 # Chromium native messaging host — relay between Chrome extension and lvt
@@ -329,18 +401,20 @@ add_executable(lvt_chromium_host
 target_compile_definitions(lvt_chromium_host PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(lvt_chromium_host PRIVATE advapi32)
 set_target_properties(lvt_chromium_host PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY $<TARGET_FILE_DIR:lvt>/plugins/chromium
+    RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium
 )
 
 # Copy Chromium extension files to output
 add_custom_command(TARGET lvt_chromium_plugin POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/src/plugin_chromium/extension"
-        "$<TARGET_FILE_DIR:lvt>/plugins/chromium/extension"
+        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium/extension"
     COMMENT "Copying Chromium extension files"
 )
+endif()
 
 # --- Tests ---
+if(LVT_BUILD_TESTS)
 enable_testing()
 find_package(GTest CONFIG REQUIRED)
 
@@ -439,20 +513,24 @@ target_link_libraries(lvt_integration_tests PRIVATE
     comctl32
 )
 target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
-add_dependencies(lvt_integration_tests
-    lvt
-    lvt_winforms_tap
-    lvt_avalonia_plugin
-    lvt_avalonia_tap
-    lvt_avalonia_tree_walker
-    avalonia_test_app
-    wpf_sample_app
-    winui3_sample_app
-    winforms_sample_app
-)
+set(LVT_INTEGRATION_DEPS wpf_sample_app winui3_sample_app)
+if(LVT_BUILD_TOOL)
+    list(APPEND LVT_INTEGRATION_DEPS lvt)
+endif()
+if(LVT_ENABLE_WINFORMS)
+    list(APPEND LVT_INTEGRATION_DEPS lvt_winforms_tap winforms_sample_app)
+endif()
+if(LVT_ENABLE_AVALONIA)
+    list(APPEND LVT_INTEGRATION_DEPS lvt_avalonia_plugin lvt_avalonia_tap avalonia_test_app)
+    if(LVT_BUILD_MANAGED)
+        list(APPEND LVT_INTEGRATION_DEPS lvt_avalonia_tree_walker)
+    endif()
+endif()
+add_dependencies(lvt_integration_tests ${LVT_INTEGRATION_DEPS})
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
 
 # Chromium plugin tests — DOM JSON format and native messaging protocol
+if(LVT_ENABLE_CHROMIUM)
 add_executable(lvt_chromium_tests
     tests/chromium_tests.cpp
     src/element_key.cpp
@@ -461,7 +539,7 @@ target_include_directories(lvt_chromium_tests PRIVATE src)
 target_compile_definitions(lvt_chromium_tests PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX
     "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
-    "LVT_CHROMIUM_EXTENSION_OUTPUT_DIR=\"$<TARGET_FILE_DIR:lvt>/plugins/chromium/extension\""
+    "LVT_CHROMIUM_EXTENSION_OUTPUT_DIR=\"${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium/extension\""
 )
 target_link_libraries(lvt_chromium_tests PRIVATE
     GTest::gtest GTest::gtest_main
@@ -469,3 +547,6 @@ target_link_libraries(lvt_chromium_tests PRIVATE
 )
 add_dependencies(lvt_chromium_tests lvt_chromium_plugin)
 add_test(NAME chromium_tests COMMAND lvt_chromium_tests)
+endif()
+
+endif() # LVT_BUILD_TESTS
