@@ -1,5 +1,16 @@
 cmake_minimum_required(VERSION 3.20)
-project(lvt VERSION 0.1.8 LANGUAGES CXX)
+
+# Declared before project() because the vcpkg toolchain runs its install during
+# project(), and gtest is only wanted when the tests are actually built. Without
+# this the dependency is unconditional, so a packaging or cross-compilation
+# build fails if gtest cannot be built for the target triplet even though
+# nothing would have linked it.
+option(LVT_BUILD_TESTS "Build lvt's tests" ON)
+if(LVT_BUILD_TESTS)
+    list(APPEND VCPKG_MANIFEST_FEATURES "tests")
+endif()
+
+project(lvt VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,7 +33,7 @@ option(LVT_ENABLE_CHROMIUM "Chromium (Chrome/Edge DOM) plugin"                  
 
 option(LVT_BUILD_TOOL    "Build the lvt command-line tool"                     ON)
 option(LVT_BUILD_MANAGED "Build managed .NET assemblies (requires .NET SDK)"   ON)
-option(LVT_BUILD_TESTS   "Build lvt's tests"                                   ON)
+# LVT_BUILD_TESTS is declared above project(), before the vcpkg toolchain runs.
 
 if(LVT_BUILD_MANAGED AND NOT (LVT_ENABLE_WPF OR LVT_ENABLE_WINFORMS OR LVT_ENABLE_AVALONIA))
     message(STATUS "lvt: no managed-backed framework enabled; forcing LVT_BUILD_MANAGED=OFF")
