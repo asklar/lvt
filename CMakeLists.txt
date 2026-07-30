@@ -7,8 +7,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(wil CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
-add_executable(lvt
-    src/main.cpp
+# Public headers, installed to include/lvt/. They include each other with quoted
+# includes, which resolve relative to the including file, so the flat layout in
+# src/ and the installed lvt/ layout both work without touching sources.
+set(LVT_PUBLIC_HEADERS
+    src/element.h
+    src/element_key.h
+    src/framework_detector.h
+    src/json_serializer.h
+    src/module_util.h
+    src/plugin.h
+    src/plugin_loader.h
+    src/screenshot.h
+    src/target.h
+    src/tree_builder.h
+    src/watch_diff.h
+)
+
+# --- lvt_core: the reusable library behind the CLI ---
+add_library(lvt_core STATIC
     src/target.cpp
     src/framework_detector.cpp
     src/tree_builder.cpp
@@ -16,6 +33,7 @@ add_executable(lvt
     src/json_serializer.cpp
     src/watch_diff.cpp
     src/screenshot.cpp
+    src/module_util.cpp
     src/plugin_loader.cpp
     src/providers/win32_provider.cpp
     src/providers/comctl_provider.cpp
@@ -27,24 +45,33 @@ add_executable(lvt
     src/providers/winforms_inject.cpp
     src/providers/xaml_diag_common.cpp
 )
+add_library(lvt::core ALIAS lvt_core)
 
-target_include_directories(lvt PRIVATE src)
+target_include_directories(lvt_core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<INSTALL_INTERFACE:include/lvt>
+)
 
-target_link_libraries(lvt PRIVATE
-    WIL::WIL
-    nlohmann_json::nlohmann_json
+target_link_libraries(lvt_core PUBLIC
     dwmapi
     d3d11
     dxgi
     windowsapp
     windowscodecs
 )
+target_link_libraries(lvt_core PRIVATE
+    WIL::WIL
+    nlohmann_json::nlohmann_json
+)
 
-target_compile_definitions(lvt PRIVATE
+target_compile_definitions(lvt_core PUBLIC
     WIN32_LEAN_AND_MEAN
     NOMINMAX
     WINRT_LEAN_AND_MEAN
 )
+
+add_executable(lvt src/main.cpp)
+target_link_libraries(lvt PRIVATE lvt_core WIL::WIL nlohmann_json::nlohmann_json)
 
 # Determine TAP DLL architecture suffix from vcpkg triplet
 if(VCPKG_TARGET_TRIPLET MATCHES "arm64")
@@ -320,26 +347,11 @@ find_package(GTest CONFIG REQUIRED)
 # Unit tests — pure logic, no live HWND needed
 add_executable(lvt_unit_tests
     tests/unit_tests.cpp
-    src/tree_builder.cpp
-    src/element_key.cpp
-    src/json_serializer.cpp
-    src/watch_diff.cpp
-    src/framework_detector.cpp
-    src/target.cpp
-    src/plugin_loader.cpp
-    src/providers/win32_provider.cpp
-    src/providers/comctl_provider.cpp
-    src/providers/xaml_provider.cpp
-    src/providers/winui3_provider.cpp
-    src/providers/wpf_provider.cpp
-    src/providers/wpf_inject.cpp
-    src/providers/winforms_provider.cpp
-    src/providers/winforms_inject.cpp
-    src/providers/xaml_diag_common.cpp
 )
 target_include_directories(lvt_unit_tests PRIVATE src)
 target_compile_definitions(lvt_unit_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN)
 target_link_libraries(lvt_unit_tests PRIVATE
+    lvt_core
     GTest::gtest GTest::gtest_main
     WIL::WIL nlohmann_json::nlohmann_json
     dwmapi windowsapp

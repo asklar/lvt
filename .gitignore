@@ -2,6 +2,7 @@
 build/
 build-x86/
 build-arm64/
+packages/
 tests/apps/WinUI3Sample/bin/
 tests/apps/WinUI3Sample/obj/
 

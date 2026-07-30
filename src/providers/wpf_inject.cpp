@@ -7,6 +7,7 @@
 #include "../debug.h"
 #include "../target.h"
 #include "../bounds_util.h"
+#include "../module_util.h"
 
 #include <Windows.h>
 #include <objbase.h>
@@ -35,14 +36,6 @@ static std::wstring make_pipe_name() {
     return buf;
 }
 
-static std::wstring get_exe_dir() {
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring dir(path);
-    auto pos = dir.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) dir.resize(pos);
-    return dir;
-}
 
 static std::string sanitize(const std::string& s) {
     std::string r;
@@ -184,11 +177,8 @@ bool inject_and_collect_wpf_tree(Element& root, HWND /*hwnd*/, DWORD pid) {
         }
     }
 
-    std::wstring exeDir = get_exe_dir();
-    const wchar_t* tapSuffix = (get_host_architecture() == Architecture::arm64)
-        ? L"\\lvt_wpf_tap_arm64.dll" : (sizeof(void*) == 4)
-        ? L"\\lvt_wpf_tap_x86.dll" : L"\\lvt_wpf_tap_x64.dll";
-    std::wstring tapDll = exeDir + tapSuffix;
+    std::wstring exeDir = get_tap_directory();
+    std::wstring tapDll = tap_dll_path(L"lvt_wpf_tap");
 
     if (GetFileAttributesW(tapDll.c_str()) == INVALID_FILE_ATTRIBUTES) {
         if (g_debug)
