@@ -1,0 +1,55 @@
+{
+  "name": "lvt",
+  "version": "0.2.0",
+  "description": [
+    "Live Visual Tree - inspect the visual tree of running Windows applications",
+    "lvt walks the UI of a live Windows process and produces a unified element tree as JSON or XML. It detects the UI frameworks in use (Win32, ComCtl32, system XAML, WinUI 3, WPF, WinForms, Avalonia, Chromium) and enriches the base HWND tree with framework-native data, without using UI Automation. Ships both a C++ library and a command-line tool."
+  ],
+  "homepage": "https://github.com/asklar/lvt",
+  "documentation": "https://github.com/asklar/lvt/blob/main/README.md",
+  "license": "MIT",
+  "supports": "windows & !uwp & !mingw",
+  "dependencies": [
+    "nlohmann-json",
+    "wil",
+    {
+      "name": "vcpkg-cmake",
+      "host": true
+    },
+    {
+      "name": "vcpkg-cmake-config",
+      "host": true
+    }
+  ],
+  "default-features": [
+    "chromium",
+    "tools",
+    "winforms",
+    "winui3",
+    "wpf",
+    "xaml"
+  ],
+  "features": {
+    "avalonia": {
+      "description": "Avalonia UI support. The managed tree-walker assembly is not built here and must be deployed separately for full enrichment."
+    },
+    "chromium": {
+      "description": "Chromium (Chrome/Edge) DOM inspection plugin"
+    },
+    "tools": {
+      "description": "Build the lvt command-line tool in addition to the library"
+    },
+    "winforms": {
+      "description": "WinForms support. The managed tree-walker assembly is not built here and must be deployed separately for full enrichment."
+    },
+    "winui3": {
+      "description": "WinUI 3 (Windows App SDK) support. Pure C++; downloads the Windows App SDK winmd to generate the C++/WinRT projection."
+    },
+    "wpf": {
+      "description": "WPF support. The managed tree-walker assembly is not built here and must be deployed separately for full enrichment."
+    },
+    "xaml": {
+      "description": "System XAML (UWP / DesktopWindowXamlSource) support"
+    }
+  }
+}

@@ -560,7 +560,9 @@ include(CMakePackageConfigHelpers)
 
 # Tools, TAP DLLs and plugins all land in one directory: lvt_core resolves the
 # TAP DLLs relative to its own module, so they must stay side by side.
-set(LVT_INSTALL_TOOLSDIR "${CMAKE_INSTALL_DATAROOTDIR}/lvt/tools")
+# Package managers override this (vcpkg, for instance, wants tools/lvt).
+set(LVT_INSTALL_TOOLSDIR "${CMAKE_INSTALL_DATAROOTDIR}/lvt/tools" CACHE STRING
+    "Directory, relative to the install prefix, for lvt.exe, the TAP DLLs and plugins")
 
 install(TARGETS lvt_core
     EXPORT lvtTargets

@@ -1,0 +1,26 @@
+lvt provides CMake targets:
+
+    find_package(lvt CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE lvt::core)
+
+    # lvt locates its injectable TAP DLLs next to the binary it is linked into.
+    # This copies them beside your executable:
+    lvt_copy_tap_dlls(main)
+
+Instead of lvt_copy_tap_dlls() you can call lvt::set_tap_directory() at runtime
+or point the LVT_TAP_DIR environment variable at ${LVT_TOOLS_DIR}.
+
+Headers are installed under include/lvt:
+
+    #include <lvt/target.h>
+    #include <lvt/tree_builder.h>
+    #include <lvt/json_serializer.h>
+    #include <lvt/lvt_config.h>   // which frameworks were compiled in
+
+The WPF, WinForms and Avalonia providers additionally need a managed
+tree-walker assembly, which cannot be built inside vcpkg because it requires
+the .NET SDK and a NuGet restore. Those frameworks are detected and their
+windows are walked, but managed enrichment is unavailable unless you deploy
+LvtWpfTap.dll / LvtWinFormsTap.dll / LvtAvaloniaTreeWalker.dll alongside the
+TAP DLLs yourself. Prebuilt copies ship in the GitHub releases at
+https://github.com/asklar/lvt/releases.
