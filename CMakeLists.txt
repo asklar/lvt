@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(lvt LANGUAGES CXX)
+project(lvt VERSION 0.1.8 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,6 +95,9 @@ endif()
 
 add_library(lvt_core STATIC ${LVT_CORE_SOURCES})
 add_library(lvt::core ALIAS lvt_core)
+# Keep the exported name identical to the build-tree alias, so add_subdirectory()
+# and find_package() consumers both spell it lvt::core.
+set_target_properties(lvt_core PROPERTIES EXPORT_NAME core)
 
 target_include_directories(lvt_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
@@ -550,3 +553,88 @@ add_test(NAME chromium_tests COMMAND lvt_chromium_tests)
 endif()
 
 endif() # LVT_BUILD_TESTS
+
+# --- Install / export -------------------------------------------------------
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# Tools, TAP DLLs and plugins all land in one directory: lvt_core resolves the
+# TAP DLLs relative to its own module, so they must stay side by side.
+set(LVT_INSTALL_TOOLSDIR "${CMAKE_INSTALL_DATAROOTDIR}/lvt/tools")
+
+install(TARGETS lvt_core
+    EXPORT lvtTargets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+)
+install(FILES ${LVT_PUBLIC_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/lvt")
+
+if(LVT_BUILD_TOOL)
+    install(TARGETS lvt RUNTIME DESTINATION "${LVT_INSTALL_TOOLSDIR}")
+endif()
+
+# TAP DLLs are injected into the target process, never linked, so they are
+# installed as plain runtime files rather than exported targets.
+set(LVT_INSTALLED_TAP_FILES "")
+foreach(_tap lvt_tap lvt_wpf_tap lvt_winforms_tap)
+    if(TARGET ${_tap})
+        install(TARGETS ${_tap} RUNTIME DESTINATION "${LVT_INSTALL_TOOLSDIR}")
+        list(APPEND LVT_INSTALLED_TAP_FILES "${_tap}_${TAP_ARCH_SUFFIX}.dll")
+    endif()
+endforeach()
+unset(_tap)
+
+foreach(_plugin lvt_avalonia_plugin lvt_chromium_plugin)
+    if(TARGET ${_plugin})
+        install(TARGETS ${_plugin} RUNTIME DESTINATION "${LVT_INSTALL_TOOLSDIR}/plugins")
+    endif()
+endforeach()
+unset(_plugin)
+
+if(TARGET lvt_avalonia_tap)
+    install(TARGETS lvt_avalonia_tap
+        RUNTIME DESTINATION "${LVT_INSTALL_TOOLSDIR}/plugins/avalonia")
+endif()
+if(TARGET lvt_chromium_host)
+    install(TARGETS lvt_chromium_host
+        RUNTIME DESTINATION "${LVT_INSTALL_TOOLSDIR}/plugins/chromium")
+endif()
+if(LVT_ENABLE_CHROMIUM)
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin_chromium/extension"
+        DESTINATION "${LVT_INSTALL_TOOLSDIR}/plugins/chromium")
+endif()
+
+# Managed helper assemblies, when they were built.
+if(LVT_BUILD_MANAGED)
+    foreach(_managed
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tap_wpf/bin/Release/LvtWpfTap.dll"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.runtimeconfig.json"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tap_winforms/bin/Release/LvtWinFormsTap.dll"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.runtimeconfig.json")
+        if(EXISTS "${_managed}")
+            install(FILES "${_managed}" DESTINATION "${LVT_INSTALL_TOOLSDIR}")
+        endif()
+    endforeach()
+    unset(_managed)
+endif()
+
+install(EXPORT lvtTargets
+    FILE lvtTargets.cmake
+    NAMESPACE lvt::
+    DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/lvt"
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/lvtConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/lvtConfig.cmake"
+    INSTALL_DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/lvt"
+    PATH_VARS LVT_INSTALL_TOOLSDIR
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/lvtConfigVersion.cmake"
+    COMPATIBILITY SameMinorVersion
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/lvtConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/lvtConfigVersion.cmake"
+    DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/lvt"
+)

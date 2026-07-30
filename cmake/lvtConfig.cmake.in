@@ -1,0 +1,45 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(wil CONFIG)
+find_dependency(nlohmann_json CONFIG)
+
+include("${CMAKE_CURRENT_LIST_DIR}/lvtTargets.cmake")
+
+set_and_check(LVT_TOOLS_DIR "@PACKAGE_LVT_INSTALL_TOOLSDIR@")
+
+# Framework support compiled into this build of lvt_core.
+set(LVT_ENABLE_XAML     @LVT_ENABLE_XAML@)
+set(LVT_ENABLE_WINUI3   @LVT_ENABLE_WINUI3@)
+set(LVT_ENABLE_WPF      @LVT_ENABLE_WPF@)
+set(LVT_ENABLE_WINFORMS @LVT_ENABLE_WINFORMS@)
+set(LVT_ENABLE_AVALONIA @LVT_ENABLE_AVALONIA@)
+set(LVT_ENABLE_CHROMIUM @LVT_ENABLE_CHROMIUM@)
+set(LVT_WITH_MANAGED    @LVT_WITH_MANAGED@)
+
+# The injectable TAP DLLs shipped with this package.
+set(LVT_TAP_DLLS "")
+foreach(_lvt_tap @LVT_INSTALLED_TAP_FILES@)
+    if(EXISTS "${LVT_TOOLS_DIR}/${_lvt_tap}")
+        list(APPEND LVT_TAP_DLLS "${LVT_TOOLS_DIR}/${_lvt_tap}")
+    endif()
+endforeach()
+unset(_lvt_tap)
+
+# lvt_core locates the TAP DLLs next to the binary it is linked into, so a
+# consumer of the static library needs them beside their own executable. This
+# adds a post-build copy to do that. Alternatively call lvt::set_tap_directory()
+# or set the LVT_TAP_DIR environment variable at runtime.
+function(lvt_copy_tap_dlls target)
+    if(NOT LVT_TAP_DLLS)
+        return()
+    endif()
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${LVT_TAP_DLLS} "$<TARGET_FILE_DIR:${target}>"
+        COMMENT "Copying lvt TAP DLLs next to ${target}"
+        VERBATIM
+    )
+endfunction()
+
+check_required_components(lvt)

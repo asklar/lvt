@@ -1,11 +1,13 @@
 #include "plugin_loader.h"
 #include "debug.h"
 #include "bounds_util.h"
+#include "module_util.h"
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <functional>
+#include <set>
 #include <userenv.h>
 
 #pragma comment(lib, "userenv.lib")
@@ -16,18 +18,38 @@ namespace lvt {
 
 static std::vector<LoadedPlugin> s_plugins;
 
-static std::wstring get_plugins_dir() {
+// Directories searched for plugins, in priority order:
+//   1. $LVT_PLUGIN_DIR
+//   2. <directory of the lvt binary>/plugins, so a packaged install works
+//   3. %USERPROFILE%\.lvt\plugins, for user-installed plugins
+static std::vector<std::wstring> get_plugin_dirs() {
+    std::vector<std::wstring> dirs;
+
+    std::wstring override(MAX_PATH, L'\0');
+    DWORD len = GetEnvironmentVariableW(L"LVT_PLUGIN_DIR", override.data(),
+                                        static_cast<DWORD>(override.size()));
+    if (len > override.size()) {
+        override.resize(len);
+        len = GetEnvironmentVariableW(L"LVT_PLUGIN_DIR", override.data(),
+                                      static_cast<DWORD>(override.size()));
+    }
+    if (len > 0) {
+        override.resize(len);
+        dirs.push_back(override);
+    }
+
+    auto moduleDir = get_module_dir();
+    if (!moduleDir.empty())
+        dirs.push_back(moduleDir + L"\\plugins");
+
     wchar_t profileDir[MAX_PATH]{};
-    DWORD size = MAX_PATH;
-    if (!GetEnvironmentVariableW(L"USERPROFILE", profileDir, size))
-        return {};
-    return std::wstring(profileDir) + L"\\.lvt\\plugins";
+    if (GetEnvironmentVariableW(L"USERPROFILE", profileDir, MAX_PATH))
+        dirs.push_back(std::wstring(profileDir) + L"\\.lvt\\plugins");
+
+    return dirs;
 }
 
-void load_plugins() {
-    auto dir = get_plugins_dir();
-    if (dir.empty()) return;
-
+static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& seen) {
     std::wstring pattern = dir + L"\\*.dll";
     WIN32_FIND_DATAW fd;
     HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
@@ -35,6 +57,11 @@ void load_plugins() {
 
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+        // A plugin of the same name in an earlier directory wins.
+        std::wstring lowerName(fd.cFileName);
+        for (auto& c : lowerName) c = towlower(c);
+        if (!seen.insert(lowerName).second) continue;
 
         std::wstring fullPath = dir + L"\\" + fd.cFileName;
         HMODULE mod = LoadLibraryW(fullPath.c_str());
@@ -84,6 +111,12 @@ void load_plugins() {
     } while (FindNextFileW(hFind, &fd));
 
     FindClose(hFind);
+}
+
+void load_plugins() {
+    std::set<std::wstring> seen;
+    for (const auto& dir : get_plugin_dirs())
+        load_plugins_from(dir, seen);
 }
 
 void unload_plugins() {
