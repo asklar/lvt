@@ -50,7 +50,7 @@ jobs:
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgGitCommitId: b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01
+          vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
       - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
         run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
