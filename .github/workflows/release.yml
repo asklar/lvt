@@ -25,14 +25,17 @@ jobs:
             msvc_arch: x64
             preset: default
             build_dir: build
+            build_tests: 'ON'
           - arch: x86
             msvc_arch: amd64_x86
             preset: x86
             build_dir: build-x86
+            build_tests: 'OFF'
           - arch: arm64
             msvc_arch: amd64_arm64
             preset: arm64
             build_dir: build-arm64
+            build_tests: 'OFF'
 
     steps:
       - uses: actions/checkout@v4
@@ -52,8 +55,13 @@ jobs:
       - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
         run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
 
+      # Tests only run on x64, and gtest now sits behind a vcpkg manifest
+      # feature, so the other legs can skip building it entirely.
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }} -DCMAKE_BUILD_TYPE=Release
+        run: >
+          cmake --preset ${{ matrix.preset }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DLVT_BUILD_TESTS=${{ matrix.build_tests }}
 
       - name: Build managed WPF assembly
         run: msbuild src/tap_wpf/LvtWpfTap.csproj /p:Configuration=Release /p:Platform=AnyCPU /restore /v:minimal
