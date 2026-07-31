@@ -7,6 +7,7 @@
 #include "../bounds_util.h"
 
 #include "../target.h"
+#include "../module_util.h"
 
 #include <Windows.h>
 #include <sddl.h>
@@ -34,15 +35,6 @@ static std::wstring make_pipe_name() {
         guid.Data4[0], guid.Data4[1], guid.Data4[2], guid.Data4[3],
         guid.Data4[4], guid.Data4[5], guid.Data4[6], guid.Data4[7]);
     return buf;
-}
-
-static std::wstring get_exe_dir() {
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring dir(path);
-    auto pos = dir.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) dir.resize(pos);
-    return dir;
 }
 
 // Check if a process is running inside an AppContainer (UWP).
@@ -225,9 +217,7 @@ bool inject_and_collect_xaml_tree(
     const std::string& frameworkLabel,
     const std::wstring& connPrefix)
 {
-    const wchar_t* tapSuffix = (get_host_architecture() == Architecture::arm64)
-        ? L"\\lvt_tap_arm64.dll" : L"\\lvt_tap_x64.dll";
-    std::wstring tapDll = get_exe_dir() + tapSuffix;
+    std::wstring tapDll = tap_dll_path(L"lvt_tap");
 
     if (GetFileAttributesW(tapDll.c_str()) == INVALID_FILE_ATTRIBUTES) {
         fprintf(stderr, "lvt: TAP DLL not found: %ls\n", tapDll.c_str());

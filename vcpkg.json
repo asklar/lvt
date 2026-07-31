@@ -1,11 +1,19 @@
 {
   "name": "lvt",
-  "version-string": "0.1.0",
+  "version-string": "0.2.0",
   "description": "Live Visual Tree - CLI tool for inspecting Windows app visual trees",
-  "builtin-baseline": "b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01",
+  "builtin-baseline": "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3",
   "dependencies": [
-    "wil",
+    "cppwinrt",
     "nlohmann-json",
-    "gtest"
-  ]
+    "wil"
+  ],
+  "features": {
+    "tests": {
+      "description": "Build the test suite",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  }
 }

@@ -55,6 +55,108 @@ Produces `build/lvt.exe` and `build/lvt_tap_x64.dll` (or `build-arm64/lvt.exe` a
 
 > **Note:** lvt.exe must match the target process's architecture. If you target an ARM64 app, use the ARM64 build. A clear error message is shown on mismatch.
 
+#### Build options
+
+Framework support is per-provider, so you can drop pieces you don't need. Win32 and ComCtl are always built — every other provider enriches that base layer.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `LVT_ENABLE_XAML` | ON | System XAML (UWP / DesktopWindowXamlSource) |
+| `LVT_ENABLE_WINUI3` | ON | WinUI 3 (Windows App SDK) |
+| `LVT_ENABLE_WPF` | ON | WPF |
+| `LVT_ENABLE_WINFORMS` | ON | WinForms |
+| `LVT_ENABLE_AVALONIA` | ON | Avalonia plugin |
+| `LVT_ENABLE_CHROMIUM` | ON | Chromium (Chrome/Edge DOM) plugin |
+| `LVT_BUILD_TOOL` | ON | Build the `lvt` CLI as well as the library |
+| `LVT_BUILD_MANAGED` | ON | Build the managed .NET helper assemblies |
+| `LVT_BUILD_TESTS` | ON | Build the test executables |
+
+`LVT_BUILD_MANAGED` is the only thing that requires the .NET SDK. WPF, WinForms and Avalonia each have a native half that hosts the CLR plus a managed tree-walker assembly; only the latter needs `dotnet`. With `-DLVT_BUILD_MANAGED=OFF` the whole native build still works, including those TAP DLLs — you just lose managed enrichment for those three frameworks. XAML and WinUI 3 are pure C++ either way.
+
+#### C++/WinRT projection
+
+The XAML and WinUI 3 providers need C++/WinRT headers. These come from two places:
+
+- `winrt/base.h` and the `Windows.*` projection — from the **`cppwinrt` vcpkg port**
+- the `Microsoft.*` (WinUI 3) projection — generated at configure time into `src/tap/winui3/` from the **Windows App SDK NuGet package**, which has no vcpkg port
+
+Both halves must be produced by the same cppwinrt version, or the generated headers fail to compile against `base.h`'s macros ("Mismatched C++/WinRT headers"). Taking the generator from the `cppwinrt` port rather than the Windows SDK keeps them in lockstep — and because vcpkg installs only one version of a port per triplet, a consumer that already depends on `cppwinrt` picks the version for both.
+
+The generated projection is cached in `src/tap/winui3/` (gitignored) and regenerated whenever the generator or the Windows App SDK inputs change, tracked via `src/tap/winui3/.cppwinrt-signature`. Two escape hatches:
+
+```powershell
+# Use a specific generator or Windows App SDK package
+cmake --preset default -DLVT_CPPWINRT_EXE=... -DLVT_WASDK_WINMD_DIR=...
+
+# Force a full regeneration
+Remove-Item -Recurse src/tap/winui3
+```
+
+## Using lvt from another project
+
+lvt installs a CMake package exposing `lvt::core`, the same library the CLI is built on.
+
+### With vcpkg
+
+This repository doubles as a [vcpkg registry](https://learn.microsoft.com/vcpkg/consume/git-registries). Add a `vcpkg-configuration.json` next to your `vcpkg.json`:
+
+```json
+{
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg",
+    "baseline": "<a microsoft/vcpkg commit sha>"
+  },
+  "registries": [
+    {
+      "kind": "git",
+      "repository": "https://github.com/asklar/lvt",
+      "baseline": "<an asklar/lvt commit sha>",
+      "packages": [ "lvt" ]
+    }
+  ]
+}
+```
+
+then depend on it from your `vcpkg.json`:
+
+```json
+{
+  "dependencies": [
+    { "name": "lvt", "features": [ "winui3", "wpf" ] }
+  ]
+}
+```
+
+Features map one-to-one onto the framework options above: `xaml`, `winui3`, `wpf`, `winforms`, `avalonia`, `chromium`, plus `tools` for the CLI. All but `avalonia` are on by default. The port always builds with `LVT_BUILD_MANAGED=OFF`, because vcpkg builds have neither network access nor a .NET SDK — see [`ports/lvt/usage`](ports/lvt/usage).
+
+### In CMake
+
+```cmake
+find_package(lvt CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE lvt::core)
+
+# lvt looks for its injectable TAP DLLs next to the binary it is linked into,
+# so copy them beside your executable:
+lvt_copy_tap_dlls(my_app)
+```
+
+```cpp
+#include <lvt/target.h>
+#include <lvt/framework_detector.h>
+#include <lvt/tree_builder.h>
+#include <lvt/json_serializer.h>
+#include <lvt/lvt_config.h>   // which frameworks were compiled in
+
+auto matches    = lvt::find_by_process_name("notepad");
+auto target     = lvt::resolve_target(matches[0].hwnd, matches[0].pid);
+auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+auto tree       = lvt::build_tree(target.hwnd, target.pid, frameworks);
+lvt::assign_element_ids(tree);
+```
+
+Instead of `lvt_copy_tap_dlls()` you can call `lvt::set_tap_directory()` at runtime, or point the `LVT_TAP_DIR` environment variable at the installed tools directory. Plugins are searched for in `$LVT_PLUGIN_DIR`, then `<module dir>/plugins`, then `%USERPROFILE%\.lvt\plugins`.
+
 ### Usage
 
 ```bash

@@ -21,7 +21,7 @@ jobs:
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgGitCommitId: b1b19307e2d2ec1eefbdb7ea069de7d4bcd31f01
+          vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
       - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
         run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
@@ -70,3 +70,113 @@ jobs:
             build/LvtWinFormsTap.dll
             build/LvtWinFormsTap.runtimeconfig.json
             build/plugins/
+
+  # Covers what the vcpkg port does: a build with no .NET SDK involvement, the
+  # install/export rules, and a separate project consuming the installed package
+  # through find_package(). Also the only place the x86 and arm64 targets are
+  # exercised on a pull request.
+  packaging:
+    name: Packaging (${{ matrix.arch }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            msvc_arch: x64
+            preset: default
+            build_dir: build
+            triplet: x64-windows
+            can_run: true
+          - arch: x86
+            msvc_arch: amd64_x86
+            preset: x86
+            build_dir: build-x86
+            triplet: x86-windows
+            can_run: true
+          - arch: arm64
+            msvc_arch: amd64_arm64
+            preset: arm64
+            build_dir: build-arm64
+            triplet: arm64-windows
+            can_run: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+
+      # No Windows App SDK install step and no dotnet: this configuration must
+      # build from source alone, exactly as it does inside vcpkg. The Windows
+      # App SDK winmds come from the NuGet package the portfile downloads, so
+      # WinUI 3 enrichment is reduced here - that is expected.
+      - name: Configure (no managed, no tests)
+        run: >
+          cmake --preset ${{ matrix.preset }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DLVT_BUILD_MANAGED=OFF
+          -DLVT_BUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build ${{ matrix.build_dir }}
+
+      - name: Install
+        run: cmake --install ${{ matrix.build_dir }} --prefix ${{ github.workspace }}/_stage
+
+      - name: Configure consumer against the installed package
+        run: >
+          cmake -S tests/package_consumer -B ${{ matrix.build_dir }}/consumer
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          "-DCMAKE_PREFIX_PATH=${{ github.workspace }}/_stage;${{ github.workspace }}/${{ matrix.build_dir }}/vcpkg_installed/${{ matrix.triplet }}"
+
+      - name: Build consumer
+        run: cmake --build ${{ matrix.build_dir }}/consumer
+
+      # An arm64 binary cannot run on the x64 runner, so that leg is build-only.
+      - name: Run consumer smoke test
+        if: matrix.can_run
+        run: ${{ matrix.build_dir }}\consumer\package_consumer.exe
+
+  # The registry is only usable if the port manifest is in vcpkg's canonical
+  # format and the versions database matches the committed port tree. Both drift
+  # silently otherwise, and upstream vcpkg CI enforces the same checks.
+  port:
+    name: vcpkg port
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+
+      - name: Manifests are canonically formatted
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT/vcpkg.exe" format-manifest ports/lvt/vcpkg.json vcpkg.json
+          git diff --exit-code -- ports/lvt/vcpkg.json vcpkg.json
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Run 'vcpkg format-manifest ports/lvt/vcpkg.json vcpkg.json' and commit the result."
+            exit 1
+          }
+
+      - name: Versions database matches the port
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT/vcpkg.exe" x-add-version lvt --overwrite-version `
+            --x-builtin-ports-root=ports --x-builtin-registry-versions-dir=versions
+          git diff --exit-code -- versions
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Run scripts/update-vcpkg-port.ps1 (or vcpkg x-add-version) and commit the result."
+            exit 1
+          }
