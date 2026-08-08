@@ -78,8 +78,56 @@ WinUI 3 apps use `DesktopChildSiteBridge` windows to host XAML content inside Wi
 3. Matches them 1:1 by position
 4. Grafts each XAML subtree as children of the corresponding bridge element
 
-## Stage 4: Serialization (`json_serializer.cpp`, `screenshot.cpp`)
+## Stage 3 (alternate): UI Automation tree (`providers/uia_provider.cpp`)
 
+`--uia` swaps out Stage 3 entirely. Instead of the layered Win32-plus-providers
+build, it walks the target's UI Automation tree with an `IUIAutomation` client
+and returns the same `lvt::Element` type, so Stages 1 and 4 are untouched.
+
+```mermaid
+flowchart LR
+    A["Target"] --> B{"--uia?"}
+    B -- no --> C["Framework detection\n+ layered providers"]
+    B -- yes --> D["UiaProvider\n<small>IUIAutomation client</small>"]
+    C --> E["Element tree"]
+    D --> E
+    E --> F["Serialization"]
+```
+
+Differences that matter:
+
+| | Visual tree | UIA tree |
+|---|---|---|
+| Mechanism | Native APIs + DLL injection | `IUIAutomation` client, no injection |
+| Architecture | Must match the target | Cross-architecture |
+| Identity | Class names, x:Name | `AutomationId`, `RuntimeId` |
+| Actionability | none | `SupportedPatterns` + pattern state |
+
+Three implementation constraints shape the provider:
+
+1. **Everything goes through one cache request.** Each UIA property read is a
+   cross-process call, so the provider builds an `IUIAutomationCacheRequest`
+   with `TreeScope_Subtree` and every property and pattern it wants, calls
+   `BuildUpdatedCache` once, then walks with `GetCachedChildren()` /
+   `GetCachedPropertyValue()`. This is the difference between one round trip and
+   thousands.
+
+2. **Pattern-backed properties are gated on pattern support.** UIA answers
+   `Toggle.ToggleState` for a `Window` just as readily as for a `CheckBox`.
+   `uia_props.cpp` records the owning pattern for each such property and the
+   walk drops any whose pattern the element does not support, along with
+   framework-specific "unset" sentinels (Win32 uses `0` where XAML uses `-1`).
+
+3. **It runs on a dedicated MTA thread.** UIA clients want an MTA;
+   `screenshot.cpp` initializes an STA on the calling thread. A thread cannot be
+   both, so `run_on_mta()` marshals the walk onto its own thread, which also
+   serializes access to the client.
+
+The walk is bounded by `--uia-timeout` because a cross-process call into an
+unresponsive target can block indefinitely; on expiry it returns the partial
+tree rather than hanging.
+
+## Stage 4: Serialization (`json_serializer.cpp`, `screenshot.cpp`)
 ### JSON output
 
 Standard JSON with `target` metadata, `frameworks` array, and `root` element tree. Uses nlohmann/json for serialization.

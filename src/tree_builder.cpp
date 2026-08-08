@@ -82,13 +82,36 @@ const Element* find_element_by_key(const Element& root, const std::string& key) 
     return nullptr;
 }
 
+// Resolve an element by a "uia:<RuntimeId>" reference, e.g. "uia:42.3150138.4.5".
+// RuntimeIds survive across walks of a live UI for as long as the element does,
+// which makes them a useful handle for callers that re-walk between actions.
+template <typename ElementT>
+static ElementT* find_element_by_runtime_id_impl(ElementT& root, const std::string& runtimeId) {
+    auto it = root.properties.find("RuntimeId");
+    if (it != root.properties.end() && it->second == runtimeId)
+        return &root;
+    for (auto& child : root.children) {
+        if (auto* found = find_element_by_runtime_id_impl(child, runtimeId))
+            return found;
+    }
+    return nullptr;
+}
+
+static const char* uia_ref_prefix(const std::string& ref) {
+    return ref.rfind("uia:", 0) == 0 ? ref.c_str() + 4 : nullptr;
+}
+
 Element* find_element_by_ref(Element& root, const std::string& ref) {
+    if (const char* runtimeId = uia_ref_prefix(ref))
+        return find_element_by_runtime_id_impl(root, std::string(runtimeId));
     if (auto* byId = find_element_by_id(root, ref))
         return byId;
     return find_element_by_key(root, ref);
 }
 
 const Element* find_element_by_ref(const Element& root, const std::string& ref) {
+    if (const char* runtimeId = uia_ref_prefix(ref))
+        return find_element_by_runtime_id_impl(root, std::string(runtimeId));
     if (auto* byId = find_element_by_id(root, ref))
         return byId;
     return find_element_by_key(root, ref);

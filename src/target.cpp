@@ -10,6 +10,7 @@ const char* architecture_name(Architecture arch) {
     switch (arch) {
     case Architecture::x64:   return "x64";
     case Architecture::arm64: return "arm64";
+    case Architecture::x86:   return "x86";
     default:                  return "unknown";
     }
 }
@@ -19,6 +20,8 @@ Architecture get_host_architecture() {
     return Architecture::arm64;
 #elif defined(_M_X64)
     return Architecture::x64;
+#elif defined(_M_IX86)
+    return Architecture::x86;
 #else
     return Architecture::unknown;
 #endif
@@ -41,6 +44,7 @@ Architecture detect_process_architecture(DWORD pid) {
             switch (actual) {
             case IMAGE_FILE_MACHINE_AMD64: return Architecture::x64;
             case IMAGE_FILE_MACHINE_ARM64: return Architecture::arm64;
+            case IMAGE_FILE_MACHINE_I386:  return Architecture::x86;
             }
         }
     }

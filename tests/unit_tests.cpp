@@ -9,6 +9,10 @@
 #include "framework_detector.h"
 #include "target.h"
 #include "providers/winforms_inject.h"
+#include "providers/uia_provider.h"
+#include "providers/uia_props.h"
+#include <oleacc.h>
+#include <UIAutomation.h>
 #include "wil_diagnostics.h"
 #include "debug.h"
 #include <wil/result.h>
@@ -1033,4 +1037,126 @@ TEST(WilResultLogger, ReportsToStderrNotStdoutWhenDebug) {
     EXPECT_NE(err.find("wil/return"), std::string::npos);
     EXPECT_NE(err.find("unit_tests.cpp"), std::string::npos);
     EXPECT_TRUE(out.empty());
+}
+
+// --- UIA property/view tables and RuntimeId handling ---
+
+TEST(UiaView, ParsesAllThreeViews) {
+    lvt::UiaView view = lvt::UiaView::raw;
+    EXPECT_TRUE(lvt::parse_uia_view("control", view));
+    EXPECT_EQ(view, lvt::UiaView::control);
+    EXPECT_TRUE(lvt::parse_uia_view("RAW", view));
+    EXPECT_EQ(view, lvt::UiaView::raw);
+    EXPECT_TRUE(lvt::parse_uia_view("Content", view));
+    EXPECT_EQ(view, lvt::UiaView::content);
+}
+
+TEST(UiaView, RejectsUnknownView) {
+    lvt::UiaView view = lvt::UiaView::control;
+    EXPECT_FALSE(lvt::parse_uia_view("tree", view));
+    EXPECT_FALSE(lvt::parse_uia_view("", view));
+    EXPECT_EQ(view, lvt::UiaView::control);  // unchanged on failure
+}
+
+TEST(UiaProps, ResolvesNamesLeniently) {
+    const long expected = lvt::uia_property_id("AutomationId");
+    EXPECT_NE(expected, 0);
+    // Case-insensitive, and the UIA_/PropertyId decoration is optional, so a
+    // name pasted from the docs resolves the same as one from lvt's output.
+    EXPECT_EQ(lvt::uia_property_id("automationid"), expected);
+    EXPECT_EQ(lvt::uia_property_id("UIA_AutomationIdPropertyId"), expected);
+    EXPECT_EQ(lvt::uia_property_id("AutomationIdPropertyId"), expected);
+}
+
+TEST(UiaProps, UnknownNameResolvesToZero) {
+    EXPECT_EQ(lvt::uia_property_id("NotARealProperty"), 0);
+    EXPECT_EQ(lvt::uia_property_id(""), 0);
+}
+
+TEST(UiaProps, RoundTripsNameAndId) {
+    for (long id : lvt::uia_core_property_ids()) {
+        const auto name = lvt::uia_property_name(id);
+        ASSERT_FALSE(name.empty()) << "property id " << id << " has no name";
+        EXPECT_EQ(lvt::uia_property_id(name), id) << "round trip failed for " << name;
+    }
+}
+
+TEST(UiaProps, PatternBackedPropertiesDeclareTheirOwner) {
+    // Gating on the owning pattern is what keeps a Window from reporting
+    // Toggle.ToggleState; if these lose their owner the output regresses badly.
+    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("Toggle.ToggleState")),
+              lvt::uia_pattern_id("Toggle"));
+    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("Value.Value")),
+              lvt::uia_pattern_id("Value"));
+    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("Grid.RowCount")),
+              lvt::uia_pattern_id("Grid"));
+    // Identity properties are always meaningful and must not be gated.
+    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("AutomationId")), 0);
+    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("ControlType")), 0);
+}
+
+TEST(UiaProps, SuppressesFrameworkSpecificUnsetSentinels) {
+    // Win32 reports 0 for an unset Level; XAML reports -1. Both are noise.
+    const long level = lvt::uia_property_id("Level");
+    EXPECT_TRUE(lvt::uia_property_value_is_unset(level, "0"));
+    EXPECT_TRUE(lvt::uia_property_value_is_unset(level, "-1"));
+    EXPECT_FALSE(lvt::uia_property_value_is_unset(level, "2"));
+
+    const long automationId = lvt::uia_property_id("AutomationId");
+    EXPECT_FALSE(lvt::uia_property_value_is_unset(automationId, "0"));
+}
+
+TEST(UiaProps, ResolvesPatternNamesLeniently) {
+    const long invoke = lvt::uia_pattern_id("Invoke");
+    EXPECT_NE(invoke, 0);
+    EXPECT_EQ(lvt::uia_pattern_id("invoke"), invoke);
+    EXPECT_EQ(lvt::uia_pattern_id("InvokePattern"), invoke);
+    EXPECT_EQ(lvt::uia_pattern_name(invoke), "Invoke");
+    EXPECT_EQ(lvt::uia_pattern_id("NotAPattern"), 0);
+}
+
+TEST(UiaProps, NamesKnownControlTypesAndFallsBackForUnknown) {
+    EXPECT_EQ(lvt::uia_control_type_name(UIA_ButtonControlTypeId), "Button");
+    EXPECT_EQ(lvt::uia_control_type_name(UIA_EditControlTypeId), "Edit");
+    // An unrecognised control type must stay identifiable rather than vanish.
+    EXPECT_EQ(lvt::uia_control_type_name(999999), "ControlType(999999)");
+}
+
+TEST(UiaRuntimeId, FormatsAndParsesRoundTrip) {
+    const std::vector<int> id{42, 3150138, 4, 5};
+    const auto text = lvt::format_runtime_id(id);
+    EXPECT_EQ(text, "42.3150138.4.5");
+
+    std::vector<int> parsed;
+    ASSERT_TRUE(lvt::parse_runtime_id(text, parsed));
+    EXPECT_EQ(parsed, id);
+}
+
+TEST(UiaRuntimeId, RejectsMalformedInput) {
+    std::vector<int> parsed;
+    EXPECT_FALSE(lvt::parse_runtime_id("", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("42..5", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("42.", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("4a.5", parsed));
+}
+
+TEST(FindElementByRef, ResolvesUiaRuntimeIdReference) {
+    lvt::Element root;
+    root.type = "Window";
+    root.properties["RuntimeId"] = "42.100";
+    lvt::Element child;
+    child.type = "Button";
+    child.properties["RuntimeId"] = "42.100.3.7";
+    root.children.push_back(child);
+    lvt::assign_element_ids(root);
+
+    auto* found = lvt::find_element_by_ref(root, "uia:42.100.3.7");
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->type, "Button");
+
+    EXPECT_EQ(lvt::find_element_by_ref(root, "uia:42.999"), nullptr);
+    // A plain id must still win; the uia: prefix is what selects RuntimeId lookup.
+    auto* byId = lvt::find_element_by_ref(root, "e0");
+    ASSERT_NE(byId, nullptr);
+    EXPECT_EQ(byId->type, "Window");
 }

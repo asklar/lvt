@@ -6,7 +6,7 @@
 
 namespace lvt {
 
-enum class Architecture { unknown, x64, arm64 };
+enum class Architecture { unknown, x64, arm64, x86 };
 
 const char* architecture_name(Architecture arch);
 Architecture get_host_architecture();

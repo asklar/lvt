@@ -69,7 +69,18 @@ docs/
 
 ### No UI Automation
 
-We deliberately avoid UIA. It is slow, unreliable, and hard to use correctly. Each provider talks to the framework's native APIs directly.
+The visual tree deliberately avoids UIA. It is slow, unreliable, and hard to use correctly. Each provider talks to the framework's native APIs directly.
+
+`--uia` (`src/providers/uia_provider.cpp`) is the deliberate, opt-in exception: a *separate* automation-grade view for callers that need `AutomationId`s and patterns. It never participates in building the visual tree, so the principle above still holds for everything else.
+
+Two rules matter when working on it:
+
+- **Batch through the cache.** UIA properties are cross-process calls. Always fetch via `IUIAutomationCacheRequest` (`TreeScope_Subtree` + `AddProperty`/`AddPattern`, then `GetCachedChildren`/`GetCachedPropertyValue`). Reading live properties per node turns a fast walk into a multi-second one.
+- **Gate pattern-backed properties on pattern support.** UIA answers them on every element regardless, so an ungated walk reports a `Window`'s `Toggle.ToggleState`. `uia_property_owner_pattern()` in `uia_props.cpp` is what prevents that; new pattern-backed properties must declare their owner.
+
+### UIA runs on its own MTA thread
+
+UIA clients want an MTA, but `screenshot.cpp` initializes an STA on the calling thread and a thread cannot be both. All UIA work is marshalled onto a dedicated MTA thread (`run_on_mta` in `uia_provider.cpp`); calling it inline yields `RPC_E_CHANGED_MODE`.
 
 ### Static CRT for TAP DLL
 

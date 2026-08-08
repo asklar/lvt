@@ -199,10 +199,67 @@ lvt --name notepad --watch --interval 250
 | `--dump` | Output the tree (default unless `--screenshot` is used) |
 | `--watch` | Emit live JSON tree diff events until Ctrl+C |
 | `--interval <ms>` | Polling interval for `--watch` (default: 500) |
-| `--element <ref>` | Scope to a specific element subtree by positional `eN` id or durable key |
-| `--query <ref> [prop]` | Output an element, or one property, by positional `eN` id or durable key |
+| `--element <ref>` | Scope to a specific element subtree by positional `eN` id, durable key, or `uia:<RuntimeId>` |
+| `--query <ref> [prop]` | Output an element, or one property, by positional `eN` id, durable key, or `uia:<RuntimeId>` |
+| `--uia` | Emit the UI Automation tree instead of the visual tree |
+| `--uia-view <view>` | UIA tree view: `control` (default), `raw`, or `content` |
+| `--uia-props <list>` | Comma-separated extra UIA properties to include |
+| `--uia-timeout <ms>` | Deadline for the UIA walk (default: 10000, `0` = none) |
 | `--frameworks` | Just list detected frameworks |
 | `--depth <n>` | Max tree traversal depth |
+
+## UI Automation tree (`--uia`)
+
+The visual tree answers *"what is this UI made of?"*. `--uia` answers *"how do I
+drive it?"* — it emits the target's UI Automation tree, so every element carries
+the identifiers an automation client needs:
+
+```powershell
+# Automation-grade view of an app
+lvt --name myapp --uia
+
+# Everything UIA can see, including framework scaffolding
+lvt --name myapp --uia --uia-view raw
+
+# Add properties that are not in the default set
+lvt --name myapp --uia --uia-props ProviderDescription,IsPassword
+
+# Address an element by its UIA RuntimeId
+lvt --name myapp --uia --query uia:42.3150138.4.5 AutomationId
+```
+
+Elements report `AutomationId`, `ControlType`, `LocalizedControlType`,
+`FrameworkId`, `RuntimeId`, interaction state (`IsEnabled`, `IsOffscreen`,
+`HasKeyboardFocus`, …), the `SupportedPatterns` list, and the state belonging to
+those patterns (`Value.Value`, `Toggle.ToggleState`, `ExpandCollapse.State`,
+`RangeValue.*`, `Scroll.*`, …).
+
+Pattern-backed properties are **only emitted where the pattern is supported**.
+UIA will happily tell you a `Window`'s `Toggle.ToggleState`, which is meaningless
+noise; lvt gates each property on its owning pattern so a `Button` shows
+`SupportedPatterns="Invoke,…"` and no toggle state, while a `CheckBox` shows
+`Toggle.ToggleState="On"`.
+
+Everything that works on the visual tree works here: `eN` ids, durable keys,
+`--element`, `--query`, `--depth`, `--watch`, `--format xml`, and annotated
+screenshots.
+
+### Works across architectures
+
+`--uia` injects nothing into the target, so unlike the visual-tree providers it
+is not restricted to processes matching lvt's own architecture:
+
+```powershell
+# x64 lvt.exe reading a 32-bit process — refused for the visual tree, fine for UIA
+lvt --pid 51748 --uia
+```
+
+### Relationship to the visual tree
+
+`--uia` **replaces** the visual tree rather than enriching it; the two are
+separate views of the same window, and the visual tree still never depends on
+UIA. Use the visual tree for framework-native structure and internals, and
+`--uia` for automation identity and actionable state.
 
 ## Output format
 
@@ -271,7 +328,7 @@ See [docs/architecture.md](docs/architecture.md) for details.
 
 ## Design principles
 
-- **No UI Automation** — uses framework-native APIs directly for speed and accuracy
+- **Framework-native by default** — the visual tree uses framework-native APIs directly for speed and accuracy, and never depends on UI Automation. `--uia` is an opt-in, automation-grade *second* view, not a replacement for that
 - **Graceful degradation** — if a framework provider fails, falls back to HWND-level info
 - **AI-first** — output formats and element IDs designed for machine consumption
 - **Minimal footprint** — single exe + one DLL, no installers, no runtime dependencies
@@ -306,12 +363,8 @@ These plugins are built from source alongside lvt and deployed to `%USERPROFILE%
 
 ## Future work
 
-- WinForms provider
 - WebView2 provider
 - MAUI provider
-- Element property querying (`--query <id> <property>`)
-- Accessibility tree correlation
-- Watch mode for live tree diffing
 
 ## License
 

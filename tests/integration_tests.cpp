@@ -1931,3 +1931,178 @@ TEST_F(KnownWindowFixture, AnnotationsIncludeKnownControls) {
     fs::remove(annFile);
 }
 #endif
+
+// --- UIA tree (--uia) ---
+// These assert the properties that make the UIA tree useful for automation:
+// AutomationIds, control types, and pattern support. They reuse the WinUI3
+// sample because it has known, stable AutomationIds.
+
+namespace {
+
+// Tree JSON nests dynamic properties under "properties" (unlike --query output,
+// which flattens them), so reach through that object.
+std::string uia_prop(const json& node, const std::string& name) {
+    if (!node.contains("properties"))
+        return {};
+    return node["properties"].value(name, "");
+}
+
+bool uia_has_prop(const json& node, const std::string& name) {
+    return node.contains("properties") && node["properties"].contains(name);
+}
+
+const json* find_by_automation_id(const json& node, const std::string& automationId) {
+    if (uia_prop(node, "AutomationId") == automationId)
+        return &node;
+    if (node.contains("children")) {
+        for (const auto& child : node["children"]) {
+            if (auto* found = find_by_automation_id(child, automationId))
+                return found;
+        }
+    }
+    return nullptr;
+}
+
+size_t count_json_nodes(const json& node) {
+    size_t count = 1;
+    if (node.contains("children")) {
+        for (const auto& child : node["children"])
+            count += count_json_nodes(child);
+    }
+    return count;
+}
+
+} // namespace
+
+TEST_F(WinUI3SampleFixture, UiaTreeExposesAutomationIdsAndControlTypes) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded()) << "--uia did not produce JSON:\n" << output;
+    ASSERT_TRUE(j.contains("root"));
+
+    auto* button = find_by_automation_id(j["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr) << "PrimaryButton not found in the UIA tree";
+    EXPECT_EQ(button->value("type", ""), "Button");
+    EXPECT_EQ(uia_prop(*button, "ControlType"), "Button");
+    EXPECT_EQ(button->value("framework", ""), "uia");
+    EXPECT_EQ(uia_prop(*button, "FrameworkId"), "XAML");
+    // Invoke is what makes the button actionable; it must be advertised.
+    EXPECT_NE(uia_prop(*button, "SupportedPatterns").find("Invoke"), std::string::npos)
+        << "SupportedPatterns=" << uia_prop(*button, "SupportedPatterns");
+
+    auto* box = find_by_automation_id(j["root"], "InputBox");
+    ASSERT_NE(box, nullptr);
+    EXPECT_EQ(uia_prop(*box, "ControlType"), "Edit");
+    EXPECT_NE(uia_prop(*box, "SupportedPatterns").find("Value"), std::string::npos);
+
+    auto* check = find_by_automation_id(j["root"], "ReadyCheckBox");
+    ASSERT_NE(check, nullptr);
+    EXPECT_EQ(uia_prop(*check, "ControlType"), "CheckBox");
+    EXPECT_NE(uia_prop(*check, "SupportedPatterns").find("Toggle"), std::string::npos);
+}
+
+TEST_F(WinUI3SampleFixture, UiaTreeGatesPatternPropertiesByPatternSupport) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    // UIA answers pattern-backed properties on every element regardless of
+    // support. Without gating, a Button reports Toggle.ToggleState and the
+    // output becomes mostly noise.
+    auto* button = find_by_automation_id(j["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr);
+    EXPECT_FALSE(uia_has_prop(*button, "Toggle.ToggleState"));
+    EXPECT_FALSE(uia_has_prop(*button, "Grid.RowCount"));
+    EXPECT_FALSE(uia_has_prop(*button, "RangeValue.Value"));
+
+    // The checkbox supports Toggle, so there it is real data.
+    auto* check = find_by_automation_id(j["root"], "ReadyCheckBox");
+    ASSERT_NE(check, nullptr);
+    ASSERT_TRUE(uia_has_prop(*check, "Toggle.ToggleState"));
+    EXPECT_EQ(uia_prop(*check, "Toggle.ToggleState"), "On");
+
+    auto* box = find_by_automation_id(j["root"], "InputBox");
+    ASSERT_NE(box, nullptr);
+    ASSERT_TRUE(uia_has_prop(*box, "Value.Value"));
+    EXPECT_FALSE(uia_has_prop(*box, "Toggle.ToggleState"));
+}
+
+TEST_F(WinUI3SampleFixture, UiaViewsNarrowFromRawToContent) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto nodesFor = [&](const std::string& view) -> size_t {
+        auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia --uia-view " + view));
+        auto j = json::parse(output, nullptr, false);
+        EXPECT_FALSE(j.is_discarded()) << "--uia-view " << view << " produced no JSON";
+        if (j.is_discarded() || !j.contains("root"))
+            return 0;
+        return count_json_nodes(j["root"]);
+    };
+
+    const size_t raw = nodesFor("raw");
+    const size_t control = nodesFor("control");
+    const size_t content = nodesFor("content");
+
+    ASSERT_GT(content, 0u);
+    EXPECT_GE(raw, control) << "raw view should be at least as large as control";
+    EXPECT_GE(control, content) << "control view should be at least as large as content";
+    EXPECT_GT(raw, content) << "raw and content should differ on a real XAML tree";
+}
+
+TEST_F(WinUI3SampleFixture, UiaElementsCarryDurableKeysAndResolveByRuntimeId) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    auto* button = find_by_automation_id(j["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr);
+
+    // element_key.cpp prefers a property named "AutomationId", so a UIA element
+    // with one gets a durable key derived from it for free.
+    auto key = button->value("key", "");
+    ASSERT_FALSE(key.empty());
+    EXPECT_NE(key.find("AutomationId:PrimaryButton"), std::string::npos) << "key=" << key;
+
+    auto runtimeId = uia_prop(*button, "RuntimeId");
+    ASSERT_FALSE(runtimeId.empty());
+
+    auto queried = run_command(make_cmd(
+        lvt, get_pid_arg() + " --uia --query uia:" + runtimeId + " AutomationId"));
+    // Trim the trailing newline the CLI writes.
+    while (!queried.empty() && (queried.back() == '\n' || queried.back() == '\r'))
+        queried.pop_back();
+    EXPECT_EQ(queried, "PrimaryButton");
+}
+
+TEST_F(WinUI3SampleFixture, UiaExtraPropertiesAreOptInAndReportUnknownNames) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+
+    // ProviderDescription is verbose, so it is not in the default set.
+    auto defaultOut = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto defaultJson = json::parse(defaultOut, nullptr, false);
+    ASSERT_FALSE(defaultJson.is_discarded());
+    auto* defaultButton = find_by_automation_id(defaultJson["root"], "PrimaryButton");
+    ASSERT_NE(defaultButton, nullptr);
+    EXPECT_FALSE(uia_has_prop(*defaultButton, "ProviderDescription"));
+
+    // Asking for it by name brings it back.
+    auto withProps = run_command(make_cmd(
+        lvt, get_pid_arg() + " --uia --uia-props ProviderDescription"));
+    auto withPropsJson = json::parse(withProps, nullptr, false);
+    ASSERT_FALSE(withPropsJson.is_discarded());
+    auto* richButton = find_by_automation_id(withPropsJson["root"], "PrimaryButton");
+    ASSERT_NE(richButton, nullptr);
+    EXPECT_TRUE(uia_has_prop(*richButton, "ProviderDescription"));
+}

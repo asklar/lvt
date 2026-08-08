@@ -3,6 +3,7 @@ name: lvt
 description: >
   Inspect running Windows application UIs using the lvt (Live Visual Tree) CLI tool.
   Use this skill when you need to understand a Windows app's visual tree structure,
+  read its UI Automation tree (AutomationIds, control types, supported patterns),
   capture annotated screenshots, detect UI frameworks, or find specific UI elements
   for verification or interaction planning.
 ---
@@ -18,6 +19,7 @@ Use `lvt` whenever you need to understand the visual content or structure of a r
 - **Screenshot capture** — take an annotated screenshot of an app with element IDs overlaid
 - **Framework detection** — determine which UI frameworks an app uses (Win32, ComCtl, XAML, WinUI 3)
 - **Automated UI interaction planning** — get element IDs and bounds to plan mouse clicks or keyboard input
+- **Automation identity** — get `AutomationId`s, control types, and supported patterns with `--uia` when you need to drive the app rather than just describe it
 
 ## Prerequisites
 
@@ -101,6 +103,31 @@ lvt --name myapp --element e5 --depth 3
 lvt --name notepad --frameworks
 ```
 
+### Get the UI Automation tree
+
+Use `--uia` when you need to *act on* the app rather than just describe it. It
+emits the UI Automation tree, where elements carry the identifiers and state an
+automation client needs.
+
+```powershell
+# Automation-grade view
+lvt --name myapp --uia
+
+# Narrower (content) or wider (raw) views
+lvt --name myapp --uia --uia-view content
+
+# Look up one element by its UIA RuntimeId
+lvt --name myapp --uia --query uia:42.3150138.4.5
+```
+
+Prefer `--uia` when you want to answer "which control do I click, and can I?" —
+`AutomationId` gives a stable handle and `SupportedPatterns` tells you what the
+element can actually do (`Invoke` = clickable, `Value` = settable text,
+`Toggle` = checkable, `ExpandCollapse` = expandable).
+
+`--uia` also works when the target's architecture differs from lvt's, which the
+visual tree cannot do.
+
 ## Interpreting the output
 
 ### Element IDs
@@ -122,6 +149,24 @@ Every element gets a stable ID like `e0`, `e1`, `e2`, etc., assigned in depth-fi
 | `text` | Visible text content or window title |
 | `bounds` | Screen-relative bounding rectangle `{x, y, width, height}` |
 | `children` | Nested child elements |
+
+### Key `--uia` element properties
+
+With `--uia`, elements carry automation identity instead of framework internals.
+These live under `properties` in JSON output:
+
+| Property | Description |
+|----------|-------------|
+| `AutomationId` | Stable, developer-assigned identifier — the best handle for a control |
+| `ControlType` | UIA control type (`Button`, `Edit`, `CheckBox`, `TreeItem`, …) |
+| `SupportedPatterns` | What the element can do (`Invoke`, `Value`, `Toggle`, `ExpandCollapse`, `Scroll`, …) |
+| `RuntimeId` | Per-element handle usable as `--query uia:<RuntimeId>` |
+| `FrameworkId` | Underlying framework (`Win32`, `XAML`, `WPF`, `WinForm`, …) |
+| `IsEnabled`, `IsOffscreen`, `HasKeyboardFocus` | Whether the element is actually actionable right now |
+| `Value.Value`, `Toggle.ToggleState`, `ExpandCollapse.State` | Current state, present only when the owning pattern is supported |
+
+Pattern state is only emitted where the pattern is supported, so the presence of
+`Toggle.ToggleState` is itself a reliable signal that the element is checkable.
 
 ### JSON example
 
