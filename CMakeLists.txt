@@ -69,6 +69,7 @@ set(LVT_PUBLIC_HEADERS
     src/target.h
     src/tree_builder.h
     src/watch_diff.h
+    src/wil_diagnostics.h
     "${CMAKE_CURRENT_BINARY_DIR}/include/lvt/lvt_config.h"
 )
 
@@ -83,6 +84,7 @@ set(LVT_CORE_SOURCES
     src/screenshot.cpp
     src/module_util.cpp
     src/plugin_loader.cpp
+    src/wil_diagnostics.cpp
     src/providers/win32_provider.cpp
     src/providers/comctl_provider.cpp
 )

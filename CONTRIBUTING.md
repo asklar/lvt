@@ -87,6 +87,47 @@ After `lvt_tap.dll` is injected into a target process, the file is locked. You m
 
 `GetPropertyValuesChain` has strict thread affinity — it must run on the XAML UI thread. The TAP DLL uses a message-only window + `SendMessage` pattern to dispatch these calls. See [docs/tap-dll-design.md](docs/tap-dll-design.md).
 
+### Resource management: WIL everywhere
+
+No raw COM pointers, no raw handles, no manual `Release()` / `CloseHandle()` / `FreeLibrary()` / `SysFreeString()` / `CoTaskMemFree()` / `VariantClear()` / `CoUninitialize()`.
+
+| Use | Type |
+|-----|------|
+| COM interfaces | `wil::com_ptr<T>` |
+| Win32 handles | `wil::unique_handle`, `wil::unique_hmodule`, `wil::unique_hfile`, `wil::unique_event`, … |
+| GDI objects | `wil::unique_hdc`, `wil::unique_hbitmap`, `wil::unique_hgdiobj` |
+| `BSTR` / `CoTaskMem` / `VARIANT` | `wil::unique_bstr`, `wil::unique_cotaskmem`, `wil::unique_variant` |
+| `CoInitializeEx` | `wil::unique_couninitialize_call` |
+| Arbitrary scope cleanup | `wil::scope_exit` |
+
+`CoInitializeEx` is a common trap: pairing it with a `bool needUninit` and a single `CoUninitialize()` at the end leaks the apartment on every early return. Use `wil::unique_couninitialize_call`, `release()`d if the init itself failed.
+
+### Error handling: WIL result macros
+
+Internal helpers return `HRESULT` and use the macros; public boundaries keep their `bool` / `std::optional` / `Element` signatures and convert at the edge:
+
+```cpp
+static HRESULT do_work_hr(...) {
+    RETURN_IF_FAILED(factory->CreateStream(&stream));
+    RETURN_HR_IF(E_INVALIDARG, width <= 0);
+    return S_OK;
+}
+
+static bool do_work(...) {
+    return SUCCEEDED(LOG_IF_FAILED(do_work_hr(...)));
+}
+```
+
+This is not cosmetic: a bare `return false` discards the failing `HRESULT` and its location, whereas the macros report the originating file, line, function, and expression.
+
+- `lvt::install_wil_result_logger()` (in `wil_diagnostics.h`) routes those reports to **stderr**, gated on `lvt::g_debug` (`--debug`).
+- **Never write diagnostics to stdout.** stdout carries machine-readable payloads — the JSON/XML tree today, and more later. `tests/unit_tests.cpp` has `WilResultLogger` tests that enforce this.
+- At any `extern "C"` boundary, wrap the body in `CATCH_RETURN()` / `CATCH_LOG()` so exceptions never escape into a foreign runtime.
+
+### Public headers and dependency visibility
+
+Headers listed in `LVT_PUBLIC_HEADERS` are installed and consumed externally. If one uses a type from a dependency, that dependency must be linked `PUBLIC` on `lvt_core`, or consumers fail with "Cannot open include file". `lvt_public_headers_test` is a compile-only target that links `lvt_core` with no include directories of its own, so it sees exactly what an external consumer sees and catches this at build time.
+
 ## Adding a new provider
 
 1. Create `src/providers/myframework_provider.h/.cpp`
@@ -101,7 +142,7 @@ After `lvt_tap.dll` is injected into a target process, the file is locked. You m
 
 - C++20
 - No exceptions in TAP DLL code (use SEH or error codes)
-- Prefer WIL smart pointers where available
+- Use WIL smart pointers and result macros — see [Key conventions](#key-conventions)
 - Keep comments minimal — only where behavior is non-obvious
 - Use `static` for file-scope helpers
 
