@@ -6,6 +6,7 @@
 #include "screenshot.h"
 #include "plugin_loader.h"
 #include "debug.h"
+#include "wil_diagnostics.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -288,6 +289,11 @@ int main(int argc, char* argv[]) {
     }
 
     auto args = parse_args(argc, argv);
+
+    // Route WIL failures to stderr now that --debug is known. stdout carries the
+    // tree payload, so diagnostics must never go there.
+    lvt::install_wil_result_logger();
+
     bool hasNonTitleTarget = args.hwnd || args.pid || !args.processName.empty();
     args.pluginOption = hasNonTitleTarget ? args.windowTitle : "";
 

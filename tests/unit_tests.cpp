@@ -9,6 +9,9 @@
 #include "framework_detector.h"
 #include "target.h"
 #include "providers/winforms_inject.h"
+#include "wil_diagnostics.h"
+#include "debug.h"
+#include <wil/result.h>
 #include <nlohmann/json.hpp>
 #include <string>
 
@@ -980,4 +983,54 @@ TEST(PluginGraft, NormalBoundsStillWork) {
     EXPECT_EQ(root.children[0].bounds.y, 220);    // 200 + 20
     EXPECT_EQ(root.children[0].bounds.width, 80);
     EXPECT_EQ(root.children[0].bounds.height, 30);
+}
+
+// --- WIL result logger ---
+// Guards the invariant Phase 2's MCP stdio transport depends on: WIL failure
+// diagnostics go to stderr and are silent unless --debug is set.
+
+namespace {
+
+HRESULT failing_helper() {
+    RETURN_HR(E_ACCESSDENIED);
+}
+
+} // namespace
+
+TEST(WilResultLogger, SilentUnlessDebug) {
+    lvt::install_wil_result_logger();
+
+    const bool previous = lvt::g_debug;
+    lvt::g_debug = false;
+
+    testing::internal::CaptureStderr();
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(failing_helper(), E_ACCESSDENIED);
+    const auto out = testing::internal::GetCapturedStdout();
+    const auto err = testing::internal::GetCapturedStderr();
+
+    lvt::g_debug = previous;
+
+    EXPECT_EQ(err.find("wil/"), std::string::npos);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST(WilResultLogger, ReportsToStderrNotStdoutWhenDebug) {
+    lvt::install_wil_result_logger();
+
+    const bool previous = lvt::g_debug;
+    lvt::g_debug = true;
+
+    testing::internal::CaptureStderr();
+    testing::internal::CaptureStdout();
+    EXPECT_EQ(failing_helper(), E_ACCESSDENIED);
+    const auto out = testing::internal::GetCapturedStdout();
+    const auto err = testing::internal::GetCapturedStderr();
+
+    lvt::g_debug = previous;
+
+    // The diagnostic names the originating site, and never touches stdout.
+    EXPECT_NE(err.find("wil/return"), std::string::npos);
+    EXPECT_NE(err.find("unit_tests.cpp"), std::string::npos);
+    EXPECT_TRUE(out.empty());
 }

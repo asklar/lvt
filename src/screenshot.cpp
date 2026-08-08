@@ -2,6 +2,7 @@
 #include "tree_builder.h"
 #include <wil/com.h>
 #include <wil/resource.h>
+#include <wil/result.h>
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
@@ -289,19 +290,17 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
 }
 
 // Save BGRA pixels to PNG using WIC
-static bool save_pixels_as_png(const BYTE* pixels, int width, int height,
-                               const std::string& outputPath,
-                               const RECT* cropRect = nullptr) {
+static HRESULT save_pixels_as_png_hr(const BYTE* pixels, int width, int height,
+                                     const std::string& outputPath,
+                                     const RECT* cropRect) {
     // Scope the COM initialization so every early return below uninitializes.
     wil::unique_couninitialize_call couninit;
-    auto hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (FAILED(hr))
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)))
         couninit.release();
 
     wil::com_ptr<IWICImagingFactory> factory;
-    hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                          IID_PPV_ARGS(&factory));
-    if (FAILED(hr)) return false;
+    RETURN_IF_FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&factory)));
 
     int outX = 0, outY = 0, outW = width, outH = height;
     if (cropRect) {
@@ -311,7 +310,7 @@ static bool save_pixels_as_png(const BYTE* pixels, int width, int height,
         outH = static_cast<int>(cropRect->bottom - cropRect->top);
         if (outX + outW > width) outW = width - outX;
         if (outY + outH > height) outH = height - outY;
-        if (outW <= 0 || outH <= 0) return false;
+        RETURN_HR_IF(E_INVALIDARG, outW <= 0 || outH <= 0);
     }
 
     int wlen = MultiByteToWideChar(CP_UTF8, 0, outputPath.c_str(), -1, nullptr, 0);
@@ -319,51 +318,48 @@ static bool save_pixels_as_png(const BYTE* pixels, int width, int height,
     MultiByteToWideChar(CP_UTF8, 0, outputPath.c_str(), -1, wpath.data(), wlen);
 
     wil::com_ptr<IWICStream> stream;
-    hr = factory->CreateStream(&stream);
-    if (FAILED(hr)) return false;
-    hr = stream->InitializeFromFilename(wpath.c_str(), GENERIC_WRITE);
-    if (FAILED(hr)) return false;
+    RETURN_IF_FAILED(factory->CreateStream(&stream));
+    RETURN_IF_FAILED(stream->InitializeFromFilename(wpath.c_str(), GENERIC_WRITE));
 
     wil::com_ptr<IWICBitmapEncoder> encoder;
-    hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-    if (FAILED(hr)) return false;
-    hr = encoder->Initialize(stream.get(), WICBitmapEncoderNoCache);
-    if (FAILED(hr)) return false;
+    RETURN_IF_FAILED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder));
+    RETURN_IF_FAILED(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache));
 
     wil::com_ptr<IWICBitmapFrameEncode> frame;
-    hr = encoder->CreateNewFrame(&frame, nullptr);
-    if (FAILED(hr)) return false;
-    hr = frame->Initialize(nullptr);
-    if (FAILED(hr)) return false;
-    hr = frame->SetSize(outW, outH);
-    if (FAILED(hr)) return false;
+    RETURN_IF_FAILED(encoder->CreateNewFrame(&frame, nullptr));
+    RETURN_IF_FAILED(frame->Initialize(nullptr));
+    RETURN_IF_FAILED(frame->SetSize(outW, outH));
 
     WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppBGRA;
-    hr = frame->SetPixelFormat(&pixelFormat);
-    if (FAILED(hr)) return false;
+    RETURN_IF_FAILED(frame->SetPixelFormat(&pixelFormat));
 
     UINT srcStride = width * 4;
     UINT outStride = outW * 4;
     const BYTE* startPixel = pixels + outY * srcStride + outX * 4;
 
     if (outX == 0 && outW == width) {
-        hr = frame->WritePixels(outH, srcStride, outH * srcStride,
-                                const_cast<BYTE*>(startPixel));
+        RETURN_IF_FAILED(frame->WritePixels(outH, srcStride, outH * srcStride,
+                                            const_cast<BYTE*>(startPixel)));
     } else {
         for (int row = 0; row < outH; row++) {
-            hr = frame->WritePixels(1, outStride, outStride,
-                                    const_cast<BYTE*>(startPixel + row * srcStride));
-            if (FAILED(hr)) break;
+            RETURN_IF_FAILED(frame->WritePixels(1, outStride, outStride,
+                                                const_cast<BYTE*>(startPixel + row * srcStride)));
         }
     }
-    if (FAILED(hr)) return false;
 
-    hr = frame->Commit();
-    if (FAILED(hr)) return false;
-    hr = encoder->Commit();
-    if (FAILED(hr)) return false;
+    RETURN_IF_FAILED(frame->Commit());
+    RETURN_IF_FAILED(encoder->Commit());
 
-    return true;
+    return S_OK;
+}
+
+static bool save_pixels_as_png(const BYTE* pixels, int width, int height,
+                               const std::string& outputPath,
+                               const RECT* cropRect = nullptr) {
+    // Convert at the boundary: LOG_IF_FAILED reports the originating file/line
+    // (on stderr, under --debug) that a bare `return false` would have lost.
+    return SUCCEEDED(LOG_IF_FAILED(
+        save_pixels_as_png_hr(pixels, width, height, outputPath, cropRect)));
 }
 
 bool capture_screenshot(HWND hwnd, const std::string& outputPath,
