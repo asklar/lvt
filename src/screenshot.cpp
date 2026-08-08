@@ -292,8 +292,11 @@ static void annotate_pixels(BYTE* pixels, int bmpWidth, int bmpHeight,
 static bool save_pixels_as_png(const BYTE* pixels, int width, int height,
                                const std::string& outputPath,
                                const RECT* cropRect = nullptr) {
+    // Scope the COM initialization so every early return below uninitializes.
+    wil::unique_couninitialize_call couninit;
     auto hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    bool needUninit = SUCCEEDED(hr);
+    if (FAILED(hr))
+        couninit.release();
 
     wil::com_ptr<IWICImagingFactory> factory;
     hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
@@ -360,7 +363,6 @@ static bool save_pixels_as_png(const BYTE* pixels, int width, int height,
     hr = encoder->Commit();
     if (FAILED(hr)) return false;
 
-    if (needUninit) CoUninitialize();
     return true;
 }
 
