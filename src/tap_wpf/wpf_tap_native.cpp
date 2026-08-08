@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <metahost.h>
 #include <wil/com.h>
+#include <wil/resource.h>
 #include <string>
 #include <cstdio>
 
@@ -46,17 +47,16 @@ static std::wstring ReadPipeName() {
     std::wstring dir = GetDllDirectory();
     std::wstring path = dir + L"\\lvt_wpf_pipe.txt";
 
-    HANDLE hFile = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, 0, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
+    wil::unique_hfile hFile(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, 0, nullptr));
+    if (!hFile) {
         LogMsg("Failed to open pipe name file: %lu", GetLastError());
         return {};
     }
 
     char buf[256]{};
     DWORD bytesRead = 0;
-    ReadFile(hFile, buf, sizeof(buf) - 1, &bytesRead, nullptr);
-    CloseHandle(hFile);
+    ReadFile(hFile.get(), buf, sizeof(buf) - 1, &bytesRead, nullptr);
 
     // Convert UTF-8 to wide
     int wlen = MultiByteToWideChar(CP_UTF8, 0, buf, bytesRead, nullptr, 0);
@@ -73,7 +73,7 @@ static std::wstring ReadPipeName() {
 
 // Try .NET Framework hosting via ICLRMetaHost
 static bool TryNetFramework(const std::wstring& assemblyPath, const std::wstring& pipeName) {
-    HMODULE hMscoree = LoadLibraryW(L"mscoree.dll");
+    wil::unique_hmodule hMscoree(LoadLibraryW(L"mscoree.dll"));
     if (!hMscoree) {
         LogMsg("mscoree.dll not found");
         return false;
@@ -81,10 +81,9 @@ static bool TryNetFramework(const std::wstring& assemblyPath, const std::wstring
 
     using CLRCreateInstanceFn = HRESULT(WINAPI*)(REFCLSID, REFIID, LPVOID*);
     auto pCLRCreateInstance = reinterpret_cast<CLRCreateInstanceFn>(
-        GetProcAddress(hMscoree, "CLRCreateInstance"));
+        GetProcAddress(hMscoree.get(), "CLRCreateInstance"));
     if (!pCLRCreateInstance) {
         LogMsg("CLRCreateInstance not found in mscoree.dll");
-        FreeLibrary(hMscoree);
         return false;
     }
 
@@ -92,7 +91,6 @@ static bool TryNetFramework(const std::wstring& assemblyPath, const std::wstring
     HRESULT hr = pCLRCreateInstance(CLSID_CLRMetaHost, IID_PPV_ARGS(metaHost.put()));
     if (FAILED(hr)) {
         LogMsg("CLRCreateInstance failed: 0x%08X", hr);
-        FreeLibrary(hMscoree);
         return false;
     }
 
@@ -182,18 +180,21 @@ static bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pip
         std::wstring dotnetDir = std::wstring(progFiles) + L"\\dotnet\\host\\fxr";
 
         WIN32_FIND_DATAW fd;
-        HANDLE hFind = FindFirstFileW((dotnetDir + L"\\*").c_str(), &fd);
+        wil::unique_hfind hFind(FindFirstFileW((dotnetDir + L"\\*").c_str(), &fd));
         std::wstring latestFxr;
-        if (hFind != INVALID_HANDLE_VALUE) {
+        if (hFind) {
             do {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY && fd.cFileName[0] != L'.') {
                     latestFxr = dotnetDir + L"\\" + fd.cFileName + L"\\hostfxr.dll";
                 }
-            } while (FindNextFileW(hFind, &fd));
-            FindClose(hFind);
+            } while (FindNextFileW(hFind.get(), &fd));
         }
 
         if (!latestFxr.empty()) {
+            // Intentionally kept resident (raw, not scope-owned): hostfxr pins the
+            // hosted CoreCLR resolver for the lifetime of this injected process.
+            // Freeing it on scope exit would diverge from the original behavior and
+            // risk unloading a host library out from under the running runtime.
             hHostfxr = LoadLibraryW(latestFxr.c_str());
             LogMsg("Loaded hostfxr from: %ls -> %p", latestFxr.c_str(), hHostfxr);
         }
@@ -357,8 +358,7 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {
 
         // Spawn worker thread for the initial collection.
         // The worker calls FreeLibraryAndExitThread when done to unload this DLL.
-        HANDLE hThread = CreateThread(nullptr, 0, WorkerThread, reinterpret_cast<LPVOID>(hMod), 0, nullptr);
-        if (hThread) CloseHandle(hThread);
+        wil::unique_handle hThread(CreateThread(nullptr, 0, WorkerThread, reinterpret_cast<LPVOID>(hMod), 0, nullptr));
     }
     return TRUE;
 }

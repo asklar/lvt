@@ -124,9 +124,12 @@ target_link_libraries(lvt_core PUBLIC
     dxgi
     windowsapp
     windowscodecs
+    # PUBLIC: plugin_loader.h is an installed header and exposes wil::unique_hmodule
+    # in LoadedPlugin, so consumers need WIL's include directories. The generated
+    # package config already does find_dependency(wil CONFIG).
+    WIL::WIL
 )
 target_link_libraries(lvt_core PRIVATE
-    WIL::WIL
     nlohmann_json::nlohmann_json
 )
 
@@ -400,7 +403,7 @@ add_library(lvt_avalonia_plugin SHARED
 )
 target_compile_definitions(lvt_avalonia_plugin PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(lvt_avalonia_plugin PRIVATE src)
-target_link_libraries(lvt_avalonia_plugin PRIVATE ole32 version)
+target_link_libraries(lvt_avalonia_plugin PRIVATE WIL::WIL ole32 version)
 set_target_properties(lvt_avalonia_plugin PROPERTIES
     OUTPUT_NAME "lvt_avalonia_plugin"
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins
@@ -413,6 +416,7 @@ add_library(lvt_avalonia_tap SHARED
     src/plugin_avalonia/avalonia_tap_native.def
 )
 target_compile_definitions(lvt_avalonia_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(lvt_avalonia_tap PRIVATE WIL::WIL)
 set_property(TARGET lvt_avalonia_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(lvt_avalonia_tap PROPERTIES
     OUTPUT_NAME "lvt_avalonia_tap_${TAP_ARCH_SUFFIX}"
@@ -453,7 +457,7 @@ add_library(lvt_chromium_plugin SHARED
 )
 target_compile_definitions(lvt_chromium_plugin PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(lvt_chromium_plugin PRIVATE src)
-target_link_libraries(lvt_chromium_plugin PRIVATE nlohmann_json::nlohmann_json ole32 version)
+target_link_libraries(lvt_chromium_plugin PRIVATE WIL::WIL nlohmann_json::nlohmann_json ole32 version)
 set_target_properties(lvt_chromium_plugin PROPERTIES
     OUTPUT_NAME "lvt_chromium_plugin"
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins
@@ -464,7 +468,7 @@ add_executable(lvt_chromium_host
     src/plugin_chromium/chromium_host.cpp
 )
 target_compile_definitions(lvt_chromium_host PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(lvt_chromium_host PRIVATE advapi32)
+target_link_libraries(lvt_chromium_host PRIVATE WIL::WIL advapi32)
 set_target_properties(lvt_chromium_host PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium
 )
@@ -496,6 +500,13 @@ target_link_libraries(lvt_unit_tests PRIVATE
     dwmapi windowsapp
 )
 add_test(NAME unit_tests COMMAND lvt_unit_tests)
+
+# Compile-only guard: links lvt_core with no include dirs of its own, so it sees
+# only what lvt_core propagates. Catches a public header depending on something
+# lvt_core links PRIVATE before a downstream consumer does.
+add_executable(lvt_public_headers_test tests/public_headers_test.cpp)
+target_compile_definitions(lvt_public_headers_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN)
+target_link_libraries(lvt_public_headers_test PRIVATE lvt_core)
 
 # WPF sample app used by integration tests
 set(WPF_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WpfSample/WpfSample.csproj")

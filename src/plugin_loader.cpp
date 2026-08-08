@@ -8,7 +8,9 @@
 #include <cmath>
 #include <functional>
 #include <set>
+#include <utility>
 #include <userenv.h>
+#include <wil/resource.h>
 
 #pragma comment(lib, "userenv.lib")
 
@@ -52,8 +54,8 @@ static std::vector<std::wstring> get_plugin_dirs() {
 static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& seen) {
     std::wstring pattern = dir + L"\\*.dll";
     WIN32_FIND_DATAW fd;
-    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
+    wil::unique_hfind hFind(FindFirstFileW(pattern.c_str(), &fd));
+    if (!hFind) return;
 
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
@@ -64,7 +66,7 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
         if (!seen.insert(lowerName).second) continue;
 
         std::wstring fullPath = dir + L"\\" + fd.cFileName;
-        HMODULE mod = LoadLibraryW(fullPath.c_str());
+        wil::unique_hmodule mod(LoadLibraryW(fullPath.c_str()));
         if (!mod) {
             if (g_debug)
                 fprintf(stderr, "lvt: failed to load plugin %ls (error %lu)\n",
@@ -73,12 +75,11 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
         }
 
         auto infoFn = reinterpret_cast<LvtPluginInfoFn>(
-            GetProcAddress(mod, LVT_PLUGIN_INFO_FUNC));
+            GetProcAddress(mod.get(), LVT_PLUGIN_INFO_FUNC));
         if (!infoFn) {
             if (g_debug)
                 fprintf(stderr, "lvt: %ls has no %s export, skipping\n",
                         fd.cFileName, LVT_PLUGIN_INFO_FUNC);
-            FreeLibrary(mod);
             continue;
         }
 
@@ -88,29 +89,26 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
             if (g_debug)
                 fprintf(stderr, "lvt: %ls has incompatible plugin API version\n",
                         fd.cFileName);
-            FreeLibrary(mod);
             continue;
         }
 
         LoadedPlugin lp{};
-        lp.module = mod;
+        lp.module = std::move(mod);
         lp.info = info;
         lp.detect = reinterpret_cast<LvtDetectFrameworkFn>(
-            GetProcAddress(mod, LVT_PLUGIN_DETECT_FUNC));
+            GetProcAddress(lp.module.get(), LVT_PLUGIN_DETECT_FUNC));
         lp.enrich = reinterpret_cast<LvtEnrichTreeFn>(
-            GetProcAddress(mod, LVT_PLUGIN_ENRICH_FUNC));
+            GetProcAddress(lp.module.get(), LVT_PLUGIN_ENRICH_FUNC));
         lp.free_fn = reinterpret_cast<LvtPluginFreeFn>(
-            GetProcAddress(mod, LVT_PLUGIN_FREE_FUNC));
+            GetProcAddress(lp.module.get(), LVT_PLUGIN_FREE_FUNC));
 
         if (g_debug)
             fprintf(stderr, "lvt: loaded plugin '%s' (%s)\n",
                     info->name ? info->name : "?",
                     info->description ? info->description : "");
 
-        s_plugins.push_back(lp);
-    } while (FindNextFileW(hFind, &fd));
-
-    FindClose(hFind);
+        s_plugins.push_back(std::move(lp));
+    } while (FindNextFileW(hFind.get(), &fd));
 }
 
 void load_plugins() {
@@ -120,9 +118,6 @@ void load_plugins() {
 }
 
 void unload_plugins() {
-    for (auto& p : s_plugins) {
-        FreeLibrary(p.module);
-    }
     s_plugins.clear();
 }
 

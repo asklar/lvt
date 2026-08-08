@@ -10,6 +10,7 @@
 
 #include <Windows.h>
 #include <Psapi.h>
+#include <wil/resource.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -110,29 +111,27 @@ static bool write_pipe_message(HANDLE pipe, const std::string& msg) {
     uint32_t len = static_cast<uint32_t>(msg.size());
     DWORD bytesWritten = 0;
     OVERLAPPED ov = {};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    wil::unique_event event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ov.hEvent = event.get();
 
     BOOL ok = WriteFile(pipe, &len, 4, &bytesWritten, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
         WaitForSingleObject(ov.hEvent, 5000);
         if (!GetOverlappedResult(pipe, &ov, &bytesWritten, FALSE)) {
-            CloseHandle(ov.hEvent);
             return false;
         }
     }
-    if (bytesWritten != 4) { CloseHandle(ov.hEvent); return false; }
+    if (bytesWritten != 4) { return false; }
 
     ResetEvent(ov.hEvent);
     ok = WriteFile(pipe, msg.data(), len, &bytesWritten, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
         WaitForSingleObject(ov.hEvent, 30000);
         if (!GetOverlappedResult(pipe, &ov, &bytesWritten, FALSE)) {
-            CloseHandle(ov.hEvent);
             return false;
         }
     }
 
-    CloseHandle(ov.hEvent);
     return bytesWritten == len;
 }
 
@@ -141,21 +140,19 @@ static bool read_pipe_message(HANDLE pipe, std::string& out, DWORD timeoutMs = 3
     uint32_t len = 0;
     DWORD bytesRead = 0;
     OVERLAPPED ov = {};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    wil::unique_event event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ov.hEvent = event.get();
 
     BOOL ok = ReadFile(pipe, &len, 4, &bytesRead, &ov);
     if (!ok && GetLastError() == ERROR_IO_PENDING) {
         if (WaitForSingleObject(ov.hEvent, timeoutMs) != WAIT_OBJECT_0) {
             CancelIo(pipe);
-            CloseHandle(ov.hEvent);
             return false;
         }
         if (!GetOverlappedResult(pipe, &ov, &bytesRead, FALSE)) {
-            CloseHandle(ov.hEvent);
             return false;
         }
     }
-    CloseHandle(ov.hEvent);
 
     if (bytesRead != 4 || len == 0 || len > 64 * 1024 * 1024) // 64MB max for large DOMs
         return false;
@@ -164,20 +161,18 @@ static bool read_pipe_message(HANDLE pipe, std::string& out, DWORD timeoutMs = 3
     DWORD totalRead = 0;
     while (totalRead < len) {
         ov = {};
-        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        wil::unique_event loopEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        ov.hEvent = loopEvent.get();
         ok = ReadFile(pipe, out.data() + totalRead, len - totalRead, &bytesRead, &ov);
         if (!ok && GetLastError() == ERROR_IO_PENDING) {
             if (WaitForSingleObject(ov.hEvent, timeoutMs) != WAIT_OBJECT_0) {
                 CancelIo(pipe);
-                CloseHandle(ov.hEvent);
                 return false;
             }
             if (!GetOverlappedResult(pipe, &ov, &bytesRead, FALSE)) {
-                CloseHandle(ov.hEvent);
                 return false;
             }
         }
-        CloseHandle(ov.hEvent);
         if (bytesRead == 0) return false;
         totalRead += bytesRead;
     }
@@ -202,21 +197,19 @@ __declspec(dllexport) LvtPluginInfo* lvt_plugin_info(void) {
 __declspec(dllexport) int lvt_detect_framework(DWORD pid, HWND /*hwnd*/, LvtFrameworkDetection* out) {
     if (!out) return 0;
 
-    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    wil::unique_handle proc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
     if (!proc) return 0;
 
     // Check for Chrome or Edge
-    bool isChrome = has_module(proc, L"chrome.dll");
-    bool isEdge = has_module(proc, L"msedge.dll");
+    bool isChrome = has_module(proc.get(), L"chrome.dll");
+    bool isEdge = has_module(proc.get(), L"msedge.dll");
 
     if (!isChrome && !isEdge) {
-        CloseHandle(proc);
         return 0;
     }
 
     const wchar_t* versionModule = isEdge ? L"msedge.dll" : L"chrome.dll";
-    auto version = get_module_version(proc, versionModule);
-    CloseHandle(proc);
+    auto version = get_module_version(proc.get(), versionModule);
 
     if (!version.empty()) {
         // Include browser name in version for display: "145.0.3800.70 (Edge)"
@@ -241,16 +234,16 @@ __declspec(dllexport) int lvt_enrich_tree(HWND /*hwnd*/, DWORD /*pid*/,
     *json_out = nullptr;
 
     // Connect to the native messaging host's named pipe
-    HANDLE pipe = CreateFileA(
+    wil::unique_hfile pipe(CreateFileA(
         PIPE_NAME,
         GENERIC_READ | GENERIC_WRITE,
         0,
         nullptr,
         OPEN_EXISTING,
         FILE_FLAG_OVERLAPPED,
-        nullptr);
+        nullptr));
 
-    if (pipe == INVALID_HANDLE_VALUE) {
+    if (!pipe) {
         DebugLog("failed to connect to native messaging host pipe (error %lu). "
                  "Is the LVT Chromium extension installed and active?", GetLastError());
         fprintf(stderr, "lvt-chromium: Cannot connect to browser extension.\n"
@@ -266,16 +259,14 @@ __declspec(dllexport) int lvt_enrich_tree(HWND /*hwnd*/, DWORD /*pid*/,
 
     if (!selector.empty()) {
         json listRequest = {{"type", "listTabs"}, {"requestId", "1"}};
-        if (!write_pipe_message(pipe, listRequest.dump())) {
+        if (!write_pipe_message(pipe.get(), listRequest.dump())) {
             DebugLog("failed to send listTabs request");
-            CloseHandle(pipe);
             return 0;
         }
 
         std::string listResponse;
-        if (!read_pipe_message(pipe, listResponse, 30000)) {
+        if (!read_pipe_message(pipe.get(), listResponse, 30000)) {
             DebugLog("failed to read listTabs response");
-            CloseHandle(pipe);
             return 0;
         }
 
@@ -285,7 +276,6 @@ __declspec(dllexport) int lvt_enrich_tree(HWND /*hwnd*/, DWORD /*pid*/,
                 auto msg = tabsEnvelope.value("message", "unknown error");
                 DebugLog("extension returned error while listing tabs: %s", msg.c_str());
                 fprintf(stderr, "lvt-chromium: %s\n", msg.c_str());
-                CloseHandle(pipe);
                 return 0;
             }
 
@@ -294,7 +284,6 @@ __declspec(dllexport) int lvt_enrich_tree(HWND /*hwnd*/, DWORD /*pid*/,
             if (!selected) {
                 DebugLog("%s", error.c_str());
                 fprintf(stderr, "lvt-chromium: %s\n", error.c_str());
-                CloseHandle(pipe);
                 return 0;
             }
             DebugLog("selected tab %d: %s (%s)",
@@ -303,16 +292,14 @@ __declspec(dllexport) int lvt_enrich_tree(HWND /*hwnd*/, DWORD /*pid*/,
             request["tabId"] = selected->tab_id;
         } catch (const json::parse_error& e) {
             DebugLog("failed to parse listTabs response JSON: %s", e.what());
-            CloseHandle(pipe);
             return 0;
         }
     }
 
     // Send getDOM request
     std::string requestString = request.dump();
-    if (!write_pipe_message(pipe, requestString)) {
+    if (!write_pipe_message(pipe.get(), requestString)) {
         DebugLog("failed to send getDOM request");
-        CloseHandle(pipe);
         return 0;
     }
 
@@ -320,13 +307,10 @@ __declspec(dllexport) int lvt_enrich_tree(HWND /*hwnd*/, DWORD /*pid*/,
 
     // Read response (may be large — full DOM tree)
     std::string response;
-    if (!read_pipe_message(pipe, response, 60000)) {
+    if (!read_pipe_message(pipe.get(), response, 60000)) {
         DebugLog("failed to read DOM response (timeout or error)");
-        CloseHandle(pipe);
         return 0;
     }
-
-    CloseHandle(pipe);
 
     DebugLog("received %zu bytes of DOM data", response.size());
 

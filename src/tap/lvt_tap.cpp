@@ -8,6 +8,7 @@
 #include <ocidl.h>
 #include <xamlOM.h>
 #include <wil/com.h>
+#include <wil/resource.h>
 #include <string>
 #include <map>
 #include <vector>
@@ -98,7 +99,7 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     LONG m_refCount = 1;
     wil::com_ptr<IUnknown> m_site;
     wil::com_ptr<IXamlDiagnostics> m_diag;
-    HWND m_msgWnd = nullptr; // Message-only window for UI thread dispatch
+    wil::unique_hwnd m_msgWnd; // Message-only window for UI thread dispatch
     std::map<InstanceHandle, TreeNode> m_nodes;
     std::vector<InstanceHandle> m_roots;
     std::wstring m_pipeName;
@@ -173,11 +174,11 @@ public:
             return S_OK;
         }
 
-        BSTR initData = nullptr;
-        diag->GetInitializationData(&initData);
+        BSTR rawInitData = nullptr;
+        diag->GetInitializationData(&rawInitData);
+        wil::unique_bstr initData(rawInitData);
         if (initData) {
-            std::wstring data(initData);
-            SysFreeString(initData);
+            std::wstring data(initData.get());
             // Format: "pipe_name" or "pipe_name|PROPS"
             auto sep = data.find(L'|');
             if (sep != std::wstring::npos) {
@@ -205,11 +206,11 @@ public:
         wc.hInstance = GetCurrentModuleHandle();
         wc.lpszClassName = L"LvtTapMsg";
         RegisterClassW(&wc);
-        m_msgWnd = CreateWindowExW(0, L"LvtTapMsg", nullptr, 0,
-            0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+        m_msgWnd.reset(CreateWindowExW(0, L"LvtTapMsg", nullptr, 0,
+            0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr));
         if (m_msgWnd) {
-            SetWindowLongPtrW(m_msgWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-            LogMsg("Created message window %p on thread %lu", m_msgWnd, GetCurrentThreadId());
+            SetWindowLongPtrW(m_msgWnd.get(), GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+            LogMsg("Created message window %p on thread %lu", m_msgWnd.get(), GetCurrentThreadId());
         }
 
         // AdviseVisualTreeChange hangs if called on the SetSite thread.
@@ -217,10 +218,9 @@ public:
         AddRef();
         wil::com_ptr<LvtTap> threadSelf;
         threadSelf.attach(this);
-        HANDLE hThread = CreateThread(nullptr, 0, &AdviseThreadProc, threadSelf.get(), 0, nullptr);
+        wil::unique_handle hThread(CreateThread(nullptr, 0, &AdviseThreadProc, threadSelf.get(), 0, nullptr));
         if (hThread) {
             (void)threadSelf.detach();
-            CloseHandle(hThread); // Don't wait — return immediately to unblock UI thread
         } else {
             LogMsg("CreateThread failed: %lu", GetLastError());
         }
@@ -255,14 +255,14 @@ public:
                 // SendMessage blocks until the UI thread processes the message.
                 if (m_msgWnd) {
                     LogMsg("Dispatching CollectBounds to UI thread via SendMessage");
-                    SendMessageW(m_msgWnd, WM_COLLECT_BOUNDS, 0,
+                    SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS, 0,
                                  reinterpret_cast<LPARAM>(this));
                 }
                 // Get element positions via TransformToVisual (works around broken
                 // ActualOffset serialization in WinUI3). Must run on the UI thread.
 #if LVT_HAS_XAML_PROJECTION
                 if (m_msgWnd) {
-                    SendMessageW(m_msgWnd, WM_COLLECT_BOUNDS + 1, 0,
+                    SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS + 1, 0,
                                  reinterpret_cast<LPARAM>(this));
                 }
 #endif
@@ -344,11 +344,24 @@ private:
         if (FAILED(hr)) {
             return;
         }
+        wil::unique_cotaskmem propsMem(props);
+        wil::unique_cotaskmem sourcesMem(sources);
         bool hasWidth = false, hasHeight = false;
         bool foundOffset = false;
         for (unsigned int i = 0; i < propCount; i++) {
-            std::wstring name = props[i].PropertyName ? props[i].PropertyName : L"";
-            std::wstring value = props[i].Value ? props[i].Value : L"";
+            wil::unique_bstr type(props[i].Type);
+            wil::unique_bstr declaringType(props[i].DeclaringType);
+            wil::unique_bstr valueTypeBstr(props[i].ValueType);
+            wil::unique_bstr propertyName(props[i].PropertyName);
+            wil::unique_bstr propertyValue(props[i].Value);
+            props[i].Type = nullptr;
+            props[i].DeclaringType = nullptr;
+            props[i].ValueType = nullptr;
+            props[i].PropertyName = nullptr;
+            props[i].Value = nullptr;
+
+            std::wstring name = propertyName ? propertyName.get() : L"";
+            std::wstring value = propertyValue ? propertyValue.get() : L"";
             if (name == L"ActualWidth" && !value.empty()) {
                 double v = _wtof(value.c_str());
                 if (std::isfinite(v)) {
@@ -373,7 +386,7 @@ private:
             // Only capture the first occurrence of each (most-specific in the chain).
             // For text-like properties, check ValueType to avoid handle references
             // (XAML serializes reference types as numeric handle IDs).
-            std::wstring valueType = props[i].ValueType ? props[i].ValueType : L"";
+            std::wstring valueType = valueTypeBstr ? valueTypeBstr.get() : L"";
             bool isTextProp = (name == L"Text" || name == L"Content" ||
                                name == L"Header" || name == L"PlaceholderText" ||
                                name == L"Description" || name == L"Title" ||
@@ -407,18 +420,13 @@ private:
                     node.properties.emplace_back(name, value);
                 }
             }
-            if (props[i].Type) SysFreeString(props[i].Type);
-            if (props[i].DeclaringType) SysFreeString(props[i].DeclaringType);
-            if (props[i].ValueType) SysFreeString(props[i].ValueType);
-            if (props[i].PropertyName) SysFreeString(props[i].PropertyName);
-            if (props[i].Value) SysFreeString(props[i].Value);
         }
         for (unsigned int i = 0; i < srcCount; i++) {
-            if (sources[i].TargetType) SysFreeString(sources[i].TargetType);
-            if (sources[i].Name) SysFreeString(sources[i].Name);
+            wil::unique_bstr targetType(sources[i].TargetType);
+            wil::unique_bstr sourceName(sources[i].Name);
+            sources[i].TargetType = nullptr;
+            sources[i].Name = nullptr;
         }
-        if (props) CoTaskMemFree(props);
-        if (sources) CoTaskMemFree(sources);
         node.hasBounds = hasWidth && hasHeight;
     }
 
@@ -619,21 +627,16 @@ private:
         WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
                             utf8.data(), len, nullptr, nullptr);
 
-        HANDLE pipe = CreateFileW(m_pipeName.c_str(), GENERIC_WRITE, 0,
-                                  nullptr, OPEN_EXISTING, 0, nullptr);
-        if (pipe != INVALID_HANDLE_VALUE) {
+        wil::unique_hfile pipe(CreateFileW(m_pipeName.c_str(), GENERIC_WRITE, 0,
+                                  nullptr, OPEN_EXISTING, 0, nullptr));
+        if (pipe) {
             DWORD written = 0;
-            WriteFile(pipe, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
-            FlushFileBuffers(pipe);
-            CloseHandle(pipe);
+            WriteFile(pipe.get(), utf8.data(), (DWORD)utf8.size(), &written, nullptr);
+            FlushFileBuffers(pipe.get());
             LogMsg("Wrote %lu bytes to pipe", written);
         } else {
             LogMsg("Failed to open pipe: %lu", GetLastError());
         }
-    }
-
-    ~LvtTap() {
-        if (m_msgWnd) DestroyWindow(m_msgWnd);
     }
 };
 

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <Windows.h>
 #include <Psapi.h>
+#include <wil/resource.h>
 #include <string>
 
 namespace lvt {
@@ -26,28 +27,25 @@ static void label_winui3_windows(Element& el) {
 
 // Find the FrameworkUdk.dll path loaded in the target process
 static std::wstring find_framework_udk(DWORD pid) {
-    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    wil::unique_handle proc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
     if (!proc) return {};
 
     HMODULE modules[1024];
     DWORD needed = 0;
-    if (!EnumProcessModulesEx(proc, modules, sizeof(modules), &needed, LIST_MODULES_ALL)) {
-        CloseHandle(proc);
+    if (!EnumProcessModulesEx(proc.get(), modules, sizeof(modules), &needed, LIST_MODULES_ALL)) {
         return {};
     }
 
     for (DWORD i = 0; i < needed / sizeof(HMODULE); i++) {
         wchar_t name[MAX_PATH]{};
-        if (GetModuleBaseNameW(proc, modules[i], name, MAX_PATH)) {
+        if (GetModuleBaseNameW(proc.get(), modules[i], name, MAX_PATH)) {
             if (_wcsicmp(name, L"Microsoft.Internal.FrameworkUdk.dll") == 0) {
                 wchar_t fullPath[MAX_PATH]{};
-                GetModuleFileNameExW(proc, modules[i], fullPath, MAX_PATH);
-                CloseHandle(proc);
+                GetModuleFileNameExW(proc.get(), modules[i], fullPath, MAX_PATH);
                 return fullPath;
             }
         }
     }
-    CloseHandle(proc);
     return {};
 }
 

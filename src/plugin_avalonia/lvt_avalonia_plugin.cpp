@@ -8,6 +8,7 @@
 #include <Psapi.h>
 #include <objbase.h>
 #include <sddl.h>
+#include <wil/resource.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -125,48 +126,43 @@ static bool write_pipe_name_file(const std::wstring& dir, const std::wstring& pi
 }
 
 static bool inject_dll(DWORD pid, const std::wstring& dllPath) {
-    HANDLE proc = OpenProcess(
+    wil::unique_handle proc(OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION,
-        FALSE, pid);
+        FALSE, pid));
     if (!proc) {
         DebugLog("failed to open target process %lu (error %lu)", pid, GetLastError());
         return false;
     }
 
     size_t pathBytes = (dllPath.size() + 1) * sizeof(wchar_t);
-    void* remoteMem = VirtualAllocEx(proc, nullptr, pathBytes, MEM_COMMIT, PAGE_READWRITE);
+    void* remoteMem = VirtualAllocEx(proc.get(), nullptr, pathBytes, MEM_COMMIT, PAGE_READWRITE);
     if (!remoteMem) {
         DebugLog("VirtualAllocEx failed (error %lu)", GetLastError());
-        CloseHandle(proc);
         return false;
     }
 
-    if (!WriteProcessMemory(proc, remoteMem, dllPath.c_str(), pathBytes, nullptr)) {
+    if (!WriteProcessMemory(proc.get(), remoteMem, dllPath.c_str(), pathBytes, nullptr)) {
         DebugLog("WriteProcessMemory failed (error %lu)", GetLastError());
-        VirtualFreeEx(proc, remoteMem, 0, MEM_RELEASE);
-        CloseHandle(proc);
+        VirtualFreeEx(proc.get(), remoteMem, 0, MEM_RELEASE);
         return false;
     }
 
     auto loadLibAddr = reinterpret_cast<LPTHREAD_START_ROUTINE>(
         GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
 
-    HANDLE thread = CreateRemoteThread(
-        proc, nullptr, 0, loadLibAddr, remoteMem, 0, nullptr);
+    wil::unique_handle thread(CreateRemoteThread(
+        proc.get(), nullptr, 0, loadLibAddr, remoteMem, 0, nullptr));
     if (!thread) {
         DebugLog("CreateRemoteThread failed (error %lu)", GetLastError());
-        VirtualFreeEx(proc, remoteMem, 0, MEM_RELEASE);
-        CloseHandle(proc);
+        VirtualFreeEx(proc.get(), remoteMem, 0, MEM_RELEASE);
         return false;
     }
 
-    WaitForSingleObject(thread, 5000);
+    WaitForSingleObject(thread.get(), 5000);
 
     DWORD exitCode = 0;
-    GetExitCodeThread(thread, &exitCode);
-    CloseHandle(thread);
-    VirtualFreeEx(proc, remoteMem, 0, MEM_RELEASE);
-    CloseHandle(proc);
+    GetExitCodeThread(thread.get(), &exitCode);
+    VirtualFreeEx(proc.get(), remoteMem, 0, MEM_RELEASE);
 
     if (exitCode == 0) {
         DebugLog("LoadLibraryW failed in target process");
@@ -195,15 +191,14 @@ __declspec(dllexport) LvtPluginInfo* lvt_plugin_info(void) {
 __declspec(dllexport) int lvt_detect_framework(DWORD pid, HWND /*hwnd*/, LvtFrameworkDetection* out) {
     if (!out) return 0;
 
-    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    wil::unique_handle proc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
     if (!proc) return 0;
 
-    auto avaloniaPath = get_module_path(proc, L"Avalonia.Base.dll");
+    auto avaloniaPath = get_module_path(proc.get(), L"Avalonia.Base.dll");
     if (avaloniaPath.empty()) {
         // Try alternative: some older versions may just be "Avalonia.dll"
-        avaloniaPath = get_module_path(proc, L"Avalonia.dll");
+        avaloniaPath = get_module_path(proc.get(), L"Avalonia.dll");
     }
-    CloseHandle(proc);
 
     if (avaloniaPath.empty()) return 0;
 
@@ -258,32 +253,33 @@ __declspec(dllexport) int lvt_enrich_tree(HWND hwnd, DWORD pid,
     SECURITY_ATTRIBUTES sa = {};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = FALSE;
+    PSECURITY_DESCRIPTOR rawSd = nullptr;
     ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
+        L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &rawSd, nullptr);
+    wil::unique_hlocal securityDescriptor(rawSd);
+    sa.lpSecurityDescriptor = securityDescriptor.get();
 
-    HANDLE pipe = CreateNamedPipeW(
+    wil::unique_hfile pipe(CreateNamedPipeW(
         pipeName.c_str(),
         PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1, 0, 1024 * 1024, 10000, &sa);
-    LocalFree(sa.lpSecurityDescriptor);
+        1, 0, 1024 * 1024, 10000, &sa));
 
-    if (pipe == INVALID_HANDLE_VALUE) {
+    if (!pipe) {
         DebugLog("failed to create named pipe (error %lu)", GetLastError());
         return 0;
     }
 
     // Start overlapped connect before injection
     OVERLAPPED ov = {};
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    ConnectNamedPipe(pipe, &ov);
+    wil::unique_event connectEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ov.hEvent = connectEvent.get();
+    ConnectNamedPipe(pipe.get(), &ov);
     DWORD connectErr = GetLastError();
 
     // Inject TAP DLL
     if (!inject_dll(pid, tapDll)) {
-        CancelIo(pipe);
-        CloseHandle(ov.hEvent);
-        CloseHandle(pipe);
+        CancelIo(pipe.get());
         return 0;
     }
 
@@ -293,36 +289,32 @@ __declspec(dllexport) int lvt_enrich_tree(HWND hwnd, DWORD pid,
     if (connectErr == ERROR_IO_PENDING) {
         if (WaitForSingleObject(ov.hEvent, 15000) != WAIT_OBJECT_0) {
             DebugLog("TAP DLL did not connect (timeout)");
-            CancelIo(pipe);
-            CloseHandle(ov.hEvent);
-            CloseHandle(pipe);
+            CancelIo(pipe.get());
             return 0;
         }
     } else if (connectErr != ERROR_PIPE_CONNECTED) {
         DebugLog("ConnectNamedPipe failed (error %lu)", connectErr);
-        CloseHandle(ov.hEvent);
-        CloseHandle(pipe);
         return 0;
     }
-    CloseHandle(ov.hEvent);
 
     // Read all data
     std::string data;
     char buf[4096];
     DWORD bytesRead = 0;
     OVERLAPPED readOv = {};
-    readOv.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    wil::unique_event readEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    readOv.hEvent = readEvent.get();
     for (;;) {
         ResetEvent(readOv.hEvent);
-        BOOL ok = ReadFile(pipe, buf, sizeof(buf), &bytesRead, &readOv);
+        BOOL ok = ReadFile(pipe.get(), buf, sizeof(buf), &bytesRead, &readOv);
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
                 if (WaitForSingleObject(readOv.hEvent, 15000) != WAIT_OBJECT_0) {
-                    CancelIo(pipe);
+                    CancelIo(pipe.get());
                     break;
                 }
-                if (!GetOverlappedResult(pipe, &readOv, &bytesRead, FALSE) || bytesRead == 0)
+                if (!GetOverlappedResult(pipe.get(), &readOv, &bytesRead, FALSE) || bytesRead == 0)
                     break;
             } else {
                 break;
@@ -332,8 +324,6 @@ __declspec(dllexport) int lvt_enrich_tree(HWND hwnd, DWORD pid,
         }
         data.append(buf, bytesRead);
     }
-    CloseHandle(readOv.hEvent);
-    CloseHandle(pipe);
 
     // Clean up sidecar file
     DeleteFileW((tapDir + L"\\lvt_avalonia_pipe.txt").c_str());
