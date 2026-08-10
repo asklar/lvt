@@ -67,9 +67,21 @@ docs/
 
 ## Key conventions
 
-### No UI Automation
+### No UI Automation in the visual tree
 
-We deliberately avoid UIA. It is slow, unreliable, and hard to use correctly. Each provider talks to the framework's native APIs directly.
+The visual tree deliberately avoids UIA. It is slow, unreliable, and hard to use correctly. Each provider talks to the framework's native APIs directly, and that is the default mode.
+
+`--uia` (`src/providers/uia_provider.cpp`) is a *separate* view, not an exception to the rule: it walks the target's UIA tree for callers that need `AutomationId`s and patterns, and it never participates in building the visual tree. Adding UIA to a visual-tree provider is still off the table.
+
+Two rules matter when working on it:
+
+- **Batch through the cache.** UIA properties are cross-process calls. Always fetch via `IUIAutomationCacheRequest` (`TreeScope_Subtree` + `AddProperty`/`AddPattern`, then `GetCachedChildren`/`GetCachedPropertyValue`). Reading live properties per node turns a fast walk into a multi-second one.
+- **Read pattern-backed properties with the `Ex` form.** `GetCachedPropertyValue` substitutes the property type's *default* when an element does not support the owning pattern, so a `Window` answers `Toggle.ToggleState` with `2` (`ToggleState_Indeterminate`). `GetCachedPropertyValueEx(id, /*ignoreDefaultValue=*/TRUE, &v)` returns UIA's reserved "not supported" object instead — compare it against `IUIAutomation::get_ReservedNotSupportedValue`. Core properties deliberately keep the plain form: there, "not supported" also fires when a provider simply did not set a value, which would drop useful state like `IsControlElement`.
+- **Name pattern-backed properties `Pattern.Member`.** That naming is what selects the `Ex` read path, so it is load-bearing rather than cosmetic; `UiaProps` unit tests enforce it.
+
+### UIA runs on its own MTA thread
+
+UIA clients want an MTA, but `screenshot.cpp` initializes an STA on the calling thread and a thread cannot be both. All UIA work is marshalled onto a dedicated MTA thread (`run_on_mta` in `uia_provider.cpp`); calling it inline yields `RPC_E_CHANGED_MODE`.
 
 ### Static CRT for TAP DLL
 

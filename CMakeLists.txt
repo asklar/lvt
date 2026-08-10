@@ -30,6 +30,7 @@ option(LVT_ENABLE_WPF      "WPF support"                                        
 option(LVT_ENABLE_WINFORMS "WinForms support"                                    ON)
 option(LVT_ENABLE_AVALONIA "Avalonia plugin"                                     ON)
 option(LVT_ENABLE_CHROMIUM "Chromium (Chrome/Edge DOM) plugin"                   ON)
+option(LVT_ENABLE_UIA      "UI Automation tree output (--uia)"                    ON)
 
 option(LVT_BUILD_TOOL    "Build the lvt command-line tool"                     ON)
 option(LVT_BUILD_MANAGED "Build managed .NET assemblies (requires .NET SDK)"   ON)
@@ -105,6 +106,12 @@ endif()
 if(LVT_ENABLE_WINFORMS)
     list(APPEND LVT_CORE_SOURCES src/providers/winforms_provider.cpp src/providers/winforms_inject.cpp)
 endif()
+if(LVT_ENABLE_UIA)
+    list(APPEND LVT_CORE_SOURCES
+        src/providers/uia_provider.cpp
+        src/providers/uia_props.cpp
+    )
+endif()
 
 add_library(lvt_core STATIC ${LVT_CORE_SOURCES})
 add_library(lvt::core ALIAS lvt_core)
@@ -131,6 +138,10 @@ target_link_libraries(lvt_core PUBLIC
     # package config already does find_dependency(wil CONFIG).
     WIL::WIL
 )
+if(LVT_ENABLE_UIA)
+    target_link_libraries(lvt_core PUBLIC uiautomationcore)
+    target_compile_definitions(lvt_core PUBLIC LVT_ENABLE_UIA)
+endif()
 target_link_libraries(lvt_core PRIVATE
     nlohmann_json::nlohmann_json
 )

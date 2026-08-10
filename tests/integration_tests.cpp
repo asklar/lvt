@@ -2,6 +2,7 @@
 // Run: ctest --test-dir build -R integration
 
 #include <gtest/gtest.h>
+#include <sstream>
 #include <Windows.h>
 #include <CommCtrl.h>
 #include <wil/resource.h>
@@ -1931,3 +1932,572 @@ TEST_F(KnownWindowFixture, AnnotationsIncludeKnownControls) {
     fs::remove(annFile);
 }
 #endif
+
+// --- UIA tree (--uia) ---
+// These assert the properties that make the UIA tree useful for automation:
+// AutomationIds, control types, and pattern support. They reuse the WinUI3
+// sample because it has known, stable AutomationIds.
+
+namespace {
+
+// Tree JSON nests dynamic properties under "properties" (unlike --query output,
+// which flattens them), so reach through that object.
+std::string uia_prop(const json& node, const std::string& name) {
+    if (!node.contains("properties"))
+        return {};
+    return node["properties"].value(name, "");
+}
+
+bool uia_has_prop(const json& node, const std::string& name) {
+    return node.contains("properties") && node["properties"].contains(name);
+}
+
+const json* find_by_automation_id(const json& node, const std::string& automationId) {
+    if (uia_prop(node, "AutomationId") == automationId)
+        return &node;
+    if (node.contains("children")) {
+        for (const auto& child : node["children"]) {
+            if (auto* found = find_by_automation_id(child, automationId))
+                return found;
+        }
+    }
+    return nullptr;
+}
+
+size_t count_json_nodes(const json& node) {
+    size_t count = 1;
+    if (node.contains("children")) {
+        for (const auto& child : node["children"])
+            count += count_json_nodes(child);
+    }
+    return count;
+}
+
+} // namespace
+
+TEST_F(WinUI3SampleFixture, UiaTreeExposesAutomationIdsAndControlTypes) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded()) << "--uia did not produce JSON:\n" << output;
+    ASSERT_TRUE(j.contains("root"));
+
+    auto* button = find_by_automation_id(j["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr) << "PrimaryButton not found in the UIA tree";
+    EXPECT_EQ(button->value("type", ""), "Button");  // ControlType is promoted to "type"
+    EXPECT_EQ(uia_prop(*button, "framework"), "");
+    EXPECT_EQ(button->value("framework", ""), "uia");
+    EXPECT_EQ(uia_prop(*button, "FrameworkId"), "XAML");
+    // Invoke is what makes the button actionable; it must be advertised.
+    EXPECT_NE(uia_prop(*button, "SupportedPatterns").find("Invoke"), std::string::npos)
+        << "SupportedPatterns=" << uia_prop(*button, "SupportedPatterns");
+
+    auto* box = find_by_automation_id(j["root"], "InputBox");
+    ASSERT_NE(box, nullptr);
+    EXPECT_EQ(box->value("type", ""), "Edit");
+    EXPECT_NE(uia_prop(*box, "SupportedPatterns").find("Value"), std::string::npos);
+
+    auto* check = find_by_automation_id(j["root"], "ReadyCheckBox");
+    ASSERT_NE(check, nullptr);
+    EXPECT_EQ(check->value("type", ""), "CheckBox");
+    EXPECT_NE(uia_prop(*check, "SupportedPatterns").find("Toggle"), std::string::npos);
+}
+
+TEST_F(WinUI3SampleFixture, UiaTreeGatesPatternPropertiesByPatternSupport) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    // UIA answers pattern-backed properties on every element regardless of
+    // support. Without gating, a Button reports Toggle.ToggleState and the
+    // output becomes mostly noise.
+    auto* button = find_by_automation_id(j["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr);
+    EXPECT_FALSE(uia_has_prop(*button, "Toggle.ToggleState"));
+    EXPECT_FALSE(uia_has_prop(*button, "Grid.RowCount"));
+    EXPECT_FALSE(uia_has_prop(*button, "RangeValue.Value"));
+
+    // The checkbox supports Toggle, so there it is real data.
+    auto* check = find_by_automation_id(j["root"], "ReadyCheckBox");
+    ASSERT_NE(check, nullptr);
+    ASSERT_TRUE(uia_has_prop(*check, "Toggle.ToggleState"));
+    EXPECT_EQ(uia_prop(*check, "Toggle.ToggleState"), "On");
+
+    auto* box = find_by_automation_id(j["root"], "InputBox");
+    ASSERT_NE(box, nullptr);
+    ASSERT_TRUE(uia_has_prop(*box, "Value.Value"));
+    EXPECT_FALSE(uia_has_prop(*box, "Toggle.ToggleState"));
+}
+
+TEST_F(WinUI3SampleFixture, UiaViewsNarrowFromRawToContent) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto nodesFor = [&](const std::string& view) -> size_t {
+        auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia --uia-view " + view));
+        auto j = json::parse(output, nullptr, false);
+        EXPECT_FALSE(j.is_discarded()) << "--uia-view " << view << " produced no JSON";
+        if (j.is_discarded() || !j.contains("root"))
+            return 0;
+        return count_json_nodes(j["root"]);
+    };
+
+    const size_t raw = nodesFor("raw");
+    const size_t control = nodesFor("control");
+    const size_t content = nodesFor("content");
+
+    ASSERT_GT(content, 0u);
+    EXPECT_GE(raw, control) << "raw view should be at least as large as control";
+    EXPECT_GE(control, content) << "control view should be at least as large as content";
+    EXPECT_GT(raw, content) << "raw and content should differ on a real XAML tree";
+}
+
+TEST_F(WinUI3SampleFixture, UiaElementsCarryDurableKeysAndResolveByRuntimeId) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    auto* button = find_by_automation_id(j["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr);
+
+    // element_key.cpp prefers a property named "AutomationId", so a UIA element
+    // with one gets a durable key derived from it for free.
+    auto key = button->value("key", "");
+    ASSERT_FALSE(key.empty());
+    EXPECT_NE(key.find("AutomationId:PrimaryButton"), std::string::npos) << "key=" << key;
+
+    auto runtimeId = uia_prop(*button, "RuntimeId");
+    ASSERT_FALSE(runtimeId.empty());
+
+    auto queried = run_command(make_cmd(
+        lvt, get_pid_arg() + " --uia --query uia:" + runtimeId + " AutomationId"));
+    // Trim the trailing newline the CLI writes.
+    while (!queried.empty() && (queried.back() == '\n' || queried.back() == '\r'))
+        queried.pop_back();
+    EXPECT_EQ(queried, "PrimaryButton");
+}
+
+TEST_F(WinUI3SampleFixture, UiaExtraPropertiesAreOptInAndReportUnknownNames) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+
+    // ProviderDescription is verbose, so it is not in the default set.
+    auto defaultOut = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto defaultJson = json::parse(defaultOut, nullptr, false);
+    ASSERT_FALSE(defaultJson.is_discarded());
+    auto* defaultButton = find_by_automation_id(defaultJson["root"], "PrimaryButton");
+    ASSERT_NE(defaultButton, nullptr);
+    EXPECT_FALSE(uia_has_prop(*defaultButton, "ProviderDescription"));
+
+    // Asking for it by name brings it back.
+    auto withProps = run_command(make_cmd(
+        lvt, get_pid_arg() + " --uia --uia-props ProviderDescription"));
+    auto withPropsJson = json::parse(withProps, nullptr, false);
+    ASSERT_FALSE(withPropsJson.is_discarded());
+    auto* richButton = find_by_automation_id(withPropsJson["root"], "PrimaryButton");
+    ASSERT_NE(richButton, nullptr);
+    EXPECT_TRUE(uia_has_prop(*richButton, "ProviderDescription"));
+
+    // An explicitly requested property also bypasses the unset-value
+    // suppression: naming one means wanting it even at its default.
+    auto forced = json::parse(
+        run_command(make_cmd(lvt, get_pid_arg() + " --uia --uia-props LandmarkType")),
+        nullptr, false);
+    ASSERT_FALSE(forced.is_discarded());
+    EXPECT_TRUE(uia_has_prop(forced["root"], "LandmarkType"))
+        << "--uia-props should override sentinel suppression";
+
+    // And an unknown name is reported on stderr without failing the walk —
+    // the other half of what this test's name promises.
+    auto unknown = run_command(make_cmd(
+        lvt, get_pid_arg() + " --uia --uia-props NotARealProperty") + " 2>&1");
+    EXPECT_NE(unknown.find("unknown UIA property 'NotARealProperty'"), std::string::npos)
+        << "an unknown property name should be reported";
+    EXPECT_NE(unknown.find("\"root\""), std::string::npos)
+        << "an unknown property name must not abort the walk";
+}
+
+TEST_F(WinUI3SampleFixture, UiaWorksWithElementScopingAndXmlFormat) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto full = json::parse(run_command(make_cmd(lvt, get_pid_arg() + " --uia")), nullptr, false);
+    ASSERT_FALSE(full.is_discarded());
+    auto* box = find_by_automation_id(full["root"], "InputBox");
+    ASSERT_NE(box, nullptr);
+    const auto boxId = box->value("id", "");
+    ASSERT_FALSE(boxId.empty());
+
+    // --element scopes the UIA tree the same way it scopes the visual tree.
+    auto scoped = json::parse(
+        run_command(make_cmd(lvt, get_pid_arg() + " --uia --element " + boxId)), nullptr, false);
+    ASSERT_FALSE(scoped.is_discarded()) << "--uia --element produced no JSON";
+    ASSERT_TRUE(scoped.contains("root"));
+    EXPECT_EQ(uia_prop(scoped["root"], "AutomationId"), "InputBox");
+    EXPECT_LT(count_json_nodes(scoped["root"]), count_json_nodes(full["root"]));
+
+    // XML is a supported output format for the UIA tree too.
+    auto xml = run_command(make_cmd(lvt, get_pid_arg() + " --uia --format xml"));
+    EXPECT_NE(xml.find("<LiveVisualTree"), std::string::npos) << xml.substr(0, 200);
+    EXPECT_NE(xml.find("AutomationId=\"InputBox\""), std::string::npos);
+    EXPECT_NE(xml.find("frameworks=\"uia (control view)\""), std::string::npos);
+}
+
+#ifndef NDEBUG
+TEST_F(WinUI3SampleFixture, UiaTreeDrivesScreenshotAnnotations) {
+    SkipIfNotReady();
+
+    // UIA BoundingRectangle is already in screen coordinates, which is why
+    // annotation works unchanged. Assert that rather than assuming it.
+    auto lvt = get_lvt_path();
+    auto annFile = fs::path(lvt).parent_path() / "lvt_uia_annotations.json";
+    fs::remove(annFile);
+
+    run_command(make_cmd(lvt,
+        get_pid_arg() + " --uia --dump --annotations-json " + annFile.string()));
+
+    ASSERT_TRUE(fs::exists(annFile)) << "no annotations produced for a UIA tree";
+    std::string content;
+    {
+        std::ifstream f(annFile);
+        content.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }  // close before removing
+    auto aj = json::parse(content, nullptr, false);
+    fs::remove(annFile);
+
+    ASSERT_FALSE(aj.is_discarded());
+    ASSERT_TRUE(aj.is_array());
+    EXPECT_GT(aj.size(), 0u) << "UIA elements produced no annotation rectangles";
+    for (const auto& a : aj) {
+        EXPECT_FALSE(a.value("id", "").empty());
+        EXPECT_GT(a.value("width", 0), 0);
+        EXPECT_GT(a.value("height", 0), 0);
+    }
+}
+#endif
+
+TEST_F(WinUI3SampleFixture, UiaWalkDegradesGracefullyOnDeadline) {
+    SkipIfNotReady();
+
+    // A cross-process UIA call can block indefinitely on a wedged target, so
+    // the walk is bounded. Assert the bound actually bites and is *visible*:
+    // for a machine consumer, a silently shortened tree that parses fine is
+    // worse than an error.
+    auto lvt = get_lvt_path();
+
+    auto full = json::parse(run_command(make_cmd(lvt, get_pid_arg() + " --uia")), nullptr, false);
+    ASSERT_FALSE(full.is_discarded());
+    const size_t fullNodes = count_json_nodes(full["root"]);
+    ASSERT_GT(fullNodes, 1u);
+    EXPECT_FALSE(uia_has_prop(full["root"], "Truncated"))
+        << "a complete walk must not be marked truncated";
+
+    auto clipped = json::parse(
+        run_command(make_cmd(lvt, get_pid_arg() + " --uia --uia-timeout 1")), nullptr, false);
+    ASSERT_FALSE(clipped.is_discarded())
+        << "a hit deadline must not corrupt the emitted tree";
+    ASSERT_TRUE(clipped.contains("root"));
+
+    // The deadline must have had an effect, and said so in the document.
+    EXPECT_LT(count_json_nodes(clipped["root"]), fullNodes)
+        << "--uia-timeout 1 produced a full tree, so the deadline is not bounding anything";
+    EXPECT_EQ(uia_prop(clipped["root"], "Truncated"), "true")
+        << "a truncated tree must be self-describing, not silently short";
+}
+
+TEST_F(WinUI3SampleFixture, UiaWatchEmitsAddedEvents) {
+    SkipIfNotReady();
+
+    // --watch runs until Ctrl+C, so it must be driven with an explicit pipe and
+    // terminated: _popen/_pclose would block forever waiting for a process that
+    // never exits. The first tick emits the current tree as "added" events,
+    // which is enough to prove --uia is wired into the watch path and not only
+    // the one-shot dump path.
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    wil::unique_handle readEnd, writeEnd;
+    ASSERT_TRUE(CreatePipe(readEnd.put(), writeEnd.put(), &sa, 0));
+    ASSERT_TRUE(SetHandleInformation(readEnd.get(), HANDLE_FLAG_INHERIT, 0));
+
+    STARTUPINFOA si{sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = writeEnd.get();
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION pi{};
+
+    auto lvt = get_lvt_path();
+    std::string cmd = make_cmd(lvt, get_pid_arg() + " --uia --watch --interval 500");
+    ASSERT_TRUE(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                               CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi));
+    wil::unique_handle process(pi.hProcess);
+    wil::unique_handle thread(pi.hThread);
+    writeEnd.reset();  // so ReadFile sees EOF if the child ever exits
+
+    // Read whatever the first tick produces, bounded by a deadline. Stop once a
+    // *complete* line mentioning the button has arrived, so the parse below is
+    // never handed a half-read line.
+    auto have_complete_button_line = [](const std::string& s) {
+        const auto at = s.find("PrimaryButton");
+        return at != std::string::npos && s.find('\n', at) != std::string::npos;
+    };
+
+    std::string output;
+    const auto deadline = GetTickCount64() + 20000;
+    while (GetTickCount64() < deadline && !have_complete_button_line(output)) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(readEnd.get(), nullptr, 0, nullptr, &available, nullptr))
+            break;
+        if (available == 0) {
+            Sleep(50);
+            continue;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!ReadFile(readEnd.get(), chunk.data(), available, &read, nullptr) || read == 0)
+            break;
+        output.append(chunk, 0, read);
+    }
+
+    TerminateProcess(process.get(), 0);
+    WaitForSingleObject(process.get(), 5000);
+
+    ASSERT_FALSE(output.empty()) << "--uia --watch emitted nothing";
+    EXPECT_TRUE(have_complete_button_line(output))
+        << "watch events did not include the UIA tree's controls";
+
+    // Every complete line must be a well-formed change event. Drop anything
+    // after the final newline: that is a partially read line, not malformed output.
+    const auto lastNewline = output.rfind('\n');
+    ASSERT_NE(lastNewline, std::string::npos) << "no complete line was read";
+    std::istringstream lines(output.substr(0, lastNewline));
+    std::string line;
+    int events = 0;
+    while (std::getline(lines, line)) {
+        if (line.empty())
+            continue;
+        auto ev = json::parse(line, nullptr, false);
+        ASSERT_FALSE(ev.is_discarded())
+            << "watch emitted non-JSON: " << line.substr(0, 200);
+        EXPECT_EQ(ev.value("event", ""), "added");
+        ASSERT_TRUE(ev.contains("element"));
+        ++events;
+    }
+    EXPECT_GT(events, 0) << "no complete watch events parsed";
+}
+
+// --- Cross-architecture behaviour ---
+// --uia injects nothing, so it is exempt from the architecture-match check that
+// the visual-tree providers need. Both halves of that claim are asserted here,
+// against a real 32-bit process.
+
+namespace {
+
+// Returns a 32-bit system executable with a UI, or empty if none is available.
+std::string find_wow64_app() {
+    for (const char* name : {"charmap.exe", "notepad.exe", "mspaint.exe"}) {
+        auto candidate = fs::path("C:\\Windows\\SysWOW64") / name;
+        if (fs::exists(candidate))
+            return candidate.string();
+    }
+    return {};
+}
+
+bool is_wow64(HANDLE process) {
+    BOOL wow64 = FALSE;
+    return IsWow64Process(process, &wow64) && wow64;
+}
+
+} // namespace
+
+class Wow64TargetFixture : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        auto exe = find_wow64_app();
+        if (exe.empty()) {
+            s_skip_reason = "no 32-bit system app available on this machine";
+            return;
+        }
+        if (sizeof(void*) == 4) {
+            // These tests are built for the same architecture as lvt.exe, so a
+            // 32-bit build has no mismatch to observe against a 32-bit target.
+            s_skip_reason = "host is 32-bit, so a 32-bit target is not a mismatch";
+            return;
+        }
+
+        STARTUPINFOA si = {sizeof(si)};
+        PROCESS_INFORMATION pi = {};
+        std::string cmd = "\"" + exe + "\"";
+        if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                            nullptr, nullptr, &si, &pi)) {
+            s_skip_reason = "failed to launch " + exe;
+            return;
+        }
+        s_process.reset(pi.hProcess);
+        s_thread.reset(pi.hThread);
+        s_pid = pi.dwProcessId;
+        WaitForInputIdle(s_process.get(), 10000);
+
+        if (!is_wow64(s_process.get())) {
+            s_skip_reason = exe + " did not start as a 32-bit process";
+            return;
+        }
+
+        // Wait for a top-level window so lvt has something to resolve.
+        auto lvt = get_lvt_path();
+        for (int attempt = 0; attempt < 30; ++attempt) {
+            auto probe = run_command(make_cmd(lvt, get_pid_arg() + " --uia --depth 0"));
+            auto j = json::parse(probe, nullptr, false);
+            if (!j.is_discarded() && j.contains("root")) {
+                s_ready = true;
+                return;
+            }
+            Sleep(500);
+        }
+        s_skip_reason = "32-bit target never exposed a resolvable window";
+    }
+
+    static void TearDownTestSuite() {
+        if (s_process) {
+            TerminateProcess(s_process.get(), 0);
+            s_process.reset();
+            s_thread.reset();
+        }
+    }
+
+    static void SkipIfNotReady() {
+        if (!s_ready)
+            GTEST_SKIP() << s_skip_reason;
+    }
+
+    static std::string get_pid_arg() { return "--pid " + std::to_string(s_pid); }
+
+    static wil::unique_handle s_process;
+    static wil::unique_handle s_thread;
+    static DWORD s_pid;
+    static bool s_ready;
+    static std::string s_skip_reason;
+};
+
+wil::unique_handle Wow64TargetFixture::s_process;
+wil::unique_handle Wow64TargetFixture::s_thread;
+DWORD Wow64TargetFixture::s_pid = 0;
+bool Wow64TargetFixture::s_ready = false;
+std::string Wow64TargetFixture::s_skip_reason;
+
+TEST_F(Wow64TargetFixture, VisualTreeReportsArchitectureMismatch) {
+    SkipIfNotReady();
+
+    // IMAGE_FILE_MACHINE_I386 used to be unhandled, so a 32-bit target was
+    // classified as the host architecture and this check never fired at all.
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --depth 0") + " 2>&1");
+
+    EXPECT_NE(output.find("architecture mismatch"), std::string::npos)
+        << "expected a mismatch against a 32-bit target, got:\n" << output;
+    EXPECT_NE(output.find("x86"), std::string::npos)
+        << "the target architecture should be named:\n" << output;
+    // The message should point at the way forward.
+    EXPECT_NE(output.find("--uia"), std::string::npos)
+        << "the mismatch message should mention the cross-architecture option";
+}
+
+TEST_F(Wow64TargetFixture, UiaReadsAcrossArchitectures) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded())
+        << "--uia should work against a 32-bit target:\n" << output;
+    ASSERT_TRUE(j.contains("root"));
+
+    // Not just a bare root: real automation data must come across the boundary.
+    const auto& root = j["root"];
+    EXPECT_FALSE(root.value("id", "").empty());
+    EXPECT_FALSE(root.value("type", "").empty());  // ControlType is promoted to "type"
+    EXPECT_FALSE(uia_prop(root, "RuntimeId").empty());
+    EXPECT_GT(count_json_nodes(root), 1u) << "expected child elements from the 32-bit target";
+}
+
+TEST_F(WinUI3SampleFixture, UiaEmitsEnumNamesNotRawNumbers) {
+    SkipIfNotReady();
+
+    // The unit tests pin each mapping; this asserts the mappings are actually
+    // reached on a live tree, and that no enum-valued property leaks an integer.
+    auto lvt = get_lvt_path();
+    auto j = json::parse(run_command(make_cmd(lvt, get_pid_arg() + " --uia")), nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    auto* window = &j["root"];
+    ASSERT_TRUE(window->contains("properties"));
+
+    // Used to be emitted raw as "2".
+    EXPECT_EQ(uia_prop(*window, "Window.WindowInteractionState"), "ReadyForUserInteraction");
+
+    auto* check = find_by_automation_id(j["root"], "ReadyCheckBox");
+    ASSERT_NE(check, nullptr);
+    EXPECT_EQ(uia_prop(*check, "Toggle.ToggleState"), "On");
+    // Culture is an LCID, previously emitted as "1033". Assert it resolved to a
+    // BCP-47 tag rather than a specific locale: the value depends on the
+    // machine's language, and the exact LCID mapping is pinned by unit tests.
+    const auto culture = uia_prop(*check, "Culture");
+    ASSERT_FALSE(culture.empty());
+    EXPECT_EQ(culture.find_first_of("0123456789"), std::string::npos)
+        << "Culture should be a locale name, not a raw LCID: " << culture;
+    EXPECT_NE(culture.find('-'), std::string::npos) << culture;
+
+    // Properties that are unset must be absent, not rendered as their default.
+    // This is the seam where LandmarkType shipped as "LandmarkType(0)" and
+    // LiveSetting as "Off" on every single element.
+    EXPECT_FALSE(uia_has_prop(*check, "LandmarkType"))
+        << "an unset LandmarkType must be omitted, not rendered";
+    EXPECT_FALSE(uia_has_prop(*check, "LiveSetting"))
+        << "an unset LiveSetting must be omitted, not rendered";
+    EXPECT_FALSE(uia_has_prop(*check, "Orientation"))
+        << "an unset Orientation must be omitted, not rendered";
+
+    // ControlType is promoted to Element::type, so it must not also appear in
+    // the property map.
+    EXPECT_FALSE(uia_has_prop(*check, "ControlType"))
+        << "ControlType is promoted to \"type\" and must not be duplicated";
+    EXPECT_EQ(check->value("type", ""), "CheckBox");
+
+    // Sweep the whole tree: no enum-valued property may render as a bare number.
+    static const char* enumProps[] = {
+        "Toggle.ToggleState", "ExpandCollapse.State", "Orientation",
+        "Window.WindowVisualState", "Window.WindowInteractionState",
+        "Table.RowOrColumnMajor", "LiveSetting", "LandmarkType",
+    };
+    std::vector<const json*> stack{&j["root"]};
+    int checked = 0;
+    while (!stack.empty()) {
+        const json* node = stack.back();
+        stack.pop_back();
+        for (const char* prop : enumProps) {
+            const auto value = uia_prop(*node, prop);
+            if (value.empty())
+                continue;
+            ++checked;
+            const bool numeric = value.find_first_not_of("-0123456789") == std::string::npos;
+            EXPECT_FALSE(numeric) << prop << " rendered as a raw number: " << value;
+            // "EnumName(n)" means lvt did not recognise the value. On a stock
+            // control that is a mapping gap, not a legitimate rendering — this
+            // is what let LandmarkType="LandmarkType(0)" ship green.
+            EXPECT_EQ(value.find('('), std::string::npos)
+                << prop << " fell back to the unrecognised-value form: " << value;
+        }
+        if (node->contains("children")) {
+            for (const auto& child : (*node)["children"])
+                stack.push_back(&child);
+        }
+    }
+    EXPECT_GT(checked, 0) << "no enum-valued properties were present to check";
+}

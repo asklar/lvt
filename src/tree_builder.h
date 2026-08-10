@@ -19,6 +19,9 @@ Element* find_element_by_id(Element& root, const std::string& id);
 const Element* find_element_by_id(const Element& root, const std::string& id);
 Element* find_element_by_key(Element& root, const std::string& key);
 const Element* find_element_by_key(const Element& root, const std::string& key);
+
+// Resolve an element reference: a positional id ("e4"), a durable key, or a
+// "uia:<RuntimeId>" reference against a UIA tree.
 Element* find_element_by_ref(Element& root, const std::string& ref);
 const Element* find_element_by_ref(const Element& root, const std::string& ref);
 

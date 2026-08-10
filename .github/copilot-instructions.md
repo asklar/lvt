@@ -70,7 +70,7 @@ Shared injection/pipe/grafting logic lives in `xaml_diag_common.cpp`.
 
 ## Key conventions
 
-- **No UIA** — the tool uses framework-native APIs directly, never UI Automation
+- **No UIA in the visual tree** — the visual tree uses framework-native APIs directly and never depends on UI Automation. `--uia` is a separate, opt-in view that walks the target's UIA tree for callers that need `AutomationId`s, control types and patterns; it never participates in building the visual tree
 - **x64 only** for `lvt.exe` itself; bitness matching is only needed for injected DLLs into the target process
 - **Static CRT for TAP DLL** — `lvt_tap.dll` uses `/MT` (static CRT) to avoid CRT version conflicts when injected into arbitrary processes
 - **XAML type name sanitization** — the XAML runtime returns type names with embedded control characters (e.g. literal `\n`). All strings from XAML must be sanitized (strip chars < 0x20) before serialization

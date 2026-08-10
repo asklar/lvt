@@ -1,6 +1,7 @@
 // Unit tests for LVT — pure logic, no live windows required
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include "element.h"
 #include "tree_builder.h"
 #include "element_key.h"
@@ -9,6 +10,10 @@
 #include "framework_detector.h"
 #include "target.h"
 #include "providers/winforms_inject.h"
+#include "providers/uia_provider.h"
+#include "providers/uia_props.h"
+#include <oleacc.h>
+#include <UIAutomation.h>
 #include "wil_diagnostics.h"
 #include "debug.h"
 #include <wil/result.h>
@@ -1033,4 +1038,412 @@ TEST(WilResultLogger, ReportsToStderrNotStdoutWhenDebug) {
     EXPECT_NE(err.find("wil/return"), std::string::npos);
     EXPECT_NE(err.find("unit_tests.cpp"), std::string::npos);
     EXPECT_TRUE(out.empty());
+}
+
+// --- UIA property/view tables and RuntimeId handling ---
+
+TEST(UiaView, ParsesAllThreeViews) {
+    lvt::UiaView view = lvt::UiaView::raw;
+    EXPECT_TRUE(lvt::parse_uia_view("control", view));
+    EXPECT_EQ(view, lvt::UiaView::control);
+    EXPECT_TRUE(lvt::parse_uia_view("RAW", view));
+    EXPECT_EQ(view, lvt::UiaView::raw);
+    EXPECT_TRUE(lvt::parse_uia_view("Content", view));
+    EXPECT_EQ(view, lvt::UiaView::content);
+}
+
+TEST(UiaView, RejectsUnknownView) {
+    lvt::UiaView view = lvt::UiaView::control;
+    EXPECT_FALSE(lvt::parse_uia_view("tree", view));
+    EXPECT_FALSE(lvt::parse_uia_view("", view));
+    EXPECT_EQ(view, lvt::UiaView::control);  // unchanged on failure
+}
+
+TEST(UiaProps, ResolvesNamesLeniently) {
+    const long expected = lvt::uia_property_id("AutomationId");
+    EXPECT_NE(expected, 0);
+    // Case-insensitive, and the UIA_/PropertyId decoration is optional, so a
+    // name pasted from the docs resolves the same as one from lvt's output.
+    EXPECT_EQ(lvt::uia_property_id("automationid"), expected);
+    EXPECT_EQ(lvt::uia_property_id("UIA_AutomationIdPropertyId"), expected);
+    EXPECT_EQ(lvt::uia_property_id("AutomationIdPropertyId"), expected);
+}
+
+TEST(UiaProps, UnknownNameResolvesToZero) {
+    EXPECT_EQ(lvt::uia_property_id("NotARealProperty"), 0);
+    EXPECT_EQ(lvt::uia_property_id(""), 0);
+}
+
+TEST(UiaProps, RoundTripsNameAndId) {
+    for (long id : lvt::uia_core_property_ids()) {
+        const auto name = lvt::uia_property_name(id);
+        ASSERT_FALSE(name.empty()) << "property id " << id << " has no name";
+        EXPECT_EQ(lvt::uia_property_id(name), id) << "round trip failed for " << name;
+    }
+}
+
+TEST(UiaProps, PatternBackedPropertiesAreNamedUnderTheirPattern) {
+    // The provider decides how to read a property from its name: anything
+    // containing '.' is pattern-backed and is read with
+    // GetCachedPropertyValueEx(ignoreDefaultValue=TRUE) so UIA reports
+    // "not supported" instead of substituting a default (a Window otherwise
+    // answers Toggle.ToggleState with 2 = Indeterminate). Core properties use
+    // the plain form, because there "not supported" would also fire whenever a
+    // provider simply did not set the value, dropping useful state such as
+    // IsControlElement.
+    //
+    // That makes this naming convention load-bearing, so pin it down.
+    const char* patternBacked[] = {
+        "Toggle.ToggleState", "Value.Value", "Grid.RowCount",
+        "ExpandCollapse.State", "RangeValue.Value", "Scroll.VerticalPercent",
+        "SelectionItem.IsSelected", "Window.CanMaximize", "Transform.CanMove",
+    };
+    for (const char* name : patternBacked) {
+        const std::string n = name;
+        EXPECT_NE(n.find('.'), std::string::npos) << n << " must be pattern-namespaced";
+        const long id = lvt::uia_property_id(n);
+        EXPECT_NE(id, 0) << n << " does not resolve";
+        EXPECT_EQ(lvt::uia_property_name(id), n);
+
+        // The prefix must name a real pattern, or the convention is a lie.
+        EXPECT_NE(lvt::uia_pattern_id(n.substr(0, n.find('.'))), 0)
+            << n << " has no matching pattern";
+    }
+
+    // Conversely, identity/state properties must NOT look pattern-backed.
+    for (const char* name : {"AutomationId", "ControlType", "IsEnabled",
+                             "IsControlElement", "IsContentElement", "RuntimeId"}) {
+        const std::string n = name;
+        EXPECT_EQ(n.find('.'), std::string::npos) << n << " must not be pattern-namespaced";
+        EXPECT_NE(lvt::uia_property_id(n), 0) << n << " does not resolve";
+    }
+}
+
+TEST(UiaProps, EveryDottedCorePropertyNamesARealPattern) {
+    // Guards the same rule across the whole default set, so a property added
+    // later cannot quietly break the read path.
+    for (long id : lvt::uia_core_property_ids()) {
+        const auto name = lvt::uia_property_name(id);
+        const auto dot = name.find('.');
+        if (dot == std::string::npos)
+            continue;
+        EXPECT_NE(lvt::uia_pattern_id(name.substr(0, dot)), 0)
+            << name << " is pattern-namespaced but '" << name.substr(0, dot)
+            << "' is not a known pattern";
+    }
+}
+
+TEST(UiaProps, SuppressesFrameworkSpecificUnsetSentinels) {
+    // Win32 reports 0 for an unset Level; XAML reports -1. Both are noise.
+    const long level = lvt::uia_property_id("Level");
+    EXPECT_TRUE(lvt::uia_property_value_is_unset(level, "0"));
+    EXPECT_TRUE(lvt::uia_property_value_is_unset(level, "-1"));
+    EXPECT_FALSE(lvt::uia_property_value_is_unset(level, "2"));
+
+    const long automationId = lvt::uia_property_id("AutomationId");
+    EXPECT_FALSE(lvt::uia_property_value_is_unset(automationId, "0"));
+}
+
+TEST(UiaProps, ResolvesPatternNamesLeniently) {
+    const long invoke = lvt::uia_pattern_id("Invoke");
+    EXPECT_NE(invoke, 0);
+    EXPECT_EQ(lvt::uia_pattern_id("invoke"), invoke);
+    EXPECT_EQ(lvt::uia_pattern_id("InvokePattern"), invoke);
+    EXPECT_EQ(lvt::uia_pattern_name(invoke), "Invoke");
+    EXPECT_EQ(lvt::uia_pattern_id("NotAPattern"), 0);
+}
+
+TEST(UiaProps, NamesKnownControlTypesAndFallsBackForUnknown) {
+    EXPECT_EQ(lvt::uia_control_type_name(UIA_ButtonControlTypeId), "Button");
+    EXPECT_EQ(lvt::uia_control_type_name(UIA_EditControlTypeId), "Edit");
+    // An unrecognised control type must stay identifiable rather than vanish.
+    EXPECT_EQ(lvt::uia_control_type_name(999999), "ControlType(999999)");
+}
+
+// --- Architecture reporting ---
+// --uia skips the architecture-match check because UIA needs no injection, so
+// the check has to classify targets correctly for that exemption to mean
+// anything. x86 was previously missing here, which silently disabled the check
+// for every 32-bit target.
+
+TEST(Architecture, NamesEveryValue) {
+    EXPECT_STREQ(lvt::architecture_name(lvt::Architecture::x64), "x64");
+    EXPECT_STREQ(lvt::architecture_name(lvt::Architecture::arm64), "arm64");
+    EXPECT_STREQ(lvt::architecture_name(lvt::Architecture::x86), "x86");
+    EXPECT_STREQ(lvt::architecture_name(lvt::Architecture::unknown), "unknown");
+}
+
+TEST(Architecture, HostIsIdentifiedNotUnknown) {
+    // An x86 build used to report its own architecture as "unknown", which made
+    // every comparison against it meaningless.
+    EXPECT_NE(lvt::get_host_architecture(), lvt::Architecture::unknown);
+}
+
+TEST(Architecture, CurrentProcessMatchesHost) {
+    EXPECT_EQ(lvt::detect_process_architecture(GetCurrentProcessId()),
+              lvt::get_host_architecture());
+}
+
+TEST(UiaRuntimeId, FormatsAndParsesRoundTrip) {
+    const std::vector<int> id{42, 3150138, 4, 5};
+    const auto text = lvt::format_runtime_id(id);
+    EXPECT_EQ(text, "42.3150138.4.5");
+
+    std::vector<int> parsed;
+    ASSERT_TRUE(lvt::parse_runtime_id(text, parsed));
+    EXPECT_EQ(parsed, id);
+}
+
+TEST(UiaRuntimeId, RoundTripsNegativeComponents) {
+    // RuntimeIds derived from an HWND with the high bit set have negative
+    // components, and format_runtime_id emits them with a '-'. The parser must
+    // accept what the formatter produces, or a uia:<RuntimeId> reference to
+    // such an element silently resolves to nothing.
+    const std::vector<int> id{42, -2147483647, 9705532, -2, 0};
+    const auto text = lvt::format_runtime_id(id);
+    EXPECT_EQ(text, "42.-2147483647.9705532.-2.0");
+
+    std::vector<int> parsed;
+    ASSERT_TRUE(lvt::parse_runtime_id(text, parsed)) << text;
+    EXPECT_EQ(parsed, id);
+}
+
+TEST(UiaRuntimeId, RejectsMalformedInput) {
+    std::vector<int> parsed;
+    EXPECT_FALSE(lvt::parse_runtime_id("", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("42..5", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("42.", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("4a.5", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("-", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("1.-", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("1..2", parsed));
+}
+
+TEST(FindElementByRef, ResolvesUiaRuntimeIdReference) {
+    lvt::Element root;
+    root.type = "Window";
+    root.properties["RuntimeId"] = "42.100";
+    lvt::Element child;
+    child.type = "Button";
+    child.properties["RuntimeId"] = "42.100.3.7";
+    root.children.push_back(child);
+    lvt::assign_element_ids(root);
+
+    auto* found = lvt::find_element_by_ref(root, "uia:42.100.3.7");
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->type, "Button");
+
+    EXPECT_EQ(lvt::find_element_by_ref(root, "uia:42.999"), nullptr);
+    // A plain id must still win; the uia: prefix is what selects RuntimeId lookup.
+    auto* byId = lvt::find_element_by_ref(root, "e0");
+    ASSERT_NE(byId, nullptr);
+    EXPECT_EQ(byId->type, "Window");
+}
+
+// --- Enum-valued property rendering ---
+// UIA returns these as bare integers. Every enum has its own value space, and
+// several overlap numerically (ToggleState_Indeterminate == 2 ==
+// WindowInteractionState_ReadyForUserInteraction == RowOrColumnMajor_Indeterminate),
+// so a mapping keyed on the wrong property is silently plausible. These tests
+// pin each enum against the SDK constants rather than against literals.
+
+TEST(UiaEnums, ToggleStateCoversEveryValue) {
+    const long id = lvt::uia_property_id("Toggle.ToggleState");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ToggleState_Off), "Off");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ToggleState_On), "On");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ToggleState_Indeterminate), "Indeterminate");
+}
+
+TEST(UiaEnums, ExpandCollapseStateCoversEveryValue) {
+    const long id = lvt::uia_property_id("ExpandCollapse.State");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ExpandCollapseState_Collapsed), "Collapsed");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ExpandCollapseState_Expanded), "Expanded");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ExpandCollapseState_PartiallyExpanded),
+              "PartiallyExpanded");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ExpandCollapseState_LeafNode), "LeafNode");
+}
+
+TEST(UiaEnums, OrientationCoversEveryValue) {
+    const long id = lvt::uia_property_id("Orientation");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, OrientationType_None), "None");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, OrientationType_Horizontal), "Horizontal");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, OrientationType_Vertical), "Vertical");
+}
+
+TEST(UiaEnums, WindowVisualStateCoversEveryValue) {
+    const long id = lvt::uia_property_id("Window.WindowVisualState");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowVisualState_Normal), "Normal");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowVisualState_Maximized), "Maximized");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowVisualState_Minimized), "Minimized");
+}
+
+TEST(UiaEnums, WindowInteractionStateCoversEveryValue) {
+    // Previously emitted raw, so a Window reported WindowInteractionState="2".
+    const long id = lvt::uia_property_id("Window.WindowInteractionState");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_Running), "Running");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_Closing), "Closing");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_ReadyForUserInteraction),
+              "ReadyForUserInteraction");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_BlockedByModalWindow),
+              "BlockedByModalWindow");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_NotResponding),
+              "NotResponding");
+}
+
+TEST(UiaEnums, RowOrColumnMajorCoversEveryValue) {
+    const long id = lvt::uia_property_id("Table.RowOrColumnMajor");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, RowOrColumnMajor_RowMajor), "RowMajor");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, RowOrColumnMajor_ColumnMajor), "ColumnMajor");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, RowOrColumnMajor_Indeterminate), "Indeterminate");
+}
+
+TEST(UiaEnums, LiveSettingCoversEveryValue) {
+    const long id = lvt::uia_property_id("LiveSetting");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, Off), "Off");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, Polite), "Polite");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, Assertive), "Assertive");
+}
+
+TEST(UiaEnums, LandmarkTypeCoversEveryValue) {
+    // Landmark ids live in the 80000 range, far from every other enum, which is
+    // exactly why a copy-paste mistake here would be invisible in normal output.
+    const long id = lvt::uia_property_id("LandmarkType");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_CustomLandmarkTypeId), "Custom");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_FormLandmarkTypeId), "Form");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_MainLandmarkTypeId), "Main");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_NavigationLandmarkTypeId), "Navigation");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_SearchLandmarkTypeId), "Search");
+}
+
+TEST(UiaEnums, OverlappingNumericValuesResolvePerProperty) {
+    // 2 means something different in each of these. A mapping keyed on the
+    // wrong property would still produce a plausible-looking name, so assert
+    // the disambiguation directly.
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Toggle.ToggleState"), 2),
+              "Indeterminate");
+    EXPECT_EQ(lvt::uia_enum_value_name(
+                  lvt::uia_property_id("Window.WindowInteractionState"), 2),
+              "ReadyForUserInteraction");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Orientation"), 2), "Vertical");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Window.WindowVisualState"), 2),
+              "Minimized");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("ExpandCollapse.State"), 2),
+              "PartiallyExpanded");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Table.RowOrColumnMajor"), 2),
+              "Indeterminate");
+}
+
+TEST(UiaEnums, UnknownValuesNameTheirEnum) {
+    // The value is unrecognised, so this is where naming the enum earns its
+    // keep: a bare "99" would say neither what it means nor that lvt failed to
+    // recognise it. Known values stay unqualified because the property key
+    // already names the enum.
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Toggle.ToggleState"), 99),
+              "ToggleState(99)");
+    EXPECT_EQ(lvt::uia_enum_value_name(
+                  lvt::uia_property_id("Window.WindowInteractionState"), 99),
+              "WindowInteractionState(99)");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("LandmarkType"), 99),
+              "LandmarkType(99)");
+    EXPECT_EQ(lvt::uia_control_type_name(999999), "ControlType(999999)");
+}
+
+TEST(UiaEnums, NonEnumPropertiesAreNotTreatedAsEnums) {
+    for (const char* name : {"AutomationId", "Name", "ProcessId", "Level",
+                             "PositionInSet", "SizeOfSet", "IsEnabled",
+                             "Value.Value", "Grid.RowCount"}) {
+        const long id = lvt::uia_property_id(name);
+        ASSERT_NE(id, 0) << name;
+        EXPECT_FALSE(lvt::uia_property_is_enum(id)) << name << " is not an enum";
+        EXPECT_TRUE(lvt::uia_enum_value_name(id, 1).empty()) << name;
+    }
+}
+
+TEST(UiaEnums, EnumTableAndEmittedSetAgreeBothWays) {
+    const auto& core = lvt::uia_core_property_ids();
+    const auto& enums = lvt::uia_enum_property_ids();
+
+    // Forward: every enum mapping must belong to a property lvt actually
+    // emits, or it is dead weight.
+    for (long id : enums) {
+        EXPECT_NE(std::find(core.begin(), core.end(), id), core.end())
+            << lvt::uia_property_name(id) << " is enum-mapped but never emitted";
+        EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    }
+
+    // Reverse: every emitted property whose name is a known enum property must
+    // be in the enum table, or it leaks a raw integer. Driven off the tables
+    // themselves rather than a hardcoded list, so adding either side is caught.
+    for (long id : core) {
+        const auto name = lvt::uia_property_name(id);
+        const bool mapped = std::find(enums.begin(), enums.end(), id) != enums.end();
+        EXPECT_EQ(mapped, lvt::uia_property_is_enum(id))
+            << name << " disagrees between the enum table and uia_property_is_enum";
+    }
+}
+
+TEST(UiaEnums, EnumPropertiesNeverCollideWithUnsetSentinels) {
+    // The sentinel table is compared against the *raw* UIA value, before
+    // humanizing. Expressing a sentinel in humanized form makes it dead: it
+    // shipped once as LandmarkType="LandmarkType(0)" and LiveSetting="Off" on
+    // every element. A sentinel that parses as an integer is raw-form.
+    for (long id : lvt::uia_enum_property_ids()) {
+        for (const char* candidate : {"0", "-1", "1", "2"}) {
+            if (!lvt::uia_property_value_is_unset(id, candidate))
+                continue;
+            // If a sentinel exists it must be numeric, i.e. the raw form, not
+            // the name this enum would humanize it into.
+            const auto humanized = lvt::uia_enum_value_name(id, std::atol(candidate));
+            EXPECT_NE(humanized, candidate)
+                << lvt::uia_property_name(id)
+                << " sentinel is written in humanized form and can never match";
+        }
+    }
+}
+
+TEST(UiaCulture, RendersLcidAsLocaleName) {
+    // "Culture=1033" is opaque; "Culture=en-US" is not.
+    EXPECT_EQ(lvt::uia_culture_name(1033), "en-US");
+    EXPECT_EQ(lvt::uia_culture_name(1036), "fr-FR");
+}
+
+TEST(UiaCulture, FallsBackToTheNumberWhenUnresolvable) {
+    EXPECT_EQ(lvt::uia_culture_name(0), "0");
+    EXPECT_EQ(lvt::uia_culture_name(-1), "-1");
+    EXPECT_EQ(lvt::uia_culture_name(0x7FFFFFF), "134217727");
+}
+
+TEST(FindElementByRef, NormalizesAndValidatesUiaReferences) {
+    lvt::Element root;
+    root.type = "Window";
+    root.properties["RuntimeId"] = "42.100";
+    lvt::Element child;
+    child.type = "Button";
+    child.properties["RuntimeId"] = "42.100.3.-7";
+    root.children.push_back(child);
+    lvt::assign_element_ids(root);
+
+    // Negative components must resolve; the ref goes through the same
+    // parse/format pair the walk uses to produce the property.
+    auto* negative = lvt::find_element_by_ref(root, "uia:42.100.3.-7");
+    ASSERT_NE(negative, nullptr);
+    EXPECT_EQ(negative->type, "Button");
+
+    // Leading zeros normalize to the emitted form rather than failing to match.
+    auto* padded = lvt::find_element_by_ref(root, "uia:042.0100");
+    ASSERT_NE(padded, nullptr);
+    EXPECT_EQ(padded->type, "Window");
+
+    // A malformed reference resolves to nothing rather than falling through to
+    // the id/key lookups and matching something unrelated.
+    EXPECT_EQ(lvt::find_element_by_ref(root, "uia:not-an-id"), nullptr);
+    EXPECT_EQ(lvt::find_element_by_ref(root, "uia:"), nullptr);
 }

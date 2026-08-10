@@ -7,7 +7,11 @@
 #include "plugin_loader.h"
 #include "debug.h"
 #include "wil_diagnostics.h"
+#ifdef LVT_ENABLE_UIA
+#include "providers/uia_provider.h"
+#endif
 
+#include "element_key.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +63,10 @@ static void print_usage() {
         "  --interval <ms>      Watch polling interval (default: 500)\n"
         "  --element <ref>      Scope to a specific element subtree by id or key\n"
         "  --query <ref> [prop] Output one element or one property by id or key\n"
+        "  --uia                Emit the UI Automation tree instead of the visual tree\n"
+        "  --uia-view <view>    UIA tree view: control (default), raw, or content\n"
+        "  --uia-props <list>   Comma-separated extra UIA properties to include\n"
+        "  --uia-timeout <ms>   UIA walk deadline (default: 10000; 0 leaves UIA's own)\n"
         "  --frameworks         Just detect and list frameworks\n"
         "  --depth <n>          Max tree traversal depth (default: unlimited)\n"
         "  --debug              Show verbose diagnostic output\n"
@@ -81,6 +89,10 @@ struct Args {
     std::string queryId;
     std::string queryProperty;
     std::string pluginOption;
+    bool uia = false;
+    std::string uiaViewName = "control";
+    std::vector<std::string> uiaProps;
+    int uiaTimeoutMs = 10000;
     int depth = -1;
     int intervalMs = 500;
     bool frameworksOnly = false;
@@ -88,6 +100,25 @@ struct Args {
     bool dumpSet = false;   // true if --dump was passed on command line
     bool watch = false;
 };
+
+static std::vector<std::string> split_csv(const std::string& text) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (start <= text.size()) {
+        const size_t comma = text.find(',', start);
+        auto piece = text.substr(start, comma == std::string::npos ? std::string::npos
+                                                                   : comma - start);
+        // Tolerate "a, b , c" so the flag is forgiving about spacing.
+        const size_t first = piece.find_first_not_of(" \t");
+        const size_t last = piece.find_last_not_of(" \t");
+        if (first != std::string::npos)
+            parts.push_back(piece.substr(first, last - first + 1));
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return parts;
+}
 
 static Args parse_args(int argc, char* argv[]) {
     Args args;
@@ -126,6 +157,26 @@ static Args parse_args(int argc, char* argv[]) {
                 args.queryProperty = argv[++i];
         } else if (strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
             args.depth = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--uia") == 0) {
+            args.uia = true;
+        } else if (strcmp(argv[i], "--uia-view") == 0 && i + 1 < argc) {
+            args.uia = true;
+            args.uiaViewName = argv[++i];
+        } else if (strcmp(argv[i], "--uia-props") == 0 && i + 1 < argc) {
+            args.uia = true;
+            args.uiaProps = split_csv(argv[++i]);
+        } else if (strcmp(argv[i], "--uia-timeout") == 0 && i + 1 < argc) {
+            args.uia = true;
+            // atoi would turn a typo into 0, which silently *disables* the
+            // deadline rather than rejecting the argument.
+            char* end = nullptr;
+            const long value = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value < 0) {
+                fprintf(stderr, "lvt: --uia-timeout must be a whole number of "
+                                "milliseconds (0 disables the deadline)\n");
+                exit(1);
+            }
+            args.uiaTimeoutMs = static_cast<int>(value);
         } else if (strcmp(argv[i], "--watch") == 0) {
             args.watch = true;
         } else if (strcmp(argv[i], "--interval") == 0 && i + 1 < argc) {
@@ -222,10 +273,72 @@ static bool write_output(const std::string& outputFile, const std::string& conte
     return true;
 }
 
+// UIA support is compile-time optional (LVT_ENABLE_UIA). Keep the two entry
+// points behind a single seam so the rest of main.cpp does not need guards.
+#ifdef LVT_ENABLE_UIA
+static bool build_uia_tree(const lvt::TargetInfo& target, const Args& args,
+                           lvt::Element& tree) {
+    lvt::UiaOptions options;
+    if (!lvt::parse_uia_view(args.uiaViewName, options.view)) {
+        fprintf(stderr, "lvt: --uia-view must be raw, control, or content\n");
+        return false;
+    }
+    options.extraProperties = args.uiaProps;
+    options.timeoutMs = args.uiaTimeoutMs;
+
+    lvt::UiaProvider provider;
+    auto result = provider.build(target.hwnd, options);
+    if (!result) {
+        fprintf(stderr, "lvt: could not read the UI Automation tree for this window");
+        if (options.timeoutMs > 0) {
+            fprintf(stderr, " (a slow or busy target may need a larger "
+                            "--uia-timeout than %d ms)", options.timeoutMs);
+        }
+        fprintf(stderr, "\n");
+        return false;
+    }
+    tree = std::move(*result);
+    lvt::assign_element_ids(tree);
+    lvt::assign_element_keys(tree);
+    return true;
+}
+
+static std::string uia_framework_label(const Args& args) {
+    lvt::UiaView view = lvt::UiaView::control;
+    lvt::parse_uia_view(args.uiaViewName, view);
+    return std::string("uia (") + lvt::uia_view_name(view) + " view)";
+}
+#else
+static bool build_uia_tree(const lvt::TargetInfo&, const Args&, lvt::Element&) {
+    fprintf(stderr, "lvt: this build has UI Automation support compiled out "
+                    "(LVT_ENABLE_UIA=OFF)\n");
+    return false;
+}
+
+static std::string uia_framework_label(const Args&) { return "uia"; }
+#endif
+
+// Build the root tree for the requested mode. --uia replaces the visual tree
+// outright rather than enriching it: it is a different view of the same window,
+// produced without injecting anything into the target.
+static bool build_root_tree(const lvt::TargetInfo& target, const Args& args,
+                            lvt::Element& tree) {
+    if (args.uia) {
+        if (!build_uia_tree(target, args, tree))
+            return false;
+        return true;
+    }
+
+    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+    tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption);
+    return true;
+}
+
 static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
                               lvt::Element& outputTree) {
-    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
-    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption);
+    lvt::Element tree;
+    if (!build_root_tree(target, args, tree))
+        return false;
 
     lvt::Element* outputRoot = &tree;
     if (!args.elementId.empty()) {
@@ -269,8 +382,15 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
         }
 
         lvt::Element current;
-        if (!build_output_tree(target, args, current))
-            return 1;
+        if (!build_output_tree(target, args, current)) {
+            // A tick can fail transiently — most easily in UIA mode, where a
+            // momentarily busy target trips the transaction timeout. That is
+            // precisely the condition --watch exists to observe, so skip the
+            // tick and keep watching rather than ending the session.
+            if (lvt::g_debug)
+                fprintf(stderr, "lvt: skipping watch tick; tree unavailable\n");
+            continue;
+        }
 
         for (const auto& event : lvt::diff_trees(previous, current))
             printf("%s\n", lvt::serialize_change_event(event).c_str());
@@ -372,22 +492,29 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Check architecture match
+    // Check architecture match. --uia is exempt: UI Automation is a cross-process,
+    // cross-architecture client API, so an x64 lvt can read an ARM64 or x86
+    // target's UIA tree. Only the injecting visual-tree providers need a match.
     auto hostArch = lvt::get_host_architecture();
-    if (target.architecture != lvt::Architecture::unknown &&
+    if (!args.uia &&
+        target.architecture != lvt::Architecture::unknown &&
         hostArch != lvt::Architecture::unknown &&
         target.architecture != hostArch) {
         const char* targetArchName = lvt::architecture_name(target.architecture);
         const char* hostArchName = lvt::architecture_name(hostArch);
         fprintf(stderr,
             "lvt: architecture mismatch - this is lvt.exe (%s) but the target process "
-            "(pid %lu) is %s.\nRun lvt-%s.exe instead.\n",
+            "(pid %lu) is %s.\nRun lvt-%s.exe instead, or use --uia which works "
+            "across architectures.\n",
             hostArchName, target.pid, targetArchName, targetArchName);
         return 1;
     }
 
-    // Detect frameworks
-    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+    // Detect frameworks. Skipped for --uia, which reports the per-element
+    // FrameworkId from UIA instead and needs no module enumeration.
+    std::vector<lvt::FrameworkInfo> frameworks;
+    if (!args.uia || args.frameworksOnly)
+        frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
 
     if (args.frameworksOnly) {
         // Just print detected frameworks
@@ -409,7 +536,11 @@ int main(int argc, char* argv[]) {
     }
 
     // Build full tree (no depth limit) so element IDs are stable
-    auto tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption);
+    lvt::Element tree;
+    if (!build_root_tree(target, args, tree)) {
+        lvt::unload_plugins();
+        return 1;
+    }
 
     // Scope to element if requested
     lvt::Element* outputRoot = &tree;
@@ -457,6 +588,10 @@ int main(int argc, char* argv[]) {
     // Serialize and output tree (unless suppressed by --screenshot without --dump)
     if (args.dump) {
         auto frameworkNames = framework_names(frameworks);
+        // In UIA mode the module-scan framework list is not what was walked;
+        // report the view actually produced instead.
+        if (args.uia)
+            frameworkNames = {uia_framework_label(args)};
         std::string serialized;
         if (args.format == "xml") {
             serialized = lvt::serialize_to_xml(*outputRoot, target.hwnd, target.pid,

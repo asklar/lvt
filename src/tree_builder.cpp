@@ -1,4 +1,7 @@
 #include "tree_builder.h"
+#ifdef LVT_ENABLE_UIA
+#include "providers/uia_provider.h"
+#endif
 #include "lvt_config.h"
 #include "element_key.h"
 #include "providers/provider.h"
@@ -82,13 +85,71 @@ const Element* find_element_by_key(const Element& root, const std::string& key) 
     return nullptr;
 }
 
+// Resolve an element by a "uia:<RuntimeId>" reference, e.g. "uia:42.3150138.4.5".
+// RuntimeIds survive across walks of a live UI for as long as the element does,
+// which makes them a useful handle for callers that re-walk between actions.
+template <typename ElementT>
+static ElementT* find_element_by_runtime_id_impl(ElementT& root, const std::string& runtimeId) {
+    auto it = root.properties.find("RuntimeId");
+    if (it != root.properties.end() && it->second == runtimeId)
+        return &root;
+    for (auto& child : root.children) {
+        if (auto* found = find_element_by_runtime_id_impl(child, runtimeId))
+            return found;
+    }
+    return nullptr;
+}
+
+#ifdef LVT_ENABLE_UIA
+static const char* uia_ref_suffix(const std::string& ref) {
+    return ref.rfind("uia:", 0) == 0 ? ref.c_str() + 4 : nullptr;
+}
+
+// Round-trip the reference through the RuntimeId parser/formatter so a
+// user-supplied "uia:042.1" matches the "42.1" the walk emitted, and so a
+// malformed reference is rejected rather than silently matching nothing.
+static bool normalize_runtime_id(const char* text, std::string& out) {
+    std::vector<int> parts;
+    if (!parse_runtime_id(text, parts))
+        return false;
+    out = format_runtime_id(parts);
+    return true;
+}
+#endif
+
+// Resolve a "uia:<RuntimeId>" reference. Returns false when ref is not one,
+// leaving resolution to the id/key lookups. Always false when UIA support is
+// compiled out, since no tree can contain RuntimeIds in that build.
+template <typename ElementT>
+static bool try_find_by_uia_ref(ElementT& root, const std::string& ref, ElementT** out) {
+#ifdef LVT_ENABLE_UIA
+    const char* runtimeId = uia_ref_suffix(ref);
+    if (!runtimeId)
+        return false;
+    std::string normalized;
+    *out = normalize_runtime_id(runtimeId, normalized)
+               ? find_element_by_runtime_id_impl(root, normalized)
+               : nullptr;
+    return true;
+#else
+    (void)root; (void)ref; (void)out;
+    return false;
+#endif
+}
+
 Element* find_element_by_ref(Element& root, const std::string& ref) {
+    Element* byRuntimeId = nullptr;
+    if (try_find_by_uia_ref(root, ref, &byRuntimeId))
+        return byRuntimeId;
     if (auto* byId = find_element_by_id(root, ref))
         return byId;
     return find_element_by_key(root, ref);
 }
 
 const Element* find_element_by_ref(const Element& root, const std::string& ref) {
+    const Element* byRuntimeId = nullptr;
+    if (try_find_by_uia_ref(root, ref, &byRuntimeId))
+        return byRuntimeId;
     if (auto* byId = find_element_by_id(root, ref))
         return byId;
     return find_element_by_key(root, ref);
