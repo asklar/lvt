@@ -10,7 +10,7 @@ if(LVT_BUILD_TESTS)
     list(APPEND VCPKG_MANIFEST_FEATURES "tests")
 endif()
 
-project(lvt VERSION 0.2.0 LANGUAGES CXX)
+project(lvt VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,6 +66,7 @@ set(LVT_PUBLIC_HEADERS
     src/module_util.h
     src/plugin.h
     src/plugin_loader.h
+    src/input.h
     src/screenshot.h
     src/target.h
     src/tree_builder.h
@@ -84,6 +85,7 @@ set(LVT_CORE_SOURCES
     src/watch_diff.cpp
     src/screenshot.cpp
     src/module_util.cpp
+    src/input.cpp
     src/plugin_loader.cpp
     src/wil_diagnostics.cpp
     src/providers/win32_provider.cpp
@@ -110,6 +112,7 @@ if(LVT_ENABLE_UIA)
     list(APPEND LVT_CORE_SOURCES
         src/providers/uia_provider.cpp
         src/providers/uia_props.cpp
+        src/providers/uia_actions.cpp
     )
 endif()
 
@@ -595,6 +598,9 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
     AVALONIA_SAMPLE_EXE_PATH="${AVALONIA_SAMPLE_EXE_ESCAPED}"
     WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
+    # Lets tests assert on repository files, e.g. that the packaged skill has
+    # not drifted from the one this repo's own agent reads.
+    "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
 )
 target_link_libraries(lvt_integration_tests PRIVATE
     GTest::gtest GTest::gtest_main

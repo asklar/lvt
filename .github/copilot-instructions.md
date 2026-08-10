@@ -84,10 +84,16 @@ Shared injection/pipe/grafting logic lives in `xaml_diag_common.cpp`.
 ## CLI usage
 
 ```
-lvt --name notepad --format xml --element e2 --depth 5
-lvt --pid 1234 --screenshot out.png
-lvt --hwnd 0x1A0B3C --frameworks
+lvt dump --name notepad --format xml --element e2 --depth 5
+lvt screenshot --pid 1234 --output out.png
+lvt frameworks --hwnd 0x1A0B3C
+lvt dump --uia --name notepad          # UI Automation tree instead
+lvt click e6 --name notepad            # drive the app
 ```
+
+lvt takes a verb first, then arguments, then options. `dump` is implied when no
+verb is given, so `lvt --name notepad` still works. Interaction verbs (`click`,
+`toggle`, `set-value`, `type`, `press-key`, `wait-for`, …) imply `--uia`.
 
 ## Dependencies
 

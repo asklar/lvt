@@ -1,10 +1,11 @@
 ---
 name: lvt
 description: >
-  Inspect running Windows application UIs using the lvt (Live Visual Tree) CLI tool.
+  Inspect and drive running Windows application UIs using the lvt (Live Visual Tree) CLI tool.
   Use this skill when you need to understand a Windows app's visual tree structure,
-  capture annotated screenshots, detect UI frameworks, or find specific UI elements
-  for verification or interaction planning.
+  read its UI Automation tree (AutomationIds, control types, supported patterns),
+  capture annotated screenshots, detect UI frameworks, find specific UI elements,
+  or interact with an app by clicking, typing, toggling and waiting on its controls.
 ---
 
 # Inspect Windows application UI with lvt
@@ -16,21 +17,22 @@ Use `lvt` whenever you need to understand the visual content or structure of a r
 - **UI verification** — confirm that a UI change was applied correctly (e.g. a button label changed, a dialog appeared)
 - **Finding UI elements** — locate a specific control, menu item, or text field in an app's visual tree
 - **Screenshot capture** — take an annotated screenshot of an app with element IDs overlaid
-- **Framework detection** — determine which UI frameworks an app uses (Win32, ComCtl, XAML, WinUI 3, WPF, Chromium)
+- **Framework detection** — determine which UI frameworks an app uses (Win32, ComCtl, XAML, WinUI 3)
 - **Automated UI interaction planning** — get element IDs and bounds to plan mouse clicks or keyboard input
+- **Automation identity** — get `AutomationId`s, control types, and supported patterns with `--uia`
+- **Driving an app** — click, toggle, type, set values, and wait for the UI to settle
 
 ## Prerequisites
 
-Before using lvt, ensure `lvt.exe` and `lvt_tap_{arch}.dll` are available. If they are not already on PATH or in the current directory, download and extract them automatically:
+Before using lvt, ensure `lvt.exe` and `lvt_tap.dll` are available. If they are not already on PATH or in the current directory, download and extract them automatically:
 
 ```powershell
-# Download the latest release zip (matching host architecture) and extract to ~/.lvt
+# Download the latest release zip and extract to ~/.lvt
 $lvtDir = "$env:USERPROFILE\.lvt"
 if (-not (Test-Path "$lvtDir\lvt.exe")) {
   New-Item -ItemType Directory -Path $lvtDir -Force | Out-Null
-  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } elseif ($env:PROCESSOR_ARCHITECTURE -eq "x86") { "x86" } else { "x64" }
   $release = Invoke-RestMethod "https://api.github.com/repos/asklar/lvt/releases/latest"
-  $asset = $release.assets | Where-Object { $_.name -like "lvt-*-$arch.zip" } | Select-Object -First 1
+  $asset = $release.assets | Where-Object { $_.name -like "lvt-*-x64.zip" } | Select-Object -First 1
   $zip = "$env:TEMP\lvt.zip"
   Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
   Expand-Archive -Path $zip -DestinationPath $lvtDir -Force
@@ -79,10 +81,11 @@ lvt --name notepad --output tree.json
 
 ```powershell
 # Screenshot only (no tree output)
-lvt --name notepad --screenshot out.png
+lvt screenshot --name notepad --output out.png
 
 # Screenshot + tree output together
-lvt --name notepad --screenshot out.png --dump
+lvt screenshot --name notepad --output out.png
+lvt dump --name notepad
 ```
 
 Screenshots are annotated with element IDs (e0, e1, …) overlaid on each element, making it easy to correlate visual positions with tree nodes.
@@ -93,15 +96,84 @@ When the full tree is too large, scope to a specific element:
 
 ```powershell
 # Only show element e5 and its descendants, up to 3 levels deep
-lvt --name myapp --element e5 --depth 3
+lvt dump --name myapp --element e5 --depth 3
 ```
 
 ### Detect frameworks only
 
 ```powershell
-lvt --name notepad --frameworks
+lvt frameworks --name notepad
 ```
 
+### Get the UI Automation tree
+
+Use `--uia` when you need to *act on* the app rather than just describe it. It
+emits the UI Automation tree, where elements carry the identifiers and state an
+automation client needs.
+
+```powershell
+# Automation-grade view
+lvt dump --uia --name myapp
+
+# Narrower (content) or wider (raw) views
+lvt dump --uia --uia-view content --name myapp
+
+# Look up one element by its UIA RuntimeId
+lvt query uia:42.3150138.4.5 --name myapp
+```
+
+Prefer `--uia` when you want to answer "which control do I click, and can I?" —
+`AutomationId` gives a stable handle and `SupportedPatterns` tells you what the
+element can actually do (`Invoke` = clickable, `Value` = settable text,
+`Toggle` = checkable, `ExpandCollapse` = expandable).
+
+`--uia` also works when the target's architecture differs from lvt's, which the
+visual tree cannot do.
+
+### Drive the app
+
+lvt can act on elements, not just read them. Every interaction verb resolves its
+`<ref>` against a UIA walk, so it implies `--uia`.
+
+```powershell
+# Click a button. Uses the Invoke pattern where possible, which does not steal
+# focus or move the cursor.
+lvt click e6 --name myapp
+
+# Flip a checkbox, set a text box, type, send a chord
+lvt toggle e7 --name myapp
+lvt set-value e4 "hello" --name myapp
+lvt type "some text" --focus-first e4 --name myapp
+lvt press-key "Ctrl+S" --name myapp
+
+# Wait for the UI to catch up before the next step
+lvt wait-for e9 --wait-prop IsEnabled=true --name myapp
+```
+
+The result JSON reports **how** the action was performed:
+
+```json
+{ "action": "click", "ok": true, "method": "InvokePattern",
+  "result": { "AutomationId": "PrimaryButton", "...": "..." } }
+```
+
+- `method` distinguishes a quiet UIA pattern from `SendInput`. Synthetic input
+  steals focus and needs the window on top; a pattern does not.
+- `result` is the element *after* the action, so the effect can be confirmed
+  without a second walk.
+- On failure `ok` is false, `error` explains whether the pattern was missing or
+  present but refused, and the exit code is non-zero.
+
+Use `SupportedPatterns` from the tree to choose the verb: `Invoke` means
+clickable, `Toggle` checkable, `Value` settable, `ExpandCollapse` expandable.
+
+After any action that changes the UI, prefer `wait-for` over sleeping.
+
+Choosing a reference matters when the UI changes shape: `eN` is positional and
+`uia:<RuntimeId>` is tied to the element's current host window, so expanding a
+combo box (which reparents it into a popup) invalidates both. The durable `key`
+survives. Use `eN` for one-shot commands against a static UI, and the durable
+key when acting across a structural change.
 ## Interpreting the output
 
 ### Element IDs
@@ -118,11 +190,29 @@ Every element gets a stable ID like `e0`, `e1`, `e2`, etc., assigned in depth-fi
 |----------|-------------|
 | `id` | Stable element ID (e.g. `e0`) |
 | `type` | Element type name (e.g. `Window`, `Button`, `TextBlock`) |
-| `framework` | Which framework owns this element (`win32`, `comctl`, `xaml`, `winui3`, `wpf`, `chromium`) |
+| `framework` | Which framework owns this element (`win32`, `comctl`, `xaml`, `winui3`) |
 | `className` | Win32 window class name (Win32/ComCtl elements) |
 | `text` | Visible text content or window title |
 | `bounds` | Screen-relative bounding rectangle `{x, y, width, height}` |
 | `children` | Nested child elements |
+
+### Key `--uia` element properties
+
+With `--uia`, elements carry automation identity instead of framework internals.
+These live under `properties` in JSON output:
+
+| Property | Description |
+|----------|-------------|
+| `AutomationId` | Stable, developer-assigned identifier — the best handle for a control |
+| `ControlType` | UIA control type (`Button`, `Edit`, `CheckBox`, `TreeItem`, …) |
+| `SupportedPatterns` | What the element can do (`Invoke`, `Value`, `Toggle`, `ExpandCollapse`, `Scroll`, …) |
+| `RuntimeId` | Per-element handle usable as `query uia:<RuntimeId>` |
+| `FrameworkId` | Underlying framework (`Win32`, `XAML`, `WPF`, `WinForm`, …) |
+| `IsEnabled`, `IsOffscreen`, `HasKeyboardFocus` | Whether the element is actually actionable right now |
+| `Value.Value`, `Toggle.ToggleState`, `ExpandCollapse.State` | Current state, present only when the owning pattern is supported |
+
+Pattern state is only emitted where the pattern is supported, so the presence of
+`Toggle.ToggleState` is itself a reliable signal that the element is checkable.
 
 ### JSON example
 
@@ -156,7 +246,7 @@ Every element gets a stable ID like `e0`, `e1`, `e2`, etc., assigned in depth-fi
 
 1. **Start the target app** if it isn't already running
 2. **Run `lvt --name <app> --format xml`** to get a quick overview of the UI tree
-3. **Take a screenshot** with `lvt --name <app> --screenshot ui.png` to see the visual layout with element IDs
+3. **Take a screenshot** with `lvt screenshot --name <app> --output ui.png` to see the visual layout with element IDs
 4. **Drill into a subtree** with `--element <id> --depth <n>` if the tree is large
 5. **Use element IDs and bounds** to plan any UI interactions (clicks, keyboard input)
 
@@ -166,25 +256,4 @@ Every element gets a stable ID like `e0`, `e1`, `e2`, etc., assigned in depth-fi
 - If the tree is very large, use `--depth` to limit traversal depth first, then drill deeper with `--element`
 - Element IDs change between invocations if the UI structure changes — always re-query before acting on stale IDs
 - The tool requires no special permissions beyond being able to read the target process (same user session)
-- For XAML/WinUI 3 apps, lvt injects a helper DLL into the target — this is safe and non-destructive but means `lvt_tap_{arch}.dll` must be next to `lvt.exe`
-- For WPF apps, lvt injects `lvt_wpf_tap_{arch}.dll` and the managed `LvtWpfTap.dll` — both must be next to `lvt.exe`
-- lvt.exe must match the target process architecture (x64, x86, or ARM64) — a clear error is shown on mismatch. Use `lvt-x86.exe` for 32-bit WPF apps.
-
-## Chrome/Edge DOM inspection (optional one-time setup)
-
-lvt can dump the DOM tree of web pages in Chrome and Edge. This requires a one-time setup:
-
-```powershell
-$lvtDir = "$env:USERPROFILE\.lvt"
-
-# 1. Register the native messaging host for Chrome and Edge
-& "$lvtDir\plugins\chromium\lvt_chromium_host.exe" --register
-
-# 2. Load the browser extension in Chrome or Edge:
-#    - Open chrome://extensions (or edge://extensions)
-#    - Enable "Developer mode"
-#    - Click "Load unpacked" → select the extension folder:
-Start-Process "$lvtDir\plugins\chromium\extension"
-```
-
-After setup, `lvt --name chrome` or `lvt --name msedge` will include the DOM tree of the active tab. If the extension is not installed, lvt still works for all other frameworks — it just won't show web content.
+- For XAML/WinUI 3 apps, lvt injects a helper DLL into the target — this is safe and non-destructive but means `lvt_tap.dll` must be next to `lvt.exe`

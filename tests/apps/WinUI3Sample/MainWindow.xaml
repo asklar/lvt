@@ -4,17 +4,36 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="LVT WinUI3 Sample">
 
-    <Grid x:Name="RootGrid" Padding="24" RowSpacing="12" Width="420" Height="260">
+    <Grid x:Name="RootGrid" Padding="24" RowSpacing="12" Width="460" Height="620">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
         <TextBlock x:Name="HeaderText" Text="LVT WinUI3 Sample" FontSize="24" />
         <TextBox x:Name="InputBox" Grid.Row="1" Header="Sample input" Text="Durable key text" />
-        <Button x:Name="PrimaryButton" Grid.Row="2" Content="Primary action" />
+        <Button x:Name="PrimaryButton" Grid.Row="2" Content="Primary action" Click="OnPrimaryClick" />
         <CheckBox x:Name="ReadyCheckBox" Grid.Row="3" Content="Ready" IsChecked="True" />
+        <!-- Gives interaction tests something observable to assert against:
+             a click has no effect a UIA walk can see unless it changes state. -->
+        <TextBlock x:Name="StatusText" Grid.Row="4" Text="clicks:0" />
+
+        <!-- The controls below exist so the interaction verbs have something to
+             act on: a slider for RangeValue, a combo box for ExpandCollapse and
+             Selection, and a long virtualized list for Scroll, SelectionItem
+             and VirtualizedItem.Realize. -->
+        <Slider x:Name="LevelSlider" Grid.Row="5" Minimum="0" Maximum="100" Value="25" />
+        <ComboBox x:Name="ChoiceCombo" Grid.Row="6" SelectedIndex="0" Width="200">
+            <ComboBoxItem Content="Alpha" />
+            <ComboBoxItem Content="Beta" />
+            <ComboBoxItem Content="Gamma" />
+        </ComboBox>
+        <ListView x:Name="ItemsList" Grid.Row="7" Height="220" SelectionMode="Multiple" />
     </Grid>
 </Window>
