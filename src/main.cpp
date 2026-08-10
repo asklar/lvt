@@ -9,6 +9,7 @@
 #include "wil_diagnostics.h"
 #ifdef LVT_ENABLE_UIA
 #include "providers/uia_provider.h"
+#include "providers/uia_actions.h"
 #endif
 
 #include "element_key.h"
@@ -41,64 +42,110 @@ static void print_usage() {
         "lvt - Live Visual Tree inspector\n"
         "\n"
         "Usage:\n"
-        "  lvt --hwnd <handle>  [options]\n"
-        "  lvt --pid <pid>      [options]\n"
-        "  lvt --name <exe>     [options]\n"
-        "  lvt --title <text>   [options]\n"
+        "  lvt [verb] [arguments] [options]\n"
         "\n"
-        "Options:\n"
+        "  A target is required: --hwnd, --pid, --name, or --title.\n"
+        "  The verb defaults to 'dump' when omitted.\n"
+        "\n"
+        "Inspection verbs:\n"
+        "  dump                     Output the element tree (default)\n"
+        "  screenshot               Capture an annotated PNG (see --output)\n"
+        "  frameworks               List the UI frameworks the target uses\n"
+        "  watch                    Emit live JSON tree diff events until Ctrl+C\n"
+        "  query <ref> [property]   Output one element, or one of its properties\n"
+        "\n"
+        "Interaction verbs (drive the app; each implies --uia):\n"
+        "  click <ref>              Invoke, else default action, else a real click\n"
+        "  right-click <ref>        Always a synthetic click\n"
+        "  double-click <ref>       Always a synthetic double click\n"
+        "  invoke <ref>             InvokePattern only, never a synthetic click\n"
+        "  toggle <ref>             Flip a checkbox or toggle button\n"
+        "  set-value <ref> <text>   Set a text, or numeric slider/spinner, value\n"
+        "  expand <ref> | collapse <ref>\n"
+        "  select <ref>             Select an item, replacing the selection\n"
+        "  add-to-selection <ref> | remove-from-selection <ref>\n"
+        "  select-text <ref> [text] Select a substring, or all text when omitted\n"
+        "  focus <ref>              Move keyboard focus to an element\n"
+        "  scroll <ref> <dir>       Scroll up, down, left, or right\n"
+        "  type <text>              Type text; add --focus-first <ref> to target it\n"
+        "  press-key <chord>        Send \"Ctrl+S\", or \"Enter;Tab\" for a sequence\n"
+        "  close | minimize | maximize | restore [<ref>]\n"
+        "                           Window commands; default to the target window\n"
+        "  wait-for <ref>           Block until an element appears\n"
+        "  wait-gone <ref>          Block until an element disappears\n"
+        "\n"
+        "A <ref> is an element id (e5), a durable key, or uia:<RuntimeId>.\n"
+        "\n"
+        "Target options:\n"
         "  --hwnd <handle>      Target window by HWND (hex, e.g. 0x1A0B3C)\n"
         "  --pid <pid>          Target process by PID (finds main window)\n"
         "  --name <exe>         Target by process name (e.g. notepad.exe)\n"
         "  --title <text>       Target by window title substring; with Chromium and\n"
         "                       --name/--pid/--hwnd, select tab by URL/title substring\n"
-        "  --output <file>      Write output to file instead of stdout\n"
+        "\n"
+        "Output options:\n"
+        "  --output <file>      Write to a file instead of stdout (or the PNG path)\n"
         "  --format <fmt>       Output format: json (default) or xml\n"
-        "  --screenshot <file>  Capture annotated screenshot to PNG\n"
+        "  --element <ref>      Scope the tree to one element's subtree\n"
+        "  --depth <n>          Max tree traversal depth (default: unlimited)\n"
+        "  --interval <ms>      Watch polling interval (default: 500)\n"
 #ifndef NDEBUG
         "  --annotations-json <file>  Write annotation rectangles as JSON (test hook)\n"
 #endif
-        "  --dump               Output the tree (default; implied unless --screenshot)\n"
-        "  --watch              Emit live JSON tree diff events until Ctrl+C\n"
-        "  --interval <ms>      Watch polling interval (default: 500)\n"
-        "  --element <ref>      Scope to a specific element subtree by id or key\n"
-        "  --query <ref> [prop] Output one element or one property by id or key\n"
-        "  --uia                Emit the UI Automation tree instead of the visual tree\n"
+        "\n"
+        "UI Automation options:\n"
+        "  --uia                Use the UI Automation tree instead of the visual tree\n"
         "  --uia-view <view>    UIA tree view: control (default), raw, or content\n"
         "  --uia-props <list>   Comma-separated extra UIA properties to include\n"
         "  --uia-timeout <ms>   UIA walk deadline (default: 10000; 0 leaves UIA's own)\n"
-        "  --frameworks         Just detect and list frameworks\n"
-        "  --depth <n>          Max tree traversal depth (default: unlimited)\n"
+        "\n"
+        "Interaction options:\n"
+        "  --focus-first <ref>  Focus this element before type / press-key\n"
+        "  --wait-prop <name=value>  Narrow wait-for to a property value\n"
+        "  --wait-timeout <ms>  How long wait-for / wait-gone block (default: 5000)\n"
+        "\n"
         "  --debug              Show verbose diagnostic output\n"
         "  --help               Show this help\n"
     );
 }
 
+// The verb selects what lvt does. Inspection verbs read; interaction verbs
+// drive the app. Keeping them positional makes them mutually exclusive by
+// construction, rather than by a runtime check across a dozen flags.
+enum class Verb {
+    dump, screenshot, frameworks, watch, query,
+    click, rightClick, doubleClick, invoke, toggle, setValue,
+    expand, collapse, select, addToSelection, removeFromSelection, selectText,
+    focus, scroll, type, pressKey,
+    close, minimize, maximize, restore,
+    waitFor, waitGone,
+};
+
 struct Args {
+    Verb verb = Verb::dump;
     HWND hwnd = nullptr;
     DWORD pid = 0;
     std::string processName;
     std::string windowTitle;
     std::string outputFile;
     std::string format = "json";
-    std::string screenshotFile;
 #ifndef NDEBUG
     std::string annotationsFile;
 #endif
     std::string elementId;
-    std::string queryId;
-    std::string queryProperty;
     std::string pluginOption;
+    // Positional arguments belonging to the verb, in order.
+    std::vector<std::string> verbArgs;
     bool uia = false;
     std::string uiaViewName = "control";
     std::vector<std::string> uiaProps;
     int uiaTimeoutMs = 10000;
+    std::string focusFirstRef;
+    std::string waitProperty;
+    std::string waitValue;
+    int waitTimeoutMs = 5000;
     int depth = -1;
     int intervalMs = 500;
-    bool frameworksOnly = false;
-    bool dump = false;      // explicitly requested via --dump
-    bool dumpSet = false;   // true if --dump was passed on command line
-    bool watch = false;
 };
 
 static std::vector<std::string> split_csv(const std::string& text) {
@@ -120,82 +167,210 @@ static std::vector<std::string> split_csv(const std::string& text) {
     return parts;
 }
 
+// Reject a value that is not a whole non-negative number, rather than letting
+// atoi turn a typo into 0.
+static int parse_non_negative_int(const char* text, const char* flag) {
+    char* end = nullptr;
+    const long value = strtol(text, &end, 10);
+    if (end == text || *end != '\0' || value < 0 || value > INT_MAX) {
+        fprintf(stderr, "lvt: %s must be a whole non-negative number\n", flag);
+        exit(1);
+    }
+    return static_cast<int>(value);
+}
+
+struct VerbSpec {
+    const char* name;
+    Verb verb;
+    int minArgs;
+    int maxArgs;
+    const char* usage;
+};
+
+// maxArgs of -1 means the verb takes an optional trailing argument.
+static const VerbSpec kVerbs[] = {
+    {"dump",                 Verb::dump,                0, 0, "dump"},
+    {"screenshot",           Verb::screenshot,          0, 0, "screenshot [--output <file>]"},
+    {"frameworks",           Verb::frameworks,          0, 0, "frameworks"},
+    {"watch",                Verb::watch,               0, 0, "watch"},
+    {"query",                Verb::query,               1, 2, "query <ref> [property]"},
+    {"click",                Verb::click,               1, 1, "click <ref>"},
+    {"right-click",          Verb::rightClick,          1, 1, "right-click <ref>"},
+    {"double-click",         Verb::doubleClick,         1, 1, "double-click <ref>"},
+    {"invoke",               Verb::invoke,              1, 1, "invoke <ref>"},
+    {"toggle",               Verb::toggle,              1, 1, "toggle <ref>"},
+    {"set-value",            Verb::setValue,            2, 2, "set-value <ref> <text>"},
+    {"expand",               Verb::expand,              1, 1, "expand <ref>"},
+    {"collapse",             Verb::collapse,            1, 1, "collapse <ref>"},
+    {"select",               Verb::select,              1, 1, "select <ref>"},
+    {"add-to-selection",     Verb::addToSelection,      1, 1, "add-to-selection <ref>"},
+    {"remove-from-selection", Verb::removeFromSelection, 1, 1, "remove-from-selection <ref>"},
+    {"select-text",          Verb::selectText,          1, 2, "select-text <ref> [text]"},
+    {"focus",                Verb::focus,               1, 1, "focus <ref>"},
+    {"scroll",               Verb::scroll,              2, 2, "scroll <ref> <up|down|left|right>"},
+    {"type",                 Verb::type,                1, 1, "type <text>"},
+    {"press-key",            Verb::pressKey,            1, 1, "press-key <chord>"},
+    {"close",                Verb::close,               0, 1, "close [<ref>]"},
+    {"minimize",             Verb::minimize,            0, 1, "minimize [<ref>]"},
+    {"maximize",             Verb::maximize,            0, 1, "maximize [<ref>]"},
+    {"restore",              Verb::restore,             0, 1, "restore [<ref>]"},
+    {"wait-for",             Verb::waitFor,             1, 1, "wait-for <ref>"},
+    {"wait-gone",            Verb::waitGone,            1, 1, "wait-gone <ref>"},
+};
+
+static const VerbSpec* find_verb(const std::string& name) {
+    for (const auto& spec : kVerbs) {
+        if (name == spec.name)
+            return &spec;
+    }
+    return nullptr;
+}
+
+static bool verb_drives_app(Verb verb) {
+    switch (verb) {
+    case Verb::dump: case Verb::screenshot: case Verb::frameworks:
+    case Verb::watch: case Verb::query:
+        return false;
+    default:
+        return true;
+    }
+}
+
+// These were flags before verbs existed. Failing with the replacement is far
+// more useful than "unknown argument", since the whole shape of the command
+// changed rather than just a spelling.
+static void reject_legacy_flag(const char* arg) {
+    struct Legacy { const char* flag; const char* replacement; };
+    static const Legacy kLegacy[] = {
+        {"--dump",       "the 'dump' verb (also the default): lvt dump --name <exe>"},
+        {"--screenshot", "the 'screenshot' verb: lvt screenshot --name <exe> --output <file>"},
+        {"--frameworks", "the 'frameworks' verb: lvt frameworks --name <exe>"},
+        {"--watch",      "the 'watch' verb: lvt watch --name <exe>"},
+        {"--query",      "the 'query' verb: lvt query <ref> [property] --name <exe>"},
+    };
+    for (const auto& legacy : kLegacy) {
+        if (strcmp(arg, legacy.flag) == 0) {
+            fprintf(stderr, "lvt: %s is now %s\n", legacy.flag, legacy.replacement);
+            fprintf(stderr, "lvt: run 'lvt --help' for the full verb list\n");
+            exit(1);
+        }
+    }
+}
+
 static Args parse_args(int argc, char* argv[]) {
     Args args;
+    const VerbSpec* spec = nullptr;
+
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+        const char* arg = argv[i];
+
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
             print_usage();
             exit(0);
-        } else if (strcmp(argv[i], "--hwnd") == 0 && i + 1 < argc) {
+        }
+
+        if (strncmp(arg, "--", 2) != 0) {
+            // A bare word is either the verb, when it comes first, or an
+            // argument to the verb already chosen.
+            if (!spec) {
+                spec = find_verb(arg);
+                if (!spec) {
+                    fprintf(stderr, "lvt: unknown verb '%s'\n", arg);
+                    fprintf(stderr, "lvt: run 'lvt --help' for the verb list\n");
+                    exit(1);
+                }
+                args.verb = spec->verb;
+                if (verb_drives_app(spec->verb))
+                    args.uia = true;
+                continue;
+            }
+            args.verbArgs.push_back(arg);
+            continue;
+        }
+
+        reject_legacy_flag(arg);
+
+        if (strcmp(arg, "--hwnd") == 0 && i + 1 < argc) {
             auto val = strtoull(argv[++i], nullptr, 0);
             args.hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(val));
-        } else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--pid") == 0 && i + 1 < argc) {
             args.pid = static_cast<DWORD>(strtoul(argv[++i], nullptr, 10));
-        } else if (strcmp(argv[i], "--name") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--name") == 0 && i + 1 < argc) {
             args.processName = argv[++i];
-        } else if (strcmp(argv[i], "--title") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--title") == 0 && i + 1 < argc) {
             args.windowTitle = argv[++i];
-        } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--output") == 0 && i + 1 < argc) {
             args.outputFile = argv[++i];
-        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--format") == 0 && i + 1 < argc) {
             args.format = argv[++i];
-        } else if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
-            args.screenshotFile = argv[++i];
 #ifndef NDEBUG
-        } else if (strcmp(argv[i], "--annotations-json") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--annotations-json") == 0 && i + 1 < argc) {
             args.annotationsFile = argv[++i];
 #endif
-        } else if (strcmp(argv[i], "--element") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--element") == 0 && i + 1 < argc) {
             args.elementId = argv[++i];
-        } else if (strcmp(argv[i], "--query") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "lvt: --query requires an element id or key\n");
-                exit(1);
-            }
-            args.queryId = argv[++i];
-            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0)
-                args.queryProperty = argv[++i];
-        } else if (strcmp(argv[i], "--depth") == 0 && i + 1 < argc) {
-            args.depth = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--uia") == 0) {
+        } else if (strcmp(arg, "--depth") == 0 && i + 1 < argc) {
+            args.depth = parse_non_negative_int(argv[++i], "--depth");
+        } else if (strcmp(arg, "--interval") == 0 && i + 1 < argc) {
+            args.intervalMs = parse_non_negative_int(argv[++i], "--interval");
+        } else if (strcmp(arg, "--uia") == 0) {
             args.uia = true;
-        } else if (strcmp(argv[i], "--uia-view") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--uia-view") == 0 && i + 1 < argc) {
             args.uia = true;
             args.uiaViewName = argv[++i];
-        } else if (strcmp(argv[i], "--uia-props") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--uia-props") == 0 && i + 1 < argc) {
             args.uia = true;
             args.uiaProps = split_csv(argv[++i]);
-        } else if (strcmp(argv[i], "--uia-timeout") == 0 && i + 1 < argc) {
+        } else if (strcmp(arg, "--uia-timeout") == 0 && i + 1 < argc) {
             args.uia = true;
-            // atoi would turn a typo into 0, which silently *disables* the
-            // deadline rather than rejecting the argument.
-            char* end = nullptr;
-            const long value = strtol(argv[++i], &end, 10);
-            if (end == argv[i] || *end != '\0' || value < 0) {
-                fprintf(stderr, "lvt: --uia-timeout must be a whole number of "
-                                "milliseconds (0 disables the deadline)\n");
+            args.uiaTimeoutMs = parse_non_negative_int(argv[++i], "--uia-timeout");
+        } else if (strcmp(arg, "--focus-first") == 0 && i + 1 < argc) {
+            args.focusFirstRef = argv[++i];
+            args.uia = true;
+        } else if (strcmp(arg, "--wait-prop") == 0 && i + 1 < argc) {
+            const std::string pair = argv[++i];
+            const size_t eq = pair.find('=');
+            if (eq == std::string::npos || eq == 0) {
+                fprintf(stderr, "lvt: --wait-prop must be <name>=<value>\n");
                 exit(1);
             }
-            args.uiaTimeoutMs = static_cast<int>(value);
-        } else if (strcmp(argv[i], "--watch") == 0) {
-            args.watch = true;
-        } else if (strcmp(argv[i], "--interval") == 0 && i + 1 < argc) {
-            args.intervalMs = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--frameworks") == 0) {
-            args.frameworksOnly = true;
-        } else if (strcmp(argv[i], "--dump") == 0) {
-            args.dump = true;
-            args.dumpSet = true;
-        } else if (strcmp(argv[i], "--debug") == 0) {
+            args.waitProperty = pair.substr(0, eq);
+            args.waitValue = pair.substr(eq + 1);
+        } else if (strcmp(arg, "--wait-timeout") == 0 && i + 1 < argc) {
+            args.waitTimeoutMs = parse_non_negative_int(argv[++i], "--wait-timeout");
+        } else if (strcmp(arg, "--debug") == 0) {
             lvt::g_debug = true;
         } else {
-            fprintf(stderr, "lvt: unknown argument '%s'\n", argv[i]);
+            fprintf(stderr, "lvt: unknown argument '%s'\n", arg);
             print_usage();
             exit(1);
         }
     }
+
+    if (!spec)
+        spec = find_verb("dump");
+
+    // A uia:<RuntimeId> reference only exists in a UIA tree, so asking for one
+    // implies that view. Without this the lookup would search the visual tree
+    // and report a confusing "not found".
+    auto impliesUia = [](const std::string& ref) {
+        return ref.rfind("uia:", 0) == 0;
+    };
+    if (impliesUia(args.elementId))
+        args.uia = true;
+    for (const auto& verbArg : args.verbArgs) {
+        if (impliesUia(verbArg))
+            args.uia = true;
+    }
+
+    const int count = static_cast<int>(args.verbArgs.size());
+    if (count < spec->minArgs || count > spec->maxArgs) {
+        fprintf(stderr, "lvt: usage: lvt %s\n", spec->usage);
+        exit(1);
+    }
     return args;
 }
+
 
 static std::vector<std::string> framework_names(const std::vector<lvt::FrameworkInfo>& frameworks) {
     std::vector<std::string> names;
@@ -402,6 +577,164 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     return 0;
 }
 
+// Translate a verb and its positional arguments into an action request. The
+// mapping lives here so uia_actions stays free of CLI shape.
+#ifdef LVT_ENABLE_UIA
+static bool build_action_request(const Args& args, lvt::ActionRequest& request) {
+    auto arg = [&](size_t index) -> std::string {
+        return index < args.verbArgs.size() ? args.verbArgs[index] : std::string();
+    };
+
+    switch (args.verb) {
+    case Verb::click:
+        request.kind = lvt::ActionKind::click;
+        request.elementRef = arg(0);
+        break;
+    case Verb::rightClick:
+        // No pattern expresses "right click", so this is always synthetic.
+        request.kind = lvt::ActionKind::click;
+        request.elementRef = arg(0);
+        request.button = 1;
+        request.forceSyntheticClick = true;
+        break;
+    case Verb::doubleClick:
+        request.kind = lvt::ActionKind::click;
+        request.elementRef = arg(0);
+        request.amount = 2;
+        request.forceSyntheticClick = true;
+        break;
+    case Verb::invoke:
+        request.kind = lvt::ActionKind::invoke;
+        request.elementRef = arg(0);
+        break;
+    case Verb::toggle:
+        request.kind = lvt::ActionKind::toggle;
+        request.elementRef = arg(0);
+        break;
+    case Verb::setValue:
+        request.kind = lvt::ActionKind::setValue;
+        request.elementRef = arg(0);
+        request.text = arg(1);
+        break;
+    case Verb::expand:
+        request.kind = lvt::ActionKind::expand;
+        request.elementRef = arg(0);
+        break;
+    case Verb::collapse:
+        request.kind = lvt::ActionKind::collapse;
+        request.elementRef = arg(0);
+        break;
+    case Verb::select:
+        request.kind = lvt::ActionKind::select;
+        request.elementRef = arg(0);
+        break;
+    case Verb::addToSelection:
+        request.kind = lvt::ActionKind::addToSelection;
+        request.elementRef = arg(0);
+        break;
+    case Verb::removeFromSelection:
+        request.kind = lvt::ActionKind::removeFromSelection;
+        request.elementRef = arg(0);
+        break;
+    case Verb::selectText:
+        request.kind = lvt::ActionKind::selectText;
+        request.elementRef = arg(0);
+        request.text = arg(1);
+        break;
+    case Verb::focus:
+        request.kind = lvt::ActionKind::focus;
+        request.elementRef = arg(0);
+        break;
+    case Verb::scroll:
+        request.kind = lvt::ActionKind::scroll;
+        request.elementRef = arg(0);
+        request.direction = arg(1);
+        if (request.direction != "up" && request.direction != "down" &&
+            request.direction != "left" && request.direction != "right") {
+            fprintf(stderr, "lvt: scroll direction must be up, down, left, or right\n");
+            return false;
+        }
+        break;
+    case Verb::type:
+        request.kind = lvt::ActionKind::typeText;
+        request.text = arg(0);
+        request.elementRef = args.focusFirstRef;
+        break;
+    case Verb::pressKey:
+        request.kind = lvt::ActionKind::pressKey;
+        request.text = arg(0);
+        request.elementRef = args.focusFirstRef;
+        break;
+    case Verb::close:
+    case Verb::minimize:
+    case Verb::maximize:
+    case Verb::restore:
+        request.kind = args.verb == Verb::close    ? lvt::ActionKind::windowClose
+                     : args.verb == Verb::minimize ? lvt::ActionKind::windowMinimize
+                     : args.verb == Verb::maximize ? lvt::ActionKind::windowMaximize
+                                                   : lvt::ActionKind::windowRestore;
+        // Window commands default to the target window itself, which is the
+        // root of the walk.
+        request.elementRef = args.verbArgs.empty() ? "e0" : arg(0);
+        break;
+    case Verb::waitFor:
+    case Verb::waitGone:
+        request.kind = args.verb == Verb::waitFor ? lvt::ActionKind::waitFor
+                                                  : lvt::ActionKind::waitGone;
+        request.elementRef = arg(0);
+        request.waitProperty = args.waitProperty;
+        request.waitValue = args.waitValue;
+        request.waitTimeoutMs = args.waitTimeoutMs;
+        break;
+    default:
+        return false;
+    }
+    return true;
+}
+#endif
+
+// Carry out an interaction and report the outcome as JSON on stdout, so a
+// caller can tell not just whether it worked but *how* — a UIA pattern and a
+// synthetic click have very different reliability.
+static int run_action(const lvt::TargetInfo& target, const Args& args) {
+#ifdef LVT_ENABLE_UIA
+    lvt::UiaOptions options;
+    if (!lvt::parse_uia_view(args.uiaViewName, options.view)) {
+        fprintf(stderr, "lvt: --uia-view must be raw, control, or content\n");
+        return 1;
+    }
+    options.extraProperties = args.uiaProps;
+    options.timeoutMs = args.uiaTimeoutMs;
+
+    lvt::ActionRequest request;
+    if (!build_action_request(args, request))
+        return 1;
+
+    const auto result = lvt::perform_action(target.hwnd, options, request);
+
+    nlohmann::json out;
+    out["action"] = lvt::action_kind_name(request.kind);
+    out["ok"] = result.ok;
+    if (!request.elementRef.empty())
+        out["element"] = request.elementRef;
+    if (!result.method.empty())
+        out["method"] = result.method;
+    if (!result.message.empty())
+        out["error"] = result.message;
+    if (result.hasElement)
+        out["result"] = query_element_to_json(result.element);
+
+    if (!write_output(args.outputFile, out.dump(2)))
+        return 1;
+    return result.ok ? 0 : 1;
+#else
+    (void)target; (void)args;
+    fprintf(stderr, "lvt: this build has UI Automation support compiled out "
+                    "(LVT_ENABLE_UIA=OFF), so interaction is unavailable\n");
+    return 1;
+#endif
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         print_usage();
@@ -420,16 +753,12 @@ int main(int argc, char* argv[]) {
     // Load plugins from %USERPROFILE%/.lvt/plugins/
     lvt::load_plugins();
 
-    // --dump is default unless --screenshot is specified without --dump
-    if (!args.dumpSet)
-        args.dump = args.screenshotFile.empty();
-
     if (args.intervalMs <= 0) {
         fprintf(stderr, "lvt: --interval must be greater than 0\n");
         return 1;
     }
-    if (args.watch && args.format != "json") {
-        fprintf(stderr, "lvt: --watch emits JSON events; --format must be json\n");
+    if (args.verb == Verb::watch && args.format != "json") {
+        fprintf(stderr, "lvt: watch emits JSON events; --format must be json\n");
         return 1;
     }
     if (args.format != "json" && args.format != "xml") {
@@ -513,10 +842,10 @@ int main(int argc, char* argv[]) {
     // Detect frameworks. Skipped for --uia, which reports the per-element
     // FrameworkId from UIA instead and needs no module enumeration.
     std::vector<lvt::FrameworkInfo> frameworks;
-    if (!args.uia || args.frameworksOnly)
+    if (!args.uia || args.verb == Verb::frameworks)
         frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
 
-    if (args.frameworksOnly) {
+    if (args.verb == Verb::frameworks) {
         // Just print detected frameworks
         for (auto& fi : frameworks) {
             auto name = lvt::framework_display_name(fi);
@@ -529,7 +858,13 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    if (args.watch) {
+    if (verb_drives_app(args.verb)) {
+        auto result = run_action(target, args);
+        lvt::unload_plugins();
+        return result;
+    }
+
+    if (args.verb == Verb::watch) {
         auto result = run_watch_loop(target, args);
         lvt::unload_plugins();
         return result;
@@ -552,19 +887,23 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (!args.queryId.empty()) {
-        auto* queryElement = lvt::find_element_by_ref(tree, args.queryId);
+    if (args.verb == Verb::query) {
+        const std::string& queryRef = args.verbArgs[0];
+        const std::string queryProperty =
+            args.verbArgs.size() > 1 ? args.verbArgs[1] : std::string();
+
+        auto* queryElement = lvt::find_element_by_ref(tree, queryRef);
         if (!queryElement) {
-            fprintf(stderr, "lvt: element '%s' not found\n", args.queryId.c_str());
+            fprintf(stderr, "lvt: element '%s' not found\n", queryRef.c_str());
             return 1;
         }
 
         std::string queryOutput;
-        if (!args.queryProperty.empty()) {
-            auto value = lvt::get_element_property(*queryElement, args.queryProperty);
+        if (!queryProperty.empty()) {
+            auto value = lvt::get_element_property(*queryElement, queryProperty);
             if (!value) {
                 fprintf(stderr, "lvt: property '%s' not found on element '%s'\n",
-                        args.queryProperty.c_str(), args.queryId.c_str());
+                        queryProperty.c_str(), queryRef.c_str());
                 return 1;
             }
             queryOutput = *value;
@@ -585,8 +924,7 @@ int main(int argc, char* argv[]) {
         lvt::trim_to_depth(*outputRoot, args.depth);
     }
 
-    // Serialize and output tree (unless suppressed by --screenshot without --dump)
-    if (args.dump) {
+    if (args.verb == Verb::dump) {
         auto frameworkNames = framework_names(frameworks);
         // In UIA mode the module-scan framework list is not what was walked;
         // report the view actually produced instead.
@@ -605,13 +943,18 @@ int main(int argc, char* argv[]) {
             return 1;
     }
 
-    // Screenshot
-    if (!args.screenshotFile.empty()) {
-        bool ok = lvt::capture_screenshot(target.hwnd, args.screenshotFile,
-                                          &tree, args.elementId);
-        if (ok && lvt::g_debug) {
-            fprintf(stderr, "lvt: saved screenshot to %s\n", args.screenshotFile.c_str());
+    if (args.verb == Verb::screenshot) {
+        // The verb decides the intent, so --output names the PNG here just as
+        // it names the tree file for dump.
+        const std::string path = args.outputFile.empty() ? "lvt-screenshot.png"
+                                                         : args.outputFile;
+        if (!lvt::capture_screenshot(target.hwnd, path, &tree, args.elementId)) {
+            fprintf(stderr, "lvt: could not capture a screenshot of this window\n");
+            lvt::unload_plugins();
+            return 1;
         }
+        if (lvt::g_debug)
+            fprintf(stderr, "lvt: saved screenshot to %s\n", path.c_str());
     }
 
 #ifndef NDEBUG

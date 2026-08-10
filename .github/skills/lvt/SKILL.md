@@ -1,11 +1,11 @@
 ---
 name: lvt
 description: >
-  Inspect running Windows application UIs using the lvt (Live Visual Tree) CLI tool.
+  Inspect and drive running Windows application UIs using the lvt (Live Visual Tree) CLI tool.
   Use this skill when you need to understand a Windows app's visual tree structure,
   read its UI Automation tree (AutomationIds, control types, supported patterns),
-  capture annotated screenshots, detect UI frameworks, or find specific UI elements
-  for verification or interaction planning.
+  capture annotated screenshots, detect UI frameworks, find specific UI elements,
+  or interact with an app by clicking, typing, toggling and waiting on its controls.
 ---
 
 # Inspect Windows application UI with lvt
@@ -19,7 +19,8 @@ Use `lvt` whenever you need to understand the visual content or structure of a r
 - **Screenshot capture** — take an annotated screenshot of an app with element IDs overlaid
 - **Framework detection** — determine which UI frameworks an app uses (Win32, ComCtl, XAML, WinUI 3)
 - **Automated UI interaction planning** — get element IDs and bounds to plan mouse clicks or keyboard input
-- **Automation identity** — get `AutomationId`s, control types, and supported patterns with `--uia` when you need to drive the app rather than just describe it
+- **Automation identity** — get `AutomationId`s, control types, and supported patterns with `--uia`
+- **Driving an app** — click, toggle, type, set values, and wait for the UI to settle
 
 ## Prerequisites
 
@@ -80,10 +81,11 @@ lvt --name notepad --output tree.json
 
 ```powershell
 # Screenshot only (no tree output)
-lvt --name notepad --screenshot out.png
+lvt screenshot --name notepad --output out.png
 
 # Screenshot + tree output together
-lvt --name notepad --screenshot out.png --dump
+lvt screenshot --name notepad --output out.png
+lvt dump --name notepad
 ```
 
 Screenshots are annotated with element IDs (e0, e1, …) overlaid on each element, making it easy to correlate visual positions with tree nodes.
@@ -94,13 +96,13 @@ When the full tree is too large, scope to a specific element:
 
 ```powershell
 # Only show element e5 and its descendants, up to 3 levels deep
-lvt --name myapp --element e5 --depth 3
+lvt dump --name myapp --element e5 --depth 3
 ```
 
 ### Detect frameworks only
 
 ```powershell
-lvt --name notepad --frameworks
+lvt frameworks --name notepad
 ```
 
 ### Get the UI Automation tree
@@ -111,13 +113,13 @@ automation client needs.
 
 ```powershell
 # Automation-grade view
-lvt --name myapp --uia
+lvt dump --uia --name myapp
 
 # Narrower (content) or wider (raw) views
-lvt --name myapp --uia --uia-view content
+lvt dump --uia --uia-view content --name myapp
 
 # Look up one element by its UIA RuntimeId
-lvt --name myapp --uia --query uia:42.3150138.4.5
+lvt query uia:42.3150138.4.5 --name myapp
 ```
 
 Prefer `--uia` when you want to answer "which control do I click, and can I?" —
@@ -128,6 +130,46 @@ element can actually do (`Invoke` = clickable, `Value` = settable text,
 `--uia` also works when the target's architecture differs from lvt's, which the
 visual tree cannot do.
 
+### Drive the app
+
+lvt can act on elements, not just read them. Every interaction verb resolves its
+`<ref>` against a UIA walk, so it implies `--uia`.
+
+```powershell
+# Click a button. Uses the Invoke pattern where possible, which does not steal
+# focus or move the cursor.
+lvt click e6 --name myapp
+
+# Flip a checkbox, set a text box, type, send a chord
+lvt toggle e7 --name myapp
+lvt set-value e4 "hello" --name myapp
+lvt type "some text" --focus-first e4 --name myapp
+lvt press-key "Ctrl+S" --name myapp
+
+# Wait for the UI to catch up before the next step
+lvt wait-for e9 --wait-prop IsEnabled=true --name myapp
+```
+
+The result JSON reports **how** the action was performed:
+
+```json
+{ "action": "click", "ok": true, "method": "InvokePattern",
+  "result": { "AutomationId": "PrimaryButton", "...": "..." } }
+```
+
+- `method` distinguishes a quiet UIA pattern from `SendInput`. Synthetic input
+  steals focus and needs the window on top; a pattern does not.
+- `result` is the element *after* the action, so the effect can be confirmed
+  without a second walk.
+- On failure `ok` is false, `error` explains whether the pattern was missing or
+  present but refused, and the exit code is non-zero.
+
+Use `SupportedPatterns` from the tree to choose the verb: `Invoke` means
+clickable, `Toggle` checkable, `Value` settable, `ExpandCollapse` expandable.
+
+After any action that changes the UI, prefer `wait-for` over sleeping, and
+address elements by durable key or `uia:<RuntimeId>` rather than `eN` when the
+tree may have changed shape.
 ## Interpreting the output
 
 ### Element IDs
@@ -160,7 +202,7 @@ These live under `properties` in JSON output:
 | `AutomationId` | Stable, developer-assigned identifier — the best handle for a control |
 | `ControlType` | UIA control type (`Button`, `Edit`, `CheckBox`, `TreeItem`, …) |
 | `SupportedPatterns` | What the element can do (`Invoke`, `Value`, `Toggle`, `ExpandCollapse`, `Scroll`, …) |
-| `RuntimeId` | Per-element handle usable as `--query uia:<RuntimeId>` |
+| `RuntimeId` | Per-element handle usable as `query uia:<RuntimeId>` |
 | `FrameworkId` | Underlying framework (`Win32`, `XAML`, `WPF`, `WinForm`, …) |
 | `IsEnabled`, `IsOffscreen`, `HasKeyboardFocus` | Whether the element is actually actionable right now |
 | `Value.Value`, `Toggle.ToggleState`, `ExpandCollapse.State` | Current state, present only when the owning pattern is supported |
@@ -200,7 +242,7 @@ Pattern state is only emitted where the pattern is supported, so the presence of
 
 1. **Start the target app** if it isn't already running
 2. **Run `lvt --name <app> --format xml`** to get a quick overview of the UI tree
-3. **Take a screenshot** with `lvt --name <app> --screenshot ui.png` to see the visual layout with element IDs
+3. **Take a screenshot** with `lvt screenshot --name <app> --output ui.png` to see the visual layout with element IDs
 4. **Drill into a subtree** with `--element <id> --depth <n>` if the tree is large
 5. **Use element IDs and bounds** to plan any UI interactions (clicks, keyboard input)
 

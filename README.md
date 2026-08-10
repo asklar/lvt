@@ -160,31 +160,48 @@ Instead of `lvt_copy_tap_dlls()` you can call `lvt::set_tap_directory()` at runt
 
 ### Usage
 
+lvt takes a verb, then arguments, then options. The verb defaults to `dump`.
+
 ```bash
-# Dump Notepad's visual tree as JSON
+# Dump Notepad's visual tree as JSON (dump is implied)
 lvt --name notepad
 
 # XML output
-lvt --name notepad --format xml
+lvt dump --name notepad --format xml
 
 # Capture annotated screenshot
-lvt --pid 1234 --screenshot out.png
+lvt screenshot --pid 1234 --output out.png
 
 # Just detect frameworks
-lvt --hwnd 0x1A0B3C --frameworks
+lvt frameworks --hwnd 0x1A0B3C
 
 # Scope to a subtree
-lvt --name myapp --element e5 --depth 3
+lvt dump --name myapp --element e5 --depth 3
 
 # Query an element by durable key or eN id
-lvt --name myapp --query "win32|Window|MyWindow/win32|Button|Button|Name:OK" text
-
-# Screenshot + tree dump together
-lvt --name notepad --screenshot out.png --dump
+lvt query "win32|Window|MyWindow/win32|Button|Button|Name:OK" text --name myapp
 
 # Watch for live tree changes as JSON diff events
-lvt --name notepad --watch --interval 250
+lvt watch --name notepad --interval 250
 ```
+
+Driving an app is the same shape — see [Interaction](#interaction) for the full list:
+
+```bash
+lvt click e6 --name myapp
+lvt set-value e4 "hello" --name myapp
+lvt wait-for e9 --wait-prop IsEnabled=true --name myapp
+```
+
+### Verbs
+
+| Verb | Description |
+|------|-------------|
+| `dump` | Output the element tree (default when no verb is given) |
+| `screenshot` | Capture an annotated PNG to `--output` |
+| `frameworks` | List the UI frameworks the target uses |
+| `watch` | Emit live JSON tree diff events until Ctrl+C |
+| `query <ref> [prop]` | Output one element, or one of its properties |
 
 ### Options
 
@@ -194,20 +211,19 @@ lvt --name notepad --watch --interval 250
 | `--pid <pid>` | Target process by PID |
 | `--name <exe>` | Target by process name (e.g. `notepad` or `notepad.exe`) |
 | `--title <text>` | Target by window title substring |
-| `--output <file>` | Write tree to file instead of stdout |
+| `--output <file>` | Write to a file instead of stdout, or the PNG path for `screenshot` |
 | `--format <fmt>` | `json` (default) or `xml` |
-| `--screenshot <file>` | Capture annotated screenshot to PNG |
-| `--dump` | Output the tree (default unless `--screenshot` is used) |
-| `--watch` | Emit live JSON tree diff events until Ctrl+C |
-| `--interval <ms>` | Polling interval for `--watch` (default: 500) |
+| `--interval <ms>` | Polling interval for `watch` (default: 500) |
 | `--element <ref>` | Scope to a specific element subtree by positional `eN` id, durable key, or `uia:<RuntimeId>` |
-| `--query <ref> [prop]` | Output an element, or one property, by positional `eN` id, durable key, or `uia:<RuntimeId>` |
-| `--uia` | Emit the UI Automation tree instead of the visual tree |
+| `--uia` | Use the UI Automation tree instead of the visual tree |
 | `--uia-view <view>` | UIA tree view: `control` (default), `raw`, or `content` |
 | `--uia-props <list>` | Comma-separated extra UIA properties to include |
 | `--uia-timeout <ms>` | Walk deadline (default: 10000). Caps how long UIA waits for any single provider response, and the traversal itself; a truncated tree is marked with a `Truncated` property on its root. `0` removes lvt's deadline, leaving UIA's own 20s default |
-| `--frameworks` | Just list detected frameworks |
 | `--depth <n>` | Max tree traversal depth |
+
+> **Upgrading from 0.2.x:** `--dump`, `--screenshot`, `--frameworks`, `--watch` and
+> `--query` are now verbs. Running the old flag prints the replacement. Target and
+> output flags are unchanged, and `lvt --name notepad` still dumps the tree.
 
 ## UI Automation tree (`--uia`)
 
@@ -217,16 +233,16 @@ the identifiers an automation client needs:
 
 ```powershell
 # Automation-grade view of an app
-lvt --name myapp --uia
+lvt dump --uia --name myapp
 
 # Everything UIA can see, including framework scaffolding
-lvt --name myapp --uia --uia-view raw
+lvt dump --uia --uia-view raw --name myapp
 
 # Add properties that are not in the default set
-lvt --name myapp --uia --uia-props ProviderDescription,IsPassword
+lvt dump --uia --uia-props ProviderDescription,IsPassword --name myapp
 
 # Address an element by its UIA RuntimeId
-lvt --name myapp --uia --query uia:42.3150138.4.5 AutomationId
+lvt query uia:42.3150138.4.5 AutomationId --name myapp
 ```
 
 Elements report `AutomationId`, `ControlType`, `LocalizedControlType`,
@@ -254,7 +270,7 @@ is not restricted to processes matching lvt's own architecture:
 
 ```powershell
 # x64 lvt.exe reading a 32-bit process — refused for the visual tree, fine for UIA
-lvt --pid 51748 --uia
+lvt dump --uia --pid 51748
 ```
 
 ### Relationship to the visual tree
@@ -264,6 +280,68 @@ framework-native APIs and never depends on UIA. `--uia` **replaces** it for that
 invocation rather than enriching it — the two are separate views of the same
 window. Reach for the visual tree for framework-native structure and internals,
 and `--uia` when you need automation identity and actionable state.
+
+## Interaction
+
+lvt can also *drive* an app. Every interaction verb implies `--uia`, because
+element references are resolved against a UIA walk and acting needs the patterns
+only that view exposes.
+
+```bash
+lvt click e6 --name myapp                 # Invoke, else default action, else a real click
+lvt toggle e7 --name myapp                # flip a checkbox
+lvt set-value e4 "hello" --name myapp     # text, or a numeric slider/spinner value
+lvt press-key "Ctrl+S" --name myapp       # or "Enter;Tab" for a sequence
+lvt wait-for e9 --wait-prop IsEnabled=true --name myapp
+```
+
+| Verb | Pattern used | Falls back to |
+|------|--------------|---------------|
+| `click <ref>` | `Invoke`, then `LegacyIAccessible.DoDefaultAction` | synthetic click |
+| `right-click <ref>` / `double-click <ref>` | — | always synthetic |
+| `invoke <ref>` | `Invoke` only | nothing; fails instead |
+| `toggle <ref>` | `Toggle` | — |
+| `set-value <ref> <text>` | `Value`, then `RangeValue` for numbers | focus + select-all + type |
+| `expand` / `collapse <ref>` | `ExpandCollapse` | — |
+| `select <ref>` | `SelectionItem.Select` | — |
+| `add-to-selection` / `remove-from-selection <ref>` | `SelectionItem` | — |
+| `select-text <ref> [text]` | `Text.FindText` + `Select` | — |
+| `focus <ref>` | `SetFocus` | — |
+| `scroll <ref> <dir>` | `Scroll`, then `ScrollItem.ScrollIntoView` | mouse wheel |
+| `type <text>` | — | synthetic; `--focus-first <ref>` to target |
+| `press-key <chord>` | — | synthetic |
+| `close` / `minimize` / `maximize` / `restore [<ref>]` | `Window` | — |
+| `wait-for` / `wait-gone <ref>` | polls a walk | — |
+
+**Pattern first, input second.** A UIA pattern does not steal focus, does not move
+the cursor, and works when the window is not on top. Synthetic input does all
+three, so it is only used when nothing else will do the job. The result JSON
+reports which was used:
+
+```json
+{ "action": "click", "ok": true, "method": "InvokePattern",
+  "result": { "AutomationId": "PrimaryButton", ... } }
+```
+
+`result` is the element *after* the action, so you can confirm the effect without
+a second walk. On failure, `error` says whether the pattern was missing or present
+but refused.
+
+**Virtualized items** are realized automatically — an item in a long list does not
+exist as an element until then, and `method` reports `VirtualizedItem.Realize+…`
+when that happened.
+
+**Waiting.** `wait-for` blocks until an element appears, or with `--wait-prop
+<name>=<value>` until it reports that value; `wait-gone` waits for it to
+disappear. Both stop at `--wait-timeout` (default 5000 ms) and exit non-zero on
+timeout, so a script can branch on it.
+
+**Repeating an action** is just repeating the command — there is no repeat count,
+since only the OS-interpreted sequences (double-click, key chords) need precise
+timing, and those are their own verbs. When repeating against content that
+*changes shape*, such as scrolling a virtualized list, address elements by durable
+key or `uia:<RuntimeId>` rather than `eN`: `eN` is positional, so it is stable
+only while the tree is.
 
 ## Output format
 

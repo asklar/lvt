@@ -12,6 +12,8 @@
 #include "providers/winforms_inject.h"
 #include "providers/uia_provider.h"
 #include "providers/uia_props.h"
+#include "input.h"
+#include "providers/uia_actions.h"
 #include <oleacc.h>
 #include <UIAutomation.h>
 #include "wil_diagnostics.h"
@@ -1446,4 +1448,107 @@ TEST(FindElementByRef, NormalizesAndValidatesUiaReferences) {
     // the id/key lookups and matching something unrelated.
     EXPECT_EQ(lvt::find_element_by_ref(root, "uia:not-an-id"), nullptr);
     EXPECT_EQ(lvt::find_element_by_ref(root, "uia:"), nullptr);
+}
+
+// --- Key chord parsing ---
+// press-key is the one interaction with no UIA pattern behind it, so the chord
+// grammar is the whole contract.
+
+TEST(KeyChord, ParsesBareKeys) {
+    lvt::KeyChord chord;
+    ASSERT_TRUE(lvt::parse_key_chord("Enter", chord));
+    EXPECT_EQ(chord.vk, VK_RETURN);
+    EXPECT_FALSE(chord.ctrl || chord.alt || chord.shift || chord.win);
+
+    ASSERT_TRUE(lvt::parse_key_chord("escape", chord));
+    EXPECT_EQ(chord.vk, VK_ESCAPE);
+    ASSERT_TRUE(lvt::parse_key_chord("F5", chord));
+    EXPECT_EQ(chord.vk, VK_F5);
+    ASSERT_TRUE(lvt::parse_key_chord("f12", chord));
+    EXPECT_EQ(chord.vk, VK_F12);
+    ASSERT_TRUE(lvt::parse_key_chord("PageDown", chord));
+    EXPECT_EQ(chord.vk, VK_NEXT);
+}
+
+TEST(KeyChord, ParsesModifiers) {
+    lvt::KeyChord chord;
+    ASSERT_TRUE(lvt::parse_key_chord("Ctrl+S", chord));
+    EXPECT_TRUE(chord.ctrl);
+    EXPECT_FALSE(chord.alt);
+    EXPECT_NE(chord.vk, 0);
+
+    ASSERT_TRUE(lvt::parse_key_chord("ctrl+shift+alt+F4", chord));
+    EXPECT_TRUE(chord.ctrl);
+    EXPECT_TRUE(chord.shift);
+    EXPECT_TRUE(chord.alt);
+    EXPECT_EQ(chord.vk, VK_F4);
+
+    ASSERT_TRUE(lvt::parse_key_chord("Control+Home", chord));
+    EXPECT_TRUE(chord.ctrl);
+    EXPECT_EQ(chord.vk, VK_HOME);
+}
+
+TEST(KeyChord, ShiftedCharactersCarryTheirOwnModifier) {
+    // VkKeyScan reports the shift state a character needs, so an uppercase
+    // letter must not silently type a lowercase one.
+    lvt::KeyChord upper;
+    ASSERT_TRUE(lvt::parse_key_chord("A", upper));
+    lvt::KeyChord lower;
+    ASSERT_TRUE(lvt::parse_key_chord("a", lower));
+    EXPECT_EQ(upper.vk, lower.vk);
+    EXPECT_TRUE(upper.shift);
+    EXPECT_FALSE(lower.shift);
+}
+
+TEST(KeyChord, HandlesPlusAsAKey) {
+    // "Ctrl++" is a real accelerator (zoom in), and naive splitting on '+'
+    // turns it into a trailing empty token.
+    lvt::KeyChord chord;
+    ASSERT_TRUE(lvt::parse_key_chord("Ctrl++", chord));
+    EXPECT_TRUE(chord.ctrl);
+    EXPECT_NE(chord.vk, 0);
+}
+
+TEST(KeyChord, RejectsMalformedInput) {
+    lvt::KeyChord chord;
+    EXPECT_FALSE(lvt::parse_key_chord("", chord));
+    EXPECT_FALSE(lvt::parse_key_chord("   ", chord));
+    EXPECT_FALSE(lvt::parse_key_chord("Ctrl+", chord));
+    EXPECT_FALSE(lvt::parse_key_chord("Ctrl", chord));      // modifier with no key
+    EXPECT_FALSE(lvt::parse_key_chord("NotAKey", chord));
+    EXPECT_FALSE(lvt::parse_key_chord("F0", chord));
+    EXPECT_FALSE(lvt::parse_key_chord("F25", chord));
+    EXPECT_FALSE(lvt::parse_key_chord("Bogus+A", chord));   // unknown modifier
+}
+
+TEST(KeyChord, ParsesSequences) {
+    std::vector<lvt::KeyChord> chords;
+    ASSERT_TRUE(lvt::parse_key_chords("Ctrl+A;Delete", chords));
+    ASSERT_EQ(chords.size(), 2u);
+    EXPECT_TRUE(chords[0].ctrl);
+    EXPECT_EQ(chords[1].vk, VK_DELETE);
+
+    ASSERT_TRUE(lvt::parse_key_chords("Enter, Tab , Escape", chords));
+    ASSERT_EQ(chords.size(), 3u);
+    EXPECT_EQ(chords[0].vk, VK_RETURN);
+    EXPECT_EQ(chords[1].vk, VK_TAB);
+    EXPECT_EQ(chords[2].vk, VK_ESCAPE);
+
+    // One bad chord fails the whole sequence rather than silently sending part.
+    EXPECT_FALSE(lvt::parse_key_chords("Enter;NotAKey", chords));
+    EXPECT_FALSE(lvt::parse_key_chords("", chords));
+}
+
+TEST(ActionKind, ParsesAndRoundTripsNames) {
+    lvt::ActionKind kind;
+    ASSERT_TRUE(lvt::parse_action_kind("click", kind));
+    EXPECT_EQ(kind, lvt::ActionKind::click);
+    ASSERT_TRUE(lvt::parse_action_kind("set-value", kind));
+    EXPECT_EQ(kind, lvt::ActionKind::setValue);
+    ASSERT_TRUE(lvt::parse_action_kind("SetValue", kind));
+    EXPECT_EQ(kind, lvt::ActionKind::setValue);
+    EXPECT_FALSE(lvt::parse_action_kind("nonsense", kind));
+
+    EXPECT_STREQ(lvt::action_kind_name(lvt::ActionKind::click), "click");
+    EXPECT_STREQ(lvt::action_kind_name(lvt::ActionKind::setValue), "set-value");
 }

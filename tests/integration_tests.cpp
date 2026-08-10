@@ -186,7 +186,7 @@ TEST_F(NotepadFixture, TargetInfo) {
 
 TEST_F(NotepadFixture, FrameworkDetection) {
     auto lvt = get_lvt_path();
-    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " frameworks"));
     ASSERT_FALSE(output.empty());
     // Notepad should at least have win32
     EXPECT_NE(output.find("win32"), std::string::npos);
@@ -245,10 +245,10 @@ TEST_F(NotepadFixture, ScreenshotCapture) {
     fs::remove(tmpFile);
 
     auto output = run_command(make_cmd(lvt,
-        get_pid_arg() + " --screenshot " + tmpFile.string()));
+        get_pid_arg() + " screenshot --output " + tmpFile.string()));
 
-    // --screenshot without --dump should produce no stdout
-    EXPECT_TRUE(output.empty()) << "stdout should be empty with --screenshot only";
+    // the screenshot verb writes a PNG, not a tree, so stdout stays empty
+    EXPECT_TRUE(output.empty()) << "the screenshot verb should not write a tree to stdout";
     // File should exist and be a valid PNG
     EXPECT_TRUE(fs::exists(tmpFile)) << "Screenshot file was not created";
     if (fs::exists(tmpFile)) {
@@ -266,23 +266,23 @@ TEST_F(NotepadFixture, ScreenshotCapture) {
     fs::remove(tmpFile);
 }
 
-TEST_F(NotepadFixture, ScreenshotWithDump) {
+TEST_F(NotepadFixture, ScreenshotAndDumpAreSeparateInvocations) {
+    // `--screenshot <file> --dump` used to do both at once. Splitting the verbs
+    // makes that two commands, which is the trade for each verb having one job.
     auto lvt = get_lvt_path();
     auto tmpFile = fs::path(lvt).parent_path() / "lvt_test_both.png";
     fs::remove(tmpFile);
 
-    auto output = run_command(make_cmd(lvt,
-        get_pid_arg() + " --screenshot " + tmpFile.string() + " --dump"));
-
-    // Should have both tree output and screenshot file
-    EXPECT_FALSE(output.empty()) << "stdout should have tree output with --dump";
-    EXPECT_TRUE(fs::exists(tmpFile)) << "Screenshot file was not created";
-
-    if (!output.empty()) {
-        auto j = json::parse(output, nullptr, false);
-        EXPECT_FALSE(j.is_discarded()) << "stdout should be valid JSON";
-    }
+    auto shot = run_command(make_cmd(lvt,
+        get_pid_arg() + " screenshot --output " + tmpFile.string()));
+    EXPECT_TRUE(shot.empty()) << "the screenshot verb should not write a tree to stdout";
+    ASSERT_TRUE(fs::exists(tmpFile)) << "Screenshot file was not created";
     fs::remove(tmpFile);
+
+    auto dumped = run_command(make_cmd(lvt, get_pid_arg() + " dump"));
+    ASSERT_FALSE(dumped.empty()) << "the dump verb should write a tree to stdout";
+    auto j = json::parse(dumped, nullptr, false);
+    EXPECT_FALSE(j.is_discarded()) << "stdout should be valid JSON";
 }
 
 TEST_F(NotepadFixture, OutputToFile) {
@@ -551,7 +551,7 @@ static json query_element_until(const std::string& lvt, const std::string& pidAr
                                 int attempts = 40) {
     json q;
     for (int i = 0; i < attempts; ++i) {
-        auto out = run_command(make_cmd(lvt, pidArg + " --query " + cmd_escape_arg(ref)));
+        auto out = run_command(make_cmd(lvt, pidArg + " query " + cmd_escape_arg(ref)));
         q = json::parse(out, nullptr, false);
         if (!q.is_discarded() && q.value("key", "") == expectedKey)
             return q;
@@ -566,7 +566,7 @@ static std::string query_prop_until(const std::string& lvt, const std::string& p
                                     const std::string& expected, int attempts = 40) {
     std::string r;
     for (int i = 0; i < attempts; ++i) {
-        r = trim_crlf(run_command(make_cmd(lvt, pidArg + " --query " + cmd_escape_arg(ref) + " " + prop)));
+        r = trim_crlf(run_command(make_cmd(lvt, pidArg + " query " + cmd_escape_arg(ref) + " " + prop)));
         if (r == expected)
             return r;
         Sleep(500);
@@ -845,7 +845,7 @@ TEST_F(WinFormsSampleFixture, DetectsWinFormsFramework) {
     SkipIfNotReady();
 
     auto lvt = get_lvt_path();
-    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " frameworks"));
     ASSERT_FALSE(output.empty());
     EXPECT_NE(output.find("winforms"), std::string::npos);
 }
@@ -1275,10 +1275,10 @@ TEST_F(NotepadFixture, QueryByIdAndDurableKey) {
     auto rootKey = j["root"].value("key", "");
     ASSERT_FALSE(rootKey.empty());
 
-    auto byId = run_command(make_cmd(lvt, get_pid_arg() + " --query e0 type"));
+    auto byId = run_command(make_cmd(lvt, get_pid_arg() + " query e0 type"));
     EXPECT_EQ(trim_crlf(byId), j["root"].value("type", ""));
 
-    auto byKey = run_command(make_cmd(lvt, get_pid_arg() + " --query " + cmd_escape_arg(rootKey) + " id"));
+    auto byKey = run_command(make_cmd(lvt, get_pid_arg() + " query " + cmd_escape_arg(rootKey) + " id"));
     EXPECT_EQ(trim_crlf(byKey), "e0");
 }
 
@@ -1329,7 +1329,7 @@ TEST_F(NotepadFixture, AnnotationsMatchTreeElements) {
     fs::remove(annFile);
 
     auto output = run_command(make_cmd(lvt,
-        get_pid_arg() + " --dump --annotations-json " + annFile.string()));
+        get_pid_arg() + " dump --annotations-json " + annFile.string()));
 
     auto tree = json::parse(output, nullptr, false);
     ASSERT_FALSE(tree.is_discarded());
@@ -1565,7 +1565,7 @@ protected:
 
 TEST_F(ComCtlWindowFixture, DetectsComCtlAndEnrichesItems) {
     auto lvt = get_lvt_path();
-    auto fwOutput = run_command(make_cmd(lvt, get_hwnd_arg() + " --frameworks"));
+    auto fwOutput = run_command(make_cmd(lvt, get_hwnd_arg() + " frameworks"));
     ASSERT_FALSE(fwOutput.empty());
     EXPECT_NE(fwOutput.find("win32"), std::string::npos);
     EXPECT_NE(fwOutput.find("comctl"), std::string::npos);
@@ -1645,7 +1645,7 @@ TEST_F(ComCtlWindowFixture, DurableKeysCoverFullStaticTreeAndQueryRoundTrips) {
     auto key = item->value("key", "");
     ASSERT_FALSE(key.empty());
 
-    auto byKey = run_command(make_cmd(lvt, get_hwnd_arg() + " --query " + cmd_escape_arg(key) + " index"));
+    auto byKey = run_command(make_cmd(lvt, get_hwnd_arg() + " query " + cmd_escape_arg(key) + " index"));
     EXPECT_EQ(trim_crlf(byKey), "0");
 }
 
@@ -1654,7 +1654,7 @@ TEST_F(ComCtlWindowFixture, DurableKeysCoverFullStaticTreeAndQueryRoundTrips) {
 TEST_F(NotepadFixture, WinUI3BoundsIfDetected) {
     // If WinUI3 framework is detected, verify XAML element bounds are reasonable
     auto lvt = get_lvt_path();
-    auto fwOutput = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
+    auto fwOutput = run_command(make_cmd(lvt, get_pid_arg() + " frameworks"));
     if (fwOutput.find("winui3") == std::string::npos) {
         GTEST_SKIP() << "WinUI3 not detected for this Notepad instance";
     }
@@ -1696,7 +1696,7 @@ TEST_F(NotepadFixture, WinUI3BoundsIfDetected) {
 TEST_F(NotepadFixture, XamlBoundsIfDetected) {
     // If XAML framework is detected (UWP), verify element bounds are reasonable
     auto lvt = get_lvt_path();
-    auto fwOutput = run_command(make_cmd(lvt, get_pid_arg() + " --frameworks"));
+    auto fwOutput = run_command(make_cmd(lvt, get_pid_arg() + " frameworks"));
     if (fwOutput.find("xaml") == std::string::npos) {
         GTEST_SKIP() << "XAML (UWP) not detected for this Notepad instance";
     }
@@ -1890,7 +1890,7 @@ TEST_F(KnownWindowFixture, AnnotationsIncludeKnownControls) {
     fs::remove(annFile);
 
     auto output = run_command(make_cmd(lvt,
-        get_hwnd_arg() + " --dump --annotations-json " + annFile.string()));
+        get_hwnd_arg() + " dump --annotations-json " + annFile.string()));
     auto tree = json::parse(output, nullptr, false);
     ASSERT_FALSE(tree.is_discarded());
 
@@ -2078,7 +2078,7 @@ TEST_F(WinUI3SampleFixture, UiaElementsCarryDurableKeysAndResolveByRuntimeId) {
     ASSERT_FALSE(runtimeId.empty());
 
     auto queried = run_command(make_cmd(
-        lvt, get_pid_arg() + " --uia --query uia:" + runtimeId + " AutomationId"));
+        lvt, get_pid_arg() + " query uia:" + runtimeId + " AutomationId"));
     // Trim the trailing newline the CLI writes.
     while (!queried.empty() && (queried.back() == '\n' || queried.back() == '\r'))
         queried.pop_back();
@@ -2163,7 +2163,7 @@ TEST_F(WinUI3SampleFixture, UiaTreeDrivesScreenshotAnnotations) {
     fs::remove(annFile);
 
     run_command(make_cmd(lvt,
-        get_pid_arg() + " --uia --dump --annotations-json " + annFile.string()));
+        get_pid_arg() + " dump --uia --annotations-json " + annFile.string()));
 
     ASSERT_TRUE(fs::exists(annFile)) << "no annotations produced for a UIA tree";
     std::string content;
@@ -2234,7 +2234,7 @@ TEST_F(WinUI3SampleFixture, UiaWatchEmitsAddedEvents) {
     PROCESS_INFORMATION pi{};
 
     auto lvt = get_lvt_path();
-    std::string cmd = make_cmd(lvt, get_pid_arg() + " --uia --watch --interval 500");
+    std::string cmd = make_cmd(lvt, get_pid_arg() + " watch --uia --interval 500");
     ASSERT_TRUE(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
                                CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi));
     wil::unique_handle process(pi.hProcess);
@@ -2500,4 +2500,200 @@ TEST_F(WinUI3SampleFixture, UiaEmitsEnumNamesNotRawNumbers) {
         }
     }
     EXPECT_GT(checked, 0) << "no enum-valued properties were present to check";
+}
+
+// --- Interaction verbs ---
+// These assert that lvt actually drives the app, not merely that a command
+// returned success: each checks an observable change in the target's own tree.
+
+namespace {
+
+json run_action_json(const std::string& lvt, const std::string& args) {
+    auto output = run_command(make_cmd(lvt, args));
+    auto j = json::parse(output, nullptr, false);
+    EXPECT_FALSE(j.is_discarded()) << "action produced no JSON:\n" << output;
+    return j;
+}
+
+// Read one AutomationId's element out of a fresh UIA walk.
+json uia_element(const std::string& lvt, const std::string& pidArg,
+                 const std::string& automationId) {
+    auto tree = json::parse(run_command(make_cmd(lvt, pidArg + " dump --uia")), nullptr, false);
+    if (tree.is_discarded() || !tree.contains("root"))
+        return json();
+    const json* found = find_by_automation_id(tree["root"], automationId);
+    return found ? *found : json();
+}
+
+} // namespace
+
+TEST_F(WinUI3SampleFixture, ClickInvokesThroughAPatternAndChangesTheApp) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    const auto before = uia_element(lvt, get_pid_arg(), "StatusText");
+    ASSERT_FALSE(before.is_null());
+    const auto beforeText = before.value("text", "");
+    ASSERT_FALSE(beforeText.empty());
+
+    auto button = uia_element(lvt, get_pid_arg(), "PrimaryButton");
+    ASSERT_FALSE(button.is_null());
+    const auto ref = "uia:" + uia_prop(button, "RuntimeId");
+
+    auto result = run_action_json(lvt, get_pid_arg() + " click " + ref);
+    EXPECT_TRUE(result.value("ok", false)) << result.dump(2);
+    // A button exposes Invoke, so this must not fall back to synthetic input:
+    // the pattern route neither steals focus nor moves the cursor.
+    EXPECT_EQ(result.value("method", ""), "InvokePattern");
+
+    const auto after = uia_element(lvt, get_pid_arg(), "StatusText");
+    ASSERT_FALSE(after.is_null());
+    EXPECT_NE(after.value("text", ""), beforeText)
+        << "the click reported success but the app did not react";
+}
+
+TEST_F(WinUI3SampleFixture, ToggleFlipsCheckboxState) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    auto before = uia_element(lvt, get_pid_arg(), "ReadyCheckBox");
+    ASSERT_FALSE(before.is_null());
+    const auto beforeState = uia_prop(before, "Toggle.ToggleState");
+    ASSERT_FALSE(beforeState.empty());
+    const auto ref = "uia:" + uia_prop(before, "RuntimeId");
+
+    auto result = run_action_json(lvt, get_pid_arg() + " toggle " + ref);
+    EXPECT_TRUE(result.value("ok", false)) << result.dump(2);
+    EXPECT_EQ(result.value("method", ""), "TogglePattern");
+
+    auto after = uia_element(lvt, get_pid_arg(), "ReadyCheckBox");
+    ASSERT_FALSE(after.is_null());
+    EXPECT_NE(uia_prop(after, "Toggle.ToggleState"), beforeState);
+
+    // Put it back, so the ordering of tests in this fixture does not matter.
+    run_command(make_cmd(lvt, get_pid_arg() + " toggle " + ref));
+}
+
+TEST_F(WinUI3SampleFixture, SetValueWritesThroughTheValuePattern) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    auto box = uia_element(lvt, get_pid_arg(), "InputBox");
+    ASSERT_FALSE(box.is_null());
+    const auto ref = "uia:" + uia_prop(box, "RuntimeId");
+    const auto original = uia_prop(box, "Value.Value");
+
+    auto result = run_action_json(lvt,
+        get_pid_arg() + " set-value " + ref + " written-by-a-test");
+    EXPECT_TRUE(result.value("ok", false)) << result.dump(2);
+    EXPECT_EQ(result.value("method", ""), "ValuePattern");
+
+    auto after = uia_element(lvt, get_pid_arg(), "InputBox");
+    ASSERT_FALSE(after.is_null());
+    EXPECT_EQ(uia_prop(after, "Value.Value"), "written-by-a-test");
+
+    // Restore, so this fixture's tests do not depend on running order.
+    if (!original.empty())
+        run_command(make_cmd(lvt, get_pid_arg() + " set-value " + ref + " " +
+                                      cmd_escape_arg(original)));
+}
+
+TEST_F(WinUI3SampleFixture, ActionResultReportsHowItWasPerformed) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    // A caller needs to distinguish a quiet pattern call from synthetic input,
+    // because only the latter steals focus and depends on window ordering.
+    auto button = uia_element(lvt, get_pid_arg(), "PrimaryButton");
+    ASSERT_FALSE(button.is_null());
+    const auto ref = "uia:" + uia_prop(button, "RuntimeId");
+
+    auto viaPattern = run_action_json(lvt, get_pid_arg() + " click " + ref);
+    EXPECT_EQ(viaPattern.value("method", ""), "InvokePattern");
+
+    // double-click has no pattern equivalent, so it must say it used SendInput
+    // rather than quietly invoking once and claiming success.
+    auto viaInput = run_action_json(lvt, get_pid_arg() + " double-click " + ref);
+    EXPECT_TRUE(viaInput.value("ok", false)) << viaInput.dump(2);
+    EXPECT_EQ(viaInput.value("method", ""), "SendInput");
+}
+
+TEST_F(WinUI3SampleFixture, InvokeRefusesElementsWithoutThePattern) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    auto check = uia_element(lvt, get_pid_arg(), "ReadyCheckBox");
+    ASSERT_FALSE(check.is_null());
+    const auto ref = "uia:" + uia_prop(check, "RuntimeId");
+
+    // A checkbox toggles, it does not invoke. The strict verb must say so
+    // rather than falling back to a click that happens to work.
+    auto result = run_action_json(lvt, get_pid_arg() + " invoke " + ref);
+    EXPECT_FALSE(result.value("ok", true));
+    EXPECT_NE(result.value("error", "").find("Invoke"), std::string::npos)
+        << result.dump(2);
+}
+
+TEST_F(WinUI3SampleFixture, WindowVerbsChangeVisualState) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    auto minimized = run_action_json(lvt, get_pid_arg() + " minimize");
+    EXPECT_TRUE(minimized.value("ok", false)) << minimized.dump(2);
+    EXPECT_NE(minimized.value("method", "").find("WindowPattern"), std::string::npos);
+
+    auto restored = run_action_json(lvt, get_pid_arg() + " restore");
+    EXPECT_TRUE(restored.value("ok", false)) << restored.dump(2);
+
+    auto tree = json::parse(run_command(make_cmd(lvt, get_pid_arg() + " dump --uia")),
+                            nullptr, false);
+    ASSERT_FALSE(tree.is_discarded());
+    EXPECT_EQ(uia_prop(tree["root"], "Window.WindowVisualState"), "Normal");
+}
+
+TEST_F(WinUI3SampleFixture, WaitForReturnsImmediatelyWhenSatisfied) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    auto check = uia_element(lvt, get_pid_arg(), "ReadyCheckBox");
+    ASSERT_FALSE(check.is_null());
+    const auto ref = "uia:" + uia_prop(check, "RuntimeId");
+    const auto state = uia_prop(check, "Toggle.ToggleState");
+
+    auto present = run_action_json(lvt, get_pid_arg() + " wait-for " + ref);
+    EXPECT_TRUE(present.value("ok", false)) << present.dump(2);
+
+    auto withProp = run_action_json(lvt,
+        get_pid_arg() + " wait-for " + ref + " --wait-prop Toggle.ToggleState=" + state);
+    EXPECT_TRUE(withProp.value("ok", false)) << withProp.dump(2);
+}
+
+TEST_F(WinUI3SampleFixture, WaitForTimesOutWithAnActionableMessage) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    auto check = uia_element(lvt, get_pid_arg(), "ReadyCheckBox");
+    ASSERT_FALSE(check.is_null());
+    const auto ref = "uia:" + uia_prop(check, "RuntimeId");
+
+    const auto start = GetTickCount64();
+    auto result = run_action_json(lvt, get_pid_arg() + " wait-for " + ref +
+        " --wait-prop Toggle.ToggleState=Indeterminate --wait-timeout 900");
+    const auto elapsed = GetTickCount64() - start;
+
+    EXPECT_FALSE(result.value("ok", true));
+    EXPECT_NE(result.value("error", "").find("timed out"), std::string::npos)
+        << result.dump(2);
+    // It must actually wait rather than returning at once, and must not hang.
+    EXPECT_GE(elapsed, 800u);
+    EXPECT_LT(elapsed, 20000u);
+}
+
+TEST_F(WinUI3SampleFixture, ActionsReportFailureForUnknownElements) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    auto result = run_action_json(lvt, get_pid_arg() + " click uia:99.99.99");
+    EXPECT_FALSE(result.value("ok", true));
+    EXPECT_FALSE(result.value("error", "").empty());
 }
