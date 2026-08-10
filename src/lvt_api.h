@@ -23,12 +23,19 @@ extern "C" {
 
 // Invoke a method. `params_json` may be NULL for methods that take none.
 //
+// `allow_input` mirrors the server's --allow-input: it gates every method that
+// can change something outside lvt. That is not only the input methods — a
+// screenshot written to a caller-chosen path creates or truncates that file, so
+// it is a write too, and a server described to a model as read-only must not
+// offer one.
+//
 // Returns 0 on success. On failure returns non-zero and, where possible, still
 // writes a JSON object describing the error, so a caller always has something
 // structured to report rather than a bare code.
 //
 // `*result_json` is set to a NUL-terminated UTF-8 JSON string owned by lvt.
-int32_t lvt_api_call(const char* method, const char* params_json, char** result_json);
+int32_t lvt_api_call(const char* method, const char* params_json, int32_t allow_input,
+                     char** result_json);
 
 // Release a string produced by lvt_api_call. Safe to call with NULL.
 void lvt_api_free(char* result_json);

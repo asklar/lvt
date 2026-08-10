@@ -109,19 +109,30 @@ pub struct ElementPropertiesArgs {
     pub uia: Option<bool>,
     /// UIA tree view: "control" (default), "content", or "raw".
     pub view: Option<String>,
+    /// How long the UI Automation walk may take, in milliseconds (default
+    /// 10000). Raise this if a result comes back marked "truncated".
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScreenshotArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Write the PNG here instead of returning the image inline. Use this for
-    /// large windows, where an inline image costs a lot of context.
+    /// Write the PNG here instead of returning the image inline. Creates or
+    /// overwrites the file, so it needs --allow-input. Use it for large
+    /// windows, where an inline image costs a lot of context.
     pub path: Option<String>,
     /// Annotate only this element and its descendants.
     pub element: Option<String>,
-    /// Annotate using the UIA tree rather than the visual tree.
+    /// Annotate using the UIA tree (default) or the framework-native visual
+    /// tree. Leave this alone unless you specifically want visual-tree ids:
+    /// the ids drawn on the image only mean anything to the other tools if
+    /// they come from the same tree those tools resolve against.
     pub uia: Option<bool>,
+    /// How long the UI Automation walk may take, in milliseconds (default 10000).
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -136,6 +147,10 @@ pub struct HitTestArgs {
     pub uia: Option<bool>,
     /// UIA tree view: "control" (default), "content", or "raw".
     pub view: Option<String>,
+    /// How long the UI Automation walk may take, in milliseconds (default
+    /// 10000). Raise this if a result comes back marked "truncated".
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -278,15 +293,45 @@ pub struct LvtServer {
 
 /// Forwards to lvt and turns the result into MCP content.
 ///
+/// The FFI call runs on the blocking pool, not on a worker thread. That is not
+/// a refinement: `ffi::call` is synchronous and can take many seconds — a UIA
+/// walk of a busy app, or a `wait_for` blocking on its deadline — and it may
+/// also park on lvt's per-target mutex. rmcp dispatches every request as its
+/// own task, and the task that reads stdin lives on the same runtime, so two
+/// concurrent blocking calls on a two-worker runtime starve the reader and the
+/// server stops accepting requests entirely. Measured before this: one
+/// in-flight `wait_for` left an unrelated `list_apps` at 0.07s, two pushed it
+/// to 11.14s.
+///
+/// The blocking pool is separate and grows on demand, so calls queue on lvt's
+/// own locks — which is what those locks are for — instead of on the runtime.
+///
 /// lvt's failures come back as `isError` tool results rather than protocol
 /// errors, because they are information the model should act on — "no element
 /// matched", "the window closed" — not transport faults. Only the FFI boundary
 /// failing produces a real `ErrorData`.
-fn forward(method: &str, params: serde_json::Value) -> Result<CallToolResult, ErrorData> {
-    match ffi::call(method, &params) {
-        Ok(result) if result.ok => Ok(CallToolResult::success(vec![ContentBlock::text(result.json)])),
-        Ok(result) => Ok(CallToolResult::error(vec![ContentBlock::text(result.json)])),
-        Err(message) => Err(ErrorData::internal_error(message, None)),
+async fn call_lvt(
+    method: &str,
+    params: serde_json::Value,
+    allow_input: bool,
+) -> Result<ffi::ApiResult, ErrorData> {
+    let method = method.to_string();
+    tokio::task::spawn_blocking(move || ffi::call(&method, &params, allow_input))
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("lvt call did not complete: {e}"), None))?
+        .map_err(|message| ErrorData::internal_error(message, None))
+}
+
+async fn forward(
+    method: &str,
+    params: serde_json::Value,
+    allow_input: bool,
+) -> Result<CallToolResult, ErrorData> {
+    let result = call_lvt(method, params, allow_input).await?;
+    if result.ok {
+        Ok(CallToolResult::success(vec![ContentBlock::text(result.json)]))
+    } else {
+        Ok(CallToolResult::error(vec![ContentBlock::text(result.json)]))
     }
 }
 
@@ -308,7 +353,7 @@ impl LvtServer {
                        know which window to target."
     )]
     async fn list_apps(&self, Parameters(a): Parameters<ListAppsArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("list_apps", compact(json!({ "name": a.name, "title": a.title })))
+        forward("list_apps", compact(json!({ "name": a.name, "title": a.title })), self.allow_input).await
     }
 
     #[tool(
@@ -320,13 +365,12 @@ impl LvtServer {
     async fn connect(&self, Parameters(a): Parameters<ConnectArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
             "connect",
-            compact(json!({ "name": a.name, "title": a.title, "pid": a.pid, "hwnd": a.hwnd })),
-        )
+            compact(json!({ "name": a.name, "title": a.title, "pid": a.pid, "hwnd": a.hwnd })), self.allow_input).await
     }
 
     #[tool(description = "Close a session opened by connect and release its resources.")]
     async fn disconnect(&self, Parameters(a): Parameters<SessionArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("disconnect", json!({ "session": a.session }))
+        forward("disconnect", json!({ "session": a.session }), self.allow_input).await
     }
 
     #[tool(
@@ -336,7 +380,7 @@ impl LvtServer {
                        any process regardless of architecture."
     )]
     async fn get_uia_tree(&self, Parameters(a): Parameters<TreeArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("get_uia_tree", tree_params(a))
+        forward("get_uia_tree", tree_params(a), self.allow_input).await
     }
 
     #[tool(
@@ -347,12 +391,12 @@ impl LvtServer {
                        architecture."
     )]
     async fn get_visual_tree(&self, Parameters(a): Parameters<TreeArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("get_visual_tree", tree_params(a))
+        forward("get_visual_tree", tree_params(a), self.allow_input).await
     }
 
     #[tool(description = "List the UI frameworks detected in the connected application, with versions.")]
     async fn get_frameworks(&self, Parameters(a): Parameters<SessionArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("get_frameworks", json!({ "session": a.session }))
+        forward("get_frameworks", json!({ "session": a.session }), self.allow_input).await
     }
 
     #[tool(
@@ -373,8 +417,7 @@ impl LvtServer {
                 "uia": a.uia,
                 "view": a.view,
                 "timeoutMs": a.timeout_ms,
-            })),
-        )
+            })), self.allow_input).await
     }
 
     #[tool(
@@ -394,14 +437,16 @@ impl LvtServer {
                 "properties": a.properties,
                 "uia": a.uia,
                 "view": a.view,
-            })),
-        )
+                "timeoutMs": a.timeout_ms,
+            })), self.allow_input).await
     }
 
     #[tool(
         description = "Capture a PNG of the connected window with element ids drawn on it. \
-                       Returns the image inline unless a path is given. Use it to see a UI whose \
-                       tree is ambiguous, or to confirm an action had the effect you expected."
+                       The ids are the same ones find_elements and the action tools use, so you \
+                       can read one off the image and act on it. Returns the image inline unless \
+                       a path is given. Use it to see a UI whose tree is ambiguous, or to confirm \
+                       an action had the effect you expected."
     )]
     async fn screenshot(&self, Parameters(a): Parameters<ScreenshotArgs>) -> Result<CallToolResult, ErrorData> {
         let params = compact(json!({
@@ -409,8 +454,9 @@ impl LvtServer {
             "path": a.path,
             "element": a.element,
             "uia": a.uia,
+            "timeoutMs": a.timeout_ms,
         }));
-        let result = ffi::call("screenshot", &params).map_err(|m| ErrorData::internal_error(m, None))?;
+        let result = call_lvt("screenshot", params, self.allow_input).await?;
         if !result.ok {
             return Ok(CallToolResult::error(vec![ContentBlock::text(result.json)]));
         }
@@ -443,8 +489,8 @@ impl LvtServer {
             "hit_test",
             compact(json!({
                 "session": a.session, "x": a.x, "y": a.y, "uia": a.uia, "view": a.view,
-            })),
-        )
+                "timeoutMs": a.timeout_ms,
+            })), self.allow_input).await
     }
 
     #[tool(
@@ -462,8 +508,7 @@ impl LvtServer {
                 "waitValue": a.wait_value,
                 "timeoutMs": a.timeout_ms,
                 "view": a.view,
-            })),
-        )
+            })), self.allow_input).await
     }
 }
 
@@ -494,8 +539,7 @@ impl LvtServer {
                 "button": a.button,
                 "synthetic": a.synthetic,
                 "view": a.view,
-            })),
-        )
+            })), self.allow_input).await
     }
 
     #[tool(
@@ -503,12 +547,12 @@ impl LvtServer {
                        moving the mouse. Prefer this over click when the element supports it."
     )]
     async fn invoke(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("invoke", element_params(a))
+        forward("invoke", element_params(a), self.allow_input).await
     }
 
     #[tool(description = "Toggle a checkbox or other togglable control to its next state.")]
     async fn toggle(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("toggle", element_params(a))
+        forward("toggle", element_params(a), self.allow_input).await
     }
 
     #[tool(
@@ -520,8 +564,7 @@ impl LvtServer {
             "set_value",
             compact(json!({
                 "session": a.session, "element": a.element, "text": a.text, "view": a.view,
-            })),
-        )
+            })), self.allow_input).await
     }
 
     #[tool(description = "Expand or collapse a tree item, combo box, or other expandable control.")]
@@ -529,8 +572,7 @@ impl LvtServer {
         let method = if a.expanded { "expand" } else { "collapse" };
         forward(
             method,
-            compact(json!({ "session": a.session, "element": a.element, "view": a.view })),
-        )
+            compact(json!({ "session": a.session, "element": a.element, "view": a.view })), self.allow_input).await
     }
 
     #[tool(
@@ -550,18 +592,17 @@ impl LvtServer {
         };
         forward(
             method,
-            compact(json!({ "session": a.session, "element": a.element, "view": a.view })),
-        )
+            compact(json!({ "session": a.session, "element": a.element, "view": a.view })), self.allow_input).await
     }
 
     #[tool(description = "Give an element keyboard focus.")]
     async fn focus(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("focus", element_params(a))
+        forward("focus", element_params(a), self.allow_input).await
     }
 
     #[tool(description = "Select all of a text control's contents.")]
     async fn select_text(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("select_text", element_params(a))
+        forward("select_text", element_params(a), self.allow_input).await
     }
 
     #[tool(
@@ -577,8 +618,7 @@ impl LvtServer {
                 "direction": a.direction,
                 "amount": a.amount,
                 "view": a.view,
-            })),
-        )
+            })), self.allow_input).await
     }
 
     #[tool(
@@ -591,8 +631,7 @@ impl LvtServer {
             "type_text",
             compact(json!({
                 "session": a.session, "element": a.element, "text": a.text, "view": a.view,
-            })),
-        )
+            })), self.allow_input).await
     }
 
     #[tool(
@@ -604,8 +643,7 @@ impl LvtServer {
             "press_key",
             compact(json!({
                 "session": a.session, "element": a.element, "text": a.text, "view": a.view,
-            })),
-        )
+            })), self.allow_input).await
     }
 
     #[tool(description = "Minimize, maximize, restore, or close the connected window.")]
@@ -621,7 +659,7 @@ impl LvtServer {
                 ))]))
             }
         };
-        forward(method, json!({ "session": a.session }))
+        forward(method, json!({ "session": a.session }), self.allow_input).await
     }
 }
 

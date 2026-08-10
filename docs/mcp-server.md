@@ -127,6 +127,11 @@ Without `--allow-input`, the mutating tools are **not registered at all** —
 they do not appear in `tools/list` and calling one is rejected. A model cannot
 be talked into using a tool it cannot see.
 
+The gate is enforced in lvt itself, not only by withholding tools, so it also
+covers the one read-only-looking tool that has an effect outside lvt:
+`screenshot` with a `path` creates or overwrites that file, and is refused
+without `--allow-input`.
+
 This matters because these tools drive the real desktop: a click is a real
 click, and `window_action close` really closes an application. Run read-only
 unless the agent genuinely needs to act.
@@ -144,10 +149,18 @@ Some further properties worth knowing:
 With no `path`, `screenshot` returns the PNG inline as an image block, which
 most hosts display. That costs context proportional to the image, so for a large
 window — or when you only need the file — pass a `path` and lvt writes it there
-and returns the path instead.
+and returns the path instead. Writing to a path creates or overwrites that file,
+so it needs `--allow-input`.
 
-Screenshots are annotated with element ids, so a screenshot and a tree can be
-read together.
+Screenshots are annotated with element ids **from the UIA tree** — the same ids
+`find_elements` returns and the action tools resolve — so an id read off the
+image can be acted on directly. The response reports which tree the ids came
+from in `idsFrom`.
+
+Passing `uia: false` annotates with the framework-native visual tree instead.
+That is a *different* `eN` numbering over different nodes, and the action tools
+do not resolve against it, so only ask for it when visual-tree ids are what you
+actually want.
 
 ## Concurrency
 

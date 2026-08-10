@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,6 +28,13 @@ std::string get_lvt_path() {
     char exePath[MAX_PATH];
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
     return (fs::path(exePath).parent_path() / "lvt.exe").string();
+}
+
+std::string read_text_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return {};
+    return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 }
 
 // A live MCP conversation with `lvt mcp` over anonymous pipes.
@@ -592,6 +600,27 @@ TEST_F(McpSampleFixture, HitTestFindsTheSmallestElementAtAPointWithItsAncestors)
         inChain = inChain || ancestor.get<std::string>() == buttonId;
     EXPECT_TRUE(inChain) << "hit-testing the button's centre found " << hit.dump(2);
 
+    // Accepting the whole chain would also accept a materially wrong answer, so
+    // pin the actual contract too: the element returned is the *smallest* one
+    // covering the point, meaning nothing else covering it is smaller.
+    const auto area = [](const json& element) -> int64_t {
+        const auto& b = element["bounds"];
+        return static_cast<int64_t>(b["width"].get<int>()) * b["height"].get<int>();
+    };
+    const auto hitArea = area(hit["element"]);
+    EXPECT_LE(hitArea, area(button))
+        << "hit_test returned something larger than the button it landed on";
+    for (const auto& ancestorId : hit["ancestors"]) {
+        auto ancestor = client.call_tool(
+            "get_element_properties",
+            json{{"session", session}, {"element", ancestorId.get<std::string>()}});
+        if (!ancestor.contains("element"))
+            continue;
+        EXPECT_GE(area(ancestor["element"]), hitArea)
+            << "an ancestor was smaller than the element hit_test chose, so it did not "
+               "return the smallest element at the point";
+    }
+
     // A point outside the window belongs to no element of this session.
     bool isError = false;
     client.call_tool("hit_test", json{{"session", session}, {"x", -30000}, {"y", -30000}},
@@ -632,7 +661,16 @@ TEST_F(McpSampleFixture, ScreenshotReturnsAnInlineImageOrWritesAFile) {
     const auto path = (fs::temp_directory_path() / "lvt_mcp_shot.png").string();
     std::error_code ec;
     fs::remove(path, ec);
-    auto toFile = client.call_tool("screenshot", json{{"session", session}, {"path", path}});
+    // Writing to a path is gated behind --allow-input, since it creates or
+    // truncates the file, so this half needs a server that allows input.
+    McpClient writer(true);
+    ASSERT_TRUE(writer.started());
+    ASSERT_TRUE(writer.handshake());
+    const auto writeSession = connect(writer);
+    ASSERT_FALSE(writeSession.empty());
+
+    auto toFile = writer.call_tool(
+        "screenshot", json{{"session", writeSession}, {"path", path}});
     EXPECT_EQ(toFile.value("path", ""), path) << toFile.dump(2);
     EXPECT_TRUE(fs::exists(path)) << "a path argument must write the PNG there";
     fs::remove(path, ec);
@@ -1192,17 +1230,26 @@ TEST_F(McpSampleFixture, ATruncatedWalkIsReportedRatherThanPresentedAsComplete) 
     // told. "No element matched" from a partial walk means the walk did not
     // finish, and a model that is not told this will report the element as
     // absent — a wrong answer that looks exactly like a right one.
-    auto tight = client.call_tool(
-        "find_elements",
-        json{{"session", session}, {"automationId", "PrimaryButton"}, {"timeoutMs", 1}});
-
-    if (tight.value("elements", json::array()).empty()) {
-        EXPECT_TRUE(tight.contains("truncated"))
-            << "a walk that found nothing must say whether it actually finished: "
-            << tight.dump(2);
-        EXPECT_NE(tight.value("truncated", "").find("incomplete"), std::string::npos)
-            << tight.dump(2);
+    //
+    // Retried a few times because a 1 ms deadline is not *guaranteed* to cut a
+    // very small tree short; the assertion must not be skipped away when it
+    // does not, or the test would pass with truncation reporting deleted.
+    json tight;
+    bool sawTruncation = false;
+    for (int attempt = 0; attempt < 10 && !sawTruncation; ++attempt) {
+        tight = client.call_tool(
+            "find_elements",
+            json{{"session", session}, {"automationId", "PrimaryButton"}, {"timeoutMs", 1}});
+        sawTruncation = tight.contains("truncated");
     }
+    ASSERT_TRUE(sawTruncation)
+        << "a 1ms deadline never produced a truncated walk, so this test proves nothing: "
+        << tight.dump(2);
+    EXPECT_NE(tight.value("truncated", "").find("incomplete"), std::string::npos) << tight.dump(2);
+    // The note has to be attached to the result the caller actually reads, and
+    // the result must still be a success rather than an error: a partial answer
+    // is usable, it just cannot be trusted as a negative.
+    EXPECT_TRUE(tight.contains("elements")) << tight.dump(2);
 
     // With a workable deadline there must be no such caveat, or the field would
     // be noise that a model learns to ignore.
@@ -1224,20 +1271,255 @@ TEST_F(McpSampleFixture, TreeToolsAcceptATimeoutSoTruncationIsActionable) {
 
     // Advising a caller to raise timeoutMs is only useful if the tools actually
     // take it; it was missing from the schemas at first while the ABI already
-    // honoured it, which made the advice impossible to follow.
+    // honoured it, which made the advice impossible to follow. Every tool that
+    // can emit the note must accept the remedy — including hit_test and
+    // get_element_properties, which were the two originally left out.
+    static constexpr const char* kMustAcceptTimeout[] = {
+        "get_uia_tree", "get_visual_tree", "find_elements", "hit_test",
+        "get_element_properties", "screenshot",
+    };
     auto tools = client.request("tools/list")["result"]["tools"];
-    for (const auto& tool : tools) {
-        const auto name = tool.value("name", "");
-        if (name != "get_uia_tree" && name != "find_elements")
-            continue;
-        const auto properties = tool["inputSchema"].value("properties", json::object());
+    ASSERT_FALSE(tools.empty());
+    for (const char* wanted : kMustAcceptTimeout) {
+        const json* tool = nullptr;
+        for (const auto& candidate : tools) {
+            if (candidate.value("name", "") == wanted)
+                tool = &candidate;
+        }
+        ASSERT_NE(tool, nullptr) << wanted << " is not exposed at all";
+        const auto properties = (*tool)["inputSchema"].value("properties", json::object());
         EXPECT_TRUE(properties.contains("timeoutMs"))
-            << name << " must accept timeoutMs so a truncated result can be retried";
+            << wanted << " must accept timeoutMs so a truncated result can be retried";
     }
 
     auto result = client.call_tool(
         "get_uia_tree", json{{"session", session}, {"depth", 1}, {"timeoutMs", 20000}});
     EXPECT_TRUE(result.contains("root")) << result.dump(2);
+}
+
+// --- review regressions --------------------------------------------------
+
+TEST_F(McpSampleFixture, ScreenshotIdsComeFromTheTreeTheActionToolsResolve) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // Screenshots used to be annotated from the visual tree while every other
+    // tool resolves against the UIA tree. Those are two independent `eN`
+    // numberings over different nodes, so an id read off the image resolved to
+    // an unrelated element — and, because both ids exist, the action succeeded.
+    // Reading `e42` off a screenshot and clicking it activated a list item and
+    // reported ok:true while the intended checkbox was never touched.
+    auto shot = client.call_tool("screenshot", json{{"session", session}});
+    ASSERT_TRUE(shot.value("annotated", false)) << shot.dump(2);
+    EXPECT_EQ(shot.value("idsFrom", ""), "uia")
+        << "screenshot ids must come from the tree the action tools use";
+
+    // The invariant that matters: an id drawn on the image means the same thing
+    // to find_elements. Both are UIA ids, so the button's id must round-trip.
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_EQ(found["elements"].size(), 1u);
+    const auto buttonId = found["elements"][0].value("id", "");
+    auto props = client.call_tool(
+        "get_element_properties",
+        json{{"session", session}, {"element", buttonId},
+             {"properties", json::array({"AutomationId"})}});
+    EXPECT_EQ(props["properties"].value("AutomationId", ""), "PrimaryButton")
+        << "the id space screenshots annotate with must resolve the same element";
+
+    // The visual tree is still reachable, but must say so, since its ids are
+    // not interchangeable with the ones every other tool takes.
+    auto visual = client.call_tool("screenshot", json{{"session", session}, {"uia", false}});
+    if (visual.value("annotated", false))
+        EXPECT_EQ(visual.value("idsFrom", ""), "visual") << visual.dump(2);
+}
+
+TEST_F(McpSampleFixture, ReadOnlyServerWillNotWriteAScreenshotToAChosenPath) {
+    SkipIfNotReady();
+    const auto victim = fs::temp_directory_path() / "lvt_mcp_victim.txt";
+    {
+        std::ofstream file(victim);
+        file << "important data";
+    }
+
+    {
+        // --allow-input is described to the model as the boundary, and the
+        // read-only instructions say so outright. A path argument creates or
+        // truncates that file, so offering it without the gate made a
+        // "read-only" server into a file-write primitive.
+        McpClient readOnly(false);
+        ASSERT_TRUE(readOnly.started());
+        ASSERT_TRUE(readOnly.handshake());
+        const auto session = connect(readOnly);
+        ASSERT_FALSE(session.empty());
+
+        bool isError = false;
+        auto result = readOnly.call_tool(
+            "screenshot", json{{"session", session}, {"path", victim.string()}}, &isError);
+        EXPECT_TRUE(isError) << "a read-only server must refuse to write a file";
+        EXPECT_NE(result.value("error", "").find("--allow-input"), std::string::npos)
+            << result.dump(2);
+    }
+
+    EXPECT_EQ(read_text_file(victim.string()), "important data")
+        << "the file was modified by a read-only server";
+
+    {
+        // The capability itself is fine, it just belongs behind the gate.
+        McpClient full(true);
+        ASSERT_TRUE(full.started());
+        ASSERT_TRUE(full.handshake());
+        const auto session = connect(full);
+        ASSERT_FALSE(session.empty());
+
+        const auto shot = (fs::temp_directory_path() / "lvt_mcp_allowed.png").string();
+        std::error_code ec;
+        fs::remove(shot, ec);
+        auto result = full.call_tool("screenshot", json{{"session", session}, {"path", shot}});
+        EXPECT_EQ(result.value("path", ""), shot) << result.dump(2);
+        EXPECT_TRUE(fs::exists(shot));
+        fs::remove(shot, ec);
+    }
+
+    std::error_code ec;
+    fs::remove(victim, ec);
+}
+
+TEST_F(McpSampleFixture, ConnectRefusesAnAmbiguousTitleInsteadOfGuessing) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    // A second instance, so the title matches two windows. Connecting by title
+    // used to bind to matches[0] silently, sending every later call in that
+    // session to an arbitrary one of them — while the process-name branch right
+    // beside it deliberately refused to guess.
+    STARTUPINFOA si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    std::string cmd = WINUI3_SAMPLE_EXE_PATH;
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                        fs::path(WINUI3_SAMPLE_EXE_PATH).parent_path().string().c_str(), &si, &pi))
+        GTEST_SKIP() << "could not launch a second sample instance";
+    wil::unique_process_handle second(pi.hProcess);
+    wil::unique_handle secondThread(pi.hThread);
+    auto killSecond = wil::scope_exit([&] { TerminateProcess(second.get(), 0); });
+    WaitForInputIdle(second.get(), 10000);
+    Sleep(2500);
+
+    bool isError = false;
+    auto result = client.call_tool(
+        "connect", json{{"title", "LVT WinUI3 Sample"}}, &isError);
+
+    if (!isError) {
+        // Only one window was actually visible, so there was nothing ambiguous.
+        GTEST_SKIP() << "the second instance did not show a window";
+    }
+    EXPECT_NE(result.value("error", "").find("several windows"), std::string::npos)
+        << "an ambiguous title must be reported, not resolved arbitrarily: " << result.dump(2);
+    // The candidates have to be listed, or the caller cannot act on the refusal.
+    EXPECT_NE(result.value("error", "").find("hwnd"), std::string::npos) << result.dump(2);
+}
+
+TEST_F(McpSampleFixture, ScreenshotRefusesAnElementScopeItCannotResolve) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // Asking to annotate one dialog and silently getting the whole window back
+    // gives the caller no way to tell their scope was ignored.
+    bool isError = false;
+    auto result = client.call_tool(
+        "screenshot", json{{"session", session}, {"element", "e9999"}}, &isError);
+    EXPECT_TRUE(isError) << "an unresolvable scope must be reported: " << result.dump(2);
+    EXPECT_NE(result.value("error", "").find("not found"), std::string::npos) << result.dump(2);
+}
+
+TEST_F(McpSampleFixture, GetElementPropertiesReportsATruncatedWalkAndMissingProperties) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // This is the tool most likely to be called with a specific id in hand, so
+    // a flat "not found" from a walk that never finished is the most damaging
+    // place for the false negative.
+    bool isError = false;
+    auto tight = client.call_tool(
+        "get_element_properties",
+        json{{"session", session}, {"element", "e40"}, {"timeoutMs", 1}}, &isError);
+    if (isError) {
+        EXPECT_NE(tight.value("error", "").find("incomplete"), std::string::npos)
+            << "not-found from a partial walk must say the walk was partial: " << tight.dump(2);
+    }
+
+    // A property the element does not have must be distinguishable from one
+    // whose value happens to be empty.
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_EQ(found["elements"].size(), 1u);
+    auto props = client.call_tool(
+        "get_element_properties",
+        json{{"session", session},
+             {"element", found["elements"][0].value("id", "")},
+             {"properties", json::array({"AutomationId", "NoSuchPropertyAtAll"})}});
+    EXPECT_EQ(props["properties"].value("AutomationId", ""), "PrimaryButton");
+    ASSERT_TRUE(props.contains("notPresent")) << props.dump(2);
+    EXPECT_EQ(props["notPresent"].size(), 1u);
+    EXPECT_EQ(props["notPresent"][0], "NoSuchPropertyAtAll");
+}
+
+TEST(McpServer, BlockingToolCallsDoNotStarveTheServer) {
+    // rmcp dispatches each request as its own task and the task reading stdin
+    // lives on the same runtime, so a synchronous FFI call made directly on a
+    // worker thread blocks it. With two workers, two concurrent blocking calls
+    // stopped the server reading its stdin at all: an unrelated list_apps went
+    // from 0.07s to 11.14s. Every FFI call now runs on the blocking pool.
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    auto apps = client.call_tool("list_apps", json::object());
+    ASSERT_FALSE(apps["apps"].empty());
+    auto connected = client.call_tool(
+        "connect", json{{"hwnd", apps["apps"][0].value("hwnd", "")}});
+    const auto session = connected.value("session", "");
+    if (session.empty())
+        GTEST_SKIP() << "could not connect to a window to block on";
+
+    // Four waits that will each sit on their deadline, well over the two worker
+    // threads the runtime is built with.
+    std::vector<int> blockers;
+    for (int i = 0; i < 4; ++i) {
+        blockers.push_back(client.send_request(
+            "tools/call",
+            json{{"name", "wait_for"},
+                 {"arguments", json{{"session", session},
+                                    {"element", "uia:99.99.99"},
+                                    {"timeoutMs", 8000}}}}));
+    }
+    Sleep(500);  // let them be picked up
+
+    const auto start = GetTickCount64();
+    auto quick = client.request("tools/list");
+    const auto elapsed = GetTickCount64() - start;
+
+    ASSERT_FALSE(quick.is_null()) << "the server stopped answering while calls were in flight";
+    EXPECT_LT(elapsed, 3000u)
+        << "an unrelated request waited " << elapsed
+        << "ms behind blocking calls; the transport is being starved";
+
+    for (const int id : blockers)
+        client.await_response(id);
 }
 
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {

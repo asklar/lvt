@@ -18,8 +18,12 @@
 use std::ffi::{c_char, CStr, CString};
 
 unsafe extern "C" {
-    fn lvt_api_call(method: *const c_char, params_json: *const c_char, result_json: *mut *mut c_char)
-        -> i32;
+    fn lvt_api_call(
+        method: *const c_char,
+        params_json: *const c_char,
+        allow_input: i32,
+        result_json: *mut *mut c_char,
+    ) -> i32;
     fn lvt_api_free(result_json: *mut c_char);
     fn lvt_api_version() -> *const c_char;
 }
@@ -61,10 +65,15 @@ pub struct ApiResult {
 
 /// Calls into lvt.
 ///
+/// `allow_input` is passed through rather than being consulted only when
+/// registering tools. Withholding a tool stops a model reaching it, but the
+/// methods behind it still exist, so the capability itself is gated at the one
+/// place that cannot be bypassed.
+///
 /// Never returns `Err` for an application-level failure — those come back as
 /// `ok: false` with lvt's own JSON error, which is far more useful to a model
 /// than a transport error. `Err` is reserved for the boundary itself failing.
-pub fn call(method: &str, params: &serde_json::Value) -> Result<ApiResult, String> {
+pub fn call(method: &str, params: &serde_json::Value, allow_input: bool) -> Result<ApiResult, String> {
     // An interior NUL cannot reach C, so reject it here rather than truncating
     // silently and calling a different method than was asked for.
     let method_c = CString::new(method).map_err(|_| "method name contains a NUL byte".to_string())?;
@@ -74,7 +83,9 @@ pub fn call(method: &str, params: &serde_json::Value) -> Result<ApiResult, Strin
     let mut raw: *mut c_char = std::ptr::null_mut();
     // SAFETY: both pointers are valid NUL-terminated strings that outlive the
     // call, and `raw` is a valid out-pointer. lvt does not retain either input.
-    let status = unsafe { lvt_api_call(method_c.as_ptr(), params_c.as_ptr(), &mut raw) };
+    let status = unsafe {
+        lvt_api_call(method_c.as_ptr(), params_c.as_ptr(), i32::from(allow_input), &mut raw)
+    };
 
     // Constructed before inspecting `status` so the buffer is owned — and so
     // will be freed — no matter which branch we take below.
@@ -116,13 +127,16 @@ mod tests {
     pub(super) static FREES: AtomicUsize = AtomicUsize::new(0);
     pub(super) static NEXT_STATUS: AtomicUsize = AtomicUsize::new(0);
     pub(super) static RETURN_NULL: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static LAST_ALLOW_INPUT: AtomicUsize = AtomicUsize::new(99);
 
     #[unsafe(no_mangle)]
     extern "C" fn lvt_api_call(
         method: *const c_char,
         _params: *const c_char,
+        allow_input: i32,
         result: *mut *mut c_char,
     ) -> i32 {
+        LAST_ALLOW_INPUT.store(allow_input as usize, Ordering::SeqCst);
         if RETURN_NULL.load(Ordering::SeqCst) == 1 {
             unsafe { *result = std::ptr::null_mut() };
             return 0;
@@ -170,7 +184,7 @@ mod tests {
 
     #[test]
     fn rejects_method_with_interior_nul() {
-        let err = call("get\0tree", &serde_json::json!({})).unwrap_err();
+        let err = call("get\0tree", &serde_json::json!({}), false).unwrap_err();
         assert!(err.contains("NUL"), "unexpected error: {err}");
     }
 
@@ -184,7 +198,7 @@ mod tests {
         let params = serde_json::json!({ "text": "a\0b" });
         assert_eq!(params.to_string(), r#"{"text":"a\u0000b"}"#);
         with_stub(|| {
-            let result = call("set_value", &params).expect("escaped NUL must not fail the call");
+            let result = call("set_value", &params, false).expect("escaped NUL must not fail the call");
             assert!(result.ok);
         });
     }
@@ -193,7 +207,7 @@ mod tests {
     fn passes_method_through_and_frees_once() {
         with_stub(|| {
             let before = FREES.load(Ordering::SeqCst);
-            let result = call("list_apps", &serde_json::json!({})).unwrap();
+            let result = call("list_apps", &serde_json::json!({}), false).unwrap();
             assert!(result.ok);
             assert_eq!(result.json, "{\"method\":\"list_apps\"}");
             assert_eq!(
@@ -209,7 +223,7 @@ mod tests {
         with_stub(|| {
             NEXT_STATUS.store(1, Ordering::SeqCst);
             let before = FREES.load(Ordering::SeqCst);
-            let result = call("connect", &serde_json::json!({})).unwrap();
+            let result = call("connect", &serde_json::json!({}), false).unwrap();
             // An application-level failure must still surface lvt's own JSON:
             // that message is the whole value of the call to a model.
             assert!(!result.ok);
@@ -223,7 +237,7 @@ mod tests {
         with_stub(|| {
             NEXT_STATUS.store(usize::MAX, Ordering::SeqCst); // truncates to -1 as i32
             let before = FREES.load(Ordering::SeqCst);
-            let err = call("connect", &serde_json::json!({})).unwrap_err();
+            let err = call("connect", &serde_json::json!({}), false).unwrap_err();
             assert!(err.contains("could not service"), "unexpected error: {err}");
             assert_eq!(
                 FREES.load(Ordering::SeqCst),
@@ -237,7 +251,7 @@ mod tests {
     fn null_response_is_an_error_not_a_crash() {
         with_stub(|| {
             RETURN_NULL.store(1, Ordering::SeqCst);
-            let err = call("connect", &serde_json::json!({})).unwrap_err();
+            let err = call("connect", &serde_json::json!({}), false).unwrap_err();
             assert!(err.contains("returned nothing"), "unexpected error: {err}");
         });
     }
@@ -245,5 +259,19 @@ mod tests {
     #[test]
     fn version_reads_the_static_string() {
         assert_eq!(version(), "9.9.9-test");
+    }
+
+    #[test]
+    fn allow_input_reaches_the_c_side_verbatim() {
+        // The gate is enforced in C, not merely by withholding tools, so the
+        // flag actually arriving is the part worth pinning: a wrong-way-round
+        // conversion here would silently give a read-only server write access.
+        with_stub(|| {
+            call("screenshot", &serde_json::json!({}), false).unwrap();
+            assert_eq!(LAST_ALLOW_INPUT.load(Ordering::SeqCst), 0, "read-only must arrive as 0");
+
+            call("screenshot", &serde_json::json!({}), true).unwrap();
+            assert_eq!(LAST_ALLOW_INPUT.load(Ordering::SeqCst), 1, "allow-input must arrive as 1");
+        });
     }
 }

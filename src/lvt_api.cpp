@@ -398,6 +398,22 @@ json method_connect(const json& params) {
         auto matches = lvt::find_by_title(title);
         if (matches.empty())
             throw std::runtime_error("no visible windows found with title containing '" + title + "'");
+        if (matches.size() > 1) {
+            // Same refusal as the process-name branch above. Title matching is
+            // a substring match, so it is the more ambiguous of the two: silently
+            // binding a session to an arbitrary one of several windows would
+            // send every later call in that session to the wrong place.
+            json options = json::array();
+            for (const auto& match : matches) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "0x%p", static_cast<void*>(match.hwnd));
+                options.push_back({{"hwnd", buf},
+                                   {"title", match.windowTitle},
+                                   {"processName", match.processName}});
+            }
+            throw std::runtime_error("several windows match the title '" + title +
+                                     "'; connect by hwnd instead: " + options.dump());
+        }
         hwnd = matches[0].hwnd;
     }
 
@@ -539,30 +555,60 @@ json method_get_element_properties(const json& params) {
     const bool uia = get_bool(params, "uia", true);
     lvt::Element tree;
     std::string error;
-    if (!build_tree_for(session, params, uia, tree, error))
+    bool truncated = false;
+    if (!build_tree_for(session, params, uia, tree, error, &truncated))
         throw std::runtime_error(error);
 
     const auto ref = get_string(params, "element");
     const auto* element = lvt::find_element_by_ref(tree, ref);
-    if (!element)
-        throw std::runtime_error("element '" + ref + "' not found");
+    if (!element) {
+        // "Not found" from a partial walk is the false negative this whole
+        // mechanism exists to prevent, and this is the tool most likely to be
+        // called with a specific id already in hand.
+        throw std::runtime_error("element '" + ref + "' not found" +
+                                 (truncated ? std::string("; note that ") + truncation_note()
+                                            : std::string()));
+    }
 
     const auto wanted = get_string_array(params, "properties");
-    if (wanted.empty())
-        return json{{"element", element_fields(*element)}};
+    if (wanted.empty()) {
+        json out{{"element", element_fields(*element)}};
+        if (truncated)
+            out["truncated"] = truncation_note();
+        return out;
+    }
 
     json values = json::object();
+    json missing = json::array();
     for (const auto& propertyName : wanted) {
         const auto value = element_property(*element, propertyName);
-        if (!value.empty())
+        if (value.empty())
+            missing.push_back(propertyName);
+        else
             values[propertyName] = value;
     }
-    return json{{"element", element->id}, {"properties", values}};
+    json out{{"element", element->id}, {"properties", values}};
+    // Distinguishing "this element has no such property" from "the value is
+    // empty" matters when a caller is probing for pattern support.
+    if (!missing.empty())
+        out["notPresent"] = missing;
+    if (truncated)
+        out["truncated"] = truncation_note();
+    return out;
 }
 
-json method_screenshot(const json& params) {
+json method_screenshot(const json& params, bool allowInput) {
     const auto session = require_session(params);
     auto path = get_string(params, "path");
+
+    // Writing to a caller-chosen path creates or truncates that file, which is
+    // a side effect outside lvt regardless of the fact that no UI was touched.
+    // A server started without --allow-input tells the model it is read-only,
+    // so it must not hand out a file-write primitive.
+    if (!path.empty() && !allowInput)
+        throw std::runtime_error(
+            "writing a screenshot to a path needs --allow-input, because it creates or "
+            "overwrites a file; omit 'path' to receive the image inline instead");
 
     // With no path the caller wants the image itself, not a file. Capture to a
     // temp file and hand back base64, cleaning up either way — MCP clients
@@ -588,9 +634,19 @@ json method_screenshot(const json& params) {
 
     lvt::Element tree;
     std::string error;
-    const bool uia = get_bool(params, "uia", false);
+    // The UIA tree by default, unlike the CLI's screenshot verb.
+    //
+    // The ids drawn on the image are only useful if they mean the same thing to
+    // the tools the caller will act with, and every one of those — find_elements,
+    // get_element_properties, hit_test and all twelve action tools — resolves
+    // against the UIA tree. The visual tree is a separate `eN` numbering over a
+    // different set of nodes, so annotating with it produced ids that silently
+    // resolved to unrelated elements: reading `e42` off a screenshot and
+    // clicking it activated a list item while reporting success.
+    const bool uia = get_bool(params, "uia", true);
     bool annotated = true;
-    if (!build_tree_for(session, params, uia, tree, error)) {
+    bool truncated = false;
+    if (!build_tree_for(session, params, uia, tree, error, &truncated)) {
         // Annotation is a bonus; a plain capture is still useful.
         if (lvt::g_debug)
             fprintf(stderr, "lvt: screenshot without annotations: %s\n", error.c_str());
@@ -599,11 +655,22 @@ json method_screenshot(const json& params) {
         annotated = false;
     } else {
         const auto scope = get_string(params, "element");
+        // An unresolvable scope must not quietly become a full-window capture:
+        // a caller who asked to annotate one dialog would get the whole window
+        // back with no indication their request was ignored.
+        if (!scope.empty() && !lvt::find_element_by_ref(tree, scope))
+            throw std::runtime_error("element '" + scope + "' not found, so there is nothing "
+                                     "to scope the screenshot to");
         if (!lvt::capture_screenshot(session.hwnd, path, &tree, scope))
             throw std::runtime_error("could not capture a screenshot of this window");
     }
 
     json out{{"annotated", annotated}};
+    // Which tree the ids came from, since they are not interchangeable.
+    if (annotated)
+        out["idsFrom"] = uia ? "uia" : "visual";
+    if (truncated)
+        out["truncated"] = truncation_note();
     if (inlineImage)
         out["imageBase64"] = base64_encode(read_file_bytes(path));
     else
@@ -725,7 +792,7 @@ struct MethodEntry {
     json (*handler)(const json&);
 };
 
-json dispatch(const std::string& method, const json& params) {
+json dispatch(const std::string& method, const json& params, bool allowInput) {
     if (method == "list_apps")   return method_list_apps(params);
     if (method == "connect")     return method_connect(params);
     if (method == "disconnect")  return method_disconnect(params);
@@ -734,7 +801,7 @@ json dispatch(const std::string& method, const json& params) {
     if (method == "get_frameworks")  return method_get_frameworks(params);
     if (method == "find_elements")   return method_find_elements(params);
     if (method == "get_element_properties") return method_get_element_properties(params);
-    if (method == "screenshot")  return method_screenshot(params);
+    if (method == "screenshot")  return method_screenshot(params, allowInput);
     if (method == "hit_test")    return method_hit_test(params);
 
 #ifdef LVT_ENABLE_UIA
@@ -781,7 +848,7 @@ char* duplicate(const std::string& text) {
 } // namespace
 
 extern "C" int32_t lvt_api_call(const char* method, const char* params_json,
-                                char** result_json) {
+                                int32_t allow_input, char** result_json) {
     if (!result_json)
         return -1;
     *result_json = nullptr;
@@ -797,7 +864,7 @@ extern "C" int32_t lvt_api_call(const char* method, const char* params_json,
             if (params.is_discarded())
                 throw std::runtime_error("params is not valid JSON");
         }
-        payload = dispatch(method, params).dump();
+        payload = dispatch(method, params, allow_input != 0).dump();
     } catch (const std::exception& ex) {
         // Errors come back as JSON too, so the caller always has something
         // structured to surface rather than a bare status code.
