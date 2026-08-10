@@ -338,10 +338,14 @@ timeout, so a script can branch on it.
 
 **Repeating an action** is just repeating the command — there is no repeat count,
 since only the OS-interpreted sequences (double-click, key chords) need precise
-timing, and those are their own verbs. When repeating against content that
-*changes shape*, such as scrolling a virtualized list, address elements by durable
-key or `uia:<RuntimeId>` rather than `eN`: `eN` is positional, so it is stable
-only while the tree is.
+timing, and those are their own verbs.
+
+**Choosing a reference.** `eN` is positional and `uia:<RuntimeId>` is tied to the
+element's current host window, so both can break when the UI changes *shape* —
+not merely its values. Expanding a combo box, for instance, reparents it into a
+popup: its `eN` moves and its `RuntimeId` changes, while its durable key does
+not. Use `eN` for one-shot commands against a static UI, and the **durable key**
+for anything that acts across a structural change.
 
 ## Output format
 

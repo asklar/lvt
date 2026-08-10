@@ -167,9 +167,13 @@ The result JSON reports **how** the action was performed:
 Use `SupportedPatterns` from the tree to choose the verb: `Invoke` means
 clickable, `Toggle` checkable, `Value` settable, `ExpandCollapse` expandable.
 
-After any action that changes the UI, prefer `wait-for` over sleeping, and
-address elements by durable key or `uia:<RuntimeId>` rather than `eN` when the
-tree may have changed shape.
+After any action that changes the UI, prefer `wait-for` over sleeping.
+
+Choosing a reference matters when the UI changes shape: `eN` is positional and
+`uia:<RuntimeId>` is tied to the element's current host window, so expanding a
+combo box (which reparents it into a popup) invalidates both. The durable `key`
+survives. Use `eN` for one-shot commands against a static UI, and the durable
+key when acting across a structural change.
 ## Interpreting the output
 
 ### Element IDs
