@@ -445,43 +445,6 @@ HRESULT build_tree_on_mta(HWND hwnd, const UiaOptions& options,
     return S_OK;
 }
 
-HRESULT element_from_point_on_mta(POINT screenPoint, const UiaOptions& options, Element& out) {
-    wil::com_ptr<IUIAutomation> automation;
-    RETURN_IF_FAILED(create_automation(&automation));
-
-    wil::com_ptr<IUIAutomationElement> element;
-    RETURN_IF_FAILED(automation->ElementFromPoint(screenPoint, &element));
-    RETURN_HR_IF_NULL(E_FAIL, element.get());
-
-    std::set<long> requested;
-    auto properties = resolve_properties(options, &requested);
-
-    // Scope to the element itself; a hit test wants one node, not a subtree.
-    wil::com_ptr<IUIAutomationCacheRequest> request;
-    RETURN_IF_FAILED(automation->CreateCacheRequest(&request));
-    RETURN_IF_FAILED(request->put_TreeScope(TreeScope_Element));
-    RETURN_IF_FAILED(request->put_AutomationElementMode(AutomationElementMode_Full));
-    for (long propertyId : properties)
-        LOG_IF_FAILED(request->AddProperty(propertyId));
-    for (long patternId : uia_probed_pattern_ids())
-        LOG_IF_FAILED(request->AddPattern(patternId));
-
-    wil::com_ptr<IUIAutomationElement> cached;
-    RETURN_IF_FAILED(element->BuildUpdatedCache(request.get(), &cached));
-    RETURN_HR_IF_NULL(E_FAIL, cached.get());
-
-    WalkContext ctx;
-    ctx.automation = automation;
-    ctx.cacheRequest = request;
-    ctx.properties = std::move(properties);
-    ctx.requestedProperties = std::move(requested);
-    LOG_IF_FAILED(automation->get_ReservedNotSupportedValue(ctx.notSupported.put()));
-    ctx.maxDepth = 0;
-
-    out = build_from_cached(ctx, cached.get(), 0);
-    return S_OK;
-}
-
 // UIA clients belong in an MTA. screenshot.cpp initializes an STA on the calling
 // thread, and a thread cannot be in both, so all UIA work is marshalled onto a
 // dedicated MTA thread. This also serialises access to the client.
@@ -555,46 +518,6 @@ std::optional<Element> UiaProvider::build(HWND hwnd, const UiaOptions& options, 
                 options.timeoutMs);
     }
     return root;
-}
-
-std::optional<Element> UiaProvider::element_from_point(POINT screenPoint,
-                                                       const UiaOptions& options) {
-    Element element;
-    const HRESULT hr = run_on_mta([&] {
-        return element_from_point_on_mta(screenPoint, options, element);
-    });
-    if (FAILED(hr)) {
-        LOG_IF_FAILED(hr);
-        return std::nullopt;
-    }
-    return element;
-}
-
-std::optional<Element> UiaProvider::element_by_runtime_id(HWND hwnd, const std::string& runtimeId,
-                                                          const UiaOptions& options) {
-    std::vector<int> parsed;
-    if (!parse_runtime_id(runtimeId, parsed))
-        return std::nullopt;
-
-    // Walk the tree and match on the RuntimeId property rather than using
-    // ElementFromIUIAutomationId, which does not exist; a scoped walk is the
-    // supported way to re-find an element by runtime id.
-    auto tree = build(hwnd, options);
-    if (!tree)
-        return std::nullopt;
-
-    const std::string target = format_runtime_id(parsed);
-    std::vector<const Element*> stack{&*tree};
-    while (!stack.empty()) {
-        const Element* current = stack.back();
-        stack.pop_back();
-        auto it = current->properties.find("RuntimeId");
-        if (it != current->properties.end() && it->second == target)
-            return *current;
-        for (const auto& child : current->children)
-            stack.push_back(&child);
-    }
-    return std::nullopt;
 }
 
 } // namespace lvt

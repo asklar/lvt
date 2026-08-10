@@ -3,8 +3,10 @@ build/
 build-*/
 _stage/
 packages/
-tests/apps/WinUI3Sample/bin/
-tests/apps/WinUI3Sample/obj/
+# Managed (.NET) build output, emitted next to every .csproj — the sample apps,
+# the WPF/WinForms TAP assemblies, and the Avalonia tree walker.
+bin/
+obj/
 
 # IDE files
 .vs/

@@ -1159,8 +1159,31 @@ TEST(UiaProps, NamesKnownControlTypesAndFallsBackForUnknown) {
     EXPECT_EQ(lvt::uia_control_type_name(999999), "ControlType(999999)");
 }
 
-TEST(UiaRuntimeId, FormatsAndParsesRoundTrip) {
-    const std::vector<int> id{42, 3150138, 4, 5};
+// --- Architecture reporting ---
+// --uia skips the architecture-match check because UIA needs no injection, so
+// the check has to classify targets correctly for that exemption to mean
+// anything. x86 was previously missing here, which silently disabled the check
+// for every 32-bit target.
+
+TEST(Architecture, NamesEveryValue) {
+    EXPECT_STREQ(lvt::architecture_name(lvt::Architecture::x64), "x64");
+    EXPECT_STREQ(lvt::architecture_name(lvt::Architecture::arm64), "arm64");
+    EXPECT_STREQ(lvt::architecture_name(lvt::Architecture::x86), "x86");
+    EXPECT_STREQ(lvt::architecture_name(lvt::Architecture::unknown), "unknown");
+}
+
+TEST(Architecture, HostIsIdentifiedNotUnknown) {
+    // An x86 build used to report its own architecture as "unknown", which made
+    // every comparison against it meaningless.
+    EXPECT_NE(lvt::get_host_architecture(), lvt::Architecture::unknown);
+}
+
+TEST(Architecture, CurrentProcessMatchesHost) {
+    EXPECT_EQ(lvt::detect_process_architecture(GetCurrentProcessId()),
+              lvt::get_host_architecture());
+}
+
+TEST(UiaRuntimeId, FormatsAndParsesRoundTrip) {    const std::vector<int> id{42, 3150138, 4, 5};
     const auto text = lvt::format_runtime_id(id);
     EXPECT_EQ(text, "42.3150138.4.5");
 

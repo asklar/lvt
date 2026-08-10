@@ -38,14 +38,6 @@ public:
     // Returns std::nullopt if the UIA client could not be created or the window
     // has no UIA element. `truncated` is set when the deadline cut the walk short.
     std::optional<Element> build(HWND hwnd, const UiaOptions& options, bool* truncated = nullptr);
-
-    // The UIA element at a screen point, without its subtree.
-    std::optional<Element> element_from_point(POINT screenPoint, const UiaOptions& options);
-
-    // Read named properties off one element, addressed by its RuntimeId string
-    // (the "42.1234.0" form emitted as the RuntimeId property).
-    std::optional<Element> element_by_runtime_id(HWND hwnd, const std::string& runtimeId,
-                                                 const UiaOptions& options);
 };
 
 // Format a UIA RuntimeId as the dotted string lvt emits, e.g. "42.1234.0".

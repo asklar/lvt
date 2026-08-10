@@ -2,6 +2,7 @@
 // Run: ctest --test-dir build -R integration
 
 #include <gtest/gtest.h>
+#include <sstream>
 #include <Windows.h>
 #include <CommCtrl.h>
 #include <wil/resource.h>
@@ -2105,4 +2106,292 @@ TEST_F(WinUI3SampleFixture, UiaExtraPropertiesAreOptInAndReportUnknownNames) {
     auto* richButton = find_by_automation_id(withPropsJson["root"], "PrimaryButton");
     ASSERT_NE(richButton, nullptr);
     EXPECT_TRUE(uia_has_prop(*richButton, "ProviderDescription"));
+}
+
+TEST_F(WinUI3SampleFixture, UiaWorksWithElementScopingAndXmlFormat) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto full = json::parse(run_command(make_cmd(lvt, get_pid_arg() + " --uia")), nullptr, false);
+    ASSERT_FALSE(full.is_discarded());
+    auto* box = find_by_automation_id(full["root"], "InputBox");
+    ASSERT_NE(box, nullptr);
+    const auto boxId = box->value("id", "");
+    ASSERT_FALSE(boxId.empty());
+
+    // --element scopes the UIA tree the same way it scopes the visual tree.
+    auto scoped = json::parse(
+        run_command(make_cmd(lvt, get_pid_arg() + " --uia --element " + boxId)), nullptr, false);
+    ASSERT_FALSE(scoped.is_discarded()) << "--uia --element produced no JSON";
+    ASSERT_TRUE(scoped.contains("root"));
+    EXPECT_EQ(uia_prop(scoped["root"], "AutomationId"), "InputBox");
+    EXPECT_LT(count_json_nodes(scoped["root"]), count_json_nodes(full["root"]));
+
+    // XML is a supported output format for the UIA tree too.
+    auto xml = run_command(make_cmd(lvt, get_pid_arg() + " --uia --format xml"));
+    EXPECT_NE(xml.find("<LiveVisualTree"), std::string::npos) << xml.substr(0, 200);
+    EXPECT_NE(xml.find("AutomationId=\"InputBox\""), std::string::npos);
+    EXPECT_NE(xml.find("frameworks=\"uia (control view)\""), std::string::npos);
+}
+
+#ifndef NDEBUG
+TEST_F(WinUI3SampleFixture, UiaTreeDrivesScreenshotAnnotations) {
+    SkipIfNotReady();
+
+    // UIA BoundingRectangle is already in screen coordinates, which is why
+    // annotation works unchanged. Assert that rather than assuming it.
+    auto lvt = get_lvt_path();
+    auto annFile = fs::path(lvt).parent_path() / "lvt_uia_annotations.json";
+    fs::remove(annFile);
+
+    run_command(make_cmd(lvt,
+        get_pid_arg() + " --uia --dump --annotations-json " + annFile.string()));
+
+    ASSERT_TRUE(fs::exists(annFile)) << "no annotations produced for a UIA tree";
+    std::string content;
+    {
+        std::ifstream f(annFile);
+        content.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }  // close before removing
+    auto aj = json::parse(content, nullptr, false);
+    fs::remove(annFile);
+
+    ASSERT_FALSE(aj.is_discarded());
+    ASSERT_TRUE(aj.is_array());
+    EXPECT_GT(aj.size(), 0u) << "UIA elements produced no annotation rectangles";
+    for (const auto& a : aj) {
+        EXPECT_FALSE(a.value("id", "").empty());
+        EXPECT_GT(a.value("width", 0), 0);
+        EXPECT_GT(a.value("height", 0), 0);
+    }
+}
+#endif
+
+TEST_F(WinUI3SampleFixture, UiaWalkDegradesGracefullyOnDeadline) {
+    SkipIfNotReady();
+
+    // A cross-process UIA call can block indefinitely on a wedged target, so the
+    // walk is bounded. An impossibly short deadline must still yield usable
+    // output rather than hanging, crashing, or emitting truncated JSON.
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia --uia-timeout 1"));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded())
+        << "a hit deadline must not corrupt the emitted tree:\n" << output;
+    ASSERT_TRUE(j.contains("root"));
+    // The root is always produced; only descendants can be cut short.
+    EXPECT_FALSE(j["root"].value("id", "").empty());
+}
+
+TEST_F(WinUI3SampleFixture, UiaWatchEmitsAddedEvents) {
+    SkipIfNotReady();
+
+    // --watch runs until Ctrl+C, so it must be driven with an explicit pipe and
+    // terminated: _popen/_pclose would block forever waiting for a process that
+    // never exits. The first tick emits the current tree as "added" events,
+    // which is enough to prove --uia is wired into the watch path and not only
+    // the one-shot dump path.
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    wil::unique_handle readEnd, writeEnd;
+    ASSERT_TRUE(CreatePipe(readEnd.put(), writeEnd.put(), &sa, 0));
+    ASSERT_TRUE(SetHandleInformation(readEnd.get(), HANDLE_FLAG_INHERIT, 0));
+
+    STARTUPINFOA si{sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = writeEnd.get();
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION pi{};
+
+    auto lvt = get_lvt_path();
+    std::string cmd = make_cmd(lvt, get_pid_arg() + " --uia --watch --interval 500");
+    ASSERT_TRUE(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                               CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi));
+    wil::unique_handle process(pi.hProcess);
+    wil::unique_handle thread(pi.hThread);
+    writeEnd.reset();  // so ReadFile sees EOF if the child ever exits
+
+    // Read whatever the first tick produces, bounded by a deadline. Stop once a
+    // *complete* line mentioning the button has arrived, so the parse below is
+    // never handed a half-read line.
+    auto have_complete_button_line = [](const std::string& s) {
+        const auto at = s.find("PrimaryButton");
+        return at != std::string::npos && s.find('\n', at) != std::string::npos;
+    };
+
+    std::string output;
+    const auto deadline = GetTickCount64() + 20000;
+    while (GetTickCount64() < deadline && !have_complete_button_line(output)) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(readEnd.get(), nullptr, 0, nullptr, &available, nullptr))
+            break;
+        if (available == 0) {
+            Sleep(50);
+            continue;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!ReadFile(readEnd.get(), chunk.data(), available, &read, nullptr) || read == 0)
+            break;
+        output.append(chunk, 0, read);
+    }
+
+    TerminateProcess(process.get(), 0);
+    WaitForSingleObject(process.get(), 5000);
+
+    ASSERT_FALSE(output.empty()) << "--uia --watch emitted nothing";
+    EXPECT_TRUE(have_complete_button_line(output))
+        << "watch events did not include the UIA tree's controls";
+
+    // Every complete line must be a well-formed change event. Drop anything
+    // after the final newline: that is a partially read line, not malformed output.
+    const auto lastNewline = output.rfind('\n');
+    ASSERT_NE(lastNewline, std::string::npos) << "no complete line was read";
+    std::istringstream lines(output.substr(0, lastNewline));
+    std::string line;
+    int events = 0;
+    while (std::getline(lines, line)) {
+        if (line.empty())
+            continue;
+        auto ev = json::parse(line, nullptr, false);
+        ASSERT_FALSE(ev.is_discarded())
+            << "watch emitted non-JSON: " << line.substr(0, 200);
+        EXPECT_EQ(ev.value("event", ""), "added");
+        ASSERT_TRUE(ev.contains("element"));
+        ++events;
+    }
+    EXPECT_GT(events, 0) << "no complete watch events parsed";
+}
+
+// --- Cross-architecture behaviour ---
+// --uia injects nothing, so it is exempt from the architecture-match check that
+// the visual-tree providers need. Both halves of that claim are asserted here,
+// against a real 32-bit process.
+
+namespace {
+
+// Returns a 32-bit system executable with a UI, or empty if none is available.
+std::string find_wow64_app() {
+    for (const char* name : {"charmap.exe", "notepad.exe", "mspaint.exe"}) {
+        auto candidate = fs::path("C:\\Windows\\SysWOW64") / name;
+        if (fs::exists(candidate))
+            return candidate.string();
+    }
+    return {};
+}
+
+bool is_wow64(HANDLE process) {
+    BOOL wow64 = FALSE;
+    return IsWow64Process(process, &wow64) && wow64;
+}
+
+} // namespace
+
+class Wow64TargetFixture : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        auto exe = find_wow64_app();
+        if (exe.empty()) {
+            s_skip_reason = "no 32-bit system app available on this machine";
+            return;
+        }
+        if (sizeof(void*) == 4) {
+            // These tests are built for the same architecture as lvt.exe, so a
+            // 32-bit build has no mismatch to observe against a 32-bit target.
+            s_skip_reason = "host is 32-bit, so a 32-bit target is not a mismatch";
+            return;
+        }
+
+        STARTUPINFOA si = {sizeof(si)};
+        PROCESS_INFORMATION pi = {};
+        std::string cmd = "\"" + exe + "\"";
+        if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0,
+                            nullptr, nullptr, &si, &pi)) {
+            s_skip_reason = "failed to launch " + exe;
+            return;
+        }
+        s_process.reset(pi.hProcess);
+        s_thread.reset(pi.hThread);
+        s_pid = pi.dwProcessId;
+        WaitForInputIdle(s_process.get(), 10000);
+
+        if (!is_wow64(s_process.get())) {
+            s_skip_reason = exe + " did not start as a 32-bit process";
+            return;
+        }
+
+        // Wait for a top-level window so lvt has something to resolve.
+        auto lvt = get_lvt_path();
+        for (int attempt = 0; attempt < 30; ++attempt) {
+            auto probe = run_command(make_cmd(lvt, get_pid_arg() + " --uia --depth 0"));
+            auto j = json::parse(probe, nullptr, false);
+            if (!j.is_discarded() && j.contains("root")) {
+                s_ready = true;
+                return;
+            }
+            Sleep(500);
+        }
+        s_skip_reason = "32-bit target never exposed a resolvable window";
+    }
+
+    static void TearDownTestSuite() {
+        if (s_process) {
+            TerminateProcess(s_process.get(), 0);
+            s_process.reset();
+            s_thread.reset();
+        }
+    }
+
+    static void SkipIfNotReady() {
+        if (!s_ready)
+            GTEST_SKIP() << s_skip_reason;
+    }
+
+    static std::string get_pid_arg() { return "--pid " + std::to_string(s_pid); }
+
+    static wil::unique_handle s_process;
+    static wil::unique_handle s_thread;
+    static DWORD s_pid;
+    static bool s_ready;
+    static std::string s_skip_reason;
+};
+
+wil::unique_handle Wow64TargetFixture::s_process;
+wil::unique_handle Wow64TargetFixture::s_thread;
+DWORD Wow64TargetFixture::s_pid = 0;
+bool Wow64TargetFixture::s_ready = false;
+std::string Wow64TargetFixture::s_skip_reason;
+
+TEST_F(Wow64TargetFixture, VisualTreeReportsArchitectureMismatch) {
+    SkipIfNotReady();
+
+    // IMAGE_FILE_MACHINE_I386 used to be unhandled, so a 32-bit target was
+    // classified as the host architecture and this check never fired at all.
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --depth 0") + " 2>&1");
+
+    EXPECT_NE(output.find("architecture mismatch"), std::string::npos)
+        << "expected a mismatch against a 32-bit target, got:\n" << output;
+    EXPECT_NE(output.find("x86"), std::string::npos)
+        << "the target architecture should be named:\n" << output;
+    // The message should point at the way forward.
+    EXPECT_NE(output.find("--uia"), std::string::npos)
+        << "the mismatch message should mention the cross-architecture option";
+}
+
+TEST_F(Wow64TargetFixture, UiaReadsAcrossArchitectures) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia"));
+    auto j = json::parse(output, nullptr, false);
+    ASSERT_FALSE(j.is_discarded())
+        << "--uia should work against a 32-bit target:\n" << output;
+    ASSERT_TRUE(j.contains("root"));
+
+    // Not just a bare root: real automation data must come across the boundary.
+    const auto& root = j["root"];
+    EXPECT_FALSE(root.value("id", "").empty());
+    EXPECT_FALSE(uia_prop(root, "ControlType").empty());
+    EXPECT_FALSE(uia_prop(root, "RuntimeId").empty());
+    EXPECT_GT(count_json_nodes(root), 1u) << "expected child elements from the 32-bit target";
 }
