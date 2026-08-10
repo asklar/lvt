@@ -2395,3 +2395,52 @@ TEST_F(Wow64TargetFixture, UiaReadsAcrossArchitectures) {
     EXPECT_FALSE(uia_prop(root, "RuntimeId").empty());
     EXPECT_GT(count_json_nodes(root), 1u) << "expected child elements from the 32-bit target";
 }
+
+TEST_F(WinUI3SampleFixture, UiaEmitsEnumNamesNotRawNumbers) {
+    SkipIfNotReady();
+
+    // The unit tests pin each mapping; this asserts the mappings are actually
+    // reached on a live tree, and that no enum-valued property leaks an integer.
+    auto lvt = get_lvt_path();
+    auto j = json::parse(run_command(make_cmd(lvt, get_pid_arg() + " --uia")), nullptr, false);
+    ASSERT_FALSE(j.is_discarded());
+
+    auto* window = &j["root"];
+    ASSERT_TRUE(window->contains("properties"));
+
+    // Used to be emitted raw as "2".
+    EXPECT_EQ(uia_prop(*window, "Window.WindowInteractionState"), "ReadyForUserInteraction");
+
+    auto* check = find_by_automation_id(j["root"], "ReadyCheckBox");
+    ASSERT_NE(check, nullptr);
+    EXPECT_EQ(uia_prop(*check, "Toggle.ToggleState"), "On");
+    // Culture is an LCID, previously emitted as "1033". The root Window reports
+    // 0 (suppressed as unset), so assert it on a XAML element that sets one.
+    EXPECT_EQ(uia_prop(*check, "Culture"), "en-US");
+
+    // Sweep the whole tree: no enum-valued property may render as a bare number.
+    static const char* enumProps[] = {
+        "ControlType", "Toggle.ToggleState", "ExpandCollapse.State", "Orientation",
+        "Window.WindowVisualState", "Window.WindowInteractionState",
+        "Table.RowOrColumnMajor", "LiveSetting", "LandmarkType",
+    };
+    std::vector<const json*> stack{&j["root"]};
+    int checked = 0;
+    while (!stack.empty()) {
+        const json* node = stack.back();
+        stack.pop_back();
+        for (const char* prop : enumProps) {
+            const auto value = uia_prop(*node, prop);
+            if (value.empty())
+                continue;
+            ++checked;
+            const bool numeric = value.find_first_not_of("-0123456789") == std::string::npos;
+            EXPECT_FALSE(numeric) << prop << " rendered as a raw number: " << value;
+        }
+        if (node->contains("children")) {
+            for (const auto& child : (*node)["children"])
+                stack.push_back(&child);
+        }
+    }
+    EXPECT_GT(checked, 0) << "no enum-valued properties were present to check";
+}

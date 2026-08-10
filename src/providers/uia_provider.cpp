@@ -111,47 +111,13 @@ std::string variant_to_string(const VARIANT& v) {
     }
 }
 
-// A few properties read better as names than as raw enum numbers.
+// A few properties read better as names than as raw enum numbers or handles.
 std::string humanize(long propertyId, const VARIANT& v, const std::string& raw) {
-    if (propertyId == UIA_ControlTypePropertyId && v.vt == VT_I4)
-        return uia_control_type_name(v.lVal);
+    if (v.vt == VT_I4 && uia_property_is_enum(propertyId))
+        return uia_enum_value_name(propertyId, v.lVal);
 
-    if (propertyId == UIA_ToggleToggleStatePropertyId && v.vt == VT_I4) {
-        switch (v.lVal) {
-        case ToggleState_Off:           return "Off";
-        case ToggleState_On:            return "On";
-        case ToggleState_Indeterminate: return "Indeterminate";
-        default: break;
-        }
-    }
-
-    if (propertyId == UIA_ExpandCollapseExpandCollapseStatePropertyId && v.vt == VT_I4) {
-        switch (v.lVal) {
-        case ExpandCollapseState_Collapsed:    return "Collapsed";
-        case ExpandCollapseState_Expanded:     return "Expanded";
-        case ExpandCollapseState_PartiallyExpanded: return "PartiallyExpanded";
-        case ExpandCollapseState_LeafNode:     return "LeafNode";
-        default: break;
-        }
-    }
-
-    if (propertyId == UIA_OrientationPropertyId && v.vt == VT_I4) {
-        switch (v.lVal) {
-        case OrientationType_None:       return "None";
-        case OrientationType_Horizontal: return "Horizontal";
-        case OrientationType_Vertical:   return "Vertical";
-        default: break;
-        }
-    }
-
-    if (propertyId == UIA_WindowWindowVisualStatePropertyId && v.vt == VT_I4) {
-        switch (v.lVal) {
-        case WindowVisualState_Normal:    return "Normal";
-        case WindowVisualState_Maximized: return "Maximized";
-        case WindowVisualState_Minimized: return "Minimized";
-        default: break;
-        }
-    }
+    if (propertyId == UIA_CulturePropertyId && v.vt == VT_I4)
+        return uia_culture_name(v.lVal);
 
     if (propertyId == UIA_NativeWindowHandlePropertyId && v.vt == VT_I4) {
         char buf[32];

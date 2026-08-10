@@ -175,6 +175,104 @@ struct PatternEntry {
     long id;
 };
 
+// --- Enum-valued properties ---
+//
+// UIA hands these back as plain integers. Emitting them raw leaves a reader
+// with "Window.WindowInteractionState=2", which carries no meaning, so each is
+// mapped to its documented enumerator name.
+
+struct EnumValue {
+    long value;
+    const char* name;
+};
+
+struct EnumProperty {
+    long propertyId;
+    const char* enumName;   // used only for the unknown-value fallback
+    const EnumValue* values;
+    size_t count;
+};
+
+const EnumValue kToggleState[] = {
+    {ToggleState_Off,           "Off"},
+    {ToggleState_On,            "On"},
+    {ToggleState_Indeterminate, "Indeterminate"},
+};
+
+const EnumValue kExpandCollapseState[] = {
+    {ExpandCollapseState_Collapsed,         "Collapsed"},
+    {ExpandCollapseState_Expanded,          "Expanded"},
+    {ExpandCollapseState_PartiallyExpanded, "PartiallyExpanded"},
+    {ExpandCollapseState_LeafNode,          "LeafNode"},
+};
+
+const EnumValue kOrientation[] = {
+    {OrientationType_None,       "None"},
+    {OrientationType_Horizontal, "Horizontal"},
+    {OrientationType_Vertical,   "Vertical"},
+};
+
+const EnumValue kWindowVisualState[] = {
+    {WindowVisualState_Normal,    "Normal"},
+    {WindowVisualState_Maximized, "Maximized"},
+    {WindowVisualState_Minimized, "Minimized"},
+};
+
+const EnumValue kWindowInteractionState[] = {
+    {WindowInteractionState_Running,                 "Running"},
+    {WindowInteractionState_Closing,                 "Closing"},
+    {WindowInteractionState_ReadyForUserInteraction, "ReadyForUserInteraction"},
+    {WindowInteractionState_BlockedByModalWindow,    "BlockedByModalWindow"},
+    {WindowInteractionState_NotResponding,           "NotResponding"},
+};
+
+const EnumValue kRowOrColumnMajor[] = {
+    {RowOrColumnMajor_RowMajor,      "RowMajor"},
+    {RowOrColumnMajor_ColumnMajor,   "ColumnMajor"},
+    {RowOrColumnMajor_Indeterminate, "Indeterminate"},
+};
+
+const EnumValue kLiveSetting[] = {
+    {Off,       "Off"},
+    {Polite,    "Polite"},
+    {Assertive, "Assertive"},
+};
+
+const EnumValue kLandmarkType[] = {
+    {UIA_CustomLandmarkTypeId,     "Custom"},
+    {UIA_FormLandmarkTypeId,       "Form"},
+    {UIA_MainLandmarkTypeId,       "Main"},
+    {UIA_NavigationLandmarkTypeId, "Navigation"},
+    {UIA_SearchLandmarkTypeId,     "Search"},
+};
+
+const EnumProperty kEnumProperties[] = {
+    {UIA_ToggleToggleStatePropertyId, "ToggleState",
+     kToggleState, std::size(kToggleState)},
+    {UIA_ExpandCollapseExpandCollapseStatePropertyId, "ExpandCollapseState",
+     kExpandCollapseState, std::size(kExpandCollapseState)},
+    {UIA_OrientationPropertyId, "OrientationType",
+     kOrientation, std::size(kOrientation)},
+    {UIA_WindowWindowVisualStatePropertyId, "WindowVisualState",
+     kWindowVisualState, std::size(kWindowVisualState)},
+    {UIA_WindowWindowInteractionStatePropertyId, "WindowInteractionState",
+     kWindowInteractionState, std::size(kWindowInteractionState)},
+    {UIA_TableRowOrColumnMajorPropertyId, "RowOrColumnMajor",
+     kRowOrColumnMajor, std::size(kRowOrColumnMajor)},
+    {UIA_LiveSettingPropertyId, "LiveSetting",
+     kLiveSetting, std::size(kLiveSetting)},
+    {UIA_LandmarkTypePropertyId, "LandmarkType",
+     kLandmarkType, std::size(kLandmarkType)},
+};
+
+const EnumProperty* find_enum_property(long propertyId) {
+    for (const auto& e : kEnumProperties) {
+        if (e.propertyId == propertyId)
+            return &e;
+    }
+    return nullptr;
+}
+
 const PatternEntry kPatterns[] = {
     {"Invoke", UIA_InvokePatternId},
     {"Selection", UIA_SelectionPatternId},
@@ -296,6 +394,45 @@ std::string uia_control_type_name(long controlTypeId) {
             return e.name;
     }
     return "ControlType(" + std::to_string(controlTypeId) + ")";
+}
+
+bool uia_property_is_enum(long propertyId) {
+    return propertyId == UIA_ControlTypePropertyId || find_enum_property(propertyId) != nullptr;
+}
+
+std::string uia_enum_value_name(long propertyId, long value) {
+    if (propertyId == UIA_ControlTypePropertyId)
+        return uia_control_type_name(value);
+
+    const auto* prop = find_enum_property(propertyId);
+    if (!prop)
+        return {};
+
+    for (size_t i = 0; i < prop->count; ++i) {
+        if (prop->values[i].value == value)
+            return prop->values[i].name;
+    }
+    // Name the enum only when the value is unrecognised: a bare integer would
+    // say neither what it means nor that lvt did not recognise it.
+    return std::string(prop->enumName) + "(" + std::to_string(value) + ")";
+}
+
+std::string uia_culture_name(long lcid) {
+    if (lcid <= 0)
+        return std::to_string(lcid);
+    wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+    const int written = LCIDToLocaleName(static_cast<LCID>(lcid), name,
+                                         LOCALE_NAME_MAX_LENGTH, 0);
+    if (written <= 1)
+        return std::to_string(lcid);
+
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, name, written - 1,
+                                           nullptr, 0, nullptr, nullptr);
+    if (needed <= 0)
+        return std::to_string(lcid);
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, name, written - 1, out.data(), needed, nullptr, nullptr);
+    return out;
 }
 
 std::string uia_pattern_name(long patternId) {

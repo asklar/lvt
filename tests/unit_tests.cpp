@@ -1,6 +1,7 @@
 // Unit tests for LVT — pure logic, no live windows required
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include "element.h"
 #include "tree_builder.h"
 #include "element_key.h"
@@ -1219,4 +1220,159 @@ TEST(FindElementByRef, ResolvesUiaRuntimeIdReference) {
     auto* byId = lvt::find_element_by_ref(root, "e0");
     ASSERT_NE(byId, nullptr);
     EXPECT_EQ(byId->type, "Window");
+}
+
+// --- Enum-valued property rendering ---
+// UIA returns these as bare integers. Every enum has its own value space, and
+// several overlap numerically (ToggleState_Indeterminate == 2 ==
+// WindowInteractionState_ReadyForUserInteraction == RowOrColumnMajor_Indeterminate),
+// so a mapping keyed on the wrong property is silently plausible. These tests
+// pin each enum against the SDK constants rather than against literals.
+
+TEST(UiaEnums, ToggleStateCoversEveryValue) {
+    const long id = lvt::uia_property_id("Toggle.ToggleState");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ToggleState_Off), "Off");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ToggleState_On), "On");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ToggleState_Indeterminate), "Indeterminate");
+}
+
+TEST(UiaEnums, ExpandCollapseStateCoversEveryValue) {
+    const long id = lvt::uia_property_id("ExpandCollapse.State");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ExpandCollapseState_Collapsed), "Collapsed");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ExpandCollapseState_Expanded), "Expanded");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ExpandCollapseState_PartiallyExpanded),
+              "PartiallyExpanded");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, ExpandCollapseState_LeafNode), "LeafNode");
+}
+
+TEST(UiaEnums, OrientationCoversEveryValue) {
+    const long id = lvt::uia_property_id("Orientation");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, OrientationType_None), "None");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, OrientationType_Horizontal), "Horizontal");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, OrientationType_Vertical), "Vertical");
+}
+
+TEST(UiaEnums, WindowVisualStateCoversEveryValue) {
+    const long id = lvt::uia_property_id("Window.WindowVisualState");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowVisualState_Normal), "Normal");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowVisualState_Maximized), "Maximized");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowVisualState_Minimized), "Minimized");
+}
+
+TEST(UiaEnums, WindowInteractionStateCoversEveryValue) {
+    // Previously emitted raw, so a Window reported WindowInteractionState="2".
+    const long id = lvt::uia_property_id("Window.WindowInteractionState");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_Running), "Running");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_Closing), "Closing");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_ReadyForUserInteraction),
+              "ReadyForUserInteraction");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_BlockedByModalWindow),
+              "BlockedByModalWindow");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, WindowInteractionState_NotResponding),
+              "NotResponding");
+}
+
+TEST(UiaEnums, RowOrColumnMajorCoversEveryValue) {
+    const long id = lvt::uia_property_id("Table.RowOrColumnMajor");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, RowOrColumnMajor_RowMajor), "RowMajor");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, RowOrColumnMajor_ColumnMajor), "ColumnMajor");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, RowOrColumnMajor_Indeterminate), "Indeterminate");
+}
+
+TEST(UiaEnums, LiveSettingCoversEveryValue) {
+    const long id = lvt::uia_property_id("LiveSetting");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, Off), "Off");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, Polite), "Polite");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, Assertive), "Assertive");
+}
+
+TEST(UiaEnums, LandmarkTypeCoversEveryValue) {
+    // Landmark ids live in the 80000 range, far from every other enum, which is
+    // exactly why a copy-paste mistake here would be invisible in normal output.
+    const long id = lvt::uia_property_id("LandmarkType");
+    EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_CustomLandmarkTypeId), "Custom");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_FormLandmarkTypeId), "Form");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_MainLandmarkTypeId), "Main");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_NavigationLandmarkTypeId), "Navigation");
+    EXPECT_EQ(lvt::uia_enum_value_name(id, UIA_SearchLandmarkTypeId), "Search");
+}
+
+TEST(UiaEnums, OverlappingNumericValuesResolvePerProperty) {
+    // 2 means something different in each of these. A mapping keyed on the
+    // wrong property would still produce a plausible-looking name, so assert
+    // the disambiguation directly.
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Toggle.ToggleState"), 2),
+              "Indeterminate");
+    EXPECT_EQ(lvt::uia_enum_value_name(
+                  lvt::uia_property_id("Window.WindowInteractionState"), 2),
+              "ReadyForUserInteraction");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Orientation"), 2), "Vertical");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Window.WindowVisualState"), 2),
+              "Minimized");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("ExpandCollapse.State"), 2),
+              "PartiallyExpanded");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Table.RowOrColumnMajor"), 2),
+              "Indeterminate");
+}
+
+TEST(UiaEnums, UnknownValuesNameTheirEnum) {
+    // The value is unrecognised, so this is where naming the enum earns its
+    // keep: a bare "99" would say neither what it means nor that lvt failed to
+    // recognise it. Known values stay unqualified because the property key
+    // already names the enum.
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("Toggle.ToggleState"), 99),
+              "ToggleState(99)");
+    EXPECT_EQ(lvt::uia_enum_value_name(
+                  lvt::uia_property_id("Window.WindowInteractionState"), 99),
+              "WindowInteractionState(99)");
+    EXPECT_EQ(lvt::uia_enum_value_name(lvt::uia_property_id("LandmarkType"), 99),
+              "LandmarkType(99)");
+    EXPECT_EQ(lvt::uia_control_type_name(999999), "ControlType(999999)");
+}
+
+TEST(UiaEnums, NonEnumPropertiesAreNotTreatedAsEnums) {
+    for (const char* name : {"AutomationId", "Name", "ProcessId", "Level",
+                             "PositionInSet", "SizeOfSet", "IsEnabled",
+                             "Value.Value", "Grid.RowCount"}) {
+        const long id = lvt::uia_property_id(name);
+        ASSERT_NE(id, 0) << name;
+        EXPECT_FALSE(lvt::uia_property_is_enum(id)) << name << " is not an enum";
+        EXPECT_TRUE(lvt::uia_enum_value_name(id, 1).empty()) << name;
+    }
+}
+
+TEST(UiaEnums, EveryEnumPropertyIsInTheEmittedSet) {
+    // An enum mapping for a property lvt never emits is dead weight, and an
+    // emitted enum with no mapping leaks a raw integer. Assert the overlap.
+    const auto& core = lvt::uia_core_property_ids();
+    for (const char* name : {"ControlType", "Toggle.ToggleState", "ExpandCollapse.State",
+                             "Orientation", "Window.WindowVisualState",
+                             "Window.WindowInteractionState", "Table.RowOrColumnMajor",
+                             "LiveSetting", "LandmarkType"}) {
+        const long id = lvt::uia_property_id(name);
+        ASSERT_NE(id, 0) << name;
+        EXPECT_TRUE(lvt::uia_property_is_enum(id)) << name << " should render as an enum";
+        EXPECT_NE(std::find(core.begin(), core.end(), id), core.end())
+            << name << " is mapped but never emitted";
+    }
+}
+
+TEST(UiaCulture, RendersLcidAsLocaleName) {
+    // "Culture=1033" is opaque; "Culture=en-US" is not.
+    EXPECT_EQ(lvt::uia_culture_name(1033), "en-US");
+    EXPECT_EQ(lvt::uia_culture_name(1036), "fr-FR");
+}
+
+TEST(UiaCulture, FallsBackToTheNumberWhenUnresolvable) {
+    EXPECT_EQ(lvt::uia_culture_name(0), "0");
+    EXPECT_EQ(lvt::uia_culture_name(-1), "-1");
+    EXPECT_EQ(lvt::uia_culture_name(0x7FFFFFF), "134217727");
 }
