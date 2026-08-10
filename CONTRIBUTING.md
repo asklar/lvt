@@ -76,7 +76,8 @@ The visual tree deliberately avoids UIA. It is slow, unreliable, and hard to use
 Two rules matter when working on it:
 
 - **Batch through the cache.** UIA properties are cross-process calls. Always fetch via `IUIAutomationCacheRequest` (`TreeScope_Subtree` + `AddProperty`/`AddPattern`, then `GetCachedChildren`/`GetCachedPropertyValue`). Reading live properties per node turns a fast walk into a multi-second one.
-- **Gate pattern-backed properties on pattern support.** UIA answers them on every element regardless, so an ungated walk reports a `Window`'s `Toggle.ToggleState`. `uia_property_owner_pattern()` in `uia_props.cpp` is what prevents that; new pattern-backed properties must declare their owner.
+- **Read pattern-backed properties with the `Ex` form.** `GetCachedPropertyValue` substitutes the property type's *default* when an element does not support the owning pattern, so a `Window` answers `Toggle.ToggleState` with `2` (`ToggleState_Indeterminate`). `GetCachedPropertyValueEx(id, /*ignoreDefaultValue=*/TRUE, &v)` returns UIA's reserved "not supported" object instead — compare it against `IUIAutomation::get_ReservedNotSupportedValue`. Core properties deliberately keep the plain form: there, "not supported" also fires when a provider simply did not set a value, which would drop useful state like `IsControlElement`.
+- **Name pattern-backed properties `Pattern.Member`.** That naming is what selects the `Ex` read path, so it is load-bearing rather than cosmetic; `UiaProps` unit tests enforce it.
 
 ### UIA runs on its own MTA thread
 

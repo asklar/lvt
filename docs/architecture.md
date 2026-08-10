@@ -112,11 +112,18 @@ Three implementation constraints shape the provider:
    `GetCachedPropertyValue()`. This is the difference between one round trip and
    thousands.
 
-2. **Pattern-backed properties are gated on pattern support.** UIA answers
-   `Toggle.ToggleState` for a `Window` just as readily as for a `CheckBox`.
-   `uia_props.cpp` records the owning pattern for each such property and the
-   walk drops any whose pattern the element does not support, along with
-   framework-specific "unset" sentinels (Win32 uses `0` where XAML uses `-1`).
+2. **Pattern-backed properties are read with the `Ex` accessor.** UIA's
+   `GetCachedPropertyValue` substitutes the property type's *default* when an
+   element does not support the owning pattern, so a `Window` answers
+   `Toggle.ToggleState` with `2` (`ToggleState_Indeterminate`) exactly as a real
+   checkbox answers `1`. Properties named `Pattern.Member` are therefore read
+   with `GetCachedPropertyValueEx(id, ignoreDefaultValue=TRUE, …)`, whose
+   reserved "not supported" return is the provider-authoritative signal — no
+   property-to-pattern table needed. Core properties keep the plain accessor,
+   because for them "not supported" also fires whenever a provider simply did
+   not set the value, which would drop useful state such as `IsControlElement`.
+   Separately, `uia_props.cpp` suppresses framework-specific "unset" sentinels
+   (Win32 uses `0` where XAML uses `-1` for an unset `Level`).
 
 3. **It runs on a dedicated MTA thread.** UIA clients want an MTA;
    `screenshot.cpp` initializes an STA on the calling thread. A thread cannot be

@@ -33,15 +33,14 @@ std::string normalize_property_name(const std::string& name) {
 struct PropertyEntry {
     const char* name;
     long id;
-    // Pattern that owns this property, or 0 if it is always meaningful. UIA
-    // answers pattern-backed properties on every element regardless of support
-    // (a Window happily reports Toggle.ToggleState="Indeterminate"), so without
-    // this the output is dominated by meaningless defaults.
-    long ownerPattern;
     // Value that means "unset" for this property, so optional metadata only
     // appears where a provider actually set it. Comma-separated because
     // frameworks disagree on the sentinel: Win32 reports 0 for an unset
     // Level/PositionInSet/SizeOfSet where XAML reports -1.
+    //
+    // This is a different concern from "the element does not support this
+    // property at all" — that is answered by UIA itself via
+    // GetCachedPropertyValueEx(ignoreDefaultValue=TRUE), not by this table.
     const char* unsetValues;
 };
 
@@ -51,85 +50,75 @@ struct PropertyEntry {
 // way makes durable keys work on UIA trees with no extra plumbing.
 const PropertyEntry kProperties[] = {
     // Identity
-    {"AutomationId",         UIA_AutomationIdPropertyId,         0, nullptr},
-    {"Name",                 UIA_NamePropertyId,                 0, nullptr},
-    {"ClassName",            UIA_ClassNamePropertyId,            0, nullptr},
-    {"RuntimeId",            UIA_RuntimeIdPropertyId,            0, nullptr},
-    {"FrameworkId",          UIA_FrameworkIdPropertyId,          0, nullptr},
-    {"ProcessId",            UIA_ProcessIdPropertyId,            0, nullptr},
-    {"NativeWindowHandle",   UIA_NativeWindowHandlePropertyId,   0, "0x0"},
-    {"ProviderDescription",  UIA_ProviderDescriptionPropertyId,  0, nullptr},
+    {"AutomationId",         UIA_AutomationIdPropertyId, nullptr},
+    {"Name",                 UIA_NamePropertyId, nullptr},
+    {"ClassName",            UIA_ClassNamePropertyId, nullptr},
+    {"RuntimeId",            UIA_RuntimeIdPropertyId, nullptr},
+    {"FrameworkId",          UIA_FrameworkIdPropertyId, nullptr},
+    {"ProcessId",            UIA_ProcessIdPropertyId, nullptr},
+    {"NativeWindowHandle",   UIA_NativeWindowHandlePropertyId, "0x0"},
+    {"ProviderDescription",  UIA_ProviderDescriptionPropertyId, nullptr},
 
     // Classification
-    {"ControlType",          UIA_ControlTypePropertyId,          0, nullptr},
-    {"LocalizedControlType", UIA_LocalizedControlTypePropertyId, 0, nullptr},
-    {"ItemType",             UIA_ItemTypePropertyId,             0, nullptr},
-    {"ItemStatus",           UIA_ItemStatusPropertyId,           0, nullptr},
-    {"HelpText",             UIA_HelpTextPropertyId,             0, nullptr},
-    {"AcceleratorKey",       UIA_AcceleratorKeyPropertyId,       0, nullptr},
-    {"AccessKey",            UIA_AccessKeyPropertyId,            0, nullptr},
-    {"FullDescription",      UIA_FullDescriptionPropertyId,      0, nullptr},
+    {"ControlType",          UIA_ControlTypePropertyId, nullptr},
+    {"LocalizedControlType", UIA_LocalizedControlTypePropertyId, nullptr},
+    {"ItemType",             UIA_ItemTypePropertyId, nullptr},
+    {"ItemStatus",           UIA_ItemStatusPropertyId, nullptr},
+    {"HelpText",             UIA_HelpTextPropertyId, nullptr},
+    {"AcceleratorKey",       UIA_AcceleratorKeyPropertyId, nullptr},
+    {"AccessKey",            UIA_AccessKeyPropertyId, nullptr},
+    {"FullDescription",      UIA_FullDescriptionPropertyId, nullptr},
 
     // State
-    {"IsEnabled",            UIA_IsEnabledPropertyId,            0, nullptr},
-    {"IsOffscreen",          UIA_IsOffscreenPropertyId,          0, nullptr},
-    {"IsKeyboardFocusable",  UIA_IsKeyboardFocusablePropertyId,  0, nullptr},
-    {"HasKeyboardFocus",     UIA_HasKeyboardFocusPropertyId,     0, nullptr},
-    {"IsContentElement",     UIA_IsContentElementPropertyId,     0, nullptr},
-    {"IsControlElement",     UIA_IsControlElementPropertyId,     0, nullptr},
-    {"IsPassword",           UIA_IsPasswordPropertyId,           0, "false"},
-    {"IsDialog",             UIA_IsDialogPropertyId,             0, "false"},
-    {"BoundingRectangle",    UIA_BoundingRectanglePropertyId,    0, nullptr},
-    {"Culture",              UIA_CulturePropertyId,              0, "0"},
-    {"Orientation",          UIA_OrientationPropertyId,          0, "None"},
-    {"LiveSetting",          UIA_LiveSettingPropertyId,          0, "0"},
-    {"Level",                UIA_LevelPropertyId,                0, "0,-1"},
-    {"PositionInSet",        UIA_PositionInSetPropertyId,        0, "0,-1"},
-    {"SizeOfSet",            UIA_SizeOfSetPropertyId,            0, "0,-1"},
-    {"LandmarkType",         UIA_LandmarkTypePropertyId,         0, "0"},
-    {"LocalizedLandmarkType", UIA_LocalizedLandmarkTypePropertyId, 0, nullptr},
+    {"IsEnabled",            UIA_IsEnabledPropertyId, nullptr},
+    {"IsOffscreen",          UIA_IsOffscreenPropertyId, nullptr},
+    {"IsKeyboardFocusable",  UIA_IsKeyboardFocusablePropertyId, nullptr},
+    {"HasKeyboardFocus",     UIA_HasKeyboardFocusPropertyId, nullptr},
+    {"IsContentElement",     UIA_IsContentElementPropertyId, nullptr},
+    {"IsControlElement",     UIA_IsControlElementPropertyId, nullptr},
+    {"IsPassword",           UIA_IsPasswordPropertyId, "false"},
+    {"IsDialog",             UIA_IsDialogPropertyId, "false"},
+    {"BoundingRectangle",    UIA_BoundingRectanglePropertyId, nullptr},
+    {"Culture",              UIA_CulturePropertyId, "0"},
+    {"Orientation",          UIA_OrientationPropertyId, "None"},
+    {"LiveSetting",          UIA_LiveSettingPropertyId, "0"},
+    {"Level",                UIA_LevelPropertyId, "0,-1"},
+    {"PositionInSet",        UIA_PositionInSetPropertyId, "0,-1"},
+    {"SizeOfSet",            UIA_SizeOfSetPropertyId, "0,-1"},
+    {"LandmarkType",         UIA_LandmarkTypePropertyId, "0"},
+    {"LocalizedLandmarkType", UIA_LocalizedLandmarkTypePropertyId, nullptr},
 
     // Pattern-backed values. Fetching these as properties rather than through
     // the pattern interfaces keeps them inside the single batched cache request;
-    // ownerPattern then gates them to elements that actually support the pattern.
-    {"Value.Value",              UIA_ValueValuePropertyId,       UIA_ValuePatternId, nullptr},
-    {"Value.IsReadOnly",         UIA_ValueIsReadOnlyPropertyId,  UIA_ValuePatternId, nullptr},
-    {"Toggle.ToggleState",       UIA_ToggleToggleStatePropertyId, UIA_TogglePatternId, nullptr},
-    {"ExpandCollapse.State",     UIA_ExpandCollapseExpandCollapseStatePropertyId,
-                                 UIA_ExpandCollapsePatternId, nullptr},
-    {"SelectionItem.IsSelected", UIA_SelectionItemIsSelectedPropertyId,
-                                 UIA_SelectionItemPatternId, nullptr},
-    {"RangeValue.Value",         UIA_RangeValueValuePropertyId,  UIA_RangeValuePatternId, nullptr},
-    {"RangeValue.Minimum",       UIA_RangeValueMinimumPropertyId, UIA_RangeValuePatternId, nullptr},
-    {"RangeValue.Maximum",       UIA_RangeValueMaximumPropertyId, UIA_RangeValuePatternId, nullptr},
-    {"RangeValue.IsReadOnly",    UIA_RangeValueIsReadOnlyPropertyId, UIA_RangeValuePatternId, nullptr},
-    {"Scroll.HorizontalPercent", UIA_ScrollHorizontalScrollPercentPropertyId,
-                                 UIA_ScrollPatternId, nullptr},
-    {"Scroll.VerticalPercent",   UIA_ScrollVerticalScrollPercentPropertyId,
-                                 UIA_ScrollPatternId, nullptr},
-    {"Scroll.HorizontallyScrollable", UIA_ScrollHorizontallyScrollablePropertyId,
-                                 UIA_ScrollPatternId, nullptr},
-    {"Scroll.VerticallyScrollable",   UIA_ScrollVerticallyScrollablePropertyId,
-                                 UIA_ScrollPatternId, nullptr},
-    {"Window.CanMaximize",       UIA_WindowCanMaximizePropertyId, UIA_WindowPatternId, nullptr},
-    {"Window.CanMinimize",       UIA_WindowCanMinimizePropertyId, UIA_WindowPatternId, nullptr},
-    {"Window.IsModal",           UIA_WindowIsModalPropertyId,     UIA_WindowPatternId, nullptr},
-    {"Window.WindowVisualState", UIA_WindowWindowVisualStatePropertyId,
-                                 UIA_WindowPatternId, nullptr},
-    {"Window.WindowInteractionState", UIA_WindowWindowInteractionStatePropertyId,
-                                 UIA_WindowPatternId, nullptr},
-    {"Grid.RowCount",            UIA_GridRowCountPropertyId,      UIA_GridPatternId, nullptr},
-    {"Grid.ColumnCount",         UIA_GridColumnCountPropertyId,   UIA_GridPatternId, nullptr},
-    {"GridItem.Row",             UIA_GridItemRowPropertyId,       UIA_GridItemPatternId, nullptr},
-    {"GridItem.Column",          UIA_GridItemColumnPropertyId,    UIA_GridItemPatternId, nullptr},
-    {"Table.RowOrColumnMajor",   UIA_TableRowOrColumnMajorPropertyId, UIA_TablePatternId, nullptr},
-    {"Selection.CanSelectMultiple", UIA_SelectionCanSelectMultiplePropertyId,
-                                 UIA_SelectionPatternId, nullptr},
-    {"Selection.IsSelectionRequired", UIA_SelectionIsSelectionRequiredPropertyId,
-                                 UIA_SelectionPatternId, nullptr},
-    {"Transform.CanMove",        UIA_TransformCanMovePropertyId,   UIA_TransformPatternId, nullptr},
-    {"Transform.CanResize",      UIA_TransformCanResizePropertyId, UIA_TransformPatternId, nullptr},
-    {"Transform.CanRotate",      UIA_TransformCanRotatePropertyId, UIA_TransformPatternId, nullptr},
+    // UIA reports them as "not supported" on elements lacking the pattern.
+    {"Value.Value",              UIA_ValueValuePropertyId, nullptr},
+    {"Value.IsReadOnly",         UIA_ValueIsReadOnlyPropertyId, nullptr},
+    {"Toggle.ToggleState",       UIA_ToggleToggleStatePropertyId, nullptr},
+    {"ExpandCollapse.State",     UIA_ExpandCollapseExpandCollapseStatePropertyId, nullptr},
+    {"SelectionItem.IsSelected", UIA_SelectionItemIsSelectedPropertyId, nullptr},
+    {"RangeValue.Value",         UIA_RangeValueValuePropertyId, nullptr},
+    {"RangeValue.Minimum",       UIA_RangeValueMinimumPropertyId, nullptr},
+    {"RangeValue.Maximum",       UIA_RangeValueMaximumPropertyId, nullptr},
+    {"RangeValue.IsReadOnly",    UIA_RangeValueIsReadOnlyPropertyId, nullptr},
+    {"Scroll.HorizontalPercent", UIA_ScrollHorizontalScrollPercentPropertyId, nullptr},
+    {"Scroll.VerticalPercent",   UIA_ScrollVerticalScrollPercentPropertyId, nullptr},
+    {"Scroll.HorizontallyScrollable", UIA_ScrollHorizontallyScrollablePropertyId, nullptr},
+    {"Scroll.VerticallyScrollable",   UIA_ScrollVerticallyScrollablePropertyId, nullptr},
+    {"Window.CanMaximize",       UIA_WindowCanMaximizePropertyId, nullptr},
+    {"Window.CanMinimize",       UIA_WindowCanMinimizePropertyId, nullptr},
+    {"Window.IsModal",           UIA_WindowIsModalPropertyId, nullptr},
+    {"Window.WindowVisualState", UIA_WindowWindowVisualStatePropertyId, nullptr},
+    {"Window.WindowInteractionState", UIA_WindowWindowInteractionStatePropertyId, nullptr},
+    {"Grid.RowCount",            UIA_GridRowCountPropertyId, nullptr},
+    {"Grid.ColumnCount",         UIA_GridColumnCountPropertyId, nullptr},
+    {"GridItem.Row",             UIA_GridItemRowPropertyId, nullptr},
+    {"GridItem.Column",          UIA_GridItemColumnPropertyId, nullptr},
+    {"Table.RowOrColumnMajor",   UIA_TableRowOrColumnMajorPropertyId, nullptr},
+    {"Selection.CanSelectMultiple", UIA_SelectionCanSelectMultiplePropertyId, nullptr},
+    {"Selection.IsSelectionRequired", UIA_SelectionIsSelectionRequiredPropertyId, nullptr},
+    {"Transform.CanMove",        UIA_TransformCanMovePropertyId, nullptr},
+    {"Transform.CanResize",      UIA_TransformCanResizePropertyId, nullptr},
+    {"Transform.CanRotate",      UIA_TransformCanRotatePropertyId, nullptr},
 };
 
 struct ControlTypeEntry {
@@ -276,14 +265,6 @@ const std::vector<long>& uia_core_property_ids() {
         return v;
     }();
     return *ids;
-}
-
-long uia_property_owner_pattern(long propertyId) {
-    for (const auto& e : kProperties) {
-        if (e.id == propertyId)
-            return e.ownerPattern;
-    }
-    return 0;
 }
 
 bool uia_property_value_is_unset(long propertyId, const std::string& value) {

@@ -1081,18 +1081,55 @@ TEST(UiaProps, RoundTripsNameAndId) {
     }
 }
 
-TEST(UiaProps, PatternBackedPropertiesDeclareTheirOwner) {
-    // Gating on the owning pattern is what keeps a Window from reporting
-    // Toggle.ToggleState; if these lose their owner the output regresses badly.
-    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("Toggle.ToggleState")),
-              lvt::uia_pattern_id("Toggle"));
-    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("Value.Value")),
-              lvt::uia_pattern_id("Value"));
-    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("Grid.RowCount")),
-              lvt::uia_pattern_id("Grid"));
-    // Identity properties are always meaningful and must not be gated.
-    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("AutomationId")), 0);
-    EXPECT_EQ(lvt::uia_property_owner_pattern(lvt::uia_property_id("ControlType")), 0);
+TEST(UiaProps, PatternBackedPropertiesAreNamedUnderTheirPattern) {
+    // The provider decides how to read a property from its name: anything
+    // containing '.' is pattern-backed and is read with
+    // GetCachedPropertyValueEx(ignoreDefaultValue=TRUE) so UIA reports
+    // "not supported" instead of substituting a default (a Window otherwise
+    // answers Toggle.ToggleState with 2 = Indeterminate). Core properties use
+    // the plain form, because there "not supported" would also fire whenever a
+    // provider simply did not set the value, dropping useful state such as
+    // IsControlElement.
+    //
+    // That makes this naming convention load-bearing, so pin it down.
+    const char* patternBacked[] = {
+        "Toggle.ToggleState", "Value.Value", "Grid.RowCount",
+        "ExpandCollapse.State", "RangeValue.Value", "Scroll.VerticalPercent",
+        "SelectionItem.IsSelected", "Window.CanMaximize", "Transform.CanMove",
+    };
+    for (const char* name : patternBacked) {
+        const std::string n = name;
+        EXPECT_NE(n.find('.'), std::string::npos) << n << " must be pattern-namespaced";
+        const long id = lvt::uia_property_id(n);
+        EXPECT_NE(id, 0) << n << " does not resolve";
+        EXPECT_EQ(lvt::uia_property_name(id), n);
+
+        // The prefix must name a real pattern, or the convention is a lie.
+        EXPECT_NE(lvt::uia_pattern_id(n.substr(0, n.find('.'))), 0)
+            << n << " has no matching pattern";
+    }
+
+    // Conversely, identity/state properties must NOT look pattern-backed.
+    for (const char* name : {"AutomationId", "ControlType", "IsEnabled",
+                             "IsControlElement", "IsContentElement", "RuntimeId"}) {
+        const std::string n = name;
+        EXPECT_EQ(n.find('.'), std::string::npos) << n << " must not be pattern-namespaced";
+        EXPECT_NE(lvt::uia_property_id(n), 0) << n << " does not resolve";
+    }
+}
+
+TEST(UiaProps, EveryDottedCorePropertyNamesARealPattern) {
+    // Guards the same rule across the whole default set, so a property added
+    // later cannot quietly break the read path.
+    for (long id : lvt::uia_core_property_ids()) {
+        const auto name = lvt::uia_property_name(id);
+        const auto dot = name.find('.');
+        if (dot == std::string::npos)
+            continue;
+        EXPECT_NE(lvt::uia_pattern_id(name.substr(0, dot)), 0)
+            << name << " is pattern-namespaced but '" << name.substr(0, dot)
+            << "' is not a known pattern";
+    }
 }
 
 TEST(UiaProps, SuppressesFrameworkSpecificUnsetSentinels) {

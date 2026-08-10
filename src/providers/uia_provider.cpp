@@ -179,6 +179,9 @@ struct WalkContext {
     // suppression: if a caller asked for a property by name, report it even when
     // it holds its default.
     std::set<long> requestedProperties;
+    // UIA's sentinel for "this element does not support this property". See
+    // apply_cached_properties for why identity against this matters.
+    wil::com_ptr<IUnknown> notSupported;
     clock_type::time_point deadline;
     bool hasDeadline = false;
     bool truncated = false;
@@ -196,17 +199,13 @@ struct WalkContext {
 };
 
 void apply_cached_properties(WalkContext& ctx, IUIAutomationElement* element, Element& out) {
-    // Patterns first: pattern support gates which pattern-backed properties are
-    // meaningful, so it has to be known before the property loop runs.
     std::string supportedPatterns;
-    std::set<long> supported;
     for (long patternId : uia_probed_pattern_ids()) {
         // Availability comes from the cached pattern set, so this costs no extra
         // cross-process calls: it was part of the batched request.
         wil::com_ptr<IUnknown> pattern;
         if (FAILED(element->GetCachedPattern(patternId, &pattern)) || !pattern)
             continue;
-        supported.insert(patternId);
         auto name = uia_pattern_name(patternId);
         if (name.empty())
             continue;
@@ -216,16 +215,32 @@ void apply_cached_properties(WalkContext& ctx, IUIAutomationElement* element, El
     }
 
     for (long propertyId : ctx.properties) {
-        // Skip a pattern-backed property when the element does not support the
-        // owning pattern; UIA would otherwise answer with a meaningless default.
-        const long owner = uia_property_owner_pattern(propertyId);
-        if (owner != 0 && supported.find(owner) == supported.end())
-            continue;
+        const auto name = uia_property_name(propertyId);
+
+        // Pattern-backed properties are named "Pattern.Member"; that naming is
+        // the rule, asserted by the unit tests. Only they need the Ex form:
+        //
+        // GetCachedPropertyValue substitutes the property type's *default* when
+        // the element does not support the owning pattern, so a Window answers
+        // Toggle.ToggleState with 2 (ToggleState_Indeterminate) as readily as a
+        // real checkbox does. GetCachedPropertyValueEx with ignoreDefaultValue
+        // returns UIA's reserved "not supported" object instead — the
+        // provider-authoritative signal, and it needs no property-to-pattern table.
+        //
+        // Core properties deliberately keep the plain form: for those, UIA also
+        // reports "not supported" whenever a provider did not explicitly set the
+        // value, which would silently drop useful state such as IsControlElement.
+        const bool patternBacked = name.find('.') != std::string::npos;
 
         wil::unique_variant value;
-        // A provider may simply not answer for a given property; that is normal
-        // and must not abort the element, let alone the walk.
-        if (FAILED(element->GetCachedPropertyValue(propertyId, &value)))
+        const HRESULT hr = patternBacked
+            ? element->GetCachedPropertyValueEx(propertyId, TRUE, &value)
+            : element->GetCachedPropertyValue(propertyId, &value);
+        // A provider may simply not answer; that is normal and must not abort
+        // the element, let alone the walk.
+        if (FAILED(hr))
+            continue;
+        if (patternBacked && value.vt == VT_UNKNOWN && value.punkVal == ctx.notSupported.get())
             continue;
 
         if (propertyId == UIA_BoundingRectanglePropertyId) {
@@ -271,7 +286,6 @@ void apply_cached_properties(WalkContext& ctx, IUIAutomationElement* element, El
         if (is_promoted_property(propertyId))
             continue;
 
-        auto name = uia_property_name(propertyId);
         if (name.empty())
             continue;
 
@@ -419,6 +433,7 @@ HRESULT build_tree_on_mta(HWND hwnd, const UiaOptions& options,
     ctx.cacheRequest = request;
     ctx.properties = std::move(properties);
     ctx.requestedProperties = std::move(requested);
+    LOG_IF_FAILED(automation->get_ReservedNotSupportedValue(ctx.notSupported.put()));
     ctx.maxDepth = options.maxDepth;
     if (options.timeoutMs > 0) {
         ctx.hasDeadline = true;
@@ -460,6 +475,7 @@ HRESULT element_from_point_on_mta(POINT screenPoint, const UiaOptions& options, 
     ctx.cacheRequest = request;
     ctx.properties = std::move(properties);
     ctx.requestedProperties = std::move(requested);
+    LOG_IF_FAILED(automation->get_ReservedNotSupportedValue(ctx.notSupported.put()));
     ctx.maxDepth = 0;
 
     out = build_from_cached(ctx, cached.get(), 0);

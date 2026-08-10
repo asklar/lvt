@@ -235,10 +235,12 @@ those patterns (`Value.Value`, `Toggle.ToggleState`, `ExpandCollapse.State`,
 `RangeValue.*`, `Scroll.*`, …).
 
 Pattern-backed properties are **only emitted where the pattern is supported**.
-UIA will happily tell you a `Window`'s `Toggle.ToggleState`, which is meaningless
-noise; lvt gates each property on its owning pattern so a `Button` shows
-`SupportedPatterns="Invoke,…"` and no toggle state, while a `CheckBox` shows
-`Toggle.ToggleState="On"`.
+UIA will otherwise tell you a `Window`'s `Toggle.ToggleState` is
+`Indeterminate` — not because it has one, but because `GetCachedPropertyValue`
+substitutes the type's default for unsupported properties. lvt reads them with
+`ignoreDefaultValue` so UIA reports "not supported" instead, and a `Button`
+shows `SupportedPatterns="Invoke,…"` with no toggle state while a `CheckBox`
+shows `Toggle.ToggleState="On"`.
 
 Everything that works on the visual tree works here: `eN` ids, durable keys,
 `--element`, `--query`, `--depth`, `--watch`, `--format xml`, and annotated

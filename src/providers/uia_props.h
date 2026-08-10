@@ -28,15 +28,12 @@ std::string uia_property_name(long propertyId);
 // cost floor of a walk.
 const std::vector<long>& uia_core_property_ids();
 
-// The pattern that owns a property, or 0 if it is always meaningful. UIA answers
-// pattern-backed properties on every element whether or not the pattern is
-// supported, so callers must gate on this to avoid emitting a Window's
-// Toggle.ToggleState.
-long uia_property_owner_pattern(long propertyId);
-
 // True when a value equals the "unset" sentinel for that property (e.g. Level 0,
 // NativeWindowHandle 0x0), so optional metadata is only emitted where a provider
 // actually set it.
+//
+// Distinct from "the element does not support this property", which UIA answers
+// itself via GetCachedPropertyValueEx(ignoreDefaultValue=TRUE).
 bool uia_property_value_is_unset(long propertyId, const std::string& value);
 
 // Human-readable name for a UIA_*ControlTypeId, e.g. "Button". Falls back to
