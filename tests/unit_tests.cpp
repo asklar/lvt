@@ -1476,6 +1476,10 @@ TEST(KeyChord, ParsesModifiers) {
     EXPECT_TRUE(chord.ctrl);
     EXPECT_FALSE(chord.alt);
     EXPECT_NE(chord.vk, 0);
+    // The case written by the caller must not become a Shift. Ctrl+S and
+    // Ctrl+Shift+S are different shortcuts in most applications, so folding
+    // VkKeyScan's case bit in here silently sends the wrong one.
+    EXPECT_FALSE(chord.shift) << "Ctrl+S must not become Ctrl+Shift+S";
 
     ASSERT_TRUE(lvt::parse_key_chord("ctrl+shift+alt+F4", chord));
     EXPECT_TRUE(chord.ctrl);
@@ -1486,6 +1490,79 @@ TEST(KeyChord, ParsesModifiers) {
     ASSERT_TRUE(lvt::parse_key_chord("Control+Home", chord));
     EXPECT_TRUE(chord.ctrl);
     EXPECT_EQ(chord.vk, VK_HOME);
+}
+
+TEST(SyntheticInput, PointIsOnScreenAcceptsTheDesktopAndRejectsOffscreenCoordinates) {
+    // The guard that stops a click aimed at an offscreen element from being
+    // clamped onto whatever sits at the desktop's corner. Offscreen XAML
+    // elements routinely report coordinates like -20237,-21283.
+    POINT onScreen{GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2};
+    EXPECT_TRUE(lvt::point_is_on_screen(onScreen));
+
+    EXPECT_FALSE(lvt::point_is_on_screen(POINT{-20237, -21283}));
+    EXPECT_FALSE(lvt::point_is_on_screen(POINT{1'000'000, 1'000'000}));
+}
+
+TEST(SyntheticInput, PointIsOnScreenAcceptsTheVirtualDesktopEdges) {
+    // Multi-monitor coordinates can legitimately be negative, so the check must
+    // be against the virtual desktop rather than the primary monitor.
+    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+    EXPECT_TRUE(lvt::point_is_on_screen(POINT{left, top}));
+    EXPECT_TRUE(lvt::point_is_on_screen(POINT{left + width - 1, top + height - 1}));
+    // Just outside the virtual desktop must be rejected.
+    EXPECT_FALSE(lvt::point_is_on_screen(POINT{left + width + 500, top + height + 500}));
+}
+
+TEST(KeyChord, UppercaseLettersWithModifiersDoNotGainAPhantomShift) {    // Every one of these is a real, commonly used shortcut whose Shift variant
+    // does something different, which is what makes the bug this pins down
+    // more than cosmetic.
+    for (const char* text : {"Ctrl+S", "Ctrl+A", "Ctrl+N", "Ctrl+O", "Ctrl+W", "Alt+F"}) {
+        lvt::KeyChord chord;
+        ASSERT_TRUE(lvt::parse_key_chord(text, chord)) << text;
+        EXPECT_FALSE(chord.shift) << text << " must not imply Shift";
+    }
+
+    // The lowercase spelling has always been correct, and must stay identical
+    // to the uppercase one now that both are accepted.
+    lvt::KeyChord upper;
+    lvt::KeyChord lower;
+    ASSERT_TRUE(lvt::parse_key_chord("Ctrl+N", upper));
+    ASSERT_TRUE(lvt::parse_key_chord("Ctrl+n", lower));
+    EXPECT_EQ(upper.vk, lower.vk);
+    EXPECT_EQ(upper.shift, lower.shift);
+    EXPECT_EQ(upper.ctrl, lower.ctrl);
+}
+
+TEST(KeyChord, ExplicitShiftIsStillHonouredWithLetters) {
+    lvt::KeyChord chord;
+    ASSERT_TRUE(lvt::parse_key_chord("Ctrl+Shift+S", chord));
+    EXPECT_TRUE(chord.ctrl);
+    EXPECT_TRUE(chord.shift);
+
+    // Shift written on its own with a lowercase letter must still shift.
+    ASSERT_TRUE(lvt::parse_key_chord("Shift+a", chord));
+    EXPECT_TRUE(chord.shift);
+}
+
+TEST(KeyChord, PunctuationKeepsTheLayoutShiftEvenWithModifiers) {
+    // Unlike a letter's case, the Shift on punctuation is how the character is
+    // produced at all: dropping it would send Ctrl+/ instead of Ctrl+?. This is
+    // the distinction that stops the fix for the letter case from overreaching.
+    //
+    // Guarded on the layout actually needing Shift for '?', so the test does
+    // not fail on layouts where it does not.
+    const SHORT scan = VkKeyScanW(L'?');
+    if (scan == -1 || !((scan >> 8) & 1))
+        GTEST_SKIP() << "this keyboard layout does not reach '?' via Shift";
+
+    lvt::KeyChord chord;
+    ASSERT_TRUE(lvt::parse_key_chord("Ctrl+?", chord));
+    EXPECT_TRUE(chord.ctrl);
+    EXPECT_TRUE(chord.shift) << "punctuation must keep the shift that produces it";
 }
 
 TEST(KeyChord, ShiftedCharactersCarryTheirOwnModifier) {
@@ -1551,4 +1628,81 @@ TEST(ActionKind, ParsesAndRoundTripsNames) {
 
     EXPECT_STREQ(lvt::action_kind_name(lvt::ActionKind::click), "click");
     EXPECT_STREQ(lvt::action_kind_name(lvt::ActionKind::setValue), "set-value");
+}
+
+// Every ActionKind, so a new one cannot be added without a name. The previous
+// spot-check of two kinds let nine of them silently report themselves as
+// "unknown" in the result JSON.
+static constexpr lvt::ActionKind kAllActionKinds[] = {
+    lvt::ActionKind::click,          lvt::ActionKind::invoke,
+    lvt::ActionKind::toggle,         lvt::ActionKind::setValue,
+    lvt::ActionKind::expand,         lvt::ActionKind::collapse,
+    lvt::ActionKind::select,         lvt::ActionKind::addToSelection,
+    lvt::ActionKind::removeFromSelection, lvt::ActionKind::selectText,
+    lvt::ActionKind::focus,          lvt::ActionKind::scroll,
+    lvt::ActionKind::typeText,       lvt::ActionKind::pressKey,
+    lvt::ActionKind::windowClose,    lvt::ActionKind::windowMinimize,
+    lvt::ActionKind::windowMaximize, lvt::ActionKind::windowRestore,
+    lvt::ActionKind::waitFor,        lvt::ActionKind::waitGone,
+};
+
+TEST(ActionKind, EveryKindHasARealName) {
+    for (const auto kind : kAllActionKinds) {
+        const std::string name = lvt::action_kind_name(kind);
+        EXPECT_NE(name, "unknown")
+            << "ActionKind " << static_cast<int>(kind)
+            << " has no name, so it reports itself as \"unknown\" in the result JSON";
+        EXPECT_FALSE(name.empty());
+    }
+}
+
+TEST(ActionKind, EveryNameParsesBackToItsOwnKind) {
+    for (const auto kind : kAllActionKinds) {
+        const auto* name = lvt::action_kind_name(kind);
+        lvt::ActionKind parsed{};
+        ASSERT_TRUE(lvt::parse_action_kind(name, parsed))
+            << "'" << name << "' is emitted but not accepted back";
+        EXPECT_EQ(parsed, kind) << "'" << name << "' round-tripped to a different kind";
+    }
+}
+
+TEST(ActionKind, NamesAreUnique) {
+    // Two kinds sharing a name would make the round trip above pass while the
+    // reported action was still wrong for one of them.
+    std::set<std::string> seen;
+    for (const auto kind : kAllActionKinds) {
+        const std::string name = lvt::action_kind_name(kind);
+        EXPECT_TRUE(seen.insert(name).second) << "duplicate action name '" << name << "'";
+    }
+    EXPECT_EQ(seen.size(), std::size(kAllActionKinds));
+}
+
+TEST(ActionKind, CliVerbNamesMatchTheReportedActionNames) {
+    // The verb a user types and the action lvt reports having performed should
+    // be the same word; a mismatch makes result JSON hard to correlate with the
+    // command that produced it.
+    const std::pair<const char*, lvt::ActionKind> pairs[] = {
+        {"click", lvt::ActionKind::click},
+        {"invoke", lvt::ActionKind::invoke},
+        {"toggle", lvt::ActionKind::toggle},
+        {"set-value", lvt::ActionKind::setValue},
+        {"expand", lvt::ActionKind::expand},
+        {"collapse", lvt::ActionKind::collapse},
+        {"select", lvt::ActionKind::select},
+        {"add-to-selection", lvt::ActionKind::addToSelection},
+        {"remove-from-selection", lvt::ActionKind::removeFromSelection},
+        {"select-text", lvt::ActionKind::selectText},
+        {"focus", lvt::ActionKind::focus},
+        {"scroll", lvt::ActionKind::scroll},
+        {"type", lvt::ActionKind::typeText},
+        {"press-key", lvt::ActionKind::pressKey},
+        {"close", lvt::ActionKind::windowClose},
+        {"minimize", lvt::ActionKind::windowMinimize},
+        {"maximize", lvt::ActionKind::windowMaximize},
+        {"restore", lvt::ActionKind::windowRestore},
+        {"wait-for", lvt::ActionKind::waitFor},
+        {"wait-gone", lvt::ActionKind::waitGone},
+    };
+    for (const auto& [verb, kind] : pairs)
+        EXPECT_STREQ(lvt::action_kind_name(kind), verb);
 }

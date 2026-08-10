@@ -598,6 +598,9 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
     AVALONIA_SAMPLE_EXE_PATH="${AVALONIA_SAMPLE_EXE_ESCAPED}"
     WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
+    # Lets tests assert on repository files, e.g. that the packaged skill has
+    # not drifted from the one this repo's own agent reads.
+    "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
 )
 target_link_libraries(lvt_integration_tests PRIVATE
     GTest::gtest GTest::gtest_main

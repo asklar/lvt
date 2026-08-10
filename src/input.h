@@ -32,12 +32,23 @@ bool send_key_chord(const KeyChord& chord);
 // keyboard layout. Goes to whatever currently has focus.
 bool send_text(const std::string& utf8);
 
-// Click at a screen point. Saves and restores the cursor position, and brings
-// the owning window forward first, because synthetic clicks land on whatever is
-// actually on top.
+// Is this screen point on a monitor? Worth checking before any synthetic mouse
+// input: an offscreen UI element reports coordinates far outside the desktop,
+// and the mouse APIs clamp such a point to the nearest edge and report success,
+// so input aimed at it would silently land on an unrelated window.
+bool point_is_on_screen(POINT screenPoint);
+
+// Click at a screen point. Saves and restores the cursor position, and carries
+// the position on the button events themselves so the click cannot be delivered
+// somewhere else if the cursor moves first. Returns false if the point is not
+// on any monitor.
+//
+// Callers are responsible for bringing the target window forward: synthetic
+// clicks land on whatever is actually on top.
 bool send_click(POINT screenPoint, int button = 0, int clickCount = 1);
 
-// Wheel scroll at a screen point. Positive delta scrolls up / right.
+// Wheel scroll at a screen point. Positive delta scrolls up / right. Same
+// position guarantees as send_click.
 bool send_wheel(POINT screenPoint, int delta, bool horizontal = false);
 
 // Bring the window containing an element to the foreground. Synthetic input is

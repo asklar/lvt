@@ -173,12 +173,25 @@ bool parse_key_chord(const std::string& text, KeyChord& out) {
 
     // Single character: resolve through the active layout so punctuation and
     // letters both work. VkKeyScanW also reports the shift state it needs.
-    const auto wide = widen(key);
+    //
+    // That shift state means two different things, and conflating them is a
+    // bug: for a letter it merely encodes the case that was written, but for
+    // punctuation it is genuinely how the character is produced on this layout
+    // ('?' is Shift+/ on a US layout). So when the caller has written their own
+    // modifiers, resolve a letter from its lowercase form — otherwise "Ctrl+S"
+    // silently becomes Ctrl+Shift+S, which is a different shortcut in most
+    // applications. Punctuation still keeps the layout's shift, since dropping
+    // it would produce the wrong character entirely.
+    const bool hasWrittenModifiers = !modifierPart.empty();
+    const bool isLetter = key.size() == 1 && std::isalpha(static_cast<unsigned char>(key[0])) != 0;
+    const auto wide = widen(hasWrittenModifiers && isLetter ? lower : key);
     if (wide.size() == 1) {
         const SHORT scan = VkKeyScanW(wide[0]);
         if (scan == -1)
             return false;
         out.vk = static_cast<WORD>(scan & 0xFF);
+        // AltGr characters report ctrl+alt here; those are how the character is
+        // reached, so they are always folded in.
         if ((scan >> 8) & 1) out.shift = true;
         if ((scan >> 8) & 2) out.ctrl = true;
         if ((scan >> 8) & 4) out.alt = true;
@@ -261,6 +274,16 @@ bool send_text(const std::string& utf8) {
     return dispatch(inputs);
 }
 
+// Poll until the window actually reaches the foreground. Every route to the
+// foreground is asynchronous and advisory, so the only trustworthy answer is
+// what the system reports afterwards — callers use this to say the click was
+// refused rather than silently landing it on the wrong window.
+static bool wait_for_foreground(HWND root) {
+    for (int i = 0; i < 20 && GetForegroundWindow() != root; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    return GetForegroundWindow() == root;
+}
+
 bool bring_to_foreground(HWND hwnd) {
     if (!IsWindow(hwnd))
         return false;
@@ -272,18 +295,76 @@ bool bring_to_foreground(HWND hwnd) {
 
     if (IsIconic(root))
         ShowWindow(root, SW_RESTORE);
-    SetForegroundWindow(root);
 
-    // SetForegroundWindow is advisory: the shell refuses it when the calling
-    // process does not own the foreground. Give the change a moment to land and
-    // report whether it actually did, so callers can say so rather than
-    // silently clicking the wrong window.
-    for (int i = 0; i < 20 && GetForegroundWindow() != root; ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    return GetForegroundWindow() == root;
+    if (SetForegroundWindow(root))
+        return wait_for_foreground(root);
+
+    // SetForegroundWindow is advisory: the shell refuses a process that does
+    // not already own the foreground. That is the normal case for lvt — an
+    // agent driving an app is never the active window — so without a second
+    // attempt every synthetic click would fail with "could not bring the
+    // target window to the foreground".
+    //
+    // Attaching our input queue to the current foreground thread's makes the
+    // shell treat this process as part of that input context, which is the
+    // documented way to make the call succeed. The attachment is always undone,
+    // including on an early return, because leaving two threads sharing an
+    // input queue affects their focus and capture handling.
+    const DWORD self = GetCurrentThreadId();
+    const HWND foreground = GetForegroundWindow();
+    const DWORD other = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    if (!other || other == self)
+        return wait_for_foreground(root);
+
+    if (!AttachThreadInput(self, other, TRUE))
+        return wait_for_foreground(root);
+    auto detach = wil::scope_exit([&] { AttachThreadInput(self, other, FALSE); });
+
+    SetForegroundWindow(root);
+    BringWindowToTop(root);
+    return wait_for_foreground(root);
+}
+
+// Convert screen coordinates to the 0..65535 normalized space MOUSEEVENTF_ABSOLUTE
+// uses. MOUSEEVENTF_VIRTUALDESK makes that space span all monitors, so negative
+// coordinates on a secondary display work.
+static bool to_absolute(POINT screenPoint, LONG& dx, LONG& dy) {
+    const int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (width <= 1 || height <= 1)
+        return false;
+
+    // Rounded rather than truncated: at 4K widths a truncating conversion can
+    // land a pixel short, which is enough to miss a 1px-border control.
+    const double nx = (static_cast<double>(screenPoint.x - left) * 65535.0) / (width - 1);
+    const double ny = (static_cast<double>(screenPoint.y - top) * 65535.0) / (height - 1);
+    dx = static_cast<LONG>(nx + 0.5);
+    dy = static_cast<LONG>(ny + 0.5);
+    return true;
+}
+
+bool point_is_on_screen(POINT screenPoint) {
+    return MonitorFromPoint(screenPoint, MONITOR_DEFAULTTONULL) != nullptr;
 }
 
 bool send_click(POINT screenPoint, int button, int clickCount) {
+    // Refuse rather than clamp. SetCursorPos silently pins an out-of-range
+    // point to the nearest edge and still reports success, so a click aimed at
+    // an offscreen element would land on the desktop corner — on whatever
+    // window happens to be there — and be reported as having worked.
+    if (!point_is_on_screen(screenPoint)) {
+        LOG_HR_MSG(E_INVALIDARG, "click point %ld,%ld is not on any monitor",
+                   screenPoint.x, screenPoint.y);
+        return false;
+    }
+
+    LONG dx = 0;
+    LONG dy = 0;
+    if (!to_absolute(screenPoint, dx, dy))
+        return false;
+
     POINT restore{};
     const bool haveRestore = GetCursorPos(&restore) != FALSE;
     // Put the cursor back even if a SendInput below fails.
@@ -292,30 +373,56 @@ bool send_click(POINT screenPoint, int button, int clickCount) {
             SetCursorPos(restore.x, restore.y);
     });
 
-    if (!SetCursorPos(screenPoint.x, screenPoint.y)) {
-        LOG_LAST_ERROR_MSG("SetCursorPos(%ld, %ld)", screenPoint.x, screenPoint.y);
-        return false;
-    }
-
     DWORD down = MOUSEEVENTF_LEFTDOWN, up = MOUSEEVENTF_LEFTUP;
     if (button == 1) { down = MOUSEEVENTF_RIGHTDOWN;  up = MOUSEEVENTF_RIGHTUP; }
     if (button == 2) { down = MOUSEEVENTF_MIDDLEDOWN; up = MOUSEEVENTF_MIDDLEUP; }
 
+    // The move travels in the same batch as the buttons, and every button event
+    // repeats the absolute position. SendInput only enqueues: button events
+    // without a position are resolved against wherever the cursor is when the
+    // raw input thread dequeues them, which — because the scope_exit above
+    // restores the cursor as soon as SendInput returns — can be the user's
+    // original position rather than the target. Carrying the coordinates on
+    // every event makes position and click atomic.
+    const DWORD move = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+
     std::vector<INPUT> inputs;
+    INPUT moveInput{};
+    moveInput.type = INPUT_MOUSE;
+    moveInput.mi.dwFlags = move;
+    moveInput.mi.dx = dx;
+    moveInput.mi.dy = dy;
+    inputs.push_back(moveInput);
+
     for (int i = 0; i < (std::max)(1, clickCount); ++i) {
         INPUT d{};
         d.type = INPUT_MOUSE;
-        d.mi.dwFlags = down;
+        d.mi.dwFlags = down | move;
+        d.mi.dx = dx;
+        d.mi.dy = dy;
         inputs.push_back(d);
         INPUT u{};
         u.type = INPUT_MOUSE;
-        u.mi.dwFlags = up;
+        u.mi.dwFlags = up | move;
+        u.mi.dx = dx;
+        u.mi.dy = dy;
         inputs.push_back(u);
     }
     return dispatch(inputs);
 }
 
 bool send_wheel(POINT screenPoint, int delta, bool horizontal) {
+    if (!point_is_on_screen(screenPoint)) {
+        LOG_HR_MSG(E_INVALIDARG, "scroll point %ld,%ld is not on any monitor",
+                   screenPoint.x, screenPoint.y);
+        return false;
+    }
+
+    LONG dx = 0;
+    LONG dy = 0;
+    if (!to_absolute(screenPoint, dx, dy))
+        return false;
+
     POINT restore{};
     const bool haveRestore = GetCursorPos(&restore) != FALSE;
     auto restoreCursor = wil::scope_exit([&] {
@@ -323,12 +430,15 @@ bool send_wheel(POINT screenPoint, int delta, bool horizontal) {
             SetCursorPos(restore.x, restore.y);
     });
 
-    SetCursorPos(screenPoint.x, screenPoint.y);
-
+    // Same reasoning as send_click: the wheel event carries its own position so
+    // it cannot be delivered wherever the cursor was restored to.
     INPUT input{};
     input.type = INPUT_MOUSE;
-    input.mi.dwFlags = horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL;
+    input.mi.dwFlags = (horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL) |
+                       MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
     input.mi.mouseData = static_cast<DWORD>(delta);
+    input.mi.dx = dx;
+    input.mi.dy = dy;
     std::vector<INPUT> inputs{input};
     return dispatch(inputs);
 }

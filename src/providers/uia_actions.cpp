@@ -59,6 +59,77 @@ HRESULT create_automation(const UiaOptions& options, IUIAutomation** out) {
     return S_OK;
 }
 
+// Compare a RuntimeId SAFEARRAY against the components we are looking for.
+bool runtime_id_matches(SAFEARRAY* array, const std::vector<int>& runtimeId) {
+    if (!array)
+        return false;
+    LONG lower = 0;
+    LONG upper = -1;
+    if (FAILED(SafeArrayGetLBound(array, 1, &lower)) ||
+        FAILED(SafeArrayGetUBound(array, 1, &upper)))
+        return false;
+    if (static_cast<size_t>(upper - lower + 1) != runtimeId.size())
+        return false;
+
+    for (LONG i = lower; i <= upper; ++i) {
+        int component = 0;
+        if (FAILED(SafeArrayGetElement(array, &i, &component)))
+            return false;
+        if (component != runtimeId[static_cast<size_t>(i - lower)])
+            return false;
+    }
+    return true;
+}
+
+// Does this element's live RuntimeId equal the one requested? Used to decide
+// whether the window root is genuinely the element being addressed.
+bool element_has_runtime_id(IUIAutomationElement* element, const std::vector<int>& runtimeId) {
+    wil::unique_variant value;
+    if (FAILED(element->GetCurrentPropertyValue(UIA_RuntimeIdPropertyId, &value)))
+        return false;
+    if (value.vt != (VT_ARRAY | VT_I4))
+        return false;
+    return runtime_id_matches(value.parray, runtimeId);
+}
+
+// The same test against a cached RuntimeId, so a bulk FindAllBuildCache can be
+// scanned without a cross-process call per candidate.
+bool cached_runtime_id_matches(IUIAutomationElement* element, const std::vector<int>& runtimeId) {
+    wil::unique_variant value;
+    if (FAILED(element->GetCachedPropertyValue(UIA_RuntimeIdPropertyId, &value)))
+        return false;
+    if (value.vt != (VT_ARRAY | VT_I4))
+        return false;
+    return runtime_id_matches(value.parray, runtimeId);
+}
+
+// Depth-first search of a materialised cache for the element with this
+// RuntimeId. Purely in-process: the cross-process cost was paid by the
+// BuildUpdatedCache that produced `cachedRoot`.
+wil::com_ptr<IUIAutomationElement> find_in_cached_tree(IUIAutomationElement* node,
+                                                      const std::vector<int>& runtimeId) {
+    if (!node)
+        return {};
+    if (cached_runtime_id_matches(node, runtimeId))
+        return wil::com_ptr<IUIAutomationElement>(node);
+
+    wil::com_ptr<IUIAutomationElementArray> children;
+    if (FAILED(node->GetCachedChildren(&children)) || !children)
+        return {};
+    int count = 0;
+    if (FAILED(children->get_Length(&count)))
+        return {};
+
+    for (int i = 0; i < count; ++i) {
+        wil::com_ptr<IUIAutomationElement> child;
+        if (FAILED(children->GetElement(i, &child)) || !child)
+            continue;
+        if (auto match = find_in_cached_tree(child.get(), runtimeId))
+            return match;
+    }
+    return {};
+}
+
 // Re-find the live element by RuntimeId. The walk produces plain data, so
 // acting on an element means locating it again; RuntimeId is the handle UIA
 // provides for exactly this.
@@ -81,16 +152,50 @@ HRESULT find_by_runtime_id(IUIAutomation* automation, HWND hwnd,
     RETURN_IF_FAILED(automation->CreatePropertyCondition(
         UIA_RuntimeIdPropertyId, condition, &byRuntimeId));
 
+    // FindFirst is the fast path, but it cannot be the only one. Providers are
+    // not required to support RuntimeId in a property condition, and in
+    // practice many do not — against Notepad it matches nothing at all. It is
+    // still tried first because when it does work it is a single round trip.
     wil::com_ptr<IUIAutomationElement> found;
-    RETURN_IF_FAILED(root->FindFirst(TreeScope_Subtree, byRuntimeId.get(), &found));
-    if (!found) {
-        // The root itself is not covered by a Subtree search on some providers.
-        wil::unique_variant rootId;
-        if (SUCCEEDED(root->GetCurrentPropertyValue(UIA_RuntimeIdPropertyId, &rootId)) &&
-            rootId.vt == (VT_ARRAY | VT_I4)) {
-            found = root;
-        }
+    if (FAILED(root->FindFirst(TreeScope_Subtree, byRuntimeId.get(), &found)))
+        found.reset();
+
+    if (!found && element_has_runtime_id(root.get(), runtimeId)) {
+        // TreeScope_Subtree excludes the root on some providers, so the window
+        // element itself has to be checked separately. Comparing the id is what
+        // makes this safe: accepting the root unconditionally would silently
+        // redirect every unresolvable ref at the whole window, so a `close` or
+        // `minimize` aimed at a stale element would act on the application.
+        found = root;
     }
+
+    if (!found) {
+        // Fall back to comparing ids ourselves, using exactly the mechanism the
+        // walk that produced this ref used: BuildUpdatedCache over the raw view,
+        // then a walk of the materialised cache. That equivalence is the point —
+        // FindAll does not descend into child HWNDs hosted by other providers,
+        // so an element whose RuntimeId names a different window (common: a
+        // Notepad TextBlock is `42.<child hwnd>.…` while the root is
+        // `42.<root hwnd>`) is unreachable through it, yet perfectly reachable
+        // here. One BuildUpdatedCache is still a single cross-process trip.
+        wil::com_ptr<IUIAutomationCondition> rawView;
+        RETURN_IF_FAILED(automation->get_RawViewCondition(&rawView));
+
+        wil::com_ptr<IUIAutomationCacheRequest> cache;
+        RETURN_IF_FAILED(automation->CreateCacheRequest(&cache));
+        RETURN_IF_FAILED(cache->put_TreeScope(TreeScope_Subtree));
+        RETURN_IF_FAILED(cache->put_TreeFilter(rawView.get()));
+        // The matched element is acted on afterwards, so it has to stay live
+        // rather than being a detached cache-only copy.
+        RETURN_IF_FAILED(cache->put_AutomationElementMode(AutomationElementMode_Full));
+        RETURN_IF_FAILED(cache->AddProperty(UIA_RuntimeIdPropertyId));
+
+        wil::com_ptr<IUIAutomationElement> cachedRoot;
+        RETURN_IF_FAILED(root->BuildUpdatedCache(cache.get(), &cachedRoot));
+        RETURN_HR_IF_NULL(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), cachedRoot.get());
+        found = find_in_cached_tree(cachedRoot.get(), runtimeId);
+    }
+
     RETURN_HR_IF_NULL(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), found.get());
     *out = found.detach();
     return S_OK;
@@ -101,9 +206,43 @@ POINT element_center(const Element& element) {
                  element.bounds.y + element.bounds.height / 2};
 }
 
-bool has_pattern(IUIAutomationElement* element, PATTERNID pattern) {
-    wil::com_ptr<IUnknown> unknown;
-    return SUCCEEDED(element->GetCurrentPattern(pattern, &unknown)) && unknown;
+// The point to aim synthetic input at, read from the *live* element rather than
+// from the walk that produced the ref.
+//
+// The walk and the action are separate round trips, so anything that scrolls or
+// relayouts in between leaves the walked bounds pointing at whatever now
+// occupies that rectangle. Re-reading here closes that window. The walk's bounds
+// remain the fallback for providers that do not answer the live query.
+//
+// Refuses offscreen elements outright: their bounds are typically far outside
+// the virtual desktop, and clicking such a point would otherwise be clamped
+// onto an unrelated window.
+HRESULT live_element_center(IUIAutomationElement* element, const Element& walked, POINT& out,
+                            std::string& failure) {
+    BOOL offscreen = FALSE;
+    if (SUCCEEDED(element->get_CurrentIsOffscreen(&offscreen)) && offscreen) {
+        failure = "the element is offscreen, so there is nothing on screen to click; "
+                  "scroll it into view first";
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+
+    RECT live{};
+    if (SUCCEEDED(element->get_CurrentBoundingRectangle(&live)) &&
+        live.right > live.left && live.bottom > live.top) {
+        out = POINT{live.left + (live.right - live.left) / 2,
+                    live.top + (live.bottom - live.top) / 2};
+    } else if (walked.bounds.width > 0 && walked.bounds.height > 0) {
+        out = element_center(walked);
+    } else {
+        failure = "the element has no on-screen bounds to target";
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+
+    if (!point_is_on_screen(out)) {
+        failure = "the element's on-screen position is not on any monitor";
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
+    return S_OK;
 }
 
 std::wstring widen(const std::string& text) {
@@ -254,13 +393,18 @@ PatternAttempt try_scroll(IUIAutomationElement* element, const std::string& dire
 // A virtualized item does not exist as a real element until it is realized, so
 // nothing can be done to it. Realizing first is transparent and cheap: an
 // already-real element simply does not expose the pattern.
+// Make a virtualized item real so it can be acted on. Returns true only when
+// Realize() actually succeeded: the caller reports this in `method`, and
+// claiming a realize that failed would misattribute how the action was carried
+// out.
 bool realize_if_virtualized(IUIAutomationElement* element) {
     wil::com_ptr<IUIAutomationVirtualizedItemPattern> virtualized;
     if (FAILED(element->GetCurrentPatternAs(UIA_VirtualizedItemPatternId,
                                             IID_PPV_ARGS(&virtualized))) || !virtualized)
         return false;
-    LOG_IF_FAILED(virtualized->Realize());
-    return true;
+    const HRESULT hr = virtualized->Realize();
+    LOG_IF_FAILED(hr);
+    return SUCCEEDED(hr);
 }
 
 PatternAttempt try_set_range_value(IUIAutomationElement* element, const std::string& text,
@@ -379,38 +523,59 @@ std::string describe_decline(const PatternAttempt& attempt, const char* patternN
 
 } // namespace
 
+// The one place an ActionKind's textual name is defined. `parse_action_kind`
+// and `action_kind_name` are both generated from this, so a new kind cannot end
+// up parseable but nameless (or vice versa) — the earlier hand-written pair had
+// drifted to the point that nine kinds reported themselves as "unknown".
+//
+// The first spelling is the canonical one, the rest are accepted aliases.
+struct ActionKindNames {
+    ActionKind kind;
+    const char* canonical;
+    const char* alias;  // nullptr when there is none
+};
+
+constexpr ActionKindNames kActionKindNames[] = {
+    {ActionKind::click,               "click",                 nullptr},
+    {ActionKind::invoke,              "invoke",                nullptr},
+    {ActionKind::toggle,              "toggle",                nullptr},
+    {ActionKind::setValue,            "set-value",             "setvalue"},
+    {ActionKind::expand,              "expand",                nullptr},
+    {ActionKind::collapse,            "collapse",              nullptr},
+    {ActionKind::select,              "select",                nullptr},
+    {ActionKind::addToSelection,      "add-to-selection",      "addtoselection"},
+    {ActionKind::removeFromSelection, "remove-from-selection", "removefromselection"},
+    {ActionKind::selectText,          "select-text",           "selecttext"},
+    {ActionKind::focus,               "focus",                 nullptr},
+    {ActionKind::scroll,              "scroll",                nullptr},
+    {ActionKind::typeText,            "type",                  "typetext"},
+    {ActionKind::pressKey,            "press-key",             "presskey"},
+    {ActionKind::windowClose,         "close",                 "windowclose"},
+    {ActionKind::windowMinimize,      "minimize",              "windowminimize"},
+    {ActionKind::windowMaximize,      "maximize",              "windowmaximize"},
+    {ActionKind::windowRestore,       "restore",               "windowrestore"},
+    {ActionKind::waitFor,             "wait-for",              "waitfor"},
+    {ActionKind::waitGone,            "wait-gone",             "waitgone"},
+};
+
 bool parse_action_kind(const std::string& name, ActionKind& out) {
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-    if (lower == "click")      { out = ActionKind::click;    return true; }
-    if (lower == "invoke")     { out = ActionKind::invoke;   return true; }
-    if (lower == "toggle")     { out = ActionKind::toggle;   return true; }
-    if (lower == "setvalue" || lower == "set-value") { out = ActionKind::setValue; return true; }
-    if (lower == "expand")     { out = ActionKind::expand;   return true; }
-    if (lower == "collapse")   { out = ActionKind::collapse; return true; }
-    if (lower == "select")     { out = ActionKind::select;   return true; }
-    if (lower == "focus")      { out = ActionKind::focus;    return true; }
-    if (lower == "scroll")     { out = ActionKind::scroll;   return true; }
-    if (lower == "type" || lower == "typetext")  { out = ActionKind::typeText; return true; }
-    if (lower == "key" || lower == "presskey")   { out = ActionKind::pressKey; return true; }
+    for (const auto& entry : kActionKindNames) {
+        if (lower == entry.canonical || (entry.alias && lower == entry.alias)) {
+            out = entry.kind;
+            return true;
+        }
+    }
     return false;
 }
 
 const char* action_kind_name(ActionKind kind) {
-    switch (kind) {
-    case ActionKind::click:    return "click";
-    case ActionKind::invoke:   return "invoke";
-    case ActionKind::toggle:   return "toggle";
-    case ActionKind::setValue: return "set-value";
-    case ActionKind::expand:   return "expand";
-    case ActionKind::collapse: return "collapse";
-    case ActionKind::select:   return "select";
-    case ActionKind::focus:    return "focus";
-    case ActionKind::scroll:   return "scroll";
-    case ActionKind::typeText: return "type";
-    case ActionKind::pressKey: return "press-key";
+    for (const auto& entry : kActionKindNames) {
+        if (entry.kind == kind)
+            return entry.canonical;
     }
     return "unknown";
 }
@@ -432,6 +597,22 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
         const bool wantPresent = request.kind == ActionKind::waitFor;
 
         for (;;) {
+            // A destroyed window is a definite answer, not a failed read: an
+            // element inside a window that no longer exists is unambiguously
+            // gone. Without this the natural `close` then `wait-gone` pairing
+            // polls until it times out, reporting failure for the exact
+            // outcome it was waiting for.
+            if (!IsWindow(hwnd)) {
+                if (!wantPresent) {
+                    result.ok = true;
+                    result.method = "wait-gone";
+                    return result;
+                }
+                result.message = "the window closed while waiting for '" +
+                                 request.elementRef + "'";
+                return result;
+            }
+
             UiaProvider provider;
             if (auto tree = provider.build(hwnd, options)) {
                 assign_element_ids(*tree);
@@ -512,7 +693,6 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
     std::string method;
     std::string failure;
     bool realized = false;
-    const POINT center = element_center(target);
 
     const HRESULT hr = run_on_mta([&]() -> HRESULT {
         wil::com_ptr<IUIAutomation> automation;
@@ -556,11 +736,8 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
 
             // Nothing accepted it, so fall back to a real click. This is the
             // only path that needs the window on top and moves the cursor.
-            if (target.bounds.width <= 0 || target.bounds.height <= 0) {
-                failure = "no pattern would activate this element and it has no "
-                          "on-screen bounds to click";
-                return E_NOTIMPL;
-            }
+            POINT center{};
+            RETURN_IF_FAILED(live_element_center(element.get(), target, center, failure));
             if (!bring_to_foreground(hwnd)) {
                 failure = "no pattern would activate this element, and the window "
                           "could not be brought to the foreground, so a synthetic "
@@ -696,7 +873,9 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
             const int notch = WHEEL_DELTA * (std::max)(1, request.amount);
             const bool horizontal = request.direction == "left" || request.direction == "right";
             const bool negative = request.direction == "down" || request.direction == "left";
-            if (!send_wheel(center, negative ? -notch : notch, horizontal)) {
+            POINT wheelPoint{};
+            RETURN_IF_FAILED(live_element_center(element.get(), target, wheelPoint, failure));
+            if (!send_wheel(wheelPoint, negative ? -notch : notch, horizontal)) {
                 failure = "SendInput wheel failed";
                 return E_FAIL;
             }

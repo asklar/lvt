@@ -187,7 +187,7 @@ struct VerbSpec {
     const char* usage;
 };
 
-// maxArgs of -1 means the verb takes an optional trailing argument.
+// Verbs with differing min/max arg counts take an optional trailing argument.
 static const VerbSpec kVerbs[] = {
     {"dump",                 Verb::dump,                0, 0, "dump"},
     {"screenshot",           Verb::screenshot,          0, 0, "screenshot [--output <file>]"},
@@ -816,6 +816,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (!IsWindow(target.hwnd)) {
+        // wait-gone is the one verb whose success condition is the window
+        // being gone, so an invalid handle satisfies it rather than failing it.
+        if (args.verb == Verb::waitGone) {
+            printf("%s\n", nlohmann::json{{"action", "wait-gone"},
+                                          {"ok", true},
+                                          {"element", args.verbArgs.empty()
+                                                          ? std::string()
+                                                          : args.verbArgs[0]},
+                                          {"method", "window-closed"}}
+                               .dump(2)
+                               .c_str());
+            return 0;
+        }
         fprintf(stderr, "lvt: target HWND 0x%p is not a valid window\n",
                 static_cast<void*>(target.hwnd));
         return 1;

@@ -71,6 +71,17 @@ static std::string trim_crlf(const std::string& value) {
     return value.substr(0, end + 1);
 }
 
+// Read a repository file for tests that assert on documentation. Line endings
+// are normalised so a checkout with autocrlf does not look like a difference.
+static std::string read_text_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return {};
+    std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+    return text;
+}
+
 // Launch a dedicated Notepad instance for testing
 class NotepadFixture : public ::testing::Test {
 protected:
@@ -2608,14 +2619,41 @@ TEST_F(WinUI3SampleFixture, ActionResultReportsHowItWasPerformed) {
     ASSERT_FALSE(button.is_null());
     const auto ref = "uia:" + uia_prop(button, "RuntimeId");
 
+    const auto readStatus = [&] {
+        auto status = uia_element(lvt, get_pid_arg(), "StatusText");
+        return status.is_null() ? std::string() : status.value("text", "");
+    };
+
+    const auto beforePattern = readStatus();
+    ASSERT_FALSE(beforePattern.empty());
+
     auto viaPattern = run_action_json(lvt, get_pid_arg() + " click " + ref);
     EXPECT_EQ(viaPattern.value("method", ""), "InvokePattern");
+    EXPECT_NE(readStatus(), beforePattern) << "the pattern click did not reach the app";
 
     // double-click has no pattern equivalent, so it must say it used SendInput
     // rather than quietly invoking once and claiming success.
+    const auto beforeInput = readStatus();
     auto viaInput = run_action_json(lvt, get_pid_arg() + " double-click " + ref);
+
+    if (!viaInput.value("ok", false) &&
+        viaInput.value("error", "").find("foreground") != std::string::npos) {
+        // SetForegroundWindow is advisory: the shell refuses it when another
+        // process owns the foreground, which on a shared machine can be
+        // anything. Refusing is the correct behaviour — a synthetic click that
+        // proceeded anyway would land on the wrong window — so this is an
+        // environment limitation rather than a defect.
+        GTEST_SKIP() << "another window held the foreground, so synthetic input was "
+                        "correctly refused: " << viaInput.dump(2);
+    }
+
     EXPECT_TRUE(viaInput.value("ok", false)) << viaInput.dump(2);
     EXPECT_EQ(viaInput.value("method", ""), "SendInput");
+    // The label alone proves nothing: assert the app actually saw the click.
+    // This is the only synthetic-input path in the suite, and so the one most
+    // worth verifying by effect rather than by what it claims to have done.
+    EXPECT_NE(readStatus(), beforeInput)
+        << "the synthetic click reported success but the app did not react";
 }
 
 TEST_F(WinUI3SampleFixture, InvokeRefusesElementsWithoutThePattern) {
@@ -2860,6 +2898,273 @@ TEST_F(WinUI3SampleFixture, FocusAndSelectTextActOnTheTextBox) {
     EXPECT_NE(selectedAll.value("method", "").find("TextPattern"), std::string::npos);
 }
 
+// --- Regressions from the PR review ---
+// Each of these pins a bug that shipped and was caught in review, so the test
+// names describe the wrong behaviour they prevent rather than the API surface.
+
+TEST_F(NotepadFixture, ActionOnANonWindowElementDoesNotActOnTheWindow) {
+    auto lvt = get_lvt_path();
+
+    // Re-finding an element used to fall back to the window root whenever the
+    // lookup missed, without checking the id matched. `minimize` aimed at a
+    // TextBlock therefore minimized the whole application and reported success.
+    // A raw-view element is the case that triggered it: its RuntimeId names a
+    // child HWND, which is exactly what the lookup could not reach.
+    auto tree = json::parse(
+        run_command(make_cmd(lvt, get_pid_arg() + " dump --uia --uia-view raw")), nullptr, false);
+    ASSERT_FALSE(tree.is_discarded()) << "raw UIA dump produced no JSON";
+
+    std::vector<const json*> all;
+    collect_json_elements(tree["root"], all);
+    const json* target = nullptr;
+    const auto rootId = uia_prop(tree["root"], "RuntimeId");
+    for (const auto* element : all) {
+        const auto rid = uia_prop(*element, "RuntimeId");
+        if (rid.empty() || rid == rootId)
+            continue;
+        // It has to be an element FindFirst cannot resolve, or the buggy
+        // fallback is never reached and the test proves nothing. Raw-view-only
+        // elements are exactly that case, and a Text element additionally
+        // guarantees the Window pattern is absent, so a correct implementation
+        // must refuse.
+        if (uia_prop(*element, "IsControlElement") != "false")
+            continue;
+        if (element->value("type", "") != "Text")
+            continue;
+        target = element;
+        break;
+    }
+    if (!target)
+        GTEST_SKIP() << "no raw-view-only Text element in this Notepad build to test with";
+
+    const auto ref = "uia:" + uia_prop(*target, "RuntimeId");
+    auto result = run_action_json(lvt, get_pid_arg() + " minimize " + ref + " --uia-view raw");
+
+    EXPECT_FALSE(result.value("ok", true))
+        << "minimizing a Text element must fail, not minimize the window: " << result.dump(2);
+    // The specific message matters: it proves the element was found and the
+    // pattern was checked, rather than the lookup silently redirecting to the
+    // window (which would have succeeded).
+    EXPECT_NE(result.value("error", "").find("does not support"), std::string::npos)
+        << result.dump(2);
+    EXPECT_FALSE(IsIconic(s_hwnd)) << "the window was minimized by an action aimed elsewhere";
+}
+
+TEST_F(NotepadFixture, RawViewOnlyElementsCanStillBeResolvedForActions) {
+    auto lvt = get_lvt_path();
+
+    // The counterpart to the test above: refusing must come from the pattern
+    // check, not from the element being unreachable. If re-finding regressed to
+    // control-view-only lookup this would report "could not be located".
+    auto tree = json::parse(
+        run_command(make_cmd(lvt, get_pid_arg() + " dump --uia --uia-view raw")), nullptr, false);
+    ASSERT_FALSE(tree.is_discarded());
+
+    std::vector<const json*> all;
+    collect_json_elements(tree["root"], all);
+    const json* target = nullptr;
+    for (const auto* element : all) {
+        if (uia_prop(*element, "IsControlElement") == "false" &&
+            !uia_prop(*element, "RuntimeId").empty()) {
+            target = element;
+            break;
+        }
+    }
+    if (!target)
+        GTEST_SKIP() << "this Notepad build exposes no raw-view-only elements";
+
+    const auto ref = "uia:" + uia_prop(*target, "RuntimeId");
+    auto result = run_action_json(lvt, get_pid_arg() + " focus " + ref + " --uia-view raw");
+    EXPECT_EQ(result.value("error", "").find("could not be located"), std::string::npos)
+        << "a raw-view element the walk emitted must be resolvable for actions: " << result.dump(2);
+}
+
+TEST_F(NotepadFixture, WindowVerbsStillWorkOnTheWindowElement) {
+    // The guard added above must not break the legitimate case it guards.
+    auto lvt = get_lvt_path();
+
+    auto result = run_action_json(lvt, get_pid_arg() + " minimize");
+    ASSERT_TRUE(result.value("ok", false)) << result.dump(2);
+    Sleep(600);
+    EXPECT_TRUE(IsIconic(s_hwnd));
+
+    auto restored = run_action_json(lvt, get_pid_arg() + " restore");
+    EXPECT_TRUE(restored.value("ok", false)) << restored.dump(2);
+    Sleep(600);
+    EXPECT_FALSE(IsIconic(s_hwnd));
+}
+
+TEST_F(NotepadFixture, EveryActionReportsItsOwnNameNotUnknown) {
+    auto lvt = get_lvt_path();
+
+    // Nine of the twenty action kinds had no name and reported themselves as
+    // "unknown" in the result JSON, which made results impossible to correlate
+    // with the command that produced them. These four were among them, and are
+    // reachable without needing a particular control to exist.
+    const std::pair<std::string, std::string> cases[] = {
+        {"restore", "restore"},
+        {"maximize", "maximize"},
+        {"minimize", "minimize"},
+        {"wait-gone uia:99.99.99 --wait-timeout 500", "wait-gone"},
+    };
+    for (const auto& [command, expected] : cases) {
+        auto result = run_action_json(lvt, get_pid_arg() + " " + command);
+        EXPECT_EQ(result.value("action", ""), expected)
+            << "command '" << command << "' reported the wrong action: " << result.dump(2);
+    }
+    run_action_json(lvt, get_pid_arg() + " restore");
+}
+
+TEST_F(NotepadFixture, WaitGoneSucceedsWhenTheWindowItselfCloses) {
+    auto lvt = get_lvt_path();
+
+    // `close` then `wait-gone` is the natural pairing, and it used to time out:
+    // once the window was destroyed the tree could not be built, so the
+    // satisfied-check never ran and the wait reported failure for exactly the
+    // outcome it was waiting for.
+    //
+    // The window under test is one this test owns and destroys. Launching a
+    // second Notepad and killing it is not an option: modern Notepad serves
+    // every window from one process, so terminating it would take the shared
+    // fixture window with it.
+    static constexpr wchar_t kClassName[] = L"LvtWaitGoneProbe";
+    wil::unique_event ready(wil::EventOptions::ManualReset);
+    wil::unique_event destroy(wil::EventOptions::ManualReset);
+    HWND probe = nullptr;
+
+    std::thread ui([&] {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kClassName;
+        RegisterClassExW(&wc);
+
+        probe = CreateWindowExW(0, kClassName, L"lvt wait-gone probe",
+                                WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 400, 300,
+                                nullptr, nullptr, wc.hInstance, nullptr);
+        ready.SetEvent();
+        if (!probe)
+            return;
+
+        // UIA reads this window cross-process, so it has to be pumping messages
+        // the whole time lvt is looking at it.
+        for (;;) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (destroy.wait(20))
+                break;
+        }
+        DestroyWindow(probe);
+        // Let the destruction actually complete before the thread exits.
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    });
+    auto joinUi = wil::scope_exit([&] {
+        destroy.SetEvent();
+        if (ui.joinable())
+            ui.join();
+    });
+
+    ASSERT_TRUE(ready.wait(5000)) << "the probe window thread never started";
+    ASSERT_NE(probe, nullptr) << "could not create the probe window";
+
+    char hwndArg[64];
+    snprintf(hwndArg, sizeof(hwndArg), "--hwnd 0x%llX",
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(probe)));
+
+    auto probeTree = json::parse(
+        run_command(make_cmd(lvt, std::string(hwndArg) + " dump --uia")), nullptr, false);
+    ASSERT_FALSE(probeTree.is_discarded()) << "could not read the probe window's UIA tree";
+    const auto probeRef = "uia:" + uia_prop(probeTree["root"], "RuntimeId");
+    ASSERT_NE(probeRef, "uia:");
+
+    destroy.SetEvent();
+    ui.join();
+    for (int i = 0; i < 50 && IsWindow(probe); ++i)
+        Sleep(100);
+    ASSERT_FALSE(IsWindow(probe)) << "the probe window did not go away";
+
+    const auto start = GetTickCount64();
+    auto result = run_action_json(
+        lvt, std::string(hwndArg) + " wait-gone " + probeRef + " --wait-timeout 8000");
+    const auto elapsed = GetTickCount64() - start;
+
+    EXPECT_TRUE(result.value("ok", false))
+        << "wait-gone must succeed once the window is destroyed: " << result.dump(2);
+    EXPECT_LT(elapsed, 7000u) << "wait-gone burned its timeout instead of noticing the closure";
+}
+
+TEST_F(NotepadFixture, SyntheticInputRefusesOffscreenTargets) {
+    auto lvt = get_lvt_path();
+
+    // Offscreen elements report coordinates far outside the desktop. The mouse
+    // APIs clamp such a point to the nearest edge and report success, so a
+    // click aimed at one used to be injected at the desktop corner — on some
+    // other window entirely — and reported as having worked.
+    auto tree = json::parse(
+        run_command(make_cmd(lvt, get_pid_arg() + " dump --uia --uia-view raw")), nullptr, false);
+    ASSERT_FALSE(tree.is_discarded());
+
+    std::vector<const json*> all;
+    collect_json_elements(tree["root"], all);
+    const json* offscreen = nullptr;
+    for (const auto* element : all) {
+        if (uia_prop(*element, "IsOffscreen") != "true")
+            continue;
+        if (uia_prop(*element, "RuntimeId").empty())
+            continue;
+        // Only elements with no quiet route reach the synthetic path.
+        const auto patterns = uia_prop(*element, "SupportedPatterns");
+        if (patterns.find("Invoke") != std::string::npos)
+            continue;
+        offscreen = element;
+        break;
+    }
+    if (!offscreen)
+        GTEST_SKIP() << "no offscreen element without an Invoke pattern to test with";
+
+    const auto ref = "uia:" + uia_prop(*offscreen, "RuntimeId");
+    auto result = run_action_json(lvt, get_pid_arg() + " click " + ref + " --uia-view raw");
+    EXPECT_FALSE(result.value("ok", true))
+        << "clicking an offscreen element must fail rather than click the desktop corner: "
+        << result.dump(2);
+}
+
+TEST_F(NotepadFixture, PackagedSkillMatchesTheRepositorySkill) {
+    // skills/lvt/SKILL.md is what plugin.json ships to consumers, while
+    // .github/skills/lvt/SKILL.md is what this repo's own agent reads. They had
+    // drifted far enough that the shipped copy documented flags which now exit
+    // 1, so the packaged skill actively told its reader to run broken commands.
+    const std::string root = LVT_SOURCE_DIR;
+    auto packaged = read_text_file(root + "\\skills\\lvt\\SKILL.md");
+    auto repository = read_text_file(root + "\\.github\\skills\\lvt\\SKILL.md");
+    ASSERT_FALSE(packaged.empty()) << "skills/lvt/SKILL.md is missing or empty";
+    ASSERT_FALSE(repository.empty()) << ".github/skills/lvt/SKILL.md is missing or empty";
+    EXPECT_EQ(packaged, repository)
+        << "the packaged skill has drifted from the repository skill; copy "
+           ".github/skills/lvt/SKILL.md over skills/lvt/SKILL.md";
+}
+
+TEST_F(NotepadFixture, NoSkillDocumentsRemovedFlags) {
+    // The flags below became verbs, so a doc that still shows them tells the
+    // reader to run something that exits 1.
+    const std::string root = LVT_SOURCE_DIR;
+    for (const char* relative : {"\\skills\\lvt\\SKILL.md", "\\.github\\skills\\lvt\\SKILL.md"}) {
+        const auto text = read_text_file(root + relative);
+        ASSERT_FALSE(text.empty()) << relative;
+        for (const char* removed : {"--dump", "--frameworks", "--click ", "--invoke "}) {
+            EXPECT_EQ(text.find(removed), std::string::npos)
+                << relative << " still documents the removed flag " << removed;
+        }
+    }
+}
+
 TEST_F(WinUI3SampleFixture, WaitGoneSucceedsForAnElementThatNeverExisted) {
     SkipIfNotReady();
     auto lvt = get_lvt_path();
@@ -2920,8 +3225,15 @@ TEST_F(NotepadFixture, LegacyFlagsReportTheirReplacement) {
         auto output = run_command(make_cmd(lvt, get_pid_arg() + " " + c.flag) + " 2>&1");
         EXPECT_NE(output.find("is now"), std::string::npos)
             << c.flag << " should report its replacement, got:\n" << output;
-        EXPECT_NE(output.find(c.expect), std::string::npos)
-            << c.flag << " should name the '" << c.expect << "' verb";
+        // Asserting the verb name alone is tautological — every one of these is
+        // a substring of the flag being echoed back, so it would pass for any
+        // message that merely repeated the input. Requiring the verb to appear
+        // *after* "is now" is what actually pins the replacement being named.
+        const auto isNow = output.find("is now");
+        ASSERT_NE(isNow, std::string::npos);
+        EXPECT_NE(output.find(c.expect, isNow), std::string::npos)
+            << c.flag << " should name the '" << c.expect << "' verb as its replacement, got:\n"
+            << output;
     }
 }
 
@@ -2948,6 +3260,21 @@ TEST_F(NotepadFixture, ScreenshotVerbDefaultsAndHonoursOutput) {
     run_command(make_cmd(lvt, get_pid_arg() + " screenshot --output " + tmpFile.string()));
     EXPECT_TRUE(fs::exists(tmpFile)) << "--output should name the PNG for the screenshot verb";
     fs::remove(tmpFile);
+
+    // The other half of this test's name: with no --output the verb writes
+    // lvt-screenshot.png in the working directory. Run from a scratch directory
+    // so the default cannot be confused with a leftover file.
+    const auto scratch = fs::temp_directory_path() / "lvt_screenshot_default";
+    std::error_code ec;
+    fs::remove_all(scratch, ec);
+    fs::create_directories(scratch, ec);
+    const auto defaultShot = scratch / "lvt-screenshot.png";
+
+    run_command("cd /d \"" + scratch.string() + "\" && " +
+                make_cmd(lvt, get_pid_arg() + " screenshot"));
+    EXPECT_TRUE(fs::exists(defaultShot))
+        << "screenshot with no --output should write lvt-screenshot.png";
+    fs::remove_all(scratch, ec);
 }
 
 TEST_F(WinUI3SampleFixture, UiaReferenceImpliesTheUiaTree) {
