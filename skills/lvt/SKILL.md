@@ -250,6 +250,26 @@ Pattern state is only emitted where the pattern is supported, so the presence of
 4. **Drill into a subtree** with `--element <id> --depth <n>` if the tree is large
 5. **Use element IDs and bounds** to plan any UI interactions (clicks, keyboard input)
 
+## MCP server mode
+
+`lvt mcp` serves the Model Context Protocol over stdio, which is usually a
+better fit than shelling out repeatedly: it keeps a session open on the target,
+so it walks the tree once per request rather than once per command, and it
+returns screenshots as inline images.
+
+```powershell
+lvt mcp                  # inspection only
+lvt mcp --allow-input    # also expose click, type, set-value and the rest
+```
+
+Configure it in an MCP host with `"command": "lvt.exe", "args": ["mcp", "--allow-input"]`.
+
+The flow is `connect` (returns a session id) → `get_uia_tree` or `find_elements`
+(returns element ids) → act on those ids. Without `--allow-input` the tools that
+change the target app are not registered at all.
+
+See `docs/mcp-server.md` in the repository for the full tool reference.
+
 ## Tips
 
 - Use `--format xml` for human-readable output and `--format json` for programmatic parsing

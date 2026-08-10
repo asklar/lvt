@@ -74,6 +74,12 @@ static void print_usage() {
         "  wait-for <ref>           Block until an element appears\n"
         "  wait-gone <ref>          Block until an element disappears\n"
         "\n"
+        "Server verb:\n"
+        "  mcp                      Serve the Model Context Protocol over stdio, so an\n"
+        "                           agent can inspect and drive apps through lvt.\n"
+        "                           Add --allow-input to expose the tools that click,\n"
+        "                           type and otherwise change the target app.\n"
+        "\n"
         "A <ref> is an element id (e5), a durable key, or uia:<RuntimeId>.\n"
         "\n"
         "Target options:\n"
@@ -119,6 +125,7 @@ enum class Verb {
     focus, scroll, type, pressKey,
     close, minimize, maximize, restore,
     waitFor, waitGone,
+    mcp,
 };
 
 struct Args {
@@ -146,6 +153,8 @@ struct Args {
     int waitTimeoutMs = 5000;
     int depth = -1;
     int intervalMs = 500;
+    // MCP only: expose the tools that can change the target application.
+    bool allowInput = false;
 };
 
 static std::vector<std::string> split_csv(const std::string& text) {
@@ -216,6 +225,7 @@ static const VerbSpec kVerbs[] = {
     {"restore",              Verb::restore,             0, 1, "restore [<ref>]"},
     {"wait-for",             Verb::waitFor,             1, 1, "wait-for <ref>"},
     {"wait-gone",            Verb::waitGone,            1, 1, "wait-gone <ref>"},
+    {"mcp",                  Verb::mcp,                 0, 0, "mcp [--allow-input]"},
 };
 
 static const VerbSpec* find_verb(const std::string& name) {
@@ -226,10 +236,36 @@ static const VerbSpec* find_verb(const std::string& name) {
     return nullptr;
 }
 
+// The MCP server lives in a Rust staticlib linked into this binary, so `lvt mcp`
+// is served by lvt.exe itself rather than a second executable. The declaration
+// is here rather than in a header because it is the only cross-language symbol
+// and giving it a header would imply a wider seam than exists.
+#ifdef LVT_ENABLE_MCP
+extern "C" int lvt_mcp_serve_stdio(bool allow_input);
+#endif
+
+static int run_mcp_server(bool allowInput) {
+#ifdef LVT_ENABLE_MCP
+    // stdout carries the JSON-RPC stream from here on, so nothing else may
+    // write to it. lvt's diagnostics already go to stderr; this makes the
+    // requirement explicit at the one place it becomes load-bearing.
+    return lvt_mcp_serve_stdio(allowInput);
+#else
+    (void)allowInput;
+    fprintf(stderr,
+            "lvt: this build has no MCP server. Rebuild with -DLVT_ENABLE_MCP=ON, "
+            "which needs a Rust toolchain (https://rustup.rs).\n");
+    return 1;
+#endif
+}
+
 static bool verb_drives_app(Verb verb) {
     switch (verb) {
     case Verb::dump: case Verb::screenshot: case Verb::frameworks:
     case Verb::watch: case Verb::query:
+    // mcp is a server, not an action: it is dispatched before target
+    // resolution and never reaches run_action.
+    case Verb::mcp:
         return false;
     default:
         return true;
@@ -315,6 +351,8 @@ static Args parse_args(int argc, char* argv[]) {
             args.intervalMs = parse_non_negative_int(argv[++i], "--interval");
         } else if (strcmp(arg, "--uia") == 0) {
             args.uia = true;
+        } else if (strcmp(arg, "--allow-input") == 0) {
+            args.allowInput = true;
         } else if (strcmp(arg, "--uia-view") == 0 && i + 1 < argc) {
             args.uia = true;
             args.uiaViewName = argv[++i];
@@ -765,6 +803,11 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "lvt: --format must be json or xml\n");
         return 1;
     }
+
+    // The MCP server chooses its own targets through its connect tool, so it
+    // runs before any of the target resolution below and never needs --hwnd.
+    if (args.verb == Verb::mcp)
+        return run_mcp_server(args.allowInput);
 
     if (!args.hwnd && !args.pid && args.processName.empty() && args.windowTitle.empty()) {
         fprintf(stderr, "lvt: must specify --hwnd, --pid, --name, or --title\n");

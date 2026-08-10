@@ -8,6 +8,10 @@ packages/
 bin/
 obj/
 
+# Cargo output for the MCP server. The CMake build redirects this into build/
+# via CARGO_TARGET_DIR, but a bare `cargo test` in mcp/ still creates it here.
+mcp/target/
+
 # IDE files
 .vs/
 .vscode/
