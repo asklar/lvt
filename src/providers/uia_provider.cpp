@@ -377,13 +377,19 @@ HRESULT create_automation(const UiaOptions& options, IUIAutomation** out) {
     // elements later only limits the cheap in-process walk of the materialised
     // cache. Driving the transaction timeout from --uia-timeout is what makes
     // that flag mean what it says.
-    if (auto automation2 = automation.try_query<IUIAutomation2>()) {
-        const int timeout = options.timeoutMs > 0 ? options.timeoutMs : 0;
-        LOG_IF_FAILED(automation2->put_TransactionTimeout(static_cast<DWORD>(timeout)));
-        // Connecting should never need the whole budget; cap it so an
-        // unreachable provider fails fast instead of consuming the deadline.
-        const int connect = timeout == 0 ? 0 : (std::min)(timeout, 2000);
-        LOG_IF_FAILED(automation2->put_ConnectionTimeout(static_cast<DWORD>(connect)));
+    //
+    // 0 means "no lvt-imposed deadline", which is expressed by leaving UIA's
+    // own default (20s) in place rather than passing 0 through: the meaning of
+    // 0 for put_TransactionTimeout is not documented.
+    if (options.timeoutMs > 0) {
+        if (auto automation2 = automation.try_query<IUIAutomation2>()) {
+            LOG_IF_FAILED(automation2->put_TransactionTimeout(
+                static_cast<DWORD>(options.timeoutMs)));
+            // Connecting should never need the whole budget; cap it so an
+            // unreachable provider fails fast instead of consuming the deadline.
+            LOG_IF_FAILED(automation2->put_ConnectionTimeout(
+                static_cast<DWORD>((std::min)(options.timeoutMs, 2000))));
+        }
     }
 
     *out = automation.detach();

@@ -15,11 +15,17 @@ struct UiaOptions {
     // Unknown names are reported and ignored rather than failing the walk.
     std::vector<std::string> extraProperties;
 
-    // Deadline for the walk, in milliseconds. It drives UIA's transaction
-    // timeout, which is what actually bounds a wedged target: every
-    // cross-process call happens inside one BuildUpdatedCache, and the
-    // per-element check below only limits the cheap in-process traversal of the
-    // materialised cache. 0 disables both.
+    // Walk deadline in milliseconds, defaulting to a value comfortably above a
+    // real app's walk (the heaviest measured — a WebView2 host with ~380
+    // elements — takes about 1.3s) while staying well under UIA's own 20s
+    // default, so a wedged target fails in a timeframe a caller will tolerate.
+    //
+    // It bounds two distinct things: how long UIA waits for any single provider
+    // response (its transaction timeout), and the traversal of the materialised
+    // cache. It is not a hard cap on total wall time, since one walk can involve
+    // many provider responses.
+    //
+    // 0 removes the lvt-imposed deadline; UIA's own default still applies.
     int timeoutMs = 10000;
 };
 

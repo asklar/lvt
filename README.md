@@ -11,6 +11,7 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 - Targets any running Windows app by HWND, PID, process name, or window title
 - Detects UI frameworks in use: Win32, ComCtl, Windows XAML (UWP), WinUI 3, WPF, [Avalonia](docs/avalonia-plugin.md), [Chrome/Edge](docs/chromium-plugin.md)
 - Outputs a unified element tree as JSON or XML markup
+- Optionally emits the app's [UI Automation tree](#ui-automation-tree---uia) instead, with `AutomationId`s, control types and supported patterns
 - Captures annotated PNG screenshots with element IDs overlaid
 - Elements get stable IDs (`e0`, `e1`, …) so AI agents can reference specific parts of the UI
 
@@ -204,7 +205,7 @@ lvt --name notepad --watch --interval 250
 | `--uia` | Emit the UI Automation tree instead of the visual tree |
 | `--uia-view <view>` | UIA tree view: `control` (default), `raw`, or `content` |
 | `--uia-props <list>` | Comma-separated extra UIA properties to include |
-| `--uia-timeout <ms>` | Walk deadline (default: 10000, `0` = none). Drives UIA's transaction timeout; a truncated tree is marked with a `Truncated` property on its root |
+| `--uia-timeout <ms>` | Walk deadline (default: 10000). Caps how long UIA waits for any single provider response, and the traversal itself; a truncated tree is marked with a `Truncated` property on its root. `0` removes lvt's deadline, leaving UIA's own 20s default |
 | `--frameworks` | Just list detected frameworks |
 | `--depth <n>` | Max tree traversal depth |
 
@@ -258,10 +259,11 @@ lvt --pid 51748 --uia
 
 ### Relationship to the visual tree
 
-`--uia` **replaces** the visual tree rather than enriching it; the two are
-separate views of the same window, and the visual tree still never depends on
-UIA. Use the visual tree for framework-native structure and internals, and
-`--uia` for automation identity and actionable state.
+The visual tree remains the default and is unchanged by this: it is built from
+framework-native APIs and never depends on UIA. `--uia` **replaces** it for that
+invocation rather than enriching it — the two are separate views of the same
+window. Reach for the visual tree for framework-native structure and internals,
+and `--uia` when you need automation identity and actionable state.
 
 ## Output format
 

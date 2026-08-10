@@ -67,11 +67,11 @@ docs/
 
 ## Key conventions
 
-### No UI Automation
+### No UI Automation in the visual tree
 
-The visual tree deliberately avoids UIA. It is slow, unreliable, and hard to use correctly. Each provider talks to the framework's native APIs directly.
+The visual tree deliberately avoids UIA. It is slow, unreliable, and hard to use correctly. Each provider talks to the framework's native APIs directly, and that is the default mode.
 
-`--uia` (`src/providers/uia_provider.cpp`) is the deliberate, opt-in exception: a *separate* automation-grade view for callers that need `AutomationId`s and patterns. It never participates in building the visual tree, so the principle above still holds for everything else.
+`--uia` (`src/providers/uia_provider.cpp`) is a *separate* view, not an exception to the rule: it walks the target's UIA tree for callers that need `AutomationId`s and patterns, and it never participates in building the visual tree. Adding UIA to a visual-tree provider is still off the table.
 
 Two rules matter when working on it:
 

@@ -137,6 +137,11 @@ additionally limits the in-process traversal of the materialised cache; when it
 fires, the root carries a `Truncated` property so a consumer reading only the
 document can tell the tree is incomplete.
 
+It caps each provider response rather than total wall time, since one walk
+involves many responses. The 10s default sits comfortably above a real app's
+walk — the heaviest measured, a WebView2 host with ~380 elements, takes about
+1.3s — while staying well under UIA's own 20s default.
+
 ## Stage 4: Serialization (`json_serializer.cpp`, `screenshot.cpp`)
 ### JSON output
 
