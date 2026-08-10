@@ -106,10 +106,19 @@ public:
 
     // Sends a request and returns its response, or a null json on timeout.
     json request(const std::string& method, const json& params = json::object()) {
+        return await(send_request(method, params));
+    }
+
+    // Split form, for firing several requests before waiting on any of them.
+    // rmcp dispatches each request with tokio::spawn, so requests sent this way
+    // genuinely overlap on the runtime's worker threads.
+    int send_request(const std::string& method, const json& params = json::object()) {
         const int id = ++nextId_;
         write(json{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}});
-        return await(id);
+        return id;
     }
+
+    json await_response(int id) { return await(id); }
 
     // Convenience for tools/call that returns the tool's parsed JSON payload.
     // `isError` reports whether the tool reported failure, which is distinct
@@ -158,6 +167,10 @@ public:
 private:
     void write(const json& message) {
         const auto text = message.dump() + "\n";
+        // Requests can be issued from several threads at once by the
+        // concurrency tests, and a torn write would corrupt the stream itself
+        // rather than testing the server.
+        std::lock_guard<std::mutex> lock(writeMutex_);
         DWORD written = 0;
         WriteFile(stdin_.get(), text.c_str(), static_cast<DWORD>(text.size()), &written, nullptr);
     }
@@ -210,11 +223,12 @@ private:
     wil::unique_handle thread_;
     std::thread reader_;
     std::mutex mutex_;
+    std::mutex writeMutex_;
     std::vector<json> messages_;
     std::atomic<bool> eof_{false};
     std::atomic<bool> stopping_{false};
     bool started_ = false;
-    int nextId_ = 0;
+    std::atomic<int> nextId_{0};
 };
 
 std::vector<std::string> tool_names(const json& toolsResult) {
@@ -246,16 +260,30 @@ protected:
         s_thread.reset(pi.hThread);
         WaitForInputIdle(s_process.get(), 10000);
 
+        // Match on the process we started, not just the title. A leftover
+        // instance from an earlier run has the same title, and binding to one
+        // makes the whole suite depend on a window this fixture does not own —
+        // which then disappears when that other run's teardown kills it.
+        struct Search {
+            DWORD pid;
+            HWND found;
+        } search{pi.dwProcessId, nullptr};
+
         for (int attempt = 0; attempt < 20 && !s_hwnd; ++attempt) {
             EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+                auto* state = reinterpret_cast<Search*>(lParam);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(hwnd, &owner);
+                if (owner != state->pid || !IsWindowVisible(hwnd))
+                    return TRUE;
                 char title[256];
                 GetWindowTextA(hwnd, title, sizeof(title));
-                if (strstr(title, "LVT WinUI3 Sample") && IsWindowVisible(hwnd)) {
-                    *reinterpret_cast<HWND*>(lParam) = hwnd;
-                    return FALSE;
-                }
-                return TRUE;
-            }, reinterpret_cast<LPARAM>(&s_hwnd));
+                if (!strstr(title, "LVT WinUI3 Sample"))
+                    return TRUE;
+                state->found = hwnd;
+                return FALSE;
+            }, reinterpret_cast<LPARAM>(&search));
+            s_hwnd = search.found;
             if (!s_hwnd)
                 Sleep(500);
         }
@@ -272,6 +300,11 @@ protected:
     void SkipIfNotReady() {
         if (!s_hwnd)
             GTEST_SKIP() << "the WinUI3 sample app is not available";
+        // Every test in this fixture shares one app instance, so if it has gone
+        // away the remaining tests would all fail with unrelated-looking
+        // errors. Saying so once is far easier to act on.
+        if (!IsWindow(s_hwnd))
+            GTEST_SKIP() << "the WinUI3 sample app's window closed during the run";
     }
 
     static std::string hwnd_string() {
@@ -822,6 +855,389 @@ TEST_F(McpSampleFixture, InvalidEnumArgumentsAreRejectedWithAUsefulMessage) {
         "select", json{{"session", session}, {"element", "e0"}, {"mode", "sideways"}}, &isError);
     EXPECT_TRUE(isError);
     EXPECT_NE(select.value("error", "").find("replace"), std::string::npos) << select.dump(2);
+}
+
+// --- concurrency ---------------------------------------------------------
+//
+// rmcp dispatches every request with tokio::spawn onto a multi-threaded
+// runtime, so `lvt_api_call` is reentrant in a way the CLI never was: the CLI
+// is one process, one action, exit. These tests exist because that is the
+// single biggest behavioural difference the server introduces, and nothing
+// about lvt_core was originally written with it in mind.
+
+TEST_F(McpSampleFixture, OverlappingRequestsAllGetTheirOwnCorrectAnswer) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // Issue everything before awaiting anything, so the server is working on
+    // several at once. The mix is deliberate: get_uia_tree walks on a dedicated
+    // MTA thread, screenshot initialises an STA and uses GDI/WIC on the calling
+    // thread, and find_elements does neither. Those were the paths most likely
+    // to collide.
+    //
+    // This is a regression test with teeth: without per-target serialization in
+    // lvt_api.cpp these calls contend for the target's UI thread and the walk
+    // fails outright with "could not read the UI Automation tree" — measured at
+    // 2 failures in 5 runs. Enough rounds are issued that the race is reliably
+    // hit rather than occasionally.
+    struct Pending { int id; std::string tool; };
+    std::vector<Pending> pending;
+    for (int round = 0; round < 5; ++round) {
+        pending.push_back({client.send_request("tools/call",
+            json{{"name", "get_uia_tree"},
+                 {"arguments", json{{"session", session}, {"depth", 3}}}}), "get_uia_tree"});
+        pending.push_back({client.send_request("tools/call",
+            json{{"name", "find_elements"},
+                 {"arguments", json{{"session", session}, {"automationId", "PrimaryButton"}}}}),
+            "find_elements"});
+        pending.push_back({client.send_request("tools/call",
+            json{{"name", "screenshot"},
+                 {"arguments", json{{"session", session}}}}), "screenshot"});
+        pending.push_back({client.send_request("tools/call",
+            json{{"name", "get_frameworks"},
+                 {"arguments", json{{"session", session}}}}), "get_frameworks"});
+    }
+
+    for (const auto& [id, tool] : pending) {
+        auto response = client.await_response(id);
+        ASSERT_FALSE(response.is_null()) << tool << " never answered under concurrency";
+        // Every response must carry the id of the request it answers. A mix-up
+        // here would mean one caller receiving another's tree, which is the
+        // worst plausible outcome and would not be obvious from the payload.
+        EXPECT_EQ(response.value("id", -1), id) << "response/request correlation broke";
+        ASSERT_TRUE(response.contains("result")) << tool << ": " << response.dump(2);
+        EXPECT_FALSE(response["result"].value("isError", false))
+            << tool << " failed under concurrency: " << response.dump(2);
+    }
+}
+
+TEST_F(McpSampleFixture, ConcurrentRequestsAcrossTwoSessionsDoNotCrossOver) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    // Two sessions on different windows, interleaved. The session registry is a
+    // shared map behind a mutex, so this is what would expose a locking mistake
+    // — and, more subtly, an answer built for the wrong target.
+    const auto sampleSession = connect(client);
+    ASSERT_FALSE(sampleSession.empty());
+
+    auto apps = client.call_tool("list_apps", json::object());
+    std::string otherHwnd;
+    for (const auto& app : apps["apps"]) {
+        const auto name = app.value("processName", "");
+        if (name.find("WinUI3Sample") == std::string::npos && !name.empty()) {
+            otherHwnd = app.value("hwnd", "");
+            break;
+        }
+    }
+    if (otherHwnd.empty())
+        GTEST_SKIP() << "no second window to test session isolation with";
+
+    auto other = client.call_tool("connect", json{{"hwnd", otherHwnd}});
+    const auto otherSession = other.value("session", "");
+    ASSERT_FALSE(otherSession.empty());
+    ASSERT_NE(sampleSession, otherSession);
+
+    // Prove the baseline before testing it under load: if the sample session
+    // cannot find its own button when nothing else is happening, the failure
+    // below is about the fixture, not about concurrency.
+    auto baseline = client.call_tool(
+        "find_elements", json{{"session", sampleSession}, {"automationId", "PrimaryButton"}});
+    ASSERT_EQ(baseline["elements"].size(), 1u)
+        << "sequential baseline already broken: " << baseline.dump(2);
+
+    std::vector<std::pair<int, std::string>> pending;
+    for (int round = 0; round < 4; ++round) {
+        pending.emplace_back(client.send_request("tools/call",
+            json{{"name", "find_elements"},
+                 {"arguments", json{{"session", sampleSession},
+                                    {"automationId", "PrimaryButton"}}}}), sampleSession);
+        pending.emplace_back(client.send_request("tools/call",
+            json{{"name", "find_elements"},
+                 {"arguments", json{{"session", otherSession},
+                                    {"automationId", "PrimaryButton"}}}}), otherSession);
+    }
+
+    for (const auto& [id, session] : pending) {
+        auto response = client.await_response(id);
+        ASSERT_FALSE(response.is_null());
+        ASSERT_TRUE(response.contains("result")) << response.dump(2);
+        auto payload = json::parse(
+            response["result"]["content"][0].value("text", "{}"), nullptr, false);
+        ASSERT_FALSE(payload.is_discarded());
+
+        // Only the sample app has a PrimaryButton. If a request against the
+        // other window ever returned one, an answer built for one session was
+        // handed to another.
+        const bool isSample = session == sampleSession;
+        const size_t matches = payload.value("elements", json::array()).size();
+        if (isSample) {
+            EXPECT_EQ(matches, 1u) << "the sample session lost its own element. session="
+                                   << session << " payload=" << payload.dump();
+        } else {
+            EXPECT_EQ(matches, 0u)
+                << "a session returned another session's element: " << payload.dump(2);
+        }
+    }
+}
+
+TEST(McpServer, ConcurrentRequestsNeverInterleaveOnTheOutputStream) {
+    // Every response is written by its own tokio task, so a missing lock in the
+    // transport would splice two JSON documents together on stdout. The client
+    // parses line by line, so anything spliced would fail to parse — which is
+    // exactly what this asserts does not happen.
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    std::vector<int> ids;
+    for (int i = 0; i < 30; ++i) {
+        // tools/list produces a large response, which is what makes a torn
+        // write likely if one were possible.
+        ids.push_back(client.send_request("tools/list"));
+    }
+
+    for (const int id : ids) {
+        auto response = client.await_response(id);
+        ASSERT_FALSE(response.is_null()) << "request " << id << " went missing";
+        EXPECT_EQ(response.value("id", -1), id);
+        ASSERT_TRUE(response.contains("result"));
+        EXPECT_FALSE(response["result"]["tools"].empty());
+    }
+}
+
+TEST(McpServer, SurvivesRequestsArrivingFromSeveralClientThreadsAtOnce) {
+    // The transport is fed by one pipe, but a host is free to write from
+    // several threads. This drives that case rather than assuming it.
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 8;
+    std::vector<std::thread> writers;
+    std::mutex idMutex;
+    std::vector<int> ids;
+
+    for (int t = 0; t < kThreads; ++t) {
+        writers.emplace_back([&] {
+            for (int i = 0; i < kPerThread; ++i) {
+                const int id = client.send_request(
+                    "tools/call", json{{"name", "list_apps"}, {"arguments", json::object()}});
+                std::lock_guard<std::mutex> lock(idMutex);
+                ids.push_back(id);
+            }
+        });
+    }
+    for (auto& writer : writers)
+        writer.join();
+
+    ASSERT_EQ(ids.size(), static_cast<size_t>(kThreads * kPerThread));
+    for (const int id : ids) {
+        auto response = client.await_response(id);
+        ASSERT_FALSE(response.is_null()) << "request " << id << " went missing";
+        ASSERT_TRUE(response.contains("result")) << response.dump(2);
+        EXPECT_FALSE(response["result"].value("isError", false));
+    }
+}
+
+// --- long-lived server ---------------------------------------------------
+
+TEST_F(McpSampleFixture, ConnectingRepeatedlyDoesNotDegradeTheServer) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    // An MCP server is long-lived, unlike the CLI. Sessions, temp screenshot
+    // files and UIA worker threads all accumulate per request, so this walks a
+    // connect/use/disconnect cycle enough times that a leak of any of them
+    // would show up as a failure or a slowdown rather than going unnoticed.
+    for (int i = 0; i < 12; ++i) {
+        const auto session = connect(client);
+        ASSERT_FALSE(session.empty()) << "connect failed on iteration " << i;
+
+        bool isError = false;
+        client.call_tool("find_elements",
+                         json{{"session", session}, {"automationId", "PrimaryButton"}}, &isError);
+        EXPECT_FALSE(isError) << "iteration " << i;
+
+        client.call_tool("screenshot", json{{"session", session}});
+        client.call_tool("disconnect", json{{"session", session}});
+    }
+
+    // Still healthy afterwards.
+    const auto session = connect(client);
+    EXPECT_FALSE(session.empty()) << "the server stopped accepting connections";
+}
+
+TEST_F(McpSampleFixture, InlineScreenshotsDoNotLeaveTempFilesBehind) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // An inline screenshot is captured to a temp file and then read back, so a
+    // missing cleanup would fill the user's temp directory over a long session.
+    const auto countTempShots = [] {
+        size_t count = 0;
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(fs::temp_directory_path(), ec)) {
+            const auto name = entry.path().filename().string();
+            if (name.rfind("lvt_mcp_", 0) == 0 && entry.path().extension() == ".png")
+                ++count;
+        }
+        return count;
+    };
+
+    const auto before = countTempShots();
+    for (int i = 0; i < 5; ++i)
+        client.call_tool_content("screenshot", json{{"session", session}});
+    EXPECT_EQ(countTempShots(), before) << "inline screenshots left temp files behind";
+}
+
+TEST_F(McpSampleFixture, SessionsFailCleanlyOnceTheirWindowIsGone) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    // A window can close at any time under a long-lived server. The session
+    // must then fail with something the model can act on rather than crashing
+    // the server or returning a stale tree.
+    static constexpr wchar_t kClassName[] = L"LvtMcpProbeWindow";
+    wil::unique_event ready(wil::EventOptions::ManualReset);
+    wil::unique_event destroy(wil::EventOptions::ManualReset);
+    HWND probe = nullptr;
+
+    std::thread ui([&] {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = DefWindowProcW;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kClassName;
+        RegisterClassExW(&wc);
+        probe = CreateWindowExW(0, kClassName, L"lvt mcp probe",
+                                WS_OVERLAPPEDWINDOW | WS_VISIBLE, 120, 120, 400, 300,
+                                nullptr, nullptr, wc.hInstance, nullptr);
+        ready.SetEvent();
+        if (!probe)
+            return;
+        for (;;) {
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if (destroy.wait(20))
+                break;
+        }
+        DestroyWindow(probe);
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    });
+    auto joinUi = wil::scope_exit([&] {
+        destroy.SetEvent();
+        if (ui.joinable())
+            ui.join();
+    });
+
+    ASSERT_TRUE(ready.wait(5000));
+    ASSERT_NE(probe, nullptr);
+
+    char hwndText[32];
+    snprintf(hwndText, sizeof(hwndText), "0x%llX",
+             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(probe)));
+    auto connected = client.call_tool("connect", json{{"hwnd", hwndText}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    destroy.SetEvent();
+    ui.join();
+    for (int i = 0; i < 50 && IsWindow(probe); ++i)
+        Sleep(100);
+    ASSERT_FALSE(IsWindow(probe));
+
+    bool isError = false;
+    auto result = client.call_tool("get_uia_tree", json{{"session", session}}, &isError);
+    EXPECT_TRUE(isError) << "a session whose window closed must not keep answering";
+    EXPECT_NE(result.value("error", "").find("closed"), std::string::npos)
+        << "the error should say the window closed: " << result.dump(2);
+
+    // And the server must still be usable for everything else.
+    auto apps = client.call_tool("list_apps", json::object());
+    EXPECT_FALSE(apps["apps"].empty()) << "the server degraded after a target closed";
+}
+
+TEST_F(McpSampleFixture, ATruncatedWalkIsReportedRatherThanPresentedAsComplete) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // A deadline this small cannot complete a real walk, which is the point:
+    // the danger is not that the walk is cut short but that a caller is not
+    // told. "No element matched" from a partial walk means the walk did not
+    // finish, and a model that is not told this will report the element as
+    // absent — a wrong answer that looks exactly like a right one.
+    auto tight = client.call_tool(
+        "find_elements",
+        json{{"session", session}, {"automationId", "PrimaryButton"}, {"timeoutMs", 1}});
+
+    if (tight.value("elements", json::array()).empty()) {
+        EXPECT_TRUE(tight.contains("truncated"))
+            << "a walk that found nothing must say whether it actually finished: "
+            << tight.dump(2);
+        EXPECT_NE(tight.value("truncated", "").find("incomplete"), std::string::npos)
+            << tight.dump(2);
+    }
+
+    // With a workable deadline there must be no such caveat, or the field would
+    // be noise that a model learns to ignore.
+    auto normal = client.call_tool(
+        "find_elements",
+        json{{"session", session}, {"automationId", "PrimaryButton"}, {"timeoutMs", 20000}});
+    EXPECT_EQ(normal["elements"].size(), 1u) << normal.dump(2);
+    EXPECT_FALSE(normal.contains("truncated"))
+        << "a complete walk must not claim to be truncated: " << normal.dump(2);
+}
+
+TEST_F(McpSampleFixture, TreeToolsAcceptATimeoutSoTruncationIsActionable) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // Advising a caller to raise timeoutMs is only useful if the tools actually
+    // take it; it was missing from the schemas at first while the ABI already
+    // honoured it, which made the advice impossible to follow.
+    auto tools = client.request("tools/list")["result"]["tools"];
+    for (const auto& tool : tools) {
+        const auto name = tool.value("name", "");
+        if (name != "get_uia_tree" && name != "find_elements")
+            continue;
+        const auto properties = tool["inputSchema"].value("properties", json::object());
+        EXPECT_TRUE(properties.contains("timeoutMs"))
+            << name << " must accept timeoutMs so a truncated result can be retried";
+    }
+
+    auto result = client.call_tool(
+        "get_uia_tree", json{{"session", session}, {"depth", 1}, {"timeoutMs", 20000}});
+    EXPECT_TRUE(result.contains("root")) << result.dump(2);
 }
 
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {

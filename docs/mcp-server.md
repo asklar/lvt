@@ -149,6 +149,31 @@ and returns the path instead.
 Screenshots are annotated with element ids, so a screenshot and a tree can be
 read together.
 
+## Concurrency
+
+Requests are dispatched independently, so tool calls can overlap. Two things
+follow from that, both handled for you:
+
+Reading a UI is not parallelisable — a UIA walk is answered by the target's UI
+thread, which serves one caller at a time. lvt therefore serializes walks **per
+target**: concurrent requests against *different* applications proceed in
+parallel, while requests against the same application queue. You get a slower
+answer rather than a failed one.
+
+Contention from *other* processes reading the same app — another lvt, a screen
+reader, Inspect.exe, a second MCP server — cannot be serialized away, so a walk
+that collides is retried before being reported as a failure.
+
+## Partial results
+
+A UIA walk has a deadline (`timeoutMs`, default 10000). If it expires, the tree
+is incomplete and `get_uia_tree`, `find_elements` and `hit_test` add a
+`truncated` field explaining so.
+
+**This matters most for negative answers.** "No element matched" from a
+truncated walk means *the walk did not finish*, not *the element is not there*.
+Raise `timeoutMs` and retry before concluding something does not exist.
+
 ## Building it
 
 The MCP server is a Rust staticlib linked into `lvt.exe`, so it needs a Rust

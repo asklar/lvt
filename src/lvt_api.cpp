@@ -26,7 +26,9 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -74,6 +76,51 @@ bool find_session(const std::string& id, Session& out) {
     return true;
 }
 
+// --- per-target serialization -------------------------------------------
+//
+// The MCP server dispatches every request on its own task, so several tool
+// calls can be in flight at once — something the CLI, which does one thing and
+// exits, never had to survive.
+//
+// Reading a UI is not actually parallelisable: a UIA walk is a cross-process
+// call answered by the target's UI thread, which serves one caller at a time.
+// Issuing several at once therefore buys no speed and instead produces
+// contention, and under contention the walk does not merely slow down — it
+// fails outright with "could not read the UI Automation tree", because the
+// connection attempt times out while the target is busy with another walk.
+//
+// Serializing per target is both correct and free: concurrent requests against
+// *different* applications still proceed in parallel, which is the case that
+// benefits, while requests against the same application queue instead of
+// failing. A caller sees a slower answer rather than a wrong one.
+std::mutex g_targetLocksMutex;
+std::map<HWND, std::shared_ptr<std::mutex>> g_targetLocks;
+
+std::shared_ptr<std::mutex> lock_for_target(HWND hwnd) {
+    std::lock_guard<std::mutex> lock(g_targetLocksMutex);
+    auto& entry = g_targetLocks[hwnd];
+    if (!entry)
+        entry = std::make_shared<std::mutex>();
+    return entry;
+}
+
+// Holds the per-target lock for as long as a walk needs it. Shared ownership
+// means a session can be disconnected, and its lock entry dropped, while a walk
+// against it is still running.
+class TargetGuard {
+public:
+    explicit TargetGuard(HWND hwnd) : mutex_(lock_for_target(hwnd)), lock_(*mutex_) {}
+
+private:
+    std::shared_ptr<std::mutex> mutex_;
+    std::lock_guard<std::mutex> lock_;
+};
+
+void forget_target_lock(HWND hwnd) {
+    std::lock_guard<std::mutex> lock(g_targetLocksMutex);
+    g_targetLocks.erase(hwnd);
+}
+
 // --- helpers ------------------------------------------------------------
 
 std::string get_string(const json& params, const char* key, const char* fallback = "") {
@@ -118,6 +165,15 @@ std::vector<std::string> get_string_array(const json& params, const char* key) {
 
 json element_to_json(const lvt::Element& element, bool includeChildren);
 
+// Attached to any result built from a walk that hit its deadline. Worded for a
+// model rather than a developer: the actionable part is that a negative answer
+// cannot be trusted, and that raising the timeout is the fix.
+const char* truncation_note() {
+    return "the UI Automation walk hit its deadline, so this tree is incomplete and "
+           "an element may be missing rather than absent; raise timeoutMs and retry "
+           "before concluding something is not there";
+}
+
 std::vector<unsigned char> read_file_bytes(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file)
@@ -126,8 +182,7 @@ std::vector<unsigned char> read_file_bytes(const std::string& path) {
                                       std::istreambuf_iterator<char>());
 }
 
-std::string base64_encode(const std::vector<unsigned char>& bytes) {
-    static constexpr char kAlphabet[] =
+std::string base64_encode(const std::vector<unsigned char>& bytes) {    static constexpr char kAlphabet[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string out;
     out.reserve((bytes.size() + 2) / 3 * 4);
@@ -218,16 +273,46 @@ lvt::UiaOptions uia_options_from(const json& params) {
 
 // Build the tree a request asked for. `uia` selects the view; the visual tree
 // still needs an architecture match because it injects.
+//
+// `truncated` reports that the UIA walk hit its deadline and the tree is
+// incomplete. Passing that back matters more here than it does for the CLI: a
+// model that asks "is there a Save button?" and is told "no" will believe it,
+// so a partial walk must never be presented as a complete negative answer.
 bool build_tree_for(const Session& session, const json& params, bool uia,
-                    lvt::Element& tree, std::string& error) {
+                    lvt::Element& tree, std::string& error, bool* truncated = nullptr) {
+    if (truncated)
+        *truncated = false;
+    // One walk of a given window at a time; see the note on g_targetLocks.
+    TargetGuard guard(session.hwnd);
     if (uia) {
 #ifdef LVT_ENABLE_UIA
         lvt::UiaProvider provider;
-        auto result = provider.build(session.hwnd, uia_options_from(params));
+        const auto options = uia_options_from(params);
+
+        // Retry a failed walk rather than reporting the target unreadable.
+        //
+        // A UIA walk is answered by the target's UI thread, which serves one
+        // caller at a time, so a walk that overlaps another fails its
+        // connection attempt instead of merely queueing. The lock above removes
+        // the contention this process causes itself, but not the contention
+        // from anything else reading the same app — another lvt, a screen
+        // reader, Inspect.exe, or a second MCP server. Those are ordinary
+        // conditions, not faults, and a transient collision should not be
+        // reported to a model as "this window cannot be read".
+        std::optional<lvt::Element> result;
+        bool wasTruncated = false;
+        for (int attempt = 0; attempt < 3 && !result; ++attempt) {
+            if (attempt > 0)
+                Sleep(static_cast<DWORD>(120 * attempt));
+            result = provider.build(session.hwnd, options, &wasTruncated);
+        }
         if (!result) {
-            error = "could not read the UI Automation tree for this window";
+            error = "could not read the UI Automation tree for this window; it may be busy "
+                    "or not responding";
             return false;
         }
+        if (truncated)
+            *truncated = wasTruncated;
         tree = std::move(*result);
         lvt::assign_element_ids(tree);
         lvt::assign_element_keys(tree);
@@ -344,10 +429,22 @@ json method_connect(const json& params) {
 
 json method_disconnect(const json& params) {
     const auto id = get_string(params, "session");
-    std::lock_guard<std::mutex> lock(g_sessionsMutex);
-    const bool erased = g_sessions.erase(id) > 0;
-    if (!erased)
-        throw std::runtime_error("unknown session '" + id + "'");
+    HWND released = nullptr;
+    bool stillReferenced = false;
+    {
+        std::lock_guard<std::mutex> lock(g_sessionsMutex);
+        auto it = g_sessions.find(id);
+        if (it == g_sessions.end())
+            throw std::runtime_error("unknown session '" + id + "'");
+        released = it->second.hwnd;
+        g_sessions.erase(it);
+        // Two sessions may point at the same window, so the lock entry can only
+        // go once nothing else needs it.
+        for (const auto& [_, session] : g_sessions)
+            stillReferenced = stillReferenced || session.hwnd == released;
+    }
+    if (!stillReferenced)
+        forget_target_lock(released);
     return json{{"disconnected", id}};
 }
 
@@ -365,7 +462,8 @@ json method_get_tree(const json& params, bool uia) {
     const auto session = require_session(params);
     lvt::Element tree;
     std::string error;
-    if (!build_tree_for(session, params, uia, tree, error))
+    bool truncated = false;
+    if (!build_tree_for(session, params, uia, tree, error, &truncated))
         throw std::runtime_error(error);
 
     lvt::Element* root = &tree;
@@ -380,7 +478,10 @@ json method_get_tree(const json& params, bool uia) {
     if (depth >= 0)
         lvt::trim_to_depth(*root, depth);
 
-    return json{{"root", element_to_json(*root, true)}};
+    json out{{"root", element_to_json(*root, true)}};
+    if (truncated)
+        out["truncated"] = truncation_note();
+    return out;
 }
 
 json method_get_frameworks(const json& params) {
@@ -399,7 +500,8 @@ json method_find_elements(const json& params) {
     const bool uia = get_bool(params, "uia", true);
     lvt::Element tree;
     std::string error;
-    if (!build_tree_for(session, params, uia, tree, error))
+    bool truncated = false;
+    if (!build_tree_for(session, params, uia, tree, error, &truncated))
         throw std::runtime_error(error);
 
     const auto automationId = get_string(params, "automationId");
@@ -426,7 +528,10 @@ json method_find_elements(const json& params) {
         if (static_cast<int>(matches.size()) >= limit)
             break;
     }
-    return json{{"elements", matches}, {"searched", static_cast<uint64_t>(all.size())}};
+    json out{{"elements", matches}, {"searched", static_cast<uint64_t>(all.size())}};
+    if (truncated)
+        out["truncated"] = truncation_note();
+    return out;
 }
 
 json method_get_element_properties(const json& params) {
@@ -521,7 +626,8 @@ json method_hit_test(const json& params) {
 
     lvt::Element tree;
     std::string error;
-    if (!build_tree_for(session, params, get_bool(params, "uia", true), tree, error))
+    bool truncated = false;
+    if (!build_tree_for(session, params, get_bool(params, "uia", true), tree, error, &truncated))
         throw std::runtime_error(error);
 
     std::vector<const lvt::Element*> all;
@@ -545,10 +651,14 @@ json method_hit_test(const json& params) {
     }
 
     if (!best)
-        throw std::runtime_error("no element of this window covers the point " +
-                                 std::to_string(x) + "," + std::to_string(y));
+        throw std::runtime_error(
+            std::string("no element of this window covers the point ") + std::to_string(x) + "," +
+            std::to_string(y) +
+            (truncated ? std::string("; note that ") + truncation_note() : std::string()));
 
     json out{{"element", element_fields(*best)}};
+    if (truncated)
+        out["truncated"] = truncation_note();
     out["ancestors"] = json::array();
     for (const auto* element : all) {
         const auto& b = element->bounds;
@@ -591,6 +701,16 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     request.waitProperty = get_string(params, "waitProperty");
     request.waitValue = get_string(params, "waitValue");
     request.waitTimeoutMs = get_int(params, "timeoutMs", 5000);
+
+    // perform_action walks the target to resolve the reference, so it needs the
+    // same serialization tree reads use. The waits are the exception: they poll
+    // until a deadline, and holding the lock for that would stall every other
+    // request against the app for the whole timeout — which is precisely when a
+    // caller is most likely to also be watching it.
+    const bool isWait = kind == lvt::ActionKind::waitFor || kind == lvt::ActionKind::waitGone;
+    std::optional<TargetGuard> guard;
+    if (!isWait)
+        guard.emplace(session.hwnd);
 
     const auto result = lvt::perform_action(session.hwnd, uia_options_from(params), request);
     auto out = action_result_to_json(result, actionName, request.elementRef);

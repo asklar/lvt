@@ -65,6 +65,10 @@ pub struct TreeArgs {
     pub view: Option<String>,
     /// Extra UIA properties to include beyond the default set.
     pub properties: Option<Vec<String>>,
+    /// How long the UI Automation walk may take, in milliseconds (default
+    /// 10000). Raise this if a result comes back marked "truncated".
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -87,6 +91,10 @@ pub struct FindArgs {
     pub uia: Option<bool>,
     /// UIA tree view to search: "control" (default), "content", or "raw".
     pub view: Option<String>,
+    /// How long the UI Automation walk may take, in milliseconds (default
+    /// 10000). Raise this if a result comes back marked "truncated".
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -364,6 +372,7 @@ impl LvtServer {
                 "limit": a.limit,
                 "uia": a.uia,
                 "view": a.view,
+                "timeoutMs": a.timeout_ms,
             })),
         )
     }
@@ -465,6 +474,7 @@ fn tree_params(a: TreeArgs) -> serde_json::Value {
         "depth": a.depth,
         "view": a.view,
         "properties": a.properties,
+        "timeoutMs": a.timeout_ms,
     }))
 }
 
