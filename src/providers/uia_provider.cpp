@@ -8,9 +8,9 @@
 #include <oleacc.h>
 #include <UIAutomation.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <future>
 #include <set>
 #include <string>
 #include <thread>
@@ -67,16 +67,17 @@ std::string variant_to_string(const VARIANT& v) {
         LONG lower = 0, upper = -1;
         if (FAILED(SafeArrayGetLBound(sa, 1, &lower)) || FAILED(SafeArrayGetUBound(sa, 1, &upper)))
             return {};
-        std::string out;
+        std::vector<int> parts;
+        parts.reserve(static_cast<size_t>((std::max)(0L, upper - lower + 1)));
         for (LONG i = lower; i <= upper; ++i) {
             int element = 0;
             if (FAILED(SafeArrayGetElement(sa, &i, &element)))
                 return {};
-            if (!out.empty())
-                out += '.';
-            out += std::to_string(element);
+            parts.push_back(element);
         }
-        return out;
+        // Same formatting the uia:<RuntimeId> reference parser expects, so the
+        // two cannot drift apart.
+        return format_runtime_id(parts);
     }
 
     if (v.vt == (VT_ARRAY | VT_R8)) {
@@ -134,6 +135,7 @@ std::string humanize(long propertyId, const VARIANT& v, const std::string& raw) 
 bool is_promoted_property(long propertyId) {
     return propertyId == UIA_NamePropertyId ||
            propertyId == UIA_ClassNamePropertyId ||
+           propertyId == UIA_ControlTypePropertyId ||
            propertyId == UIA_BoundingRectanglePropertyId;
 }
 
@@ -151,7 +153,6 @@ struct WalkContext {
     clock_type::time_point deadline;
     bool hasDeadline = false;
     bool truncated = false;
-    int maxDepth = -1;
 
     bool expired() {
         if (!hasDeadline)
@@ -233,7 +234,12 @@ void apply_cached_properties(WalkContext& ctx, IUIAutomationElement* element, El
         }
 
         const auto raw = variant_to_string(value);
-        if (raw.empty())
+        // An empty string is normally just absence, but for a pattern-backed
+        // property it is real information: the element supports Value and the
+        // value is empty, which a consumer must be able to tell apart from
+        // "no Value pattern". Only the Ex accessor is trusted to have already
+        // filtered unsupported properties, so this is safe.
+        if (raw.empty() && !patternBacked)
             continue;
 
         if (propertyId == UIA_NamePropertyId) {
@@ -256,8 +262,11 @@ void apply_cached_properties(WalkContext& ctx, IUIAutomationElement* element, El
             continue;
 
         auto rendered = humanize(propertyId, value, raw);
+        // Sentinels are expressed in raw form, so the check happens before
+        // humanizing: LiveSetting 0 renders as "Off" and LandmarkType 0 as
+        // "LandmarkType(0)", neither of which would ever match a sentinel.
         if (ctx.requestedProperties.find(propertyId) == ctx.requestedProperties.end() &&
-            uia_property_value_is_unset(propertyId, rendered))
+            uia_property_value_is_unset(propertyId, raw))
             continue;
         out.properties[name] = std::move(rendered);
     }
@@ -270,12 +279,10 @@ void apply_cached_properties(WalkContext& ctx, IUIAutomationElement* element, El
     out.framework = "uia";
 }
 
-Element build_from_cached(WalkContext& ctx, IUIAutomationElement* element, int depth) {
+Element build_from_cached(WalkContext& ctx, IUIAutomationElement* element) {
     Element out;
     apply_cached_properties(ctx, element, out);
 
-    if (ctx.maxDepth >= 0 && depth >= ctx.maxDepth)
-        return out;
     if (ctx.expired())
         return out;
 
@@ -293,7 +300,7 @@ Element build_from_cached(WalkContext& ctx, IUIAutomationElement* element, int d
         wil::com_ptr<IUIAutomationElement> child;
         if (FAILED(children->GetElement(i, &child)) || !child)
             continue;
-        out.children.push_back(build_from_cached(ctx, child.get(), depth + 1));
+        out.children.push_back(build_from_cached(ctx, child.get()));
     }
 
     return out;
@@ -352,7 +359,7 @@ std::vector<long> resolve_properties(const UiaOptions& options,
     return properties;
 }
 
-HRESULT create_automation(IUIAutomation** out) {
+HRESULT create_automation(const UiaOptions& options, IUIAutomation** out) {
     // CUIAutomation8 gives the IUIAutomation6 generation, which supports
     // per-call timeouts and connection-recovery behaviour. Fall back to the
     // original CLSID on older systems.
@@ -365,10 +372,18 @@ HRESULT create_automation(IUIAutomation** out) {
                                           IID_PPV_ARGS(&automation)));
     }
 
-    // Keep a slow or wedged provider from stalling the whole walk.
+    // This is what actually bounds a wedged target. Every cross-process call
+    // happens inside BuildUpdatedCache, so the deadline checked between
+    // elements later only limits the cheap in-process walk of the materialised
+    // cache. Driving the transaction timeout from --uia-timeout is what makes
+    // that flag mean what it says.
     if (auto automation2 = automation.try_query<IUIAutomation2>()) {
-        LOG_IF_FAILED(automation2->put_ConnectionTimeout(2000));
-        LOG_IF_FAILED(automation2->put_TransactionTimeout(2000));
+        const int timeout = options.timeoutMs > 0 ? options.timeoutMs : 0;
+        LOG_IF_FAILED(automation2->put_TransactionTimeout(static_cast<DWORD>(timeout)));
+        // Connecting should never need the whole budget; cap it so an
+        // unreachable provider fails fast instead of consuming the deadline.
+        const int connect = timeout == 0 ? 0 : (std::min)(timeout, 2000);
+        LOG_IF_FAILED(automation2->put_ConnectionTimeout(static_cast<DWORD>(connect)));
     }
 
     *out = automation.detach();
@@ -378,7 +393,7 @@ HRESULT create_automation(IUIAutomation** out) {
 HRESULT build_tree_on_mta(HWND hwnd, const UiaOptions& options,
                           Element& out, bool& truncated) {
     wil::com_ptr<IUIAutomation> automation;
-    RETURN_IF_FAILED(create_automation(&automation));
+    RETURN_IF_FAILED(create_automation(options, &automation));
 
     wil::com_ptr<IUIAutomationElement> root;
     RETURN_IF_FAILED(automation->ElementFromHandle(hwnd, &root));
@@ -400,26 +415,43 @@ HRESULT build_tree_on_mta(HWND hwnd, const UiaOptions& options,
     ctx.properties = std::move(properties);
     ctx.requestedProperties = std::move(requested);
     LOG_IF_FAILED(automation->get_ReservedNotSupportedValue(ctx.notSupported.put()));
-    ctx.maxDepth = options.maxDepth;
     if (options.timeoutMs > 0) {
         ctx.hasDeadline = true;
         ctx.deadline = clock_type::now() + std::chrono::milliseconds(options.timeoutMs);
     }
 
-    out = build_from_cached(ctx, cachedRoot.get(), 0);
+    out = build_from_cached(ctx, cachedRoot.get());
     truncated = ctx.truncated;
+    if (ctx.truncated) {
+        // The consumer of this tree is a machine. A silently shortened tree is
+        // indistinguishable from a complete one, so the marker has to travel in
+        // the document, not only on stderr.
+        out.properties["Truncated"] = "true";
+    }
     return S_OK;
 }
 
 // UIA clients belong in an MTA. screenshot.cpp initializes an STA on the calling
 // thread, and a thread cannot be in both, so all UIA work is marshalled onto a
 // dedicated MTA thread. This also serialises access to the client.
+//
+// The body is wrapped in CATCH_RETURN because an exception escaping a thread
+// function calls std::terminate: building the Element tree allocates freely, so
+// a bad_alloc on a large UI would otherwise take the whole process down instead
+// of failing the walk. Same rule as the extern "C" boundaries.
 template <typename Fn>
 HRESULT run_on_mta(Fn&& fn) {
     HRESULT result = E_FAIL;
     std::thread worker([&] {
-        auto uninit = wil::CoInitializeEx_failfast(COINIT_MULTITHREADED);
-        result = fn();
+        result = [&]() -> HRESULT {
+            try {
+                auto uninit = wil::CoInitializeEx_failfast(COINIT_MULTITHREADED);
+                // COM objects are created and released inside fn, so they are
+                // gone before this thread leaves the apartment.
+                return fn();
+            }
+            CATCH_RETURN();
+        }();
     });
     worker.join();
     return result;
@@ -448,8 +480,13 @@ bool parse_runtime_id(const std::string& text, std::vector<int>& out) {
                                                                        : dot - start);
         if (piece.empty())
             return false;
-        for (char c : piece) {
-            if (c < '0' || c > '9')
+        // Components are signed: RuntimeIds derived from an HWND with the high
+        // bit set are negative, and format_runtime_id emits them with a '-'.
+        const size_t digitsFrom = piece[0] == '-' ? 1 : 0;
+        if (piece.size() == digitsFrom)
+            return false;
+        for (size_t i = digitsFrom; i < piece.size(); ++i) {
+            if (piece[i] < '0' || piece[i] > '9')
                 return false;
         }
         try {

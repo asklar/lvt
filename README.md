@@ -204,7 +204,7 @@ lvt --name notepad --watch --interval 250
 | `--uia` | Emit the UI Automation tree instead of the visual tree |
 | `--uia-view <view>` | UIA tree view: `control` (default), `raw`, or `content` |
 | `--uia-props <list>` | Comma-separated extra UIA properties to include |
-| `--uia-timeout <ms>` | Deadline for the UIA walk (default: 10000, `0` = none) |
+| `--uia-timeout <ms>` | Walk deadline (default: 10000, `0` = none). Drives UIA's transaction timeout; a truncated tree is marked with a `Truncated` property on its root |
 | `--frameworks` | Just list detected frameworks |
 | `--depth <n>` | Max tree traversal depth |
 

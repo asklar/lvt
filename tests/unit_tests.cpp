@@ -1184,12 +1184,27 @@ TEST(Architecture, CurrentProcessMatchesHost) {
               lvt::get_host_architecture());
 }
 
-TEST(UiaRuntimeId, FormatsAndParsesRoundTrip) {    const std::vector<int> id{42, 3150138, 4, 5};
+TEST(UiaRuntimeId, FormatsAndParsesRoundTrip) {
+    const std::vector<int> id{42, 3150138, 4, 5};
     const auto text = lvt::format_runtime_id(id);
     EXPECT_EQ(text, "42.3150138.4.5");
 
     std::vector<int> parsed;
     ASSERT_TRUE(lvt::parse_runtime_id(text, parsed));
+    EXPECT_EQ(parsed, id);
+}
+
+TEST(UiaRuntimeId, RoundTripsNegativeComponents) {
+    // RuntimeIds derived from an HWND with the high bit set have negative
+    // components, and format_runtime_id emits them with a '-'. The parser must
+    // accept what the formatter produces, or a uia:<RuntimeId> reference to
+    // such an element silently resolves to nothing.
+    const std::vector<int> id{42, -2147483647, 9705532, -2, 0};
+    const auto text = lvt::format_runtime_id(id);
+    EXPECT_EQ(text, "42.-2147483647.9705532.-2.0");
+
+    std::vector<int> parsed;
+    ASSERT_TRUE(lvt::parse_runtime_id(text, parsed)) << text;
     EXPECT_EQ(parsed, id);
 }
 
@@ -1199,6 +1214,9 @@ TEST(UiaRuntimeId, RejectsMalformedInput) {
     EXPECT_FALSE(lvt::parse_runtime_id("42..5", parsed));
     EXPECT_FALSE(lvt::parse_runtime_id("42.", parsed));
     EXPECT_FALSE(lvt::parse_runtime_id("4a.5", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("-", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("1.-", parsed));
+    EXPECT_FALSE(lvt::parse_runtime_id("1..2", parsed));
 }
 
 TEST(FindElementByRef, ResolvesUiaRuntimeIdReference) {
@@ -1349,19 +1367,45 @@ TEST(UiaEnums, NonEnumPropertiesAreNotTreatedAsEnums) {
     }
 }
 
-TEST(UiaEnums, EveryEnumPropertyIsInTheEmittedSet) {
-    // An enum mapping for a property lvt never emits is dead weight, and an
-    // emitted enum with no mapping leaks a raw integer. Assert the overlap.
+TEST(UiaEnums, EnumTableAndEmittedSetAgreeBothWays) {
     const auto& core = lvt::uia_core_property_ids();
-    for (const char* name : {"ControlType", "Toggle.ToggleState", "ExpandCollapse.State",
-                             "Orientation", "Window.WindowVisualState",
-                             "Window.WindowInteractionState", "Table.RowOrColumnMajor",
-                             "LiveSetting", "LandmarkType"}) {
-        const long id = lvt::uia_property_id(name);
-        ASSERT_NE(id, 0) << name;
-        EXPECT_TRUE(lvt::uia_property_is_enum(id)) << name << " should render as an enum";
+    const auto& enums = lvt::uia_enum_property_ids();
+
+    // Forward: every enum mapping must belong to a property lvt actually
+    // emits, or it is dead weight.
+    for (long id : enums) {
         EXPECT_NE(std::find(core.begin(), core.end(), id), core.end())
-            << name << " is mapped but never emitted";
+            << lvt::uia_property_name(id) << " is enum-mapped but never emitted";
+        EXPECT_TRUE(lvt::uia_property_is_enum(id));
+    }
+
+    // Reverse: every emitted property whose name is a known enum property must
+    // be in the enum table, or it leaks a raw integer. Driven off the tables
+    // themselves rather than a hardcoded list, so adding either side is caught.
+    for (long id : core) {
+        const auto name = lvt::uia_property_name(id);
+        const bool mapped = std::find(enums.begin(), enums.end(), id) != enums.end();
+        EXPECT_EQ(mapped, lvt::uia_property_is_enum(id))
+            << name << " disagrees between the enum table and uia_property_is_enum";
+    }
+}
+
+TEST(UiaEnums, EnumPropertiesNeverCollideWithUnsetSentinels) {
+    // The sentinel table is compared against the *raw* UIA value, before
+    // humanizing. Expressing a sentinel in humanized form makes it dead: it
+    // shipped once as LandmarkType="LandmarkType(0)" and LiveSetting="Off" on
+    // every element. A sentinel that parses as an integer is raw-form.
+    for (long id : lvt::uia_enum_property_ids()) {
+        for (const char* candidate : {"0", "-1", "1", "2"}) {
+            if (!lvt::uia_property_value_is_unset(id, candidate))
+                continue;
+            // If a sentinel exists it must be numeric, i.e. the raw form, not
+            // the name this enum would humanize it into.
+            const auto humanized = lvt::uia_enum_value_name(id, std::atol(candidate));
+            EXPECT_NE(humanized, candidate)
+                << lvt::uia_property_name(id)
+                << " sentinel is written in humanized form and can never match";
+        }
     }
 }
 
@@ -1375,4 +1419,31 @@ TEST(UiaCulture, FallsBackToTheNumberWhenUnresolvable) {
     EXPECT_EQ(lvt::uia_culture_name(0), "0");
     EXPECT_EQ(lvt::uia_culture_name(-1), "-1");
     EXPECT_EQ(lvt::uia_culture_name(0x7FFFFFF), "134217727");
+}
+
+TEST(FindElementByRef, NormalizesAndValidatesUiaReferences) {
+    lvt::Element root;
+    root.type = "Window";
+    root.properties["RuntimeId"] = "42.100";
+    lvt::Element child;
+    child.type = "Button";
+    child.properties["RuntimeId"] = "42.100.3.-7";
+    root.children.push_back(child);
+    lvt::assign_element_ids(root);
+
+    // Negative components must resolve; the ref goes through the same
+    // parse/format pair the walk uses to produce the property.
+    auto* negative = lvt::find_element_by_ref(root, "uia:42.100.3.-7");
+    ASSERT_NE(negative, nullptr);
+    EXPECT_EQ(negative->type, "Button");
+
+    // Leading zeros normalize to the emitted form rather than failing to match.
+    auto* padded = lvt::find_element_by_ref(root, "uia:042.0100");
+    ASSERT_NE(padded, nullptr);
+    EXPECT_EQ(padded->type, "Window");
+
+    // A malformed reference resolves to nothing rather than falling through to
+    // the id/key lookups and matching something unrelated.
+    EXPECT_EQ(lvt::find_element_by_ref(root, "uia:not-an-id"), nullptr);
+    EXPECT_EQ(lvt::find_element_by_ref(root, "uia:"), nullptr);
 }

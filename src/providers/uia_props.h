@@ -68,6 +68,10 @@ std::string uia_pattern_name(long patternId);
 // property and the pattern-state properties derived from them.
 const std::vector<long>& uia_probed_pattern_ids();
 
+// Every property that carries an enumeration. Lets a caller check the enum
+// table and the emitted property set against each other in both directions.
+const std::vector<long>& uia_enum_property_ids();
+
 // Resolve a pattern by name (case-insensitive, "Pattern" suffix optional), e.g.
 // "Invoke", "TogglePattern". Returns 0 if unknown.
 long uia_pattern_id(const std::string& name);

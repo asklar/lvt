@@ -1986,8 +1986,8 @@ TEST_F(WinUI3SampleFixture, UiaTreeExposesAutomationIdsAndControlTypes) {
 
     auto* button = find_by_automation_id(j["root"], "PrimaryButton");
     ASSERT_NE(button, nullptr) << "PrimaryButton not found in the UIA tree";
-    EXPECT_EQ(button->value("type", ""), "Button");
-    EXPECT_EQ(uia_prop(*button, "ControlType"), "Button");
+    EXPECT_EQ(button->value("type", ""), "Button");  // ControlType is promoted to "type"
+    EXPECT_EQ(uia_prop(*button, "framework"), "");
     EXPECT_EQ(button->value("framework", ""), "uia");
     EXPECT_EQ(uia_prop(*button, "FrameworkId"), "XAML");
     // Invoke is what makes the button actionable; it must be advertised.
@@ -1996,12 +1996,12 @@ TEST_F(WinUI3SampleFixture, UiaTreeExposesAutomationIdsAndControlTypes) {
 
     auto* box = find_by_automation_id(j["root"], "InputBox");
     ASSERT_NE(box, nullptr);
-    EXPECT_EQ(uia_prop(*box, "ControlType"), "Edit");
+    EXPECT_EQ(box->value("type", ""), "Edit");
     EXPECT_NE(uia_prop(*box, "SupportedPatterns").find("Value"), std::string::npos);
 
     auto* check = find_by_automation_id(j["root"], "ReadyCheckBox");
     ASSERT_NE(check, nullptr);
-    EXPECT_EQ(uia_prop(*check, "ControlType"), "CheckBox");
+    EXPECT_EQ(check->value("type", ""), "CheckBox");
     EXPECT_NE(uia_prop(*check, "SupportedPatterns").find("Toggle"), std::string::npos);
 }
 
@@ -2106,6 +2106,24 @@ TEST_F(WinUI3SampleFixture, UiaExtraPropertiesAreOptInAndReportUnknownNames) {
     auto* richButton = find_by_automation_id(withPropsJson["root"], "PrimaryButton");
     ASSERT_NE(richButton, nullptr);
     EXPECT_TRUE(uia_has_prop(*richButton, "ProviderDescription"));
+
+    // An explicitly requested property also bypasses the unset-value
+    // suppression: naming one means wanting it even at its default.
+    auto forced = json::parse(
+        run_command(make_cmd(lvt, get_pid_arg() + " --uia --uia-props LandmarkType")),
+        nullptr, false);
+    ASSERT_FALSE(forced.is_discarded());
+    EXPECT_TRUE(uia_has_prop(forced["root"], "LandmarkType"))
+        << "--uia-props should override sentinel suppression";
+
+    // And an unknown name is reported on stderr without failing the walk —
+    // the other half of what this test's name promises.
+    auto unknown = run_command(make_cmd(
+        lvt, get_pid_arg() + " --uia --uia-props NotARealProperty") + " 2>&1");
+    EXPECT_NE(unknown.find("unknown UIA property 'NotARealProperty'"), std::string::npos)
+        << "an unknown property name should be reported";
+    EXPECT_NE(unknown.find("\"root\""), std::string::npos)
+        << "an unknown property name must not abort the walk";
 }
 
 TEST_F(WinUI3SampleFixture, UiaWorksWithElementScopingAndXmlFormat) {
@@ -2170,17 +2188,30 @@ TEST_F(WinUI3SampleFixture, UiaTreeDrivesScreenshotAnnotations) {
 TEST_F(WinUI3SampleFixture, UiaWalkDegradesGracefullyOnDeadline) {
     SkipIfNotReady();
 
-    // A cross-process UIA call can block indefinitely on a wedged target, so the
-    // walk is bounded. An impossibly short deadline must still yield usable
-    // output rather than hanging, crashing, or emitting truncated JSON.
+    // A cross-process UIA call can block indefinitely on a wedged target, so
+    // the walk is bounded. Assert the bound actually bites and is *visible*:
+    // for a machine consumer, a silently shortened tree that parses fine is
+    // worse than an error.
     auto lvt = get_lvt_path();
-    auto output = run_command(make_cmd(lvt, get_pid_arg() + " --uia --uia-timeout 1"));
-    auto j = json::parse(output, nullptr, false);
-    ASSERT_FALSE(j.is_discarded())
-        << "a hit deadline must not corrupt the emitted tree:\n" << output;
-    ASSERT_TRUE(j.contains("root"));
-    // The root is always produced; only descendants can be cut short.
-    EXPECT_FALSE(j["root"].value("id", "").empty());
+
+    auto full = json::parse(run_command(make_cmd(lvt, get_pid_arg() + " --uia")), nullptr, false);
+    ASSERT_FALSE(full.is_discarded());
+    const size_t fullNodes = count_json_nodes(full["root"]);
+    ASSERT_GT(fullNodes, 1u);
+    EXPECT_FALSE(uia_has_prop(full["root"], "Truncated"))
+        << "a complete walk must not be marked truncated";
+
+    auto clipped = json::parse(
+        run_command(make_cmd(lvt, get_pid_arg() + " --uia --uia-timeout 1")), nullptr, false);
+    ASSERT_FALSE(clipped.is_discarded())
+        << "a hit deadline must not corrupt the emitted tree";
+    ASSERT_TRUE(clipped.contains("root"));
+
+    // The deadline must have had an effect, and said so in the document.
+    EXPECT_LT(count_json_nodes(clipped["root"]), fullNodes)
+        << "--uia-timeout 1 produced a full tree, so the deadline is not bounding anything";
+    EXPECT_EQ(uia_prop(clipped["root"], "Truncated"), "true")
+        << "a truncated tree must be self-describing, not silently short";
 }
 
 TEST_F(WinUI3SampleFixture, UiaWatchEmitsAddedEvents) {
@@ -2391,7 +2422,7 @@ TEST_F(Wow64TargetFixture, UiaReadsAcrossArchitectures) {
     // Not just a bare root: real automation data must come across the boundary.
     const auto& root = j["root"];
     EXPECT_FALSE(root.value("id", "").empty());
-    EXPECT_FALSE(uia_prop(root, "ControlType").empty());
+    EXPECT_FALSE(root.value("type", "").empty());  // ControlType is promoted to "type"
     EXPECT_FALSE(uia_prop(root, "RuntimeId").empty());
     EXPECT_GT(count_json_nodes(root), 1u) << "expected child elements from the 32-bit target";
 }
@@ -2414,13 +2445,34 @@ TEST_F(WinUI3SampleFixture, UiaEmitsEnumNamesNotRawNumbers) {
     auto* check = find_by_automation_id(j["root"], "ReadyCheckBox");
     ASSERT_NE(check, nullptr);
     EXPECT_EQ(uia_prop(*check, "Toggle.ToggleState"), "On");
-    // Culture is an LCID, previously emitted as "1033". The root Window reports
-    // 0 (suppressed as unset), so assert it on a XAML element that sets one.
-    EXPECT_EQ(uia_prop(*check, "Culture"), "en-US");
+    // Culture is an LCID, previously emitted as "1033". Assert it resolved to a
+    // BCP-47 tag rather than a specific locale: the value depends on the
+    // machine's language, and the exact LCID mapping is pinned by unit tests.
+    const auto culture = uia_prop(*check, "Culture");
+    ASSERT_FALSE(culture.empty());
+    EXPECT_EQ(culture.find_first_of("0123456789"), std::string::npos)
+        << "Culture should be a locale name, not a raw LCID: " << culture;
+    EXPECT_NE(culture.find('-'), std::string::npos) << culture;
+
+    // Properties that are unset must be absent, not rendered as their default.
+    // This is the seam where LandmarkType shipped as "LandmarkType(0)" and
+    // LiveSetting as "Off" on every single element.
+    EXPECT_FALSE(uia_has_prop(*check, "LandmarkType"))
+        << "an unset LandmarkType must be omitted, not rendered";
+    EXPECT_FALSE(uia_has_prop(*check, "LiveSetting"))
+        << "an unset LiveSetting must be omitted, not rendered";
+    EXPECT_FALSE(uia_has_prop(*check, "Orientation"))
+        << "an unset Orientation must be omitted, not rendered";
+
+    // ControlType is promoted to Element::type, so it must not also appear in
+    // the property map.
+    EXPECT_FALSE(uia_has_prop(*check, "ControlType"))
+        << "ControlType is promoted to \"type\" and must not be duplicated";
+    EXPECT_EQ(check->value("type", ""), "CheckBox");
 
     // Sweep the whole tree: no enum-valued property may render as a bare number.
     static const char* enumProps[] = {
-        "ControlType", "Toggle.ToggleState", "ExpandCollapse.State", "Orientation",
+        "Toggle.ToggleState", "ExpandCollapse.State", "Orientation",
         "Window.WindowVisualState", "Window.WindowInteractionState",
         "Table.RowOrColumnMajor", "LiveSetting", "LandmarkType",
     };
@@ -2436,6 +2488,11 @@ TEST_F(WinUI3SampleFixture, UiaEmitsEnumNamesNotRawNumbers) {
             ++checked;
             const bool numeric = value.find_first_not_of("-0123456789") == std::string::npos;
             EXPECT_FALSE(numeric) << prop << " rendered as a raw number: " << value;
+            // "EnumName(n)" means lvt did not recognise the value. On a stock
+            // control that is a mapping gap, not a legitimate rendering — this
+            // is what let LandmarkType="LandmarkType(0)" ship green.
+            EXPECT_EQ(value.find('('), std::string::npos)
+                << prop << " fell back to the unrecognised-value form: " << value;
         }
         if (node->contains("children")) {
             for (const auto& child : (*node)["children"])

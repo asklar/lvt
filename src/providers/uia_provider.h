@@ -15,12 +15,12 @@ struct UiaOptions {
     // Unknown names are reported and ignored rather than failing the walk.
     std::vector<std::string> extraProperties;
 
-    // Deadline for the whole walk. UIA calls cross process boundaries and can
-    // block indefinitely on an unresponsive target, so the walk is bounded and
-    // returns what it has rather than hanging. 0 disables the deadline.
+    // Deadline for the walk, in milliseconds. It drives UIA's transaction
+    // timeout, which is what actually bounds a wedged target: every
+    // cross-process call happens inside one BuildUpdatedCache, and the
+    // per-element check below only limits the cheap in-process traversal of the
+    // materialised cache. 0 disables both.
     int timeoutMs = 10000;
-
-    int maxDepth = -1;
 };
 
 // Walks the target's UI Automation tree and returns it as a standard
@@ -35,8 +35,12 @@ struct UiaOptions {
 // one thread yields RPC_E_CHANGED_MODE.
 class UiaProvider : public IProvider {
 public:
-    // Returns std::nullopt if the UIA client could not be created or the window
-    // has no UIA element. `truncated` is set when the deadline cut the walk short.
+    // Returns std::nullopt if the UIA client could not be created, the window
+    // has no UIA element, or the cache request exceeded the timeout.
+    //
+    // When the deadline cuts the traversal short, `truncated` is set and the
+    // returned root carries a "Truncated" property, so a consumer reading only
+    // the document can still tell the tree is incomplete.
     std::optional<Element> build(HWND hwnd, const UiaOptions& options, bool* truncated = nullptr);
 };
 

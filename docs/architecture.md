@@ -130,9 +130,12 @@ Three implementation constraints shape the provider:
    both, so `run_on_mta()` marshals the walk onto its own thread, which also
    serializes access to the client.
 
-The walk is bounded by `--uia-timeout` because a cross-process call into an
-unresponsive target can block indefinitely; on expiry it returns the partial
-tree rather than hanging.
+The walk is bounded by `--uia-timeout`, which drives UIA's transaction timeout —
+the thing that actually bounds a wedged target, since every cross-process call
+happens inside the single `BuildUpdatedCache`. The per-element deadline check
+additionally limits the in-process traversal of the materialised cache; when it
+fires, the root carries a `Truncated` property so a consumer reading only the
+document can tell the tree is incomplete.
 
 ## Stage 4: Serialization (`json_serializer.cpp`, `screenshot.cpp`)
 ### JSON output

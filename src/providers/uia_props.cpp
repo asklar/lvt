@@ -33,10 +33,11 @@ std::string normalize_property_name(const std::string& name) {
 struct PropertyEntry {
     const char* name;
     long id;
-    // Value that means "unset" for this property, so optional metadata only
-    // appears where a provider actually set it. Comma-separated because
-    // frameworks disagree on the sentinel: Win32 reports 0 for an unset
-    // Level/PositionInSet/SizeOfSet where XAML reports -1.
+    // Value that means "unset" for this property, in the form UIA returns it
+    // (before humanizing), so the check is independent of how the value is
+    // later rendered. Comma-separated because frameworks disagree on the
+    // sentinel: Win32 reports 0 for an unset Level/PositionInSet/SizeOfSet
+    // where XAML reports -1.
     //
     // This is a different concern from "the element does not support this
     // property at all" — that is answered by UIA itself via
@@ -56,7 +57,7 @@ const PropertyEntry kProperties[] = {
     {"RuntimeId",            UIA_RuntimeIdPropertyId, nullptr},
     {"FrameworkId",          UIA_FrameworkIdPropertyId, nullptr},
     {"ProcessId",            UIA_ProcessIdPropertyId, nullptr},
-    {"NativeWindowHandle",   UIA_NativeWindowHandlePropertyId, "0x0"},
+    {"NativeWindowHandle",   UIA_NativeWindowHandlePropertyId,   "0"},
     {"ProviderDescription",  UIA_ProviderDescriptionPropertyId, nullptr},
 
     // Classification
@@ -80,7 +81,7 @@ const PropertyEntry kProperties[] = {
     {"IsDialog",             UIA_IsDialogPropertyId, "false"},
     {"BoundingRectangle",    UIA_BoundingRectanglePropertyId, nullptr},
     {"Culture",              UIA_CulturePropertyId, "0"},
-    {"Orientation",          UIA_OrientationPropertyId, "None"},
+    {"Orientation",          UIA_OrientationPropertyId,          "0"},
     {"LiveSetting",          UIA_LiveSettingPropertyId, "0"},
     {"Level",                UIA_LevelPropertyId, "0,-1"},
     {"PositionInSet",        UIA_PositionInSetPropertyId, "0,-1"},
@@ -299,23 +300,23 @@ const PatternEntry kPatterns[] = {
 };
 
 const std::unordered_map<std::string, long>& property_lookup() {
-    static const auto* map = [] {
-        auto* m = new std::unordered_map<std::string, long>();
+    static const std::unordered_map<std::string, long> map = [] {
+        std::unordered_map<std::string, long> m;
         for (const auto& e : kProperties)
-            m->emplace(normalize_property_name(e.name), e.id);
+            m.emplace(normalize_property_name(e.name), e.id);
         return m;
     }();
-    return *map;
+    return map;
 }
 
 const std::unordered_map<long, std::string>& property_names() {
-    static const auto* map = [] {
-        auto* m = new std::unordered_map<long, std::string>();
+    static const std::unordered_map<long, std::string> map = [] {
+        std::unordered_map<long, std::string> m;
         for (const auto& e : kProperties)
-            m->emplace(e.id, e.name);
+            m.emplace(e.id, e.name);
         return m;
     }();
-    return *map;
+    return map;
 }
 
 } // namespace
@@ -350,19 +351,19 @@ std::string uia_property_name(long propertyId) {
 }
 
 const std::vector<long>& uia_core_property_ids() {
-    static const auto* ids = [] {
-        auto* v = new std::vector<long>();
-        v->reserve(std::size(kProperties));
+    static const std::vector<long> ids = [] {
+        std::vector<long> v;
+        v.reserve(std::size(kProperties));
         for (const auto& e : kProperties) {
             // ProviderDescription is long and mostly useful when debugging a
             // provider chain, so it is opt-in via --uia-props.
             if (e.id == UIA_ProviderDescriptionPropertyId)
                 continue;
-            v->push_back(e.id);
+            v.push_back(e.id);
         }
         return v;
     }();
-    return *ids;
+    return ids;
 }
 
 bool uia_property_value_is_unset(long propertyId, const std::string& value) {
@@ -398,6 +399,17 @@ std::string uia_control_type_name(long controlTypeId) {
 
 bool uia_property_is_enum(long propertyId) {
     return propertyId == UIA_ControlTypePropertyId || find_enum_property(propertyId) != nullptr;
+}
+
+const std::vector<long>& uia_enum_property_ids() {
+    static const std::vector<long> ids = [] {
+        std::vector<long> v{UIA_ControlTypePropertyId};
+        v.reserve(std::size(kEnumProperties) + 1);
+        for (const auto& e : kEnumProperties)
+            v.push_back(e.propertyId);
+        return v;
+    }();
+    return ids;
 }
 
 std::string uia_enum_value_name(long propertyId, long value) {
@@ -444,14 +456,14 @@ std::string uia_pattern_name(long patternId) {
 }
 
 const std::vector<long>& uia_probed_pattern_ids() {
-    static const auto* ids = [] {
-        auto* v = new std::vector<long>();
-        v->reserve(std::size(kPatterns));
+    static const std::vector<long> ids = [] {
+        std::vector<long> v;
+        v.reserve(std::size(kPatterns));
         for (const auto& e : kPatterns)
-            v->push_back(e.id);
+            v.push_back(e.id);
         return v;
     }();
-    return *ids;
+    return ids;
 }
 
 long uia_pattern_id(const std::string& name) {
