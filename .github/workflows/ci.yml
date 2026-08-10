@@ -138,10 +138,11 @@ jobs:
         with:
           vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
-      # No Windows App SDK install step and no dotnet: this configuration must
-      # build from source alone, exactly as it does inside vcpkg. The Windows
-      # App SDK winmds come from the NuGet package the portfile downloads, so
-      # WinUI 3 enrichment is reduced here - that is expected.
+      # No Windows App SDK install step, no dotnet, and no Rust: this
+      # configuration must build from source alone, exactly as it does inside
+      # vcpkg — where the MCP server is off, so consumers of the port never
+      # need a Rust toolchain. Keeping this leg faithful is the point of it.
+      # The multi-architecture MCP build is covered by release.yml.
       - name: Configure (no managed, no tests)
         run: >
           cmake --preset ${{ matrix.preset }}
