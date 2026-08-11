@@ -108,7 +108,43 @@ The tree view matters too: `raw` exposes elements `control` hides, so an id from
 one view will not mean the same thing in another. Pass the same `view` you
 fetched with.
 
-### The two trees are different shapes, not different numbering
+### Modes: how a session drives the app
+
+A session declares which tree it speaks, and that determines how it acts.
+
+| | `mode: "uia"` (default) | `mode: "visual"` |
+|---|---|---|
+| references come from | `get_uia_tree`, `find_elements` | `get_visual_tree` |
+| a click is | the control's Invoke pattern | a real mouse click at its centre |
+| typing is | the Value pattern, or keystrokes | real keystrokes |
+| needs the window in front | no | yes |
+| works across architectures | yes | no — it injects |
+| available actions | all of them | click, scroll, type, press_key, focus, window_action |
+
+```json
+{ "name": "connect", "arguments": { "hwnd": "0x1A0B3C", "mode": "visual" } }
+```
+
+**Use `uia` unless you have a reason not to.** Patterns do not move the cursor,
+do not need focus, and do not race the user.
+
+**Use `visual` when UI Automation cannot see the UI properly** — custom-drawn
+controls, canvas, games — or when the app must observe genuine input.
+
+The two are kept separate on purpose: a reference from one tree is *refused* in
+a session of the other mode, rather than being matched to something that looks
+similar. That is what stops an action landing on the wrong element.
+
+Modes are per session, so you can hold one of each — read an app's structure
+through the visual tree while driving it through UIA, or drive a custom-drawn
+app by geometry while driving a normal one by patterns.
+
+`toggle`, `set_value`, `select`, `expand` and `invoke` describe what a control
+*means*, which geometry cannot express. In visual mode they are refused with a
+note pointing at `uia` mode, rather than approximated by a click that might do
+something else.
+
+## The two trees are different shapes, not different numbering
 
 This is the thing to internalise: the UIA tree and the visual tree are not one
 tree numbered twice. They are **different node sets at different
@@ -154,13 +190,19 @@ and is off by default.
 
 ### Acting on a visual-tree element
 
-If you have a `uiaRef`, just use it — no bridging, nothing to declare.
+If your session is in `visual` mode, just use the visual reference — that is
+what the mode is for, and the action is real input aimed at where the element
+is.
 
-Otherwise a visual reference is bridged for you. The bridge matches on
-**identity** (the element's `x:Name`/`Name`, which is what a UIA `AutomationId`
-is built from), falling back to visible text and preferring a candidate that
-exposes an actionable pattern. It does not match on screen position, because
-the two trees do not share a coordinate space at non-100% display scaling.
+In a `uia` session, a visual reference is bridged to its UIA counterpart as a
+convenience. If you have a `uiaRef` from `correlate: true`, use that instead —
+it needs no bridging.
+
+The bridge matches on **identity** (the element's `x:Name`/`Name`, which is what
+a UIA `AutomationId` is built from), falling back to visible text and preferring
+a candidate that exposes an actionable pattern. It does not match on screen
+position, because the two trees do not share a coordinate space at non-100%
+display scaling.
 
 When several candidates fit equally well — repeated list rows, say — it
 **refuses and lists them** rather than picking one. Acting on a guess is the

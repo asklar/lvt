@@ -43,6 +43,21 @@ pub struct ConnectArgs {
     pub pid: Option<u32>,
     /// Window handle, decimal or 0x-prefixed hex. The unambiguous option.
     pub hwnd: Option<String>,
+    /// How this session drives the app.
+    ///
+    /// "uia" (default) works through UI Automation: element references come
+    /// from get_uia_tree/find_elements, and actions use the control's own
+    /// patterns — no mouse movement, no focus stealing, and it works across
+    /// architectures.
+    ///
+    /// "visual" works through the framework-native tree instead: references
+    /// come from get_visual_tree, and actions are real mouse clicks and
+    /// keystrokes aimed at where the element is. Use it for UIs that UI
+    /// Automation cannot see properly — custom-drawn controls, canvas, games —
+    /// or when the app must observe genuine input. Only click, scroll, type,
+    /// press_key, focus and the window commands exist in this mode, because
+    /// geometry cannot express what toggle or set_value mean.
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -433,12 +448,14 @@ impl LvtServer {
         description = "Connect to an application window and open a session. Returns a session id \
                        that every other tool needs, plus the window's pid, architecture and \
                        detected UI frameworks. Identify the window by hwnd (unambiguous), pid, \
-                       process name, or title substring."
+                       process name, or title substring. Pass mode 'visual' to drive the app by \
+                       real mouse and keyboard input instead of UI Automation patterns."
     )]
     async fn connect(&self, Parameters(a): Parameters<ConnectArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
             "connect",
-            compact(json!({ "name": a.name, "title": a.title, "pid": a.pid, "hwnd": a.hwnd })), self.allow_input).await
+            compact(json!({ "name": a.name, "title": a.title, "pid": a.pid, "hwnd": a.hwnd,
+                            "mode": a.mode })), self.allow_input).await
     }
 
     #[tool(description = "Close a session opened by connect and release its resources.")]

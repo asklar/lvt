@@ -2111,6 +2111,170 @@ TEST_F(McpSampleFixture, CorrelationMapsVisualElementsToTheirUiaCounterpart) {
         << "the correlated counterpart did not actually drive the control";
 }
 
+// --- modes ---------------------------------------------------------------
+//
+// A session declares which tree it speaks and therefore how it drives the app:
+// UI Automation knows what a control *is*, so it acts through patterns; the
+// visual tree knows where things *are*, so it acts through real input. Keeping
+// them apart is what stops a reference ever being resolved against the tree it
+// did not come from.
+
+TEST_F(McpSampleFixture, VisualModeDrivesTheAppWithRealInput) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto visualSession = visual.value("session", "");
+    ASSERT_FALSE(visualSession.empty()) << visual.dump(2);
+    EXPECT_EQ(visual.value("mode", ""), "visual") << "the session should report its mode";
+
+    // A second session on the same window in the default mode, used to observe
+    // the effect — which also demonstrates that modes can be mixed.
+    const auto uiaSession = connect(client);
+    ASSERT_FALSE(uiaSession.empty());
+
+    auto tree = client.call_tool("get_visual_tree", json{{"session", visualSession}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    std::vector<const json*> all;
+    collect_json_elements(tree["root"], all);
+    const json* button = nullptr;
+    for (const auto* element : all) {
+        const auto properties = element->value("properties", json::object());
+        if (properties.value("name", "") == "PrimaryButton") {
+            button = element;
+            break;
+        }
+    }
+    if (!button)
+        GTEST_SKIP() << "the sample's button was not in the visual tree";
+
+    const auto before = status_text(client, uiaSession);
+    ASSERT_FALSE(before.empty());
+
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", visualSession}, {"element", button->value("ref", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << result.dump(2);
+    // The distinguishing property: it really was input, not a pattern call.
+    EXPECT_EQ(result.value("method", ""), "SendInput") << result.dump(2);
+    EXPECT_EQ(result.value("mode", ""), "visual");
+    EXPECT_TRUE(result.contains("at")) << "a geometric click should say where it landed";
+    // Synthetic input needs the window on top, and that changes what the user
+    // sees, so it has to be reported.
+    EXPECT_TRUE(result.value("broughtToForeground", false)) << result.dump(2);
+
+    EXPECT_NE(status_text(client, uiaSession), before)
+        << "the click reported success but the app did not react";
+}
+
+TEST_F(McpSampleFixture, ModesRefuseEachOthersReferences) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto visualSession = visual.value("session", "");
+    ASSERT_FALSE(visualSession.empty());
+
+    // The whole point of separating the modes: a reference from the other tree
+    // is refused with an explanation, never quietly matched to something else.
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", visualSession}, {"element", "uia:e6"}}, &isError);
+    EXPECT_TRUE(isError) << result.dump(2);
+    EXPECT_NE(result.value("error", "").find("visual mode"), std::string::npos) << result.dump(2);
+    EXPECT_NE(result.value("error", "").find("uia"), std::string::npos)
+        << "the message should say how to do what was asked: " << result.dump(2);
+}
+
+TEST_F(McpSampleFixture, VisualModeSaysWhatItCannotExpress) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto visualSession = visual.value("session", "");
+    ASSERT_FALSE(visualSession.empty());
+
+    auto tree = client.call_tool("get_visual_tree", json{{"session", visualSession}});
+    ASSERT_TRUE(tree.contains("root"));
+    std::vector<const json*> all;
+    collect_json_elements(tree["root"], all);
+    const json* anything = nullptr;
+    for (const auto* element : all) {
+        if (!element->value("ref", "").empty() &&
+            element->value("bounds", json::object()).value("width", 0) > 0) {
+            anything = element;
+            break;
+        }
+    }
+    ASSERT_NE(anything, nullptr);
+
+    // Toggling and setting a value describe what a control *means*. Geometry
+    // cannot express that, and approximating it with a click might do something
+    // else entirely — so it is refused, with the alternative named.
+    for (const char* pattern : {"toggle", "set_expanded"}) {
+        json args{{"session", visualSession}, {"element", anything->value("ref", "")}};
+        if (std::string(pattern) == "set_expanded")
+            args["expanded"] = true;
+        bool isError = false;
+        auto result = client.call_tool(pattern, args, &isError);
+        EXPECT_TRUE(isError) << pattern << " should not pretend to work: " << result.dump(2);
+        EXPECT_NE(result.value("error", "").find("visual mode"), std::string::npos)
+            << result.dump(2);
+    }
+}
+
+TEST_F(McpSampleFixture, UiaModeRemainsTheDefault) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    // Connecting without a mode must keep the pattern-based behaviour, or every
+    // existing caller changes meaning.
+    auto connected = client.call_tool("connect", json{{"hwnd", hwnd_string()}});
+    EXPECT_EQ(connected.value("mode", ""), "uia") << connected.dump(2);
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_EQ(found["elements"].size(), 1u);
+
+    const auto before = status_text(client, session);
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", session}, {"element", found["elements"][0].value("ref", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << result.dump(2);
+    EXPECT_EQ(result.value("method", ""), "InvokePattern")
+        << "the default mode must still act through patterns: " << result.dump(2);
+    EXPECT_NE(status_text(client, session), before);
+}
+
+TEST_F(McpSampleFixture, ConnectRejectsAModeItDoesNotKnow) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    bool isError = false;
+    auto result = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "telepathy"}}, &isError);
+    EXPECT_TRUE(isError) << result.dump(2);
+    EXPECT_NE(result.value("error", "").find("uia"), std::string::npos) << result.dump(2);
+    EXPECT_NE(result.value("error", "").find("visual"), std::string::npos) << result.dump(2);
+}
+
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {
     SkipIfNotReady();
     McpClient client(false);

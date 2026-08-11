@@ -4,6 +4,7 @@
 #include "element.h"
 #include "element_key.h"
 #include "framework_detector.h"
+#include "input.h"
 #include "json_serializer.h"
 #include "lvt_config.h"
 #include "screenshot.h"
@@ -49,6 +50,12 @@ struct Session {
     DWORD pid = 0;
     std::string processName;
     lvt::Architecture architecture = lvt::Architecture::unknown;
+    // Which tree this session speaks, and therefore how it acts. UI Automation
+    // knows what a control *is*, so it drives through patterns; the visual tree
+    // knows where things *are*, so it drives through synthetic input. Keeping
+    // them apart means a reference is never resolved against the tree it did
+    // not come from.
+    bool visualMode = false;
 };
 
 std::mutex g_sessionsMutex;
@@ -56,13 +63,14 @@ std::map<std::string, Session> g_sessions;
 std::atomic<uint64_t> g_nextSession{1};
 std::atomic<uint64_t> g_nextScreenshot{1};
 
-std::string add_session(const lvt::TargetInfo& target) {
+std::string add_session(const lvt::TargetInfo& target, bool visualMode) {
     Session session;
     session.id = "s" + std::to_string(g_nextSession.fetch_add(1));
     session.hwnd = target.hwnd;
     session.pid = target.pid;
     session.processName = target.processName;
     session.architecture = target.architecture;
+    session.visualMode = visualMode;
 
     std::lock_guard<std::mutex> lock(g_sessionsMutex);
     g_sessions[session.id] = session;
@@ -502,7 +510,27 @@ json method_connect(const json& params) {
     if (!target.hwnd || !IsWindow(target.hwnd))
         throw std::runtime_error("could not resolve a window for that target");
 
-    const auto id = add_session(target);
+    const auto mode = get_string(params, "mode", "uia");
+    if (mode != "uia" && mode != "visual")
+        throw std::runtime_error("mode must be 'uia' or 'visual', not '" + mode + "'");
+    const bool visualMode = mode == "visual";
+
+    // Driving by geometry means injecting into the target, which needs the same
+    // architecture as lvt — the visual tree is built by injecting too.
+    if (visualMode) {
+        const auto hostArch = lvt::get_host_architecture();
+        if (target.architecture != lvt::Architecture::unknown &&
+            hostArch != lvt::Architecture::unknown && target.architecture != hostArch) {
+            throw std::runtime_error(
+                std::string("visual mode needs lvt and the target to share an architecture: this "
+                            "lvt is ") +
+                lvt::architecture_name(hostArch) + " and the target is " +
+                lvt::architecture_name(target.architecture) +
+                ". Connect in uia mode instead, which works across architectures.");
+        }
+    }
+
+    const auto id = add_session(target, visualMode);
     char hwndText2[32];
     snprintf(hwndText2, sizeof(hwndText2), "0x%p", static_cast<void*>(target.hwnd));
 
@@ -518,6 +546,7 @@ json method_connect(const json& params) {
                 {"pid", static_cast<uint32_t>(target.pid)},
                 {"processName", target.processName},
                 {"architecture", lvt::architecture_name(target.architecture)},
+                {"mode", mode},
                 {"frameworks", names}};
 }
 
@@ -1175,6 +1204,178 @@ json action_result_to_json(const lvt::ActionResult& result, const std::string& a
     return out;
 }
 
+// --- visual mode ---------------------------------------------------------
+//
+// A session connected in visual mode drives the app the only way the visual
+// tree can support: by geometry. It knows where an element is, not what it is,
+// so there are no patterns to invoke — a click is a real click at the
+// element's centre and typing is real keystrokes.
+//
+// Nothing here consults UI Automation. That separation is the point: a
+// reference is resolved against the tree it came from, so it can never be
+// matched to something else.
+json visual_mode_action(const Session& session, const json& params, lvt::ActionKind kind,
+                        const char* actionName) {
+    const auto ref = get_string(params, "element");
+    const auto parsed = parse_ref(ref);
+    if (parsed.tree == RefTree::uia)
+        throw std::runtime_error(
+            "'" + ref + "' is a UI Automation reference, but this session is in visual mode. "
+            "Connect with mode 'uia' to act through UI Automation patterns, or use a reference "
+            "from get_visual_tree.");
+
+    // Synthetic input goes to the foreground window, so this is a prerequisite
+    // rather than a nicety. Refusing is better than typing into whatever else
+    // happens to be on top.
+    const bool needsForeground = kind != lvt::ActionKind::waitFor &&
+                                 kind != lvt::ActionKind::waitGone;
+
+    // No TargetGuard here: build_tree_for takes it for the read, and the mutex
+    // is not recursive. Injection afterwards is desktop-wide anyway — it goes
+    // through the foreground window, not through this target's provider — so
+    // holding a per-target lock across it would buy nothing.
+    lvt::Element tree;
+    std::string error;
+    if (!build_tree_for(session, params, false, tree, error))
+        throw std::runtime_error(error);
+
+    const lvt::Element* element = nullptr;
+    if (!parsed.ref.empty()) {
+        element = lvt::find_element_by_ref(tree, parsed.ref);
+        if (!element)
+            throw std::runtime_error("element '" + ref + "' not found in the visual tree");
+    }
+
+    json out{{"action", actionName}, {"mode", "visual"}};
+    if (!ref.empty())
+        out["element"] = ref;
+
+    const auto requireElement = [&]() -> const lvt::Element& {
+        if (!element)
+            throw std::runtime_error(std::string(actionName) +
+                                     " needs an element reference in visual mode");
+        return *element;
+    };
+
+    const auto centreOf = [&](const lvt::Element& target) {
+        const auto& b = target.bounds;
+        if (b.width <= 0 || b.height <= 0)
+            throw std::runtime_error("element '" + ref +
+                                     "' has no on-screen bounds, so there is nothing to aim at");
+        const POINT centre{b.x + b.width / 2, b.y + b.height / 2};
+        if (!lvt::point_is_on_screen(centre))
+            throw std::runtime_error("element '" + ref +
+                                     "' is not on any monitor, so it cannot be clicked");
+        return centre;
+    };
+
+    if (needsForeground && !lvt::bring_to_foreground(session.hwnd))
+        throw std::runtime_error("the target window could not be brought to the foreground, so "
+                                 "synthetic input would go somewhere else");
+
+    switch (kind) {
+    case lvt::ActionKind::click:
+    case lvt::ActionKind::invoke: {
+        const auto centre = centreOf(requireElement());
+        const int button = get_int(params, "button", 0);
+        if (!lvt::send_click(centre, button, 1))
+            throw std::runtime_error("the click could not be delivered");
+        out["method"] = "SendInput";
+        out["at"] = {{"x", centre.x}, {"y", centre.y}};
+        break;
+    }
+
+    case lvt::ActionKind::scroll: {
+        const auto centre = centreOf(requireElement());
+        const auto direction = get_string(params, "direction", "down");
+        const int amount = (std::max)(1, get_int(params, "amount", 1));
+        const bool horizontal = direction == "left" || direction == "right";
+        const bool negative = direction == "down" || direction == "left";
+        const int delta = WHEEL_DELTA * amount * (negative ? -1 : 1);
+        if (!lvt::send_wheel(centre, delta, horizontal))
+            throw std::runtime_error("the scroll could not be delivered");
+        out["method"] = "SendInput";
+        break;
+    }
+
+    case lvt::ActionKind::typeText: {
+        // Clicking first puts the caret where the caller pointed; without an
+        // element the text goes wherever focus already is.
+        if (element) {
+            const auto centre = centreOf(*element);
+            if (!lvt::send_click(centre, 0, 1))
+                throw std::runtime_error("could not click the element to type into it");
+        }
+        const auto text = get_string(params, "text");
+        if (text.empty())
+            throw std::runtime_error("type needs some text");
+        if (!lvt::send_text(text))
+            throw std::runtime_error("the text could not be delivered");
+        out["method"] = "SendInput";
+        break;
+    }
+
+    case lvt::ActionKind::pressKey: {
+        if (element) {
+            const auto centre = centreOf(*element);
+            if (!lvt::send_click(centre, 0, 1))
+                throw std::runtime_error("could not click the element to send keys to it");
+        }
+        std::vector<lvt::KeyChord> chords;
+        if (!lvt::parse_key_chords(get_string(params, "text"), chords))
+            throw std::runtime_error("could not understand that key chord");
+        for (const auto& chord : chords) {
+            if (!lvt::send_key_chord(chord))
+                throw std::runtime_error("the key chord could not be delivered");
+        }
+        out["method"] = "SendInput";
+        break;
+    }
+
+    case lvt::ActionKind::focus: {
+        const auto centre = centreOf(requireElement());
+        if (!lvt::send_click(centre, 0, 1))
+            throw std::runtime_error("could not click the element to focus it");
+        out["method"] = "SendInput";
+        break;
+    }
+
+    case lvt::ActionKind::windowClose:
+    case lvt::ActionKind::windowMinimize:
+    case lvt::ActionKind::windowMaximize:
+    case lvt::ActionKind::windowRestore: {
+        // Window commands are Win32, not UI Automation, so they work the same
+        // in either mode.
+        const int command = kind == lvt::ActionKind::windowMinimize  ? SW_MINIMIZE
+                            : kind == lvt::ActionKind::windowMaximize ? SW_MAXIMIZE
+                                                                      : SW_RESTORE;
+        if (kind == lvt::ActionKind::windowClose)
+            PostMessageW(session.hwnd, WM_CLOSE, 0, 0);
+        else
+            ShowWindow(session.hwnd, command);
+        out["method"] = kind == lvt::ActionKind::windowClose ? "WM_CLOSE" : "ShowWindow";
+        break;
+    }
+
+    default:
+        // Toggling, setting a value, expanding, selecting — these describe what
+        // a control *means*, which the visual tree does not know. Saying so is
+        // more useful than approximating them with a click that may do
+        // something else entirely.
+        throw std::runtime_error(
+            std::string("'") + actionName +
+            "' has no equivalent in visual mode, which drives by geometry rather than by "
+            "control semantics. Connect with mode 'uia' to use it, or use click/type here.");
+    }
+
+    out["ok"] = true;
+    // Synthetic input needed the window on top, which is worth reporting: it
+    // changes what the user sees.
+    if (needsForeground)
+        out["broughtToForeground"] = true;
+    return out;
+}
+
 json method_action(const json& params, lvt::ActionKind kind, const char* actionName,
                    bool allowInput) {
     const auto session = require_session(params);
@@ -1185,6 +1386,9 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     if (!isWait && !allowInput)
         throw std::runtime_error(std::string("'") + actionName +
                                  "' changes the target application, which needs --allow-input");
+
+    if (session.visualMode)
+        return visual_mode_action(session, params, kind, actionName);
 
     lvt::ActionRequest request;
     request.kind = kind;
