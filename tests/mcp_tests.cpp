@@ -2031,6 +2031,86 @@ TEST_F(McpSampleFixture, ExitsPromptlyEvenWithALongCallInFlight) {
     EXPECT_EQ(client.exit_code(), 0u);
 }
 
+TEST_F(McpSampleFixture, CorrelationMapsVisualElementsToTheirUiaCounterpart) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // The two trees are not one tree numbered twice. The sample has ~74 UIA
+    // nodes against ~314 visual ones, and a single button is one UIA element
+    // but three visual ones — Button, its ContentPresenter, its TextBlock. No
+    // renumbering could make those line up, so the relationship has to be
+    // computed and reported rather than assumed away.
+    auto plain = client.call_tool("get_visual_tree", json{{"session", session}});
+    if (!plain.contains("root"))
+        GTEST_SKIP() << "the visual tree is unavailable here";
+    std::vector<const json*> plainNodes;
+    collect_json_elements(plain["root"], plainNodes);
+    for (const auto* node : plainNodes) {
+        ASSERT_FALSE(node->contains("uiaRef"))
+            << "correlation costs an extra walk, so it must be opt-in: " << node->dump();
+    }
+
+    auto correlated = client.call_tool(
+        "get_visual_tree", json{{"session", session}, {"correlate", true}});
+    ASSERT_TRUE(correlated.contains("root")) << correlated.dump(2);
+    ASSERT_TRUE(correlated.contains("correlated")) << correlated.dump(2);
+
+    std::vector<const json*> nodes;
+    collect_json_elements(correlated["root"], nodes);
+    ASSERT_GT(nodes.size(), 20u);
+
+    std::map<std::string, int> perCounterpart;
+    int withRef = 0;
+    for (const auto* node : nodes) {
+        const auto ref = node->value("uiaRef", "");
+        if (ref.empty())
+            continue;
+        ++withRef;
+        ++perCounterpart[ref];
+        EXPECT_EQ(ref.rfind("uia:", 0), 0u) << "a counterpart must be a UIA reference: " << ref;
+    }
+    EXPECT_GT(withRef * 100 / static_cast<int>(nodes.size()), 50)
+        << "only " << withRef << " of " << nodes.size() << " visual nodes were correlated";
+
+    // The many-to-one shape is the point: if every counterpart were unique the
+    // two trees would be the same size, and the ids would have lined up all
+    // along.
+    int shared = 0;
+    for (const auto& [ref, count] : perCounterpart) {
+        if (count > 1)
+            ++shared;
+    }
+    EXPECT_GT(shared, 0)
+        << "no UIA element was the counterpart of more than one visual node, which is not "
+           "what these trees look like";
+
+    // And the counterpart is directly actionable — no second lookup, no flag.
+    const json* button = nullptr;
+    for (const auto* node : nodes) {
+        const auto properties = node->value("properties", json::object());
+        if (properties.value("name", "") == "PrimaryButton" && !node->value("uiaRef", "").empty()) {
+            button = node;
+            break;
+        }
+    }
+    ASSERT_NE(button, nullptr) << "the sample's button was not correlated";
+
+    const auto before = status_text(client, session);
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", session}, {"element", button->value("uiaRef", "")}}, &isError);
+    EXPECT_FALSE(isError) << result.dump(2);
+    // Acting on the counterpart needs no bridging, because it is already a UIA
+    // reference.
+    EXPECT_FALSE(result.contains("resolvedVia")) << result.dump(2);
+    EXPECT_NE(status_text(client, session), before)
+        << "the correlated counterpart did not actually drive the control";
+}
+
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {
     SkipIfNotReady();
     McpClient client(false);

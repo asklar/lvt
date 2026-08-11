@@ -71,6 +71,11 @@ pub struct TreeArgs {
     /// 10000). Raise this if a result comes back marked "truncated".
     #[serde(rename = "timeoutMs")]
     pub timeout_ms: Option<i32>,
+    /// get_visual_tree only: also report each element's UI Automation
+    /// counterpart as "uiaRef", so you can act on what you find without
+    /// looking it up again. Several visual nodes often share one counterpart.
+    /// Costs a second walk, so it is off by default.
+    pub correlate: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -454,9 +459,10 @@ impl LvtServer {
     #[tool(
         description = "Get the framework-native visual tree (Win32 windows, XAML/WPF/WinForms/\
                        Avalonia/Chromium elements). Use this to understand how a UI is built — \
-                       it shows implementation structure the UIA tree hides. It cannot be used \
-                       to drive the app, and it requires lvt and the target to share an \
-                       architecture."
+                       it shows implementation structure the UIA tree hides. Its elements are a \
+                       different, finer-grained set than the UIA tree's, so pass correlate:true \
+                       to get each one's UI Automation counterpart and act on that. Requires lvt \
+                       and the target to share an architecture."
     )]
     async fn get_visual_tree(&self, Parameters(a): Parameters<TreeArgs>) -> Result<CallToolResult, ErrorData> {
         forward("get_visual_tree", tree_params(a), self.allow_input).await
@@ -588,6 +594,7 @@ fn tree_params(a: TreeArgs) -> serde_json::Value {
         "view": a.view,
         "properties": a.properties,
         "timeoutMs": a.timeout_ms,
+        "correlate": a.correlate,
     }))
 }
 

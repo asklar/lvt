@@ -108,52 +108,70 @@ The tree view matters too: `raw` exposes elements `control` hides, so an id from
 one view will not mean the same thing in another. Pass the same `view` you
 fetched with.
 
-### References from the visual tree
+### The two trees are different shapes, not different numbering
 
-The UIA tree and the visual tree are **independent numberings over different
-nodes**, so `e12` means one thing in each — Okta Verify's "Go back" button is
-`e33` in the visual tree and `e15` in the UIA one.
+This is the thing to internalise: the UIA tree and the visual tree are not one
+tree numbered twice. They are **different node sets at different
+granularities**. In the WinUI 3 sample the UIA tree has 74 nodes and the visual
+tree 314, and a single button is:
 
-Every element therefore carries a **qualified `ref`** alongside its `id`:
+| tree | nodes |
+|---|---|
+| UIA | `e6` Button "Primary action" |
+| visual | `e30` Button → `e31` ContentPresenter → `e32` TextBlock "Primary action" |
+
+So no renumbering could ever make `eN` mean the same thing in both — the
+relationship is many-to-one and partial. That is why an id taken from one tree
+and used against the other lands somewhere unrelated.
+
+Two things follow.
+
+**Every element carries a qualified `ref`** saying which tree it came from:
 
 ```json
-{ "id": "e15", "ref": "uia:e15", "type": "Button", "text": "Go back" }
+{ "id": "e15", "ref": "uia:e15",    "type": "Button", "text": "Go back" }
 { "id": "e33", "ref": "visual:e33", "type": "Button", "text": "Go back" }
 ```
 
-**Prefer `ref` over `id`.** It says which tree it came from, so it cannot be
-resolved against the wrong one, and every tool accepts it. A ref used against
-the wrong tree is refused with an explanation rather than silently matching
-something unrelated. Each response also names its tree in a top-level `tree`
-field.
+Prefer `ref` over `id`. Every tool accepts it, routes it to the tree it names,
+and refuses one aimed at the wrong tree instead of resolving it to something
+else. A bare `eN` still works and means "this tool's default tree".
 
-A bare `eN` still works and means "the tree this tool reads by default", so
-nothing that already worked stops working. If you have a bare id from
-`get_visual_tree` and want to act on it, either use the `ref` form or pass
-`uia: false`.
+**`get_visual_tree` can report the correlation directly.** Pass
+`correlate: true` and each element gains a `uiaRef` naming its UI Automation
+counterpart — the thing you can actually act on:
 
-Durable keys are self-describing too — they name the framework that produced
-them (`wpf|…`, `uia|…`) — so they need no qualifier.
+```json
+{ "ref": "visual:e30", "type": "Button",           "uiaRef": "uia:e6" }
+{ "ref": "visual:e31", "type": "ContentPresenter", "uiaRef": "uia:e6" }
+{ "ref": "visual:e32", "type": "TextBlock",        "uiaRef": "uia:e6" }
+```
+
+All three share one counterpart, which is the many-to-one relationship made
+explicit. Template children inherit their control's counterpart, since acting on
+one means acting on it. Correlation needs both trees, so it costs a second walk
+and is off by default.
 
 ### Acting on a visual-tree element
 
-Actions are carried out through UI Automation, so a visual reference is bridged
-to its UIA counterpart. The bridge matches on **identity** — the element's
-`x:Name`/`Name` (which is what a UIA `AutomationId` is built from) — not on
-screen position, because the two trees do not share a coordinate space at
-non-100% display scaling. Failing that it falls back to matching visible text,
-preferring a candidate that exposes an actionable pattern.
+If you have a `uiaRef`, just use it — no bridging, nothing to declare.
+
+Otherwise a visual reference is bridged for you. The bridge matches on
+**identity** (the element's `x:Name`/`Name`, which is what a UIA `AutomationId`
+is built from), falling back to visible text and preferring a candidate that
+exposes an actionable pattern. It does not match on screen position, because
+the two trees do not share a coordinate space at non-100% display scaling.
 
 When several candidates fit equally well — repeated list rows, say — it
 **refuses and lists them** rather than picking one. Acting on a guess is the
 worst thing this tool can do.
 
 When it bridges, the result includes `resolvedVia` naming the UIA element
-actually acted on and how it was matched.
+actually acted on and how it was matched. A node with no actionable counterpart
+is reported as such rather than as a bare "not found".
 
-Handing it a presentation-only node is fine and common: clicking a XAML
-`TextBlock` label acts on the button around it. A node with no actionable
-counterpart is reported as such rather than as a bare "not found".
+Durable keys are self-describing — they name the framework that produced them
+(`wpf|…`, `uia|…`) — so they need no qualifier.
 
 ## Prefer patterns over synthetic input
 

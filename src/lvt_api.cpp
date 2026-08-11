@@ -25,10 +25,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -257,13 +259,24 @@ ParsedRef parse_ref(const std::string& ref) {
 
 const char* tree_name(bool uia) { return uia ? "uia" : "visual"; }
 
-json element_fields(const lvt::Element& element, const char* tree = nullptr) {
+using CorrelationMap = std::map<const lvt::Element*, std::string>;
+
+json element_fields(const lvt::Element& element, const char* tree = nullptr,
+                    const CorrelationMap* correlation = nullptr) {
     json j;
     j["id"] = element.id;
     // The unambiguous form, so a reference copied out of one tree cannot be
     // silently resolved against the other.
     if (tree)
         j["ref"] = std::string(tree) + ":" + element.id;
+    // The corresponding element in the other tree, when one could be found.
+    // Several visual nodes commonly share one UIA counterpart, which is exactly
+    // why their ids never lined up.
+    if (correlation) {
+        const auto found = correlation->find(&element);
+        if (found != correlation->end())
+            j["uiaRef"] = found->second;
+    }
     j["key"] = element.key;
     j["type"] = element.type;
     j["framework"] = element.framework;
@@ -279,12 +292,12 @@ json element_fields(const lvt::Element& element, const char* tree = nullptr) {
 }
 
 json element_to_json(const lvt::Element& element, bool includeChildren,
-                     const char* tree = nullptr) {
-    json j = element_fields(element, tree);
+                     const char* tree = nullptr, const CorrelationMap* correlation = nullptr) {
+    json j = element_fields(element, tree, correlation);
     if (includeChildren && !element.children.empty()) {
         json children = json::array();
         for (const auto& child : element.children)
-            children.push_back(element_to_json(child, true, tree));
+            children.push_back(element_to_json(child, true, tree, correlation));
         j["children"] = children;
     }
     return j;
@@ -539,6 +552,86 @@ Session require_session(const json& params) {
     return session;
 }
 
+#ifdef LVT_ENABLE_UIA
+// Identity values a visual element might carry that correspond to a UIA
+// AutomationId. Providers spell this differently: XAML and WPF both surface
+// x:Name / Name as "name", and XAML additionally keeps automation properties
+// under their literal XAML names. Looking only for "AutomationId" — which no
+// provider emits — meant the identity path never ran at all, and every bridge
+// fell through to matching on text.
+std::vector<std::string> visual_identity_values(const lvt::Element& visual) {
+    static constexpr const char* kKeys[] = {
+        "AutomationProperties.AutomationId",
+        "AutomationId",
+        "name",
+    };
+    std::vector<std::string> values;
+    for (const char* key : kKeys) {
+        const auto value = element_property(visual, key);
+        if (!value.empty() &&
+            std::find(values.begin(), values.end(), value) == values.end())
+            values.push_back(value);
+    }
+    return values;
+}
+
+// Correlate a whole visual tree against a UIA tree in one pass.
+//
+// The two trees are not the same nodes numbered differently — they are
+// different node sets at different granularities. The WinUI 3 sample has 74
+// UIA nodes and 314 visual ones, and a single button is one UIA element but
+// three visual ones (Button, its ContentPresenter, its TextBlock). So no
+// renumbering could ever make the ids line up; the relationship is many-to-one
+// and partial, and the only way to express it is to compute it and say so.
+//
+// Doing that for a whole tree is much cheaper than bridging element by element:
+// the UIA side is indexed once and reused, rather than re-walked per node.
+void correlate_visual_to_uia(const lvt::Element& uiaTree, const lvt::Element& visualRoot,
+                             std::map<const lvt::Element*, std::string>& out) {
+    std::vector<const lvt::Element*> uiaNodes;
+    collect_elements(uiaTree, uiaNodes);
+
+    // AutomationId is unique by contract, so a duplicate means the app has
+    // reused one; such an id identifies nothing and is dropped rather than
+    // pointed at an arbitrary winner.
+    std::map<std::string, const lvt::Element*> byAutomationId;
+    std::set<std::string> duplicateIds;
+    for (const auto* node : uiaNodes) {
+        const auto id = element_property(*node, "AutomationId");
+        if (id.empty())
+            continue;
+        if (!byAutomationId.emplace(id, node).second)
+            duplicateIds.insert(id);
+    }
+    for (const auto& id : duplicateIds)
+        byAutomationId.erase(id);
+
+    // Walk depth-first carrying the nearest correlated ancestor. A control's
+    // template children — the ContentPresenter and TextBlock inside a Button —
+    // have no identity of their own, but they belong to that control and
+    // acting on one means acting on it. Passing the ancestor's counterpart
+    // down is what makes the relationship visible: several visual nodes, one
+    // UIA element, which is exactly why the ids never lined up.
+    const std::function<void(const lvt::Element&, const std::string&)> visit =
+        [&](const lvt::Element& element, const std::string& inherited) {
+            std::string current = inherited;
+            for (const auto& identity : visual_identity_values(element)) {
+                const auto found = byAutomationId.find(identity);
+                if (found != byAutomationId.end()) {
+                    current = "uia:" + found->second->id;
+                    break;
+                }
+            }
+            if (!current.empty())
+                out[&element] = current;
+            for (const auto& child : element.children)
+                visit(child, current);
+        };
+    visit(visualRoot, std::string());
+}
+
+#endif
+
 json method_get_tree(const json& params, bool uia) {
     const auto session = require_session(params);
     lvt::Element tree;
@@ -566,10 +659,26 @@ json method_get_tree(const json& params, bool uia) {
     if (depth >= 0)
         lvt::trim_to_depth(*root, depth);
 
-    json out{{"root", element_to_json(*root, true, tree_name(uia))}};
+    // Correlating needs the other tree too, so it costs a second walk and is
+    // asked for rather than assumed. It answers the question a caller
+    // otherwise has to work out for themselves: given this visual element,
+    // what do I act on?
+    CorrelationMap correlation;
+    const bool wantCorrelation = !uia && get_bool(params, "correlate", false);
+    if (wantCorrelation) {
+        lvt::Element uiaTree;
+        std::string uiaError;
+        if (build_tree_for(session, params, true, uiaTree, uiaError))
+            correlate_visual_to_uia(uiaTree, *root, correlation);
+    }
+
+    json out{{"root", element_to_json(*root, true, tree_name(uia),
+                                      wantCorrelation ? &correlation : nullptr)}};
     // Naming the tree makes the ids self-describing even for a caller that
     // only reads the top of the response.
     out["tree"] = tree_name(uia);
+    if (wantCorrelation)
+        out["correlated"] = static_cast<uint64_t>(correlation.size());
     if (truncated)
         out["truncated"] = truncation_note();
     return out;
@@ -861,28 +970,6 @@ bool looks_like_visual_key(const std::string& ref) {
     // A durable key always has a framework prefix followed by '|'.
     const auto bar = ref.find('|');
     return bar != std::string::npos && bar > 0;
-}
-
-// Identity values a visual element might carry that correspond to a UIA
-// AutomationId. Providers spell this differently: XAML and WPF both surface
-// x:Name / Name as "name", and XAML additionally keeps automation properties
-// under their literal XAML names. Looking only for "AutomationId" — which no
-// provider emits — meant the identity path never ran at all, and every bridge
-// fell through to matching on text.
-std::vector<std::string> visual_identity_values(const lvt::Element& visual) {
-    static constexpr const char* kKeys[] = {
-        "AutomationProperties.AutomationId",
-        "AutomationId",
-        "name",
-    };
-    std::vector<std::string> values;
-    for (const char* key : kKeys) {
-        const auto value = element_property(visual, key);
-        if (!value.empty() &&
-            std::find(values.begin(), values.end(), value) == values.end())
-            values.push_back(value);
-    }
-    return values;
 }
 
 bool is_actionable(const lvt::Element& element) {
