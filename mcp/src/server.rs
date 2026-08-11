@@ -55,8 +55,10 @@ pub struct SessionArgs {
 pub struct TreeArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Return only this element and its descendants. Accepts an "eN" id, a
-    /// durable key, or "uia:<RuntimeId>".
+    /// Element reference. Prefer the qualified "ref" a tool gave you
+    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
+    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
+    /// ambiguous and is read against this tool's default tree.
     pub element: Option<String>,
     /// Maximum depth below the root. Omit for the whole tree.
     pub depth: Option<i32>,
@@ -101,7 +103,10 @@ pub struct FindArgs {
 pub struct ElementPropertiesArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element to describe: an "eN" id, a durable key, or "uia:<RuntimeId>".
+    /// Element reference. Prefer the qualified "ref" a tool gave you
+    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
+    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
+    /// ambiguous and is read against this tool's default tree.
     pub element: String,
     /// Specific properties to return. Omit for the element's standard fields.
     pub properties: Option<Vec<String>>,
@@ -157,7 +162,10 @@ pub struct HitTestArgs {
 pub struct ElementArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Target element: an "eN" id, a durable key, or "uia:<RuntimeId>".
+    /// Element reference. Prefer the qualified "ref" a tool gave you
+    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
+    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
+    /// ambiguous and is read against this tool's default tree.
     pub element: String,
     /// UIA tree view used to resolve the element: "control" (default),
     /// "content", or "raw". Must match the view the id came from.
@@ -172,7 +180,10 @@ pub struct ElementArgs {
 pub struct ClickArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element to click: an "eN" id, a durable key, or "uia:<RuntimeId>".
+    /// Element reference. Prefer the qualified "ref" a tool gave you
+    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
+    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
+    /// ambiguous and is read against this tool's default tree.
     pub element: String,
     /// Mouse button: 0 left (default), 1 right, 2 middle.
     pub button: Option<i32>,
@@ -191,7 +202,10 @@ pub struct ClickArgs {
 pub struct SetValueArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element to set: an "eN" id, a durable key, or "uia:<RuntimeId>".
+    /// Element reference. Prefer the qualified "ref" a tool gave you
+    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
+    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
+    /// ambiguous and is read against this tool's default tree.
     pub element: String,
     /// The value to set. Replaces the element's current value outright.
     pub text: String,
@@ -239,7 +253,10 @@ pub struct PressKeyArgs {
 pub struct ScrollArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element to scroll: an "eN" id, a durable key, or "uia:<RuntimeId>".
+    /// Element reference. Prefer the qualified "ref" a tool gave you
+    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
+    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
+    /// ambiguous and is read against this tool's default tree.
     pub element: String,
     /// Direction: "up", "down", "left", or "right". Defaults to "down".
     pub direction: Option<String>,
@@ -257,7 +274,10 @@ pub struct ScrollArgs {
 pub struct SelectArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element to select: an "eN" id, a durable key, or "uia:<RuntimeId>".
+    /// Element reference. Prefer the qualified "ref" a tool gave you
+    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
+    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
+    /// ambiguous and is read against this tool's default tree.
     pub element: String,
     /// "replace" (default) clears any other selection, "add" extends it,
     /// "remove" deselects just this element.
@@ -298,7 +318,10 @@ pub struct WindowActionArgs {
 pub struct WaitForArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element to watch: an "eN" id, a durable key, or "uia:<RuntimeId>".
+    /// Element reference. Prefer the qualified "ref" a tool gave you
+    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
+    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
+    /// ambiguous and is read against this tool's default tree.
     pub element: String,
     /// Wait for the element to disappear instead of for a property value.
     pub gone: Option<bool>,

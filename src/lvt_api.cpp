@@ -205,9 +205,65 @@ std::string base64_encode(const std::vector<unsigned char>& bytes) {    static c
     }
     return out;
 }
-json element_fields(const lvt::Element& element) {
+// --- element references ---------------------------------------------------
+//
+// `eN` ids are numbered per tree, so the same control is a different number in
+// each: Okta Verify's "Go back" button is e33 in the visual tree and e15 in the
+// UIA one. Nothing in a bare `eN` says which tree produced it, which makes a
+// reference copied from one tree and used against the other resolve to some
+// unrelated element rather than fail.
+//
+// Every element therefore also carries a qualified `ref` — "uia:e15" or
+// "visual:e33" — which is unambiguous and accepted anywhere an element is
+// taken. Bare `eN` still works and still means "the tree this tool reads by
+// default", so nothing that already worked stops working.
+
+enum class RefTree { unspecified, uia, visual };
+
+struct ParsedRef {
+    RefTree tree = RefTree::unspecified;
+    std::string ref;  // what to hand to find_element_by_ref
+};
+
+bool is_element_id(const std::string& ref) {
+    if (ref.size() < 2 || ref[0] != 'e')
+        return false;
+    return std::all_of(ref.begin() + 1, ref.end(),
+                       [](unsigned char c) { return std::isdigit(c) != 0; });
+}
+
+ParsedRef parse_ref(const std::string& ref) {
+    // "uia:<RuntimeId>" is the pre-existing form and stays whole, since
+    // find_element_by_ref parses it itself. "uia:eN" is the qualified id form.
+    if (ref.rfind("uia:", 0) == 0) {
+        const auto rest = ref.substr(4);
+        if (is_element_id(rest))
+            return {RefTree::uia, rest};
+        return {RefTree::uia, ref};
+    }
+    if (ref.rfind("visual:", 0) == 0)
+        return {RefTree::visual, ref.substr(7)};
+
+    // Durable keys name the framework that built them, so they are already
+    // self-describing: "uia|…" came from the UIA tree, "wpf|…" and friends did
+    // not.
+    if (ref.rfind("uia|", 0) == 0)
+        return {RefTree::uia, ref};
+    if (ref.find('|') != std::string::npos)
+        return {RefTree::visual, ref};
+
+    return {RefTree::unspecified, ref};
+}
+
+const char* tree_name(bool uia) { return uia ? "uia" : "visual"; }
+
+json element_fields(const lvt::Element& element, const char* tree = nullptr) {
     json j;
     j["id"] = element.id;
+    // The unambiguous form, so a reference copied out of one tree cannot be
+    // silently resolved against the other.
+    if (tree)
+        j["ref"] = std::string(tree) + ":" + element.id;
     j["key"] = element.key;
     j["type"] = element.type;
     j["framework"] = element.framework;
@@ -222,12 +278,13 @@ json element_fields(const lvt::Element& element) {
     return j;
 }
 
-json element_to_json(const lvt::Element& element, bool includeChildren) {
-    json j = element_fields(element);
+json element_to_json(const lvt::Element& element, bool includeChildren,
+                     const char* tree = nullptr) {
+    json j = element_fields(element, tree);
     if (includeChildren && !element.children.empty()) {
         json children = json::array();
         for (const auto& child : element.children)
-            children.push_back(element_to_json(child, true));
+            children.push_back(element_to_json(child, true, tree));
         j["children"] = children;
     }
     return j;
@@ -493,7 +550,14 @@ json method_get_tree(const json& params, bool uia) {
     lvt::Element* root = &tree;
     const auto scope = get_string(params, "element");
     if (!scope.empty()) {
-        root = lvt::find_element_by_ref(tree, scope);
+        const auto parsed = parse_ref(scope);
+        // Scoping to a reference from the *other* tree would silently show a
+        // different subtree, so say so instead.
+        if ((parsed.tree == RefTree::uia && !uia) || (parsed.tree == RefTree::visual && uia))
+            throw std::runtime_error("'" + scope + "' refers to the " +
+                                     (parsed.tree == RefTree::uia ? "UI Automation" : "visual") +
+                                     " tree, but this is the " + tree_name(uia) + " tree");
+        root = lvt::find_element_by_ref(tree, parsed.ref);
         if (!root)
             throw std::runtime_error("element '" + scope + "' not found");
     }
@@ -502,7 +566,10 @@ json method_get_tree(const json& params, bool uia) {
     if (depth >= 0)
         lvt::trim_to_depth(*root, depth);
 
-    json out{{"root", element_to_json(*root, true)}};
+    json out{{"root", element_to_json(*root, true, tree_name(uia))}};
+    // Naming the tree makes the ids self-describing even for a caller that
+    // only reads the top of the response.
+    out["tree"] = tree_name(uia);
     if (truncated)
         out["truncated"] = truncation_note();
     return out;
@@ -548,11 +615,12 @@ json method_find_elements(const json& params) {
         if (!pattern.empty() &&
             !contains_ci(element_property(*element, "SupportedPatterns"), pattern))
             continue;
-        matches.push_back(element_fields(*element));
+        matches.push_back(element_fields(*element, tree_name(uia)));
         if (static_cast<int>(matches.size()) >= limit)
             break;
     }
     json out{{"elements", matches}, {"searched", static_cast<uint64_t>(all.size())}};
+    out["tree"] = tree_name(uia);
     if (truncated)
         out["truncated"] = truncation_note();
     return out;
@@ -560,27 +628,34 @@ json method_find_elements(const json& params) {
 
 json method_get_element_properties(const json& params) {
     const auto session = require_session(params);
-    const bool uia = get_bool(params, "uia", true);
+    const auto ref = get_string(params, "element");
+    const auto parsed = parse_ref(ref);
+    // A qualified reference names its own tree, so it overrides the default
+    // rather than being resolved against the wrong one.
+    const bool uia = parsed.tree == RefTree::unspecified ? get_bool(params, "uia", true)
+                                                         : parsed.tree == RefTree::uia;
+
     lvt::Element tree;
     std::string error;
     bool truncated = false;
     if (!build_tree_for(session, params, uia, tree, error, &truncated))
         throw std::runtime_error(error);
 
-    const auto ref = get_string(params, "element");
-    const auto* element = lvt::find_element_by_ref(tree, ref);
+    const auto* element = lvt::find_element_by_ref(tree, parsed.ref);
     if (!element) {
         // "Not found" from a partial walk is the false negative this whole
         // mechanism exists to prevent, and this is the tool most likely to be
         // called with a specific id already in hand.
-        throw std::runtime_error("element '" + ref + "' not found" +
+        throw std::runtime_error("element '" + ref + "' not found in the " + tree_name(uia) +
+                                 " tree" +
                                  (truncated ? std::string("; note that ") + truncation_note()
                                             : std::string()));
     }
 
     const auto wanted = get_string_array(params, "properties");
     if (wanted.empty()) {
-        json out{{"element", element_fields(*element)}};
+        json out{{"element", element_fields(*element, tree_name(uia))}};
+        out["tree"] = tree_name(uia);
         if (truncated)
             out["truncated"] = truncation_note();
         return out;
@@ -596,6 +671,8 @@ json method_get_element_properties(const json& params) {
             values[propertyName] = value;
     }
     json out{{"element", element->id}, {"properties", values}};
+    out["ref"] = std::string(tree_name(uia)) + ":" + element->id;
+    out["tree"] = tree_name(uia);
     // Distinguishing "this element has no such property" from "the value is
     // empty" matters when a caller is probing for pattern support.
     if (!missing.empty())
@@ -651,7 +728,11 @@ json method_screenshot(const json& params, bool allowInput) {
     // different set of nodes, so annotating with it produced ids that silently
     // resolved to unrelated elements: reading `e42` off a screenshot and
     // clicking it activated a list item while reporting success.
-    const bool uia = get_bool(params, "uia", true);
+    const auto scopeRef = get_string(params, "element");
+    const auto parsedScope = parse_ref(scopeRef);
+    const bool uia = parsedScope.tree == RefTree::unspecified
+                         ? get_bool(params, "uia", true)
+                         : parsedScope.tree == RefTree::uia;
     bool annotated = true;
     bool truncated = false;
     if (!build_tree_for(session, params, uia, tree, error, &truncated)) {
@@ -662,12 +743,13 @@ json method_screenshot(const json& params, bool allowInput) {
             throw std::runtime_error("could not capture a screenshot of this window");
         annotated = false;
     } else {
-        const auto scope = get_string(params, "element");
+        const auto& scope = parsedScope.ref;
         // An unresolvable scope must not quietly become a full-window capture:
         // a caller who asked to annotate one dialog would get the whole window
         // back with no indication their request was ignored.
         if (!scope.empty() && !lvt::find_element_by_ref(tree, scope))
-            throw std::runtime_error("element '" + scope + "' not found, so there is nothing "
+            throw std::runtime_error("element '" + scopeRef + "' not found in the " +
+                                     tree_name(uia) + " tree, so there is nothing "
                                      "to scope the screenshot to");
         if (!lvt::capture_screenshot(session.hwnd, path, &tree, scope))
             throw std::runtime_error("could not capture a screenshot of this window");
@@ -676,7 +758,7 @@ json method_screenshot(const json& params, bool allowInput) {
     json out{{"annotated", annotated}};
     // Which tree the ids came from, since they are not interchangeable.
     if (annotated)
-        out["idsFrom"] = uia ? "uia" : "visual";
+        out["idsFrom"] = tree_name(uia);
     if (truncated)
         out["truncated"] = truncation_note();
     if (inlineImage)
@@ -702,7 +784,8 @@ json method_hit_test(const json& params) {
     lvt::Element tree;
     std::string error;
     bool truncated = false;
-    if (!build_tree_for(session, params, get_bool(params, "uia", true), tree, error, &truncated))
+    const bool uia = get_bool(params, "uia", true);
+    if (!build_tree_for(session, params, uia, tree, error, &truncated))
         throw std::runtime_error(error);
 
     std::vector<const lvt::Element*> all;
@@ -731,7 +814,8 @@ json method_hit_test(const json& params) {
             std::to_string(y) +
             (truncated ? std::string("; note that ") + truncation_note() : std::string()));
 
-    json out{{"element", element_fields(*best)}};
+    json out{{"element", element_fields(*best, tree_name(uia))}};
+    out["tree"] = tree_name(uia);
     if (truncated)
         out["truncated"] = truncation_note();
     out["ancestors"] = json::array();
@@ -772,13 +856,6 @@ bool looks_like_visual_key(const std::string& ref) {
     // A durable key always has a framework prefix followed by '|'.
     const auto bar = ref.find('|');
     return bar != std::string::npos && bar > 0;
-}
-
-bool is_element_id(const std::string& ref) {
-    if (ref.size() < 2 || ref[0] != 'e')
-        return false;
-    return std::all_of(ref.begin() + 1, ref.end(),
-                       [](unsigned char c) { return std::isdigit(c) != 0; });
 }
 
 // Choose the UIA element corresponding to a visual-tree element.
@@ -900,7 +977,7 @@ json action_result_to_json(const lvt::ActionResult& result, const std::string& a
     if (!result.message.empty())
         out["error"] = result.message;
     if (result.hasElement)
-        out["result"] = element_fields(result.element);
+        out["result"] = element_fields(result.element, "uia");
     return out;
 }
 
@@ -920,16 +997,18 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     request.waitTimeoutMs = get_int(params, "timeoutMs", 5000);
 
     // A reference can come from either tree, so work out which and bridge if
-    // needed. A durable key says so itself; an `eN` id cannot, so the caller
-    // states it with uia:false — the same flag the read tools use.
+    // needed. "uia:eN" / "visual:eN" and durable keys say which tree they came
+    // from; a bare "eN" does not, so the caller states it with uia:false.
     json bridge;
-    const auto& ref = request.elementRef;
-    const bool saysVisual = !get_bool(params, "uia", true);
-    if (!ref.empty()) {
-        if (looks_like_visual_key(ref) || (saysVisual && is_element_id(ref)))
-            request.elementRef = bridge_visual_ref_to_uia(session, params, ref, bridge);
-        else if (saysVisual && ref.rfind("uia", 0) != 0)
-            request.elementRef = bridge_visual_ref_to_uia(session, params, ref, bridge);
+    const auto originalRef = request.elementRef;
+    if (!originalRef.empty()) {
+        const auto parsed = parse_ref(originalRef);
+        const bool fromVisual = parsed.tree == RefTree::visual ||
+                                (parsed.tree == RefTree::unspecified &&
+                                 !get_bool(params, "uia", true));
+        request.elementRef = parsed.ref;
+        if (fromVisual)
+            request.elementRef = bridge_visual_ref_to_uia(session, params, parsed.ref, bridge);
     }
 
     // perform_action walks the target to resolve the reference, so it needs the

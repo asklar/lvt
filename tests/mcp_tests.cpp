@@ -1674,6 +1674,146 @@ TEST_F(McpSampleFixture, AVisualElementWithNoUiaCounterpartSaysSoClearly) {
     EXPECT_NE(message.find("UI Automation"), std::string::npos) << result.dump(2);
 }
 
+TEST_F(McpSampleFixture, ElementsCarryAQualifiedRefNamingTheirTree) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // `eN` is numbered per tree, so the same control is a different number in
+    // each — Okta Verify's "Go back" is e33 in the visual tree and e15 in the
+    // UIA one. A bare id therefore cannot say where it came from, which is how
+    // a reference copied from one tree came to be resolved against the other.
+    // Every element carries a qualified `ref` alongside it for that reason.
+    auto uiaTree = client.call_tool("get_uia_tree", json{{"session", session}, {"depth", 2}});
+    ASSERT_TRUE(uiaTree.contains("root")) << uiaTree.dump(2);
+    EXPECT_EQ(uiaTree.value("tree", ""), "uia");
+    EXPECT_EQ(uiaTree["root"].value("ref", ""),
+              "uia:" + uiaTree["root"].value("id", ""));
+
+    auto visualTree = client.call_tool("get_visual_tree", json{{"session", session}, {"depth", 2}});
+    if (visualTree.contains("root")) {
+        EXPECT_EQ(visualTree.value("tree", ""), "visual");
+        EXPECT_EQ(visualTree["root"].value("ref", ""),
+                  "visual:" + visualTree["root"].value("id", ""));
+    }
+
+    // find_elements too, since that is where ids usually come from.
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_EQ(found["elements"].size(), 1u);
+    EXPECT_EQ(found.value("tree", ""), "uia");
+    EXPECT_EQ(found["elements"][0].value("ref", ""),
+              "uia:" + found["elements"][0].value("id", ""));
+}
+
+TEST_F(McpSampleFixture, AQualifiedRefResolvesAgainstItsOwnTree) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto visualTree = client.call_tool("get_visual_tree", json{{"session", session}});
+    if (!visualTree.contains("root"))
+        GTEST_SKIP() << "the visual tree is unavailable here";
+
+    std::vector<const json*> all;
+    collect_json_elements(visualTree["root"], all);
+    const json* labelled = nullptr;
+    for (const auto* element : all) {
+        if (element->value("text", "") == "Primary action") {
+            labelled = element;
+            break;
+        }
+    }
+    if (!labelled)
+        GTEST_SKIP() << "no labelled visual element";
+
+    // The qualified form carries the tree with it, so no extra argument is
+    // needed and the default cannot send it to the wrong place.
+    auto props = client.call_tool(
+        "get_element_properties",
+        json{{"session", session}, {"element", labelled->value("ref", "")}});
+    EXPECT_EQ(props.value("tree", ""), "visual") << props.dump(2);
+
+    // And the same id without the qualifier goes to the default tree, which is
+    // a *different* element — the ambiguity the qualified form removes.
+    auto bare = client.call_tool(
+        "get_element_properties",
+        json{{"session", session}, {"element", labelled->value("id", "")}});
+    EXPECT_EQ(bare.value("tree", ""), "uia") << bare.dump(2);
+}
+
+TEST_F(McpSampleFixture, AQualifiedRefFromTheWrongTreeIsRefusedNotMisresolved) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // Scoping a UIA tree read to a visual reference would otherwise show a
+    // completely different subtree while looking like it worked.
+    bool isError = false;
+    auto result = client.call_tool(
+        "get_uia_tree", json{{"session", session}, {"element", "visual:e3"}}, &isError);
+    EXPECT_TRUE(isError) << result.dump(2);
+    EXPECT_NE(result.value("error", "").find("visual tree"), std::string::npos) << result.dump(2);
+}
+
+TEST_F(McpSampleFixture, ActionsAcceptQualifiedRefsFromEitherTree) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto visualTree = client.call_tool("get_visual_tree", json{{"session", session}});
+    if (!visualTree.contains("root"))
+        GTEST_SKIP() << "the visual tree is unavailable here";
+
+    std::vector<const json*> all;
+    collect_json_elements(visualTree["root"], all);
+    const json* labelled = nullptr;
+    for (const auto* element : all) {
+        if (element->value("text", "") == "Primary action") {
+            labelled = element;
+            break;
+        }
+    }
+    if (!labelled)
+        GTEST_SKIP() << "no labelled visual element";
+
+    // "visual:eN" is enough on its own — no uia:false needed — and it is
+    // bridged to the UIA element that can actually be invoked.
+    const auto before = status_text(client, session);
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", session}, {"element", labelled->value("ref", "")}}, &isError);
+    EXPECT_FALSE(isError) << result.dump(2);
+    ASSERT_TRUE(result.contains("resolvedVia")) << result.dump(2);
+    EXPECT_EQ(result["resolvedVia"].value("from", ""), "visual");
+    EXPECT_NE(status_text(client, session), before)
+        << "the click reported success but the app did not react";
+
+    // And the UIA-qualified form works without any bridging at all.
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_EQ(found["elements"].size(), 1u);
+    const auto after = status_text(client, session);
+    auto direct = client.call_tool(
+        "click", json{{"session", session}, {"element", found["elements"][0].value("ref", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << direct.dump(2);
+    EXPECT_FALSE(direct.contains("resolvedVia")) << "a UIA ref should need no bridging";
+    EXPECT_NE(status_text(client, session), after);
+}
+
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {
     SkipIfNotReady();
     McpClient client(false);

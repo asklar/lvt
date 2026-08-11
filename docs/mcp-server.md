@@ -111,28 +111,41 @@ fetched with.
 ### References from the visual tree
 
 The UIA tree and the visual tree are **independent numberings over different
-nodes**, so `e12` means one thing in each. Actions are carried out through UI
-Automation, so a visual-tree reference has to be bridged to its UIA counterpart.
-lvt does that for you:
+nodes**, so `e12` means one thing in each — Okta Verify's "Go back" button is
+`e33` in the visual tree and `e15` in the UIA one.
 
-- **A durable key is self-describing** — it names the framework that produced it
-  (`wpf|…`, `uia|…`), so it is routed automatically. Nothing to pass.
-- **A bare `eN` is ambiguous.** If it came from `get_visual_tree`, say so with
-  `uia: false`; otherwise it is treated as a UIA id, which is where ids normally
-  come from.
+Every element therefore carries a **qualified `ref`** alongside its `id`:
 
-The bridge matches on identity — `AutomationId` first, then name and control
-type — not on screen position, because the two trees do not share a coordinate
-space at non-100% display scaling. When it bridges, the result includes
-`resolvedVia` naming the UIA element actually acted on, so a surprising outcome
-can be traced.
+```json
+{ "id": "e15", "ref": "uia:e15", "type": "Button", "text": "Go back" }
+{ "id": "e33", "ref": "visual:e33", "type": "Button", "text": "Go back" }
+```
+
+**Prefer `ref` over `id`.** It says which tree it came from, so it cannot be
+resolved against the wrong one, and every tool accepts it. A ref used against
+the wrong tree is refused with an explanation rather than silently matching
+something unrelated. Each response also names its tree in a top-level `tree`
+field.
+
+A bare `eN` still works and means "the tree this tool reads by default", so
+nothing that already worked stops working. If you have a bare id from
+`get_visual_tree` and want to act on it, either use the `ref` form or pass
+`uia: false`.
+
+Durable keys are self-describing too — they name the framework that produced
+them (`wpf|…`, `uia|…`) — so they need no qualifier.
+
+### Acting on a visual-tree element
+
+Actions are carried out through UI Automation, so a visual reference is bridged
+to its UIA counterpart. The bridge matches on identity — `AutomationId` first,
+then name and control type — not on screen position, because the two trees do
+not share a coordinate space at non-100% display scaling. When it bridges, the
+result includes `resolvedVia` naming the UIA element actually acted on.
 
 Handing it a presentation-only node is fine and common: clicking a XAML
 `TextBlock` label acts on the button around it. A node with no actionable
 counterpart is reported as such rather than as a bare "not found".
-
-Prefer UIA references where you can — they need no bridging and are what the
-tools resolve natively.
 
 ## Prefer patterns over synthetic input
 
