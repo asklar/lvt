@@ -169,7 +169,8 @@ pub struct ElementArgs {
     pub element: String,
     /// UIA tree view used to resolve the element: "control" (default),
     /// "content", or "raw". Must match the view the id came from.
-    pub view: Option<String>,    /// Set false when the element id came from get_visual_tree rather than the
+    pub view: Option<String>,
+    /// Set false when the element id came from get_visual_tree rather than the
     /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
     /// ambiguous, so it needs this. lvt then matches the visual element to the
     /// UI Automation element at the same place on screen.
@@ -191,7 +192,8 @@ pub struct ClickArgs {
     /// for controls that behave differently under synthetic input.
     pub synthetic: Option<bool>,
     /// UIA tree view used to resolve the element.
-    pub view: Option<String>,    /// Set false when the element id came from get_visual_tree rather than the
+    pub view: Option<String>,
+    /// Set false when the element id came from get_visual_tree rather than the
     /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
     /// ambiguous, so it needs this. lvt then matches the visual element to the
     /// UI Automation element at the same place on screen.
@@ -210,7 +212,8 @@ pub struct SetValueArgs {
     /// The value to set. Replaces the element's current value outright.
     pub text: String,
     /// UIA tree view used to resolve the element.
-    pub view: Option<String>,    /// Set false when the element id came from get_visual_tree rather than the
+    pub view: Option<String>,
+    /// Set false when the element id came from get_visual_tree rather than the
     /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
     /// ambiguous, so it needs this. lvt then matches the visual element to the
     /// UI Automation element at the same place on screen.
@@ -226,7 +229,8 @@ pub struct TypeTextArgs {
     /// Focus this element first. Omit to type into the current focus.
     pub element: Option<String>,
     /// UIA tree view used to resolve the element.
-    pub view: Option<String>,    /// Set false when the element id came from get_visual_tree rather than the
+    pub view: Option<String>,
+    /// Set false when the element id came from get_visual_tree rather than the
     /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
     /// ambiguous, so it needs this. lvt then matches the visual element to the
     /// UI Automation element at the same place on screen.
@@ -242,7 +246,8 @@ pub struct PressKeyArgs {
     /// Focus this element first. Omit to send to the current focus.
     pub element: Option<String>,
     /// UIA tree view used to resolve the element.
-    pub view: Option<String>,    /// Set false when the element id came from get_visual_tree rather than the
+    pub view: Option<String>,
+    /// Set false when the element id came from get_visual_tree rather than the
     /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
     /// ambiguous, so it needs this. lvt then matches the visual element to the
     /// UI Automation element at the same place on screen.
@@ -263,7 +268,8 @@ pub struct ScrollArgs {
     /// Number of scroll increments. Defaults to 1.
     pub amount: Option<i32>,
     /// UIA tree view used to resolve the element.
-    pub view: Option<String>,    /// Set false when the element id came from get_visual_tree rather than the
+    pub view: Option<String>,
+    /// Set false when the element id came from get_visual_tree rather than the
     /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
     /// ambiguous, so it needs this. lvt then matches the visual element to the
     /// UI Automation element at the same place on screen.
@@ -283,7 +289,8 @@ pub struct SelectArgs {
     /// "remove" deselects just this element.
     pub mode: Option<String>,
     /// UIA tree view used to resolve the element.
-    pub view: Option<String>,    /// Set false when the element id came from get_visual_tree rather than the
+    pub view: Option<String>,
+    /// Set false when the element id came from get_visual_tree rather than the
     /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
     /// ambiguous, so it needs this. lvt then matches the visual element to the
     /// UI Automation element at the same place on screen.
@@ -299,7 +306,8 @@ pub struct SetExpandedArgs {
     /// true to expand, false to collapse.
     pub expanded: bool,
     /// UIA tree view used to resolve the element.
-    pub view: Option<String>,    /// Set false when the element id came from get_visual_tree rather than the
+    pub view: Option<String>,
+    /// Set false when the element id came from get_visual_tree rather than the
     /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
     /// ambiguous, so it needs this. lvt then matches the visual element to the
     /// UI Automation element at the same place on screen.
@@ -335,7 +343,8 @@ pub struct WaitForArgs {
     #[serde(rename = "timeoutMs")]
     pub timeout_ms: Option<i32>,
     /// UIA tree view used to resolve the element.
-    pub view: Option<String>,    /// Set false when the element id came from get_visual_tree rather than the
+    pub view: Option<String>,
+    /// Set false when the element id came from get_visual_tree rather than the
     /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
     /// ambiguous, so it needs this. lvt then matches the visual element to the
     /// UI Automation element at the same place on screen.
@@ -547,7 +556,7 @@ impl LvtServer {
         forward(
             "hit_test",
             compact(json!({
-                "session": a.session, "x": a.x, "y": a.y, "uia": a.uia, "uia": a.uia, "view": a.view,
+                "session": a.session, "x": a.x, "y": a.y, "uia": a.uia, "view": a.view,
                 "timeoutMs": a.timeout_ms,
             })), self.allow_input).await
     }

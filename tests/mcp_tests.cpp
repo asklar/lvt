@@ -1433,10 +1433,17 @@ TEST_F(McpSampleFixture, ConnectRefusesAnAmbiguousTitleInsteadOfGuessing) {
     auto result = client.call_tool(
         "connect", json{{"title", "LVT WinUI3 Sample"}}, &isError);
 
-    if (!isError) {
-        // Only one window was actually visible, so there was nothing ambiguous.
-        GTEST_SKIP() << "the second instance did not show a window";
-    }
+    // Confirm the premise before judging the behaviour: if only one window is
+    // actually visible there is nothing ambiguous, and skipping here would
+    // otherwise be indistinguishable from the refusal having been deleted.
+    auto apps = client.call_tool("list_apps", json{{"title", "LVT WinUI3 Sample"}});
+    const size_t matching = apps["apps"].size();
+    if (matching < 2)
+        GTEST_SKIP() << "only " << matching << " window matched, so nothing was ambiguous";
+
+    ASSERT_TRUE(isError)
+        << matching << " windows matched the title, so connect must refuse rather than pick one: "
+        << result.dump(2);
     EXPECT_NE(result.value("error", "").find("several windows"), std::string::npos)
         << "an ambiguous title must be reported, not resolved arbitrarily: " << result.dump(2);
     // The candidates have to be listed, or the caller cannot act on the refusal.
@@ -1475,10 +1482,18 @@ TEST_F(McpSampleFixture, GetElementPropertiesReportsATruncatedWalkAndMissingProp
     auto tight = client.call_tool(
         "get_element_properties",
         json{{"session", session}, {"element", "e40"}, {"timeoutMs", 1}}, &isError);
-    if (isError) {
-        EXPECT_NE(tight.value("error", "").find("incomplete"), std::string::npos)
-            << "not-found from a partial walk must say the walk was partial: " << tight.dump(2);
+    // Retried, because a 1 ms deadline does not *guarantee* a partial walk; the
+    // assertion must not be skipped away when it happens to complete, or this
+    // would pass with truncation reporting removed.
+    for (int attempt = 0; attempt < 10 && !isError; ++attempt) {
+        tight = client.call_tool(
+            "get_element_properties",
+            json{{"session", session}, {"element", "e40"}, {"timeoutMs", 1}}, &isError);
     }
+    ASSERT_TRUE(isError) << "a 1ms deadline never failed to resolve, so this proves nothing: "
+                         << tight.dump(2);
+    EXPECT_NE(tight.value("error", "").find("incomplete"), std::string::npos)
+        << "not-found from a partial walk must say the walk was partial: " << tight.dump(2);
 
     // A property the element does not have must be distinguishable from one
     // whose value happens to be empty.
@@ -1812,6 +1827,171 @@ TEST_F(McpSampleFixture, ActionsAcceptQualifiedRefsFromEitherTree) {
     EXPECT_FALSE(isError) << direct.dump(2);
     EXPECT_FALSE(direct.contains("resolvedVia")) << "a UIA ref should need no bridging";
     EXPECT_NE(status_text(client, session), after);
+}
+
+TEST_F(McpSampleFixture, BridgingWorksForRealControlsNotJustTextNodes) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // The controls a caller actually names. Bridging originally matched only
+    // on a property no visual provider emits ("AutomationId"), so the identity
+    // path never ran and every one of these failed with "no UI Automation
+    // counterpart" — while the one test that existed picked a TextBlock label
+    // and stayed green. Each of these carries x:Name, surfaced as "name", which
+    // is what the UIA AutomationId is built from.
+    static constexpr const char* kControls[] = {
+        "InputBox", "PrimaryButton", "ReadyCheckBox", "LevelSlider", "ChoiceCombo",
+    };
+
+    int bridged = 0;
+    int looked = 0;
+    for (const char* wanted : kControls) {
+        // Re-read the tree for each control. Focusing changes visual state, and
+        // XAML rebuilds template parts when it does, so ids captured before the
+        // previous iteration no longer describe the same nodes — the same
+        // staleness the docs warn callers about.
+        auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+        if (!visual.contains("root"))
+            GTEST_SKIP() << "the visual tree is unavailable here";
+        std::vector<const json*> all;
+        collect_json_elements(visual["root"], all);
+
+        const json* element = nullptr;
+        for (const auto* candidate : all) {
+            const auto properties = candidate->value("properties", json::object());
+            if (properties.value("name", "") == wanted) {
+                element = candidate;
+                break;
+            }
+        }
+        if (!element)
+            continue;
+        ++looked;
+
+        // focus rather than click: enough to prove the reference resolved to a
+        // real UIA element, without driving the app through five state changes.
+        bool isError = false;
+        auto result = client.call_tool(
+            "focus", json{{"session", session}, {"element", element->value("ref", "")}}, &isError);
+        EXPECT_FALSE(isError) << wanted << " (visual " << element->value("id", "")
+                              << " " << element->value("type", "") << ") did not bridge: "
+                              << result.dump(2);
+        if (isError)
+            continue;
+        ASSERT_TRUE(result.contains("resolvedVia")) << result.dump(2);
+        EXPECT_EQ(result["resolvedVia"].value("matchedBy", ""), "AutomationId")
+            << wanted << " should match on identity, not fall through to text: " << result.dump(2);
+        ++bridged;
+    }
+
+    ASSERT_GT(looked, 2) << "the sample app did not expose the named controls";
+    EXPECT_EQ(bridged, looked) << "only " << bridged << " of " << looked
+                               << " named controls bridged; the identity path is not working";
+}
+
+TEST_F(McpSampleFixture, BridgingRefusesRatherThanGuessBetweenIdenticalCandidates) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // The 200-row list gives many rows the same text. Ranking candidates by
+    // area made a zero-area offscreen element beat every visible one, so
+    // several different rows all bridged onto the same target and each
+    // reported success. Whatever happens now, two different visual elements
+    // must never resolve to the same UIA element.
+    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+    if (!visual.contains("root"))
+        GTEST_SKIP() << "the visual tree is unavailable here";
+
+    std::vector<const json*> all;
+    collect_json_elements(visual["root"], all);
+    std::vector<std::string> rowRefs;
+    for (const auto* element : all) {
+        const auto text = element->value("text", "");
+        if (text.rfind("Item ", 0) == 0 && !element->value("ref", "").empty())
+            rowRefs.push_back(element->value("ref", ""));
+        if (rowRefs.size() >= 4)
+            break;
+    }
+    if (rowRefs.size() < 2)
+        GTEST_SKIP() << "not enough repeated rows to test with";
+
+    std::map<std::string, std::string> targets;  // uia element -> first visual ref
+    for (const auto& ref : rowRefs) {
+        bool isError = false;
+        auto result = client.call_tool(
+            "focus", json{{"session", session}, {"element", ref}, {"view", "raw"}}, &isError);
+        if (isError)
+            continue;  // refusing is a fine outcome; guessing is not
+        const auto target = result.value("resolvedVia", json::object()).value("uiaElement", "");
+        if (target.empty())
+            continue;
+        const auto existing = targets.find(target);
+        EXPECT_EQ(existing, targets.end())
+            << "visual " << ref << " and " << (existing != targets.end() ? existing->second : "")
+            << " both bridged to " << target << "; distinct elements must not share a target";
+        targets[target] = ref;
+    }
+}
+
+TEST_F(McpSampleFixture, WaitGoneOnAVisualRefSucceedsWhenTheElementIsAlreadyAbsent) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // wait-gone's success condition is the element being absent, so bridging it
+    // first threw "not found in either tree" in exactly the case the caller was
+    // waiting for — breaking the natural close-then-wait pattern.
+    const auto start = GetTickCount64();
+    bool isError = false;
+    auto result = client.call_tool(
+        "wait_for",
+        json{{"session", session},
+             {"element", "wpf|Button|NeverExisted"},
+             {"gone", true},
+             {"timeoutMs", 4000}},
+        &isError);
+    const auto elapsed = GetTickCount64() - start;
+
+    EXPECT_FALSE(isError) << "an absent element must satisfy wait-gone: " << result.dump(2);
+    EXPECT_LT(elapsed, 3500u) << "wait-gone should return at once, not burn its timeout";
+}
+
+TEST_F(McpSampleFixture, ActionsAreRefusedByTheAbiWithoutAllowInput) {
+    SkipIfNotReady();
+    // The header and the docs both say the gate is enforced inside lvt rather
+    // than only by withholding tools. It was not: every action method ran
+    // regardless, and only the tool router stopped a model reaching them. That
+    // left the public C ABI's contract unmet.
+    McpClient readOnly(false);
+    ASSERT_TRUE(readOnly.started());
+    ASSERT_TRUE(readOnly.handshake());
+    const auto session = connect(readOnly);
+    ASSERT_FALSE(session.empty());
+
+    // The tool is not registered, so this is refused at the protocol level —
+    // which is the outer defence.
+    auto response = readOnly.request(
+        "tools/call",
+        json{{"name", "click"}, {"arguments", json{{"session", session}, {"element", "e0"}}}});
+    ASSERT_FALSE(response.is_null());
+    EXPECT_TRUE(response.contains("error")) << response.dump(2);
+
+    // Observation is still allowed, so the gate is not simply refusing
+    // everything.
+    bool isError = false;
+    readOnly.call_tool("get_uia_tree", json{{"session", session}, {"depth", 1}}, &isError);
+    EXPECT_FALSE(isError);
 }
 
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {

@@ -138,10 +138,18 @@ them (`wpf|…`, `uia|…`) — so they need no qualifier.
 ### Acting on a visual-tree element
 
 Actions are carried out through UI Automation, so a visual reference is bridged
-to its UIA counterpart. The bridge matches on identity — `AutomationId` first,
-then name and control type — not on screen position, because the two trees do
-not share a coordinate space at non-100% display scaling. When it bridges, the
-result includes `resolvedVia` naming the UIA element actually acted on.
+to its UIA counterpart. The bridge matches on **identity** — the element's
+`x:Name`/`Name` (which is what a UIA `AutomationId` is built from) — not on
+screen position, because the two trees do not share a coordinate space at
+non-100% display scaling. Failing that it falls back to matching visible text,
+preferring a candidate that exposes an actionable pattern.
+
+When several candidates fit equally well — repeated list rows, say — it
+**refuses and lists them** rather than picking one. Acting on a guess is the
+worst thing this tool can do.
+
+When it bridges, the result includes `resolvedVia` naming the UIA element
+actually acted on and how it was matched.
 
 Handing it a presentation-only node is fine and common: clicking a XAML
 `TextBlock` label acts on the button around it. A node with no actionable

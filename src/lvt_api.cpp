@@ -736,7 +736,12 @@ json method_screenshot(const json& params, bool allowInput) {
     bool annotated = true;
     bool truncated = false;
     if (!build_tree_for(session, params, uia, tree, error, &truncated)) {
-        // Annotation is a bonus; a plain capture is still useful.
+        // Annotation is a bonus; a plain capture is still useful. A requested
+        // scope is not a bonus, though — silently returning the whole window
+        // would reinterpret the request rather than answer it.
+        if (!scopeRef.empty())
+            throw std::runtime_error("cannot scope the screenshot to '" + scopeRef +
+                                     "' because the tree could not be read: " + error);
         if (lvt::g_debug)
             fprintf(stderr, "lvt: screenshot without annotations: %s\n", error.c_str());
         if (!lvt::capture_screenshot(session.hwnd, path, nullptr, {}))
@@ -858,67 +863,152 @@ bool looks_like_visual_key(const std::string& ref) {
     return bar != std::string::npos && bar > 0;
 }
 
+// Identity values a visual element might carry that correspond to a UIA
+// AutomationId. Providers spell this differently: XAML and WPF both surface
+// x:Name / Name as "name", and XAML additionally keeps automation properties
+// under their literal XAML names. Looking only for "AutomationId" — which no
+// provider emits — meant the identity path never ran at all, and every bridge
+// fell through to matching on text.
+std::vector<std::string> visual_identity_values(const lvt::Element& visual) {
+    static constexpr const char* kKeys[] = {
+        "AutomationProperties.AutomationId",
+        "AutomationId",
+        "name",
+    };
+    std::vector<std::string> values;
+    for (const char* key : kKeys) {
+        const auto value = element_property(visual, key);
+        if (!value.empty() &&
+            std::find(values.begin(), values.end(), value) == values.end())
+            values.push_back(value);
+    }
+    return values;
+}
+
+bool is_actionable(const lvt::Element& element) {
+    const auto patterns = element_property(element, "SupportedPatterns");
+    return contains_ci(patterns, "Invoke") || contains_ci(patterns, "Toggle") ||
+           contains_ci(patterns, "SelectionItem") || contains_ci(patterns, "ExpandCollapse") ||
+           contains_ci(patterns, "Value");
+}
+
+// Is this element somewhere a user could actually interact with? Offscreen and
+// zero-area elements are excluded from matching entirely. That is not a
+// refinement: ranking by area made a zero-area candidate beat every visible
+// one, so a list of rows sharing an icon name all bridged to the same
+// offscreen element — three different rows, one target, every call reporting
+// success.
+bool is_visible_candidate(const lvt::Element& element) {
+    if (element.bounds.width <= 0 || element.bounds.height <= 0)
+        return false;
+    return !equals_ci(element_property(element, "IsOffscreen"), "true");
+}
+
+// Where an element sits inside its own tree's root, as a fraction. Comparing
+// these lets a visual element be matched to a UIA one despite the two trees
+// not sharing a coordinate space at non-100% display scaling.
+bool relative_centre(const lvt::Element& element, const lvt::Element& root, double& fx,
+                     double& fy) {
+    if (root.bounds.width <= 0 || root.bounds.height <= 0)
+        return false;
+    fx = (element.bounds.x + element.bounds.width / 2.0 - root.bounds.x) / root.bounds.width;
+    fy = (element.bounds.y + element.bounds.height / 2.0 - root.bounds.y) / root.bounds.height;
+    return true;
+}
+
 // Choose the UIA element corresponding to a visual-tree element.
 //
-// Identity first, geometry only as a last resort. That ordering is not a
-// preference — the two trees do not reliably share a coordinate space. A WPF
-// element's position comes from the TAP DLL inside the DPI-aware target, while
-// lvt reads UIA bounds as a DPI-unaware client, so at 150% scaling the same
-// button is at 1136,933 in one tree and 757,622 in the other (sizes match;
-// only the origin is scaled). Matching on what the element *is* sidesteps that
-// entirely.
-const lvt::Element* match_visual_to_uia(const lvt::Element& uiaTree, const lvt::Element& visual,
-                                        std::string& how) {
+// Identity first, and position only ever as a tie-break between candidates that
+// are otherwise equally good. `ambiguous` is filled when the choice cannot be
+// made confidently, so the caller can refuse and say what it saw rather than
+// picking one and acting on it.
+const lvt::Element* match_visual_to_uia(const lvt::Element& uiaTree,
+                                        const lvt::Element& visualRoot,
+                                        const lvt::Element& visual, std::string& how,
+                                        std::vector<const lvt::Element*>& ambiguous) {
     std::vector<const lvt::Element*> all;
     collect_elements(uiaTree, all);
 
-    // 1. AutomationId is the strongest signal: frameworks map it straight
-    //    through to UIA, and it is meant to be unique.
-    const auto automationId = element_property(visual, "AutomationId");
-    if (!automationId.empty()) {
+    // 1. AutomationId, which frameworks map through and which is meant to be
+    //    unique. Ambiguity here is a genuine app-level collision, so report it
+    //    rather than guessing.
+    for (const auto& identity : visual_identity_values(visual)) {
+        std::vector<const lvt::Element*> hits;
         for (const auto* candidate : all) {
-            if (element_property(*candidate, "AutomationId") == automationId) {
-                how = "AutomationId";
-                return candidate;
-            }
+            if (element_property(*candidate, "AutomationId") == identity)
+                hits.push_back(candidate);
+        }
+        if (hits.size() == 1) {
+            how = "AutomationId";
+            return hits.front();
+        }
+        if (hits.size() > 1) {
+            ambiguous = hits;
+            return nullptr;
         }
     }
 
-    // 2. Otherwise the visible text, narrowed to something actually actionable.
-    //    A templated control contributes several nodes with the same text — the
-    //    Button, its ContentPresenter, its TextBlock — and only the outer one
-    //    responds to Invoke.
-    if (!visual.text.empty()) {
-        const lvt::Element* best = nullptr;
-        int64_t bestArea = 0;
-        bool bestActionable = false;
-        for (const auto* candidate : all) {
-            if (!equals_ci(candidate->text, visual.text))
+    // 2. Otherwise the visible text, over elements a user could actually reach.
+    if (visual.text.empty())
+        return nullptr;
+
+    std::vector<const lvt::Element*> candidates;
+    for (const auto* candidate : all) {
+        if (equals_ci(candidate->text, visual.text) && is_visible_candidate(*candidate))
+            candidates.push_back(candidate);
+    }
+    if (candidates.empty())
+        return nullptr;
+    if (candidates.size() == 1) {
+        how = "name";
+        return candidates.front();
+    }
+
+    // A templated control contributes several nodes with the same text — the
+    // Button, its ContentPresenter, its TextBlock — and only the outer one
+    // responds to Invoke, so an actionable candidate is always the intended
+    // one.
+    std::vector<const lvt::Element*> actionable;
+    for (const auto* candidate : candidates) {
+        if (is_actionable(*candidate))
+            actionable.push_back(candidate);
+    }
+    auto& pool = actionable.empty() ? candidates : actionable;
+    if (pool.size() == 1) {
+        how = actionable.empty() ? "name" : "name and an actionable pattern";
+        return pool.front();
+    }
+
+    // Several equally plausible candidates — repeated list rows, say. Position
+    // within the window decides, compared as a fraction of each tree's own root
+    // so the differing coordinate spaces do not matter.
+    double vx = 0, vy = 0;
+    if (relative_centre(visual, visualRoot, vx, vy)) {
+        const lvt::Element* nearest = nullptr;
+        double best = 0;
+        double runnerUp = 0;
+        for (const auto* candidate : pool) {
+            double cx = 0, cy = 0;
+            if (!relative_centre(*candidate, uiaTree, cx, cy))
                 continue;
-            const auto patterns = element_property(*candidate, "SupportedPatterns");
-            const bool actionable =
-                contains_ci(patterns, "Invoke") || contains_ci(patterns, "Toggle") ||
-                contains_ci(patterns, "SelectionItem") || contains_ci(patterns, "ExpandCollapse") ||
-                contains_ci(patterns, "Value");
-            const auto& b = candidate->bounds;
-            const int64_t area = static_cast<int64_t>(b.width) * b.height;
-
-            // An actionable match always beats a non-actionable one; between
-            // two of a kind, the smaller is the more specific.
-            const bool better = !best || (actionable && !bestActionable) ||
-                                (actionable == bestActionable && area < bestArea);
-            if (better) {
-                best = candidate;
-                bestArea = area;
-                bestActionable = actionable;
+            const double distance = (cx - vx) * (cx - vx) + (cy - vy) * (cy - vy);
+            if (!nearest || distance < best) {
+                runnerUp = nearest ? best : 0;
+                nearest = candidate;
+                best = distance;
+            } else if (runnerUp == 0 || distance < runnerUp) {
+                runnerUp = distance;
             }
         }
-        if (best) {
-            how = "name and control type";
-            return best;
+        // Only trust position when one candidate is clearly closer; two
+        // elements at almost the same place cannot be told apart this way.
+        if (nearest && best < 0.0004 && (runnerUp == 0 || runnerUp > best * 4)) {
+            how = "name and position";
+            return nearest;
         }
     }
 
+    ambiguous = pool;
     return nullptr;
 }
 
@@ -943,7 +1033,23 @@ std::string bridge_visual_ref_to_uia(const Session& session, const json& params,
         throw std::runtime_error(error);
 
     std::string how;
-    const auto* uia = match_visual_to_uia(uiaTree, *visual, how);
+    std::vector<const lvt::Element*> ambiguous;
+    const auto* uia = match_visual_to_uia(uiaTree, visualTree, *visual, how, ambiguous);
+
+    if (!uia && !ambiguous.empty()) {
+        // Several candidates fit. Naming them lets the caller pick, which is
+        // the same choice `connect` offers for an ambiguous title — and far
+        // better than acting on one of them and reporting success.
+        json options = json::array();
+        for (const auto* candidate : ambiguous) {
+            options.push_back({{"ref", "uia:" + candidate->id},
+                               {"type", candidate->type},
+                               {"name", candidate->text}});
+        }
+        throw std::runtime_error("'" + ref + "' matches more than one UI Automation element, so "
+                                 "acting on it would be a guess; use one of these instead: " +
+                                 options.dump());
+    }
     if (!uia)
         throw std::runtime_error(
             "'" + ref + "' is a visual-tree element (" + visual->type +
@@ -967,7 +1073,8 @@ std::string bridge_visual_ref_to_uia(const Session& session, const json& params,
 }
 
 json action_result_to_json(const lvt::ActionResult& result, const std::string& action,
-                           const std::string& ref) {    json out;
+                           const std::string& ref) {
+    json out;
     out["action"] = action;
     out["ok"] = result.ok;
     if (!ref.empty())
@@ -981,8 +1088,16 @@ json action_result_to_json(const lvt::ActionResult& result, const std::string& a
     return out;
 }
 
-json method_action(const json& params, lvt::ActionKind kind, const char* actionName) {
+json method_action(const json& params, lvt::ActionKind kind, const char* actionName,
+                   bool allowInput) {
     const auto session = require_session(params);
+
+    // The waits observe rather than change, so they stay available to a
+    // read-only caller; everything else here drives the application.
+    const bool isWait = kind == lvt::ActionKind::waitFor || kind == lvt::ActionKind::waitGone;
+    if (!isWait && !allowInput)
+        throw std::runtime_error(std::string("'") + actionName +
+                                 "' changes the target application, which needs --allow-input");
 
     lvt::ActionRequest request;
     request.kind = kind;
@@ -999,9 +1114,14 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     // A reference can come from either tree, so work out which and bridge if
     // needed. "uia:eN" / "visual:eN" and durable keys say which tree they came
     // from; a bare "eN" does not, so the caller states it with uia:false.
+    //
+    // wait-gone is exempt: its success condition is the element being absent,
+    // and perform_action already treats an unresolvable reference as satisfied.
+    // Bridging first would throw "not found in either tree" in exactly the case
+    // the caller is waiting for, so `close` then `wait_gone` would fail.
     json bridge;
     const auto originalRef = request.elementRef;
-    if (!originalRef.empty()) {
+    if (!originalRef.empty() && kind != lvt::ActionKind::waitGone) {
         const auto parsed = parse_ref(originalRef);
         const bool fromVisual = parsed.tree == RefTree::visual ||
                                 (parsed.tree == RefTree::unspecified &&
@@ -1009,6 +1129,10 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
         request.elementRef = parsed.ref;
         if (fromVisual)
             request.elementRef = bridge_visual_ref_to_uia(session, params, parsed.ref, bridge);
+    } else if (!originalRef.empty()) {
+        // Still strip any qualifier so the reference reaches the resolver in
+        // the form it understands.
+        request.elementRef = parse_ref(originalRef).ref;
     }
 
     // perform_action walks the target to resolve the reference, so it needs the
@@ -1016,7 +1140,6 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     // until a deadline, and holding the lock for that would stall every other
     // request against the app for the whole timeout — which is precisely when a
     // caller is most likely to also be watching it.
-    const bool isWait = kind == lvt::ActionKind::waitFor || kind == lvt::ActionKind::waitGone;
     std::optional<TargetGuard> guard;
     if (!isWait)
         guard.emplace(session.hwnd);
@@ -1051,31 +1174,31 @@ json dispatch(const std::string& method, const json& params, bool allowInput) {
     if (method == "hit_test")    return method_hit_test(params);
 
 #ifdef LVT_ENABLE_UIA
-    if (method == "click")        return method_action(params, lvt::ActionKind::click, "click");
-    if (method == "invoke")       return method_action(params, lvt::ActionKind::invoke, "invoke");
-    if (method == "toggle")       return method_action(params, lvt::ActionKind::toggle, "toggle");
-    if (method == "set_value")    return method_action(params, lvt::ActionKind::setValue, "set-value");
-    if (method == "expand")       return method_action(params, lvt::ActionKind::expand, "expand");
-    if (method == "collapse")     return method_action(params, lvt::ActionKind::collapse, "collapse");
-    if (method == "select")       return method_action(params, lvt::ActionKind::select, "select");
+    if (method == "click")        return method_action(params, lvt::ActionKind::click, "click", allowInput);
+    if (method == "invoke")       return method_action(params, lvt::ActionKind::invoke, "invoke", allowInput);
+    if (method == "toggle")       return method_action(params, lvt::ActionKind::toggle, "toggle", allowInput);
+    if (method == "set_value")    return method_action(params, lvt::ActionKind::setValue, "set-value", allowInput);
+    if (method == "expand")       return method_action(params, lvt::ActionKind::expand, "expand", allowInput);
+    if (method == "collapse")     return method_action(params, lvt::ActionKind::collapse, "collapse", allowInput);
+    if (method == "select")       return method_action(params, lvt::ActionKind::select, "select", allowInput);
     if (method == "add_to_selection")
-        return method_action(params, lvt::ActionKind::addToSelection, "add-to-selection");
+        return method_action(params, lvt::ActionKind::addToSelection, "add-to-selection", allowInput);
     if (method == "remove_from_selection")
-        return method_action(params, lvt::ActionKind::removeFromSelection, "remove-from-selection");
-    if (method == "select_text")  return method_action(params, lvt::ActionKind::selectText, "select-text");
-    if (method == "focus")        return method_action(params, lvt::ActionKind::focus, "focus");
-    if (method == "scroll")       return method_action(params, lvt::ActionKind::scroll, "scroll");
-    if (method == "type_text")    return method_action(params, lvt::ActionKind::typeText, "type");
-    if (method == "press_key")    return method_action(params, lvt::ActionKind::pressKey, "press-key");
-    if (method == "close_window") return method_action(params, lvt::ActionKind::windowClose, "close");
+        return method_action(params, lvt::ActionKind::removeFromSelection, "remove-from-selection", allowInput);
+    if (method == "select_text")  return method_action(params, lvt::ActionKind::selectText, "select-text", allowInput);
+    if (method == "focus")        return method_action(params, lvt::ActionKind::focus, "focus", allowInput);
+    if (method == "scroll")       return method_action(params, lvt::ActionKind::scroll, "scroll", allowInput);
+    if (method == "type_text")    return method_action(params, lvt::ActionKind::typeText, "type", allowInput);
+    if (method == "press_key")    return method_action(params, lvt::ActionKind::pressKey, "press-key", allowInput);
+    if (method == "close_window") return method_action(params, lvt::ActionKind::windowClose, "close", allowInput);
     if (method == "minimize_window")
-        return method_action(params, lvt::ActionKind::windowMinimize, "minimize");
+        return method_action(params, lvt::ActionKind::windowMinimize, "minimize", allowInput);
     if (method == "maximize_window")
-        return method_action(params, lvt::ActionKind::windowMaximize, "maximize");
+        return method_action(params, lvt::ActionKind::windowMaximize, "maximize", allowInput);
     if (method == "restore_window")
-        return method_action(params, lvt::ActionKind::windowRestore, "restore");
-    if (method == "wait_for")     return method_action(params, lvt::ActionKind::waitFor, "wait-for");
-    if (method == "wait_gone")    return method_action(params, lvt::ActionKind::waitGone, "wait-gone");
+        return method_action(params, lvt::ActionKind::windowRestore, "restore", allowInput);
+    if (method == "wait_for")     return method_action(params, lvt::ActionKind::waitFor, "wait-for", allowInput);
+    if (method == "wait_gone")    return method_action(params, lvt::ActionKind::waitGone, "wait-gone", allowInput);
 #endif
 
     throw std::runtime_error("unknown method '" + method + "'");
