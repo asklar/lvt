@@ -52,15 +52,67 @@ fn serve(allow_input: bool) -> Result<(), String> {
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
+        // `waiting()` finishes only once every in-flight handler has finished
+        // too. Tool calls run on the blocking pool and cannot be cancelled, so
+        // a `wait_for` part-way through a two-minute deadline would keep the
+        // server alive for two minutes after its client had gone. Watching the
+        // input stream for end-of-file gives a second, earlier signal that the
+        // client is no longer there.
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let transport = (EndOfInput::new(tokio::io::stdin(), closed_tx), tokio::io::stdout());
+
         let service = LvtServer::new(allow_input)
-            .serve(rmcp::transport::stdio())
+            .serve(transport)
             .await
             .map_err(|e| format!("could not start the stdio transport: {e}"))?;
 
-        // A client closing the pipe is how these servers normally end, so it is
-        // a clean exit rather than an error.
-        service.waiting().await.map_err(|e| format!("the connection ended unexpectedly: {e}"))?;
+        tokio::select! {
+            // The ordinary path: the service wound itself up, in-flight work
+            // included.
+            outcome = service.waiting() => {
+                outcome.map_err(|e| format!("the connection ended unexpectedly: {e}"))?;
+            }
+            // The client closed the pipe. Whatever is still running has nobody
+            // left to answer, so stop rather than outliving the session.
+            _ = closed_rx => {}
+        }
         Ok(())
-    })
+    });
+
+    // Do not block on whatever is still running: `shutdown_timeout` gives it a
+    // moment and then lets go.
+    runtime.shutdown_timeout(std::time::Duration::from_millis(250));
+    result
+}
+
+/// Wraps the input stream to report when it reaches end-of-file, which is how a
+/// stdio client signals that it has disconnected.
+struct EndOfInput<R> {
+    inner: R,
+    notify: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl<R> EndOfInput<R> {
+    fn new(inner: R, notify: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self { inner, notify: Some(notify) }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for EndOfInput<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        // A ready read that produced no bytes is end-of-file.
+        if matches!(polled, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before {
+            if let Some(notify) = self.notify.take() {
+                let _ = notify.send(());
+            }
+        }
+        polled
+    }
 }

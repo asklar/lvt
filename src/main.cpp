@@ -249,7 +249,19 @@ static int run_mcp_server(bool allowInput) {
     // stdout carries the JSON-RPC stream from here on, so nothing else may
     // write to it. lvt's diagnostics already go to stderr; this makes the
     // requirement explicit at the one place it becomes load-bearing.
-    return lvt_mcp_serve_stdio(allowInput);
+    const int result = lvt_mcp_serve_stdio(allowInput);
+
+    // Leave immediately rather than returning through normal shutdown.
+    //
+    // A tool call runs on a thread that cannot be cancelled, so one still in
+    // flight when the client disconnects — a `wait_for` part-way through its
+    // deadline, say — would otherwise keep the process alive until it finished.
+    // A host that closes the pipe expects the server to be gone, and work that
+    // has no client left to answer is not worth waiting for. Everything the
+    // caller can observe is already flushed by this point; what is skipped is
+    // process-teardown bookkeeping the OS is about to do anyway.
+    fflush(nullptr);
+    _exit(result);
 #else
     (void)allowInput;
     fprintf(stderr,

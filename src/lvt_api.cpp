@@ -1144,7 +1144,19 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     if (!isWait)
         guard.emplace(session.hwnd);
 
-    const auto result = lvt::perform_action(session.hwnd, uia_options_from(params), request);
+    auto options = uia_options_from(params);
+    if (isWait) {
+        // For a wait, `timeoutMs` means "how long to keep watching", not "how
+        // long a single tree read may take". Letting it drive the UIA
+        // transaction timeout as well means a caller who asks to wait two
+        // minutes also permits one cross-process call to block for two minutes,
+        // which stalls everything else against that app and keeps the process
+        // alive long after a client has disconnected. Each poll gets the normal
+        // read timeout instead.
+        options.timeoutMs = 10000;
+    }
+
+    const auto result = lvt::perform_action(session.hwnd, options, request);
     auto out = action_result_to_json(result, actionName, get_string(params, "element"));
     // Say so when the reference was bridged, so a surprising outcome can be
     // traced back to the element that was actually chosen.

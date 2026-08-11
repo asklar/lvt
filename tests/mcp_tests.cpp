@@ -92,7 +92,11 @@ public:
         if (!started_)
             return;
         stdin_.reset();  // EOF tells the server to stop
-        if (process_ && WaitForSingleObject(process_.get(), 5000) == WAIT_TIMEOUT)
+        // Generous, because this is the harness's patience rather than the
+        // property under test: a call already in flight can keep the server
+        // alive for a few seconds, and the timing assertions live in the tests
+        // that care. Terminating early would mask a clean exit as a failure.
+        if (process_ && WaitForSingleObject(process_.get(), 20000) == WAIT_TIMEOUT)
             TerminateProcess(process_.get(), 1);
         stopping_ = true;
         stdout_.reset();
@@ -1992,6 +1996,39 @@ TEST_F(McpSampleFixture, ActionsAreRefusedByTheAbiWithoutAllowInput) {
     bool isError = false;
     readOnly.call_tool("get_uia_tree", json{{"session", session}, {"depth", 1}}, &isError);
     EXPECT_FALSE(isError);
+}
+
+TEST_F(McpSampleFixture, ExitsPromptlyEvenWithALongCallInFlight) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    // The sample app deliberately, rather than whatever window happens to be
+    // first: this measures shutdown, so the target's tree has to be quick to
+    // read or the measurement is really about the target.
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // Tool calls run on the blocking pool and cannot be cancelled, and dropping
+    // a tokio runtime waits for blocking tasks to finish. So a host that closed
+    // the pipe while a long wait was in flight was left with a process that
+    // hung around for the whole timeout — measured at the full 120s.
+    client.send_request("tools/call",
+                        json{{"name", "wait_for"},
+                             {"arguments", json{{"session", session},
+                                                {"element", "uia:99.99.99"},
+                                                {"timeoutMs", 120000}}}});
+    Sleep(800);  // let it start
+
+    const auto start = GetTickCount64();
+    client.shutdown();
+    const auto elapsed = GetTickCount64() - start;
+
+    EXPECT_LT(elapsed, 15000u)
+        << "the server took " << elapsed
+        << "ms to exit after the client disconnected; shutdown should not wait for an "
+           "in-flight call";
+    EXPECT_EQ(client.exit_code(), 0u);
 }
 
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {
