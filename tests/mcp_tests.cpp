@@ -239,8 +239,18 @@ private:
     std::atomic<int> nextId_{0};
 };
 
-std::vector<std::string> tool_names(const json& toolsResult) {
-    std::vector<std::string> names;
+void collect_json_elements(const json& element, std::vector<const json*>& out) {
+    if (!element.is_object())
+        return;
+    out.push_back(&element);
+    const auto children = element.find("children");
+    if (children == element.end() || !children->is_array())
+        return;
+    for (const auto& child : *children)
+        collect_json_elements(child, out);
+}
+
+std::vector<std::string> tool_names(const json& toolsResult) {    std::vector<std::string> names;
     for (const auto& tool : toolsResult.value("tools", json::array()))
         names.push_back(tool.value("name", ""));
     std::sort(names.begin(), names.end());
@@ -326,6 +336,14 @@ protected:
     static std::string connect(McpClient& client) {
         auto result = client.call_tool("connect", json{{"hwnd", hwnd_string()}});
         return result.value("session", "");
+    }
+
+    // The sample app's click counter, used to prove an action actually landed
+    // rather than merely reporting success.
+    static std::string status_text(McpClient& client, const std::string& session) {
+        auto found = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "StatusText"}});
+        return found["elements"].empty() ? std::string() : found["elements"][0].value("text", "");
     }
 
     static wil::unique_process_handle s_process;
@@ -1520,6 +1538,140 @@ TEST(McpServer, BlockingToolCallsDoNotStarveTheServer) {
 
     for (const int id : blockers)
         client.await_response(id);
+}
+
+TEST_F(McpSampleFixture, ActionsAcceptVisualTreeReferencesNotJustUiaOnes) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // Every action tool documents that it takes "an eN id, a durable key, or
+    // uia:<RuntimeId>", but resolution only ever consulted the UIA tree. The
+    // two trees are independent, so a reference from get_visual_tree either
+    // failed with "element not found" — the durable-key case, reported against
+    // a real app — or silently matched whatever occupied the same eN slot in
+    // the UIA tree and acted on *that*.
+    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+    if (!visual.contains("root"))
+        GTEST_SKIP() << "the visual tree is unavailable here: " << visual.dump(2);
+
+    std::vector<const json*> all;
+    collect_json_elements(visual["root"], all);
+    const json* button = nullptr;
+    for (const auto* element : all) {
+        // The label, not the Button: in a XAML visual tree the text lives on a
+        // TextBlock inside the control's template, so that is what a caller
+        // actually finds and picks. Bridging has to cope with being handed the
+        // presentation node and still act on the control around it.
+        if (element->value("text", "") == "Primary action" &&
+            !element->value("key", "").empty()) {
+            button = element;
+            break;
+        }
+    }
+    if (!button)
+        GTEST_SKIP() << "no labelled visual element to act on";
+
+    const auto before = status_text(client, session);
+
+    // A durable key names the framework that produced it, so it is
+    // self-describing and needs no hint from the caller.
+    bool isError = false;
+    auto byKey = client.call_tool(
+        "click", json{{"session", session}, {"element", button->value("key", "")}}, &isError);
+    EXPECT_FALSE(isError) << "a visual-tree durable key must be actionable: " << byKey.dump(2);
+    ASSERT_TRUE(byKey.contains("resolvedVia"))
+        << "a bridged reference must say which element it really acted on: " << byKey.dump(2);
+    EXPECT_EQ(byKey["resolvedVia"].value("from", ""), "visual");
+    EXPECT_EQ(byKey["resolvedVia"].value("name", ""), button->value("text", ""))
+        << "the bridge matched an element with different text: " << byKey.dump(2);
+
+    EXPECT_NE(status_text(client, session), before)
+        << "the click reported success but the app did not react";
+}
+
+TEST_F(McpSampleFixture, AmbiguousVisualElementIdsNeedTheUiaFlag) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+    if (!visual.contains("root"))
+        GTEST_SKIP() << "the visual tree is unavailable here";
+
+    std::vector<const json*> all;
+    collect_json_elements(visual["root"], all);
+    const json* button = nullptr;
+    for (const auto* element : all) {
+        if (element->value("text", "") == "Primary action" &&
+            !element->value("id", "").empty()) {
+            button = element;
+            break;
+        }
+    }
+    if (!button)
+        GTEST_SKIP() << "no labelled visual element to act on";
+
+    // Unlike a durable key, a bare "eN" carries no marker saying which tree it
+    // came from, so the caller has to say. With the flag it is bridged; without
+    // it, it is treated as a UIA id — which is the documented default and must
+    // stay that way, since that is where ids normally come from.
+    const auto before = status_text(client, session);
+    bool isError = false;
+    auto bridged = client.call_tool(
+        "click",
+        json{{"session", session}, {"element", button->value("id", "")}, {"uia", false}},
+        &isError);
+    EXPECT_FALSE(isError) << bridged.dump(2);
+    ASSERT_TRUE(bridged.contains("resolvedVia")) << bridged.dump(2);
+    EXPECT_EQ(bridged["resolvedVia"].value("name", ""), button->value("text", ""));
+    EXPECT_NE(status_text(client, session), before);
+}
+
+TEST_F(McpSampleFixture, AVisualElementWithNoUiaCounterpartSaysSoClearly) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+    if (!visual.contains("root"))
+        GTEST_SKIP() << "the visual tree is unavailable here";
+
+    // Most visual-tree nodes are presentation-only — borders, grids, content
+    // presenters — with nothing in UIA to act on. That has to be explained,
+    // not reported as a bare "not found", or the caller cannot tell the
+    // difference between a bad reference and an unactionable one.
+    std::vector<const json*> all;
+    collect_json_elements(visual["root"], all);
+    const json* layout = nullptr;
+    for (const auto* element : all) {
+        const auto type = element->value("type", "");
+        if ((type == "Border" || type == "Grid" || type == "ContentPresenter") &&
+            element->value("text", "").empty() && !element->value("key", "").empty()) {
+            layout = element;
+            break;
+        }
+    }
+    if (!layout)
+        GTEST_SKIP() << "no presentation-only visual element to test with";
+
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", session}, {"element", layout->value("key", "")}}, &isError);
+    EXPECT_TRUE(isError) << result.dump(2);
+    const auto message = result.value("error", "");
+    EXPECT_NE(message.find("visual-tree element"), std::string::npos)
+        << "the message should explain what kind of element this is: " << result.dump(2);
+    EXPECT_NE(message.find("UI Automation"), std::string::npos) << result.dump(2);
 }
 
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {

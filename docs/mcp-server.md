@@ -108,6 +108,32 @@ The tree view matters too: `raw` exposes elements `control` hides, so an id from
 one view will not mean the same thing in another. Pass the same `view` you
 fetched with.
 
+### References from the visual tree
+
+The UIA tree and the visual tree are **independent numberings over different
+nodes**, so `e12` means one thing in each. Actions are carried out through UI
+Automation, so a visual-tree reference has to be bridged to its UIA counterpart.
+lvt does that for you:
+
+- **A durable key is self-describing** — it names the framework that produced it
+  (`wpf|…`, `uia|…`), so it is routed automatically. Nothing to pass.
+- **A bare `eN` is ambiguous.** If it came from `get_visual_tree`, say so with
+  `uia: false`; otherwise it is treated as a UIA id, which is where ids normally
+  come from.
+
+The bridge matches on identity — `AutomationId` first, then name and control
+type — not on screen position, because the two trees do not share a coordinate
+space at non-100% display scaling. When it bridges, the result includes
+`resolvedVia` naming the UIA element actually acted on, so a surprising outcome
+can be traced.
+
+Handing it a presentation-only node is fine and common: clicking a XAML
+`TextBlock` label acts on the button around it. A node with no actionable
+counterpart is reported as such rather than as a bare "not found".
+
+Prefer UIA references where you can — they need no bridging and are what the
+tools resolve natively.
+
 ## Prefer patterns over synthetic input
 
 `invoke`, `set_value`, `toggle` and friends go through UI Automation patterns.
