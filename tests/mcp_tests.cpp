@@ -2275,6 +2275,75 @@ TEST_F(McpSampleFixture, ConnectRejectsAModeItDoesNotKnow) {
     EXPECT_NE(result.value("error", "").find("visual"), std::string::npos) << result.dump(2);
 }
 
+TEST_F(McpSampleFixture, AVisualSessionNeverHandsOutReferencesItWouldRefuse) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    // Modes only help if the whole session speaks one tree. The read tools
+    // originally defaulted to UI Automation whatever the session's mode, so a
+    // visual session would answer find_elements with `uia:e6` and then refuse
+    // that very reference when it was passed to click — the exact confusion
+    // modes exist to remove, just relocated.
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    EXPECT_EQ(found.value("tree", ""), "visual") << found.dump(2);
+    ASSERT_FALSE(found["elements"].empty())
+        << "a visual session must be able to find a control by its name: " << found.dump(2);
+    const auto ref = found["elements"][0].value("ref", "");
+    EXPECT_EQ(ref.rfind("visual:", 0), 0u) << "expected a visual reference, got " << ref;
+
+    // The whole point: what the session gave me, the session accepts.
+    const auto uiaSession = connect(client);  // only to observe the effect
+    const auto before = status_text(client, uiaSession);
+    bool isError = false;
+    auto result = client.call_tool("click", json{{"session", session}, {"element", ref}}, &isError);
+    EXPECT_FALSE(isError) << "a visual session refused its own reference: " << result.dump(2);
+    EXPECT_EQ(result.value("method", ""), "SendInput");
+    EXPECT_NE(status_text(client, uiaSession), before);
+
+    // Screenshots and hit-testing have to agree as well, or an id read off an
+    // image is unusable in the session that produced it.
+    auto shot = client.call_tool("screenshot", json{{"session", session}});
+    EXPECT_EQ(shot.value("idsFrom", ""), "visual") << shot.dump(2);
+
+    auto bounds = found["elements"][0]["bounds"];
+    auto hit = client.call_tool(
+        "hit_test", json{{"session", session},
+                         {"x", bounds.value("x", 0) + bounds.value("width", 0) / 2},
+                         {"y", bounds.value("y", 0) + bounds.value("height", 0) / 2}});
+    if (hit.contains("tree"))
+        EXPECT_EQ(hit.value("tree", ""), "visual") << hit.dump(2);
+}
+
+TEST_F(McpSampleFixture, AnExplicitTreeArgumentStillOverridesTheSessionMode) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    // Reading the other tree to *understand* an app is reasonable even when
+    // you drive it through this one, so the mode is a default rather than a
+    // restriction on inspection.
+    auto forced = client.call_tool(
+        "find_elements",
+        json{{"session", session}, {"automationId", "PrimaryButton"}, {"uia", true}});
+    EXPECT_EQ(forced.value("tree", ""), "uia") << forced.dump(2);
+    ASSERT_FALSE(forced["elements"].empty());
+    EXPECT_EQ(forced["elements"][0].value("ref", "").rfind("uia:", 0), 0u);
+}
+
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {
     SkipIfNotReady();
     McpClient client(false);

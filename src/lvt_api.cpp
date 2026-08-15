@@ -581,6 +581,18 @@ Session require_session(const json& params) {
     return session;
 }
 
+// Which tree a tool should read for this session unless told otherwise.
+//
+// The session's mode is the default, not a hardcoded preference for UI
+// Automation. Otherwise a visual session hands out references it will then
+// refuse: find_elements would answer with `uia:e6` and click would reject it as
+// belonging to the other tree. An explicit `uia` argument still wins, since
+// reading the other tree to *understand* an app is reasonable even when you
+// drive it through this one.
+bool tree_for_session(const Session& session, const json& params) {
+    return get_bool(params, "uia", !session.visualMode);
+}
+
 #ifdef LVT_ENABLE_UIA
 // Identity values a visual element might carry that correspond to a UIA
 // AutomationId. Providers spell this differently: XAML and WPF both surface
@@ -726,7 +738,7 @@ json method_get_frameworks(const json& params) {
 
 json method_find_elements(const json& params) {
     const auto session = require_session(params);
-    const bool uia = get_bool(params, "uia", true);
+    const bool uia = tree_for_session(session, params);
     lvt::Element tree;
     std::string error;
     bool truncated = false;
@@ -744,8 +756,21 @@ json method_find_elements(const json& params) {
 
     json matches = json::array();
     for (const auto* element : all) {
-        if (!automationId.empty() && element_property(*element, "AutomationId") != automationId)
-            continue;
+        // The visual tree does not carry a property called "AutomationId" — a
+        // framework surfaces x:Name/Name as "name", which is what the UIA
+        // AutomationId is built from. Checking both spellings means the same
+        // query works in either mode, rather than silently finding nothing.
+        if (!automationId.empty()) {
+            bool matched = element_property(*element, "AutomationId") == automationId;
+#ifdef LVT_ENABLE_UIA
+            if (!matched) {
+                for (const auto& identity : visual_identity_values(*element))
+                    matched = matched || identity == automationId;
+            }
+#endif
+            if (!matched)
+                continue;
+        }
         if (!name.empty() && !contains_ci(element->text, name))
             continue;
         if (!type.empty() && !contains_ci(element->type, type))
@@ -770,7 +795,7 @@ json method_get_element_properties(const json& params) {
     const auto parsed = parse_ref(ref);
     // A qualified reference names its own tree, so it overrides the default
     // rather than being resolved against the wrong one.
-    const bool uia = parsed.tree == RefTree::unspecified ? get_bool(params, "uia", true)
+    const bool uia = parsed.tree == RefTree::unspecified ? tree_for_session(session, params)
                                                          : parsed.tree == RefTree::uia;
 
     lvt::Element tree;
@@ -869,7 +894,7 @@ json method_screenshot(const json& params, bool allowInput) {
     const auto scopeRef = get_string(params, "element");
     const auto parsedScope = parse_ref(scopeRef);
     const bool uia = parsedScope.tree == RefTree::unspecified
-                         ? get_bool(params, "uia", true)
+                         ? tree_for_session(session, params)
                          : parsedScope.tree == RefTree::uia;
     bool annotated = true;
     bool truncated = false;
@@ -927,7 +952,7 @@ json method_hit_test(const json& params) {
     lvt::Element tree;
     std::string error;
     bool truncated = false;
-    const bool uia = get_bool(params, "uia", true);
+    const bool uia = tree_for_session(session, params);
     if (!build_tree_for(session, params, uia, tree, error, &truncated))
         throw std::runtime_error(error);
 
@@ -1416,7 +1441,7 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
         const auto parsed = parse_ref(originalRef);
         const bool fromVisual = parsed.tree == RefTree::visual ||
                                 (parsed.tree == RefTree::unspecified &&
-                                 !get_bool(params, "uia", true));
+                                 !tree_for_session(session, params));
         request.elementRef = parsed.ref;
         if (fromVisual)
             request.elementRef = bridge_visual_ref_to_uia(session, params, parsed.ref, bridge);
