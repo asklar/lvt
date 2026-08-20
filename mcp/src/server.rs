@@ -232,10 +232,11 @@ pub struct ElementArgs {
     /// UIA tree view used to resolve the element: "control" (default),
     /// "content", or "raw". Must match the view the id came from.
     pub view: Option<String>,
-    /// Set false when the element id came from get_visual_tree rather than the
-    /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
-    /// ambiguous, so it needs this. lvt then matches the visual element to the
-    /// UI Automation element at the same place on screen.
+    /// Which tree a bare "eN" id should be read against: true for the UIA
+    /// tree, false for the visual tree. Defaults to this session's mode.
+    /// Qualified references ("uia:e15", "visual:e33") and durable keys already
+    /// name their tree and ignore this. An action still only accepts
+    /// references from its own session's tree.
     pub uia: Option<bool>,
 }
 
@@ -257,10 +258,11 @@ pub struct ClickArgs {
     pub synthetic: Option<bool>,
     /// UIA tree view used to resolve the element.
     pub view: Option<String>,
-    /// Set false when the element id came from get_visual_tree rather than the
-    /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
-    /// ambiguous, so it needs this. lvt then matches the visual element to the
-    /// UI Automation element at the same place on screen.
+    /// Which tree a bare "eN" id should be read against: true for the UIA
+    /// tree, false for the visual tree. Defaults to this session's mode.
+    /// Qualified references ("uia:e15", "visual:e33") and durable keys already
+    /// name their tree and ignore this. An action still only accepts
+    /// references from its own session's tree.
     pub uia: Option<bool>,
 }
 
@@ -279,10 +281,11 @@ pub struct SetValueArgs {
     pub text: String,
     /// UIA tree view used to resolve the element.
     pub view: Option<String>,
-    /// Set false when the element id came from get_visual_tree rather than the
-    /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
-    /// ambiguous, so it needs this. lvt then matches the visual element to the
-    /// UI Automation element at the same place on screen.
+    /// Which tree a bare "eN" id should be read against: true for the UIA
+    /// tree, false for the visual tree. Defaults to this session's mode.
+    /// Qualified references ("uia:e15", "visual:e33") and durable keys already
+    /// name their tree and ignore this. An action still only accepts
+    /// references from its own session's tree.
     pub uia: Option<bool>,
 }
 
@@ -296,10 +299,11 @@ pub struct TypeTextArgs {
     pub element: Option<String>,
     /// UIA tree view used to resolve the element.
     pub view: Option<String>,
-    /// Set false when the element id came from get_visual_tree rather than the
-    /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
-    /// ambiguous, so it needs this. lvt then matches the visual element to the
-    /// UI Automation element at the same place on screen.
+    /// Which tree a bare "eN" id should be read against: true for the UIA
+    /// tree, false for the visual tree. Defaults to this session's mode.
+    /// Qualified references ("uia:e15", "visual:e33") and durable keys already
+    /// name their tree and ignore this. An action still only accepts
+    /// references from its own session's tree.
     pub uia: Option<bool>,
 }
 
@@ -313,10 +317,11 @@ pub struct PressKeyArgs {
     pub element: Option<String>,
     /// UIA tree view used to resolve the element.
     pub view: Option<String>,
-    /// Set false when the element id came from get_visual_tree rather than the
-    /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
-    /// ambiguous, so it needs this. lvt then matches the visual element to the
-    /// UI Automation element at the same place on screen.
+    /// Which tree a bare "eN" id should be read against: true for the UIA
+    /// tree, false for the visual tree. Defaults to this session's mode.
+    /// Qualified references ("uia:e15", "visual:e33") and durable keys already
+    /// name their tree and ignore this. An action still only accepts
+    /// references from its own session's tree.
     pub uia: Option<bool>,
 }
 
@@ -337,10 +342,11 @@ pub struct ScrollArgs {
     pub amount: Option<i32>,
     /// UIA tree view used to resolve the element.
     pub view: Option<String>,
-    /// Set false when the element id came from get_visual_tree rather than the
-    /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
-    /// ambiguous, so it needs this. lvt then matches the visual element to the
-    /// UI Automation element at the same place on screen.
+    /// Which tree a bare "eN" id should be read against: true for the UIA
+    /// tree, false for the visual tree. Defaults to this session's mode.
+    /// Qualified references ("uia:e15", "visual:e33") and durable keys already
+    /// name their tree and ignore this. An action still only accepts
+    /// references from its own session's tree.
     pub uia: Option<bool>,
 }
 
@@ -360,10 +366,11 @@ pub struct SelectArgs {
     pub mode: Option<String>,
     /// UIA tree view used to resolve the element.
     pub view: Option<String>,
-    /// Set false when the element id came from get_visual_tree rather than the
-    /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
-    /// ambiguous, so it needs this. lvt then matches the visual element to the
-    /// UI Automation element at the same place on screen.
+    /// Which tree a bare "eN" id should be read against: true for the UIA
+    /// tree, false for the visual tree. Defaults to this session's mode.
+    /// Qualified references ("uia:e15", "visual:e33") and durable keys already
+    /// name their tree and ignore this. An action still only accepts
+    /// references from its own session's tree.
     pub uia: Option<bool>,
 }
 
@@ -377,10 +384,11 @@ pub struct SetExpandedArgs {
     pub expanded: bool,
     /// UIA tree view used to resolve the element.
     pub view: Option<String>,
-    /// Set false when the element id came from get_visual_tree rather than the
-    /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
-    /// ambiguous, so it needs this. lvt then matches the visual element to the
-    /// UI Automation element at the same place on screen.
+    /// Which tree a bare "eN" id should be read against: true for the UIA
+    /// tree, false for the visual tree. Defaults to this session's mode.
+    /// Qualified references ("uia:e15", "visual:e33") and durable keys already
+    /// name their tree and ignore this. An action still only accepts
+    /// references from its own session's tree.
     pub uia: Option<bool>,
 }
 
@@ -416,10 +424,11 @@ pub struct WaitForArgs {
     pub timeout_ms: Option<i32>,
     /// UIA tree view used to resolve the element.
     pub view: Option<String>,
-    /// Set false when the element id came from get_visual_tree rather than the
-    /// UIA tree. Durable keys are recognised automatically; a bare "eN" id is
-    /// ambiguous, so it needs this. lvt then matches the visual element to the
-    /// UI Automation element at the same place on screen.
+    /// Which tree a bare "eN" id should be read against: true for the UIA
+    /// tree, false for the visual tree. Defaults to this session's mode.
+    /// Qualified references ("uia:e15", "visual:e33") and durable keys already
+    /// name their tree and ignore this. An action still only accepts
+    /// references from its own session's tree.
     pub uia: Option<bool>,
 }
 
@@ -462,17 +471,41 @@ async fn call_lvt(
         .map_err(|message| ErrorData::internal_error(message, None))
 }
 
+/// Build a tool result that carries the same answer twice: as the JSON text a
+/// client can show or log, and as `structuredContent` it can consume as data.
+///
+/// The spec's rule is that a tool returning structured content should also
+/// return the serialised JSON in a text block, for clients that predate the
+/// field — so this is not a choice between the two. Without the structured
+/// copy, every caller has to re-parse a string we already had as JSON, and a
+/// client that validates against `outputSchema` has nothing to validate.
+///
+/// `structuredContent` must be a JSON *object*: the spec models it as one, and
+/// a schema cannot describe a bare array or scalar. Every lvt method returns an
+/// object, so this is a fact about our shapes rather than a restriction, but it
+/// is checked rather than assumed — if lvt ever returned something else, the
+/// text block still carries it instead of the call failing.
+fn tool_result(json_text: String, ok: bool) -> CallToolResult {
+    let structured = serde_json::from_str::<serde_json::Value>(&json_text)
+        .ok()
+        .filter(|value| value.is_object());
+    let content = vec![ContentBlock::text(json_text)];
+    let mut result = if ok {
+        CallToolResult::success(content)
+    } else {
+        CallToolResult::error(content)
+    };
+    result.structured_content = structured;
+    result
+}
+
 async fn forward(
     method: &str,
     params: serde_json::Value,
     allow_input: bool,
 ) -> Result<CallToolResult, ErrorData> {
     let result = call_lvt(method, params, allow_input).await?;
-    if result.ok {
-        Ok(CallToolResult::success(vec![ContentBlock::text(result.json)]))
-    } else {
-        Ok(CallToolResult::error(vec![ContentBlock::text(result.json)]))
-    }
+    Ok(tool_result(result.json, result.ok))
 }
 
 /// Drops `null` members so lvt sees an absent option as absent, and applies its
@@ -490,7 +523,9 @@ impl LvtServer {
     #[tool(
         description = "List top-level application windows on this desktop, with their process \
                        name, pid, window handle and title. Start here when you do not already \
-                       know which window to target."
+                       know which window to target.",
+        output_schema = crate::schema::apps(),
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn list_apps(&self, Parameters(a): Parameters<ListAppsArgs>) -> Result<CallToolResult, ErrorData> {
         forward("list_apps", compact(json!({ "name": a.name, "title": a.title })), self.allow_input).await
@@ -501,7 +536,9 @@ impl LvtServer {
                        that every other tool needs, plus the window's pid, architecture and \
                        detected UI frameworks. Identify the window by hwnd (unambiguous), pid, \
                        process name, or title substring. Pass mode 'visual' to drive the app by \
-                       real mouse and keyboard input instead of UI Automation patterns."
+                       real mouse and keyboard input instead of UI Automation patterns.",
+        output_schema = crate::schema::session(),
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn connect(&self, Parameters(a): Parameters<ConnectArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
@@ -510,16 +547,23 @@ impl LvtServer {
                             "mode": a.mode })), self.allow_input).await
     }
 
-    #[tool(description = "Close a session opened by connect and release its resources.")]
+    #[tool(
+        description = "Close a session opened by connect and release its resources.",
+        output_schema = crate::schema::disconnected(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
     async fn disconnect(&self, Parameters(a): Parameters<SessionArgs>) -> Result<CallToolResult, ErrorData> {
         forward("disconnect", json!({ "session": a.session }), self.allow_input).await
     }
 
     #[tool(
         description = "Get the UI Automation tree: AutomationIds, control types, names, states \
-                       and supported patterns. This is the tree to use for automating an app — \
-                       its identifiers are stable and its elements are actionable. Works against \
-                       any process regardless of architecture."
+                       and supported patterns. This is the tree to automate against in the \
+                       default 'uia' session mode — its identifiers are stable, its elements \
+                       expose the patterns the action tools drive, and it works against any \
+                       process regardless of architecture.",
+        output_schema = crate::schema::uia_tree(),
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_uia_tree(&self, Parameters(a): Parameters<TreeArgs>) -> Result<CallToolResult, ErrorData> {
         forward("get_uia_tree", tree_params(a), self.allow_input).await
@@ -532,13 +576,19 @@ impl LvtServer {
                        different, finer-grained set than the UIA tree's, and its references only \
                        work in a session connected with mode 'visual'. Pass correlate:true to see \
                        which of these elements UI Automation exposes and which it does not. \
-                       Requires lvt and the target to share an architecture."
+                       Requires lvt and the target to share an architecture.",
+        output_schema = crate::schema::visual_tree(),
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_visual_tree(&self, Parameters(a): Parameters<VisualTreeArgs>) -> Result<CallToolResult, ErrorData> {
         forward("get_visual_tree", visual_tree_params(a), self.allow_input).await
     }
 
-    #[tool(description = "List the UI frameworks detected in the connected application, with versions.")]
+    #[tool(
+        description = "List the UI frameworks detected in the connected application, with versions.",
+        output_schema = crate::schema::frameworks(),
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
     async fn get_frameworks(&self, Parameters(a): Parameters<SessionArgs>) -> Result<CallToolResult, ErrorData> {
         forward("get_frameworks", json!({ "session": a.session }), self.allow_input).await
     }
@@ -546,7 +596,9 @@ impl LvtServer {
     #[tool(
         description = "Find elements by AutomationId, name, control type, or supported pattern. \
                        Much cheaper than fetching a whole tree when you know what you are looking \
-                       for. Returns each match's element id, which the action tools accept."
+                       for. Returns each match's element id, which the action tools accept.",
+        output_schema = crate::schema::elements(),
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn find_elements(&self, Parameters(a): Parameters<FindArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
@@ -567,7 +619,9 @@ impl LvtServer {
     #[tool(
         description = "Read one element's full set of properties, or a chosen subset. Use this to \
                        check state — whether a checkbox is on, what a text box currently holds, \
-                       which patterns a control supports."
+                       which patterns a control supports.",
+        output_schema = crate::schema::element_properties(),
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn get_element_properties(
         &self,
@@ -590,7 +644,9 @@ impl LvtServer {
                        The ids are the same ones find_elements and the action tools use, so you \
                        can read one off the image and act on it. Returns the image inline unless \
                        a path is given. Use it to see a UI whose tree is ambiguous, or to confirm \
-                       an action had the effect you expected."
+                       an action had the effect you expected.",
+        output_schema = crate::schema::screenshot(),
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn screenshot(&self, Parameters(a): Parameters<ScreenshotArgs>) -> Result<CallToolResult, ErrorData> {
         let params = compact(json!({
@@ -602,12 +658,14 @@ impl LvtServer {
         }));
         let result = call_lvt("screenshot", params, self.allow_input).await?;
         if !result.ok {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(result.json)]));
+            return Ok(tool_result(result.json, false));
         }
 
         // An inline capture comes back as base64, which becomes an image
         // content block. The base64 is stripped from the JSON summary first —
-        // repeating a megabyte of it as text would be useless and expensive.
+        // repeating a megabyte of it as text would be useless and expensive,
+        // and it would bloat the structured copy for no gain, since the image
+        // is already carried as an image block.
         let mut parsed: serde_json::Value = serde_json::from_str(&result.json)
             .map_err(|e| ErrorData::internal_error(format!("lvt returned malformed JSON: {e}"), None))?;
         let image = parsed
@@ -619,14 +677,18 @@ impl LvtServer {
         if let Some(data) = image {
             content.push(ContentBlock::image(data, "image/png"));
         }
-        Ok(CallToolResult::success(content))
+        let mut out = CallToolResult::success(content);
+        out.structured_content = parsed.is_object().then_some(parsed);
+        Ok(out)
     }
 
     #[tool(
         description = "Find the element at a screen coordinate. Returns the smallest element \
                        covering the point — what a click there would hit — plus the ids of its \
                        ancestors. Useful for turning something you saw in a screenshot into an \
-                       element id you can act on."
+                       element id you can act on.",
+        output_schema = crate::schema::hit_test(),
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn hit_test(&self, Parameters(a): Parameters<HitTestArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
@@ -639,7 +701,9 @@ impl LvtServer {
 
     #[tool(
         description = "Block until an element reaches a property value, or until it disappears. \
-                       Use this instead of guessing at delays after an action that starts work."
+                       Use this instead of guessing at delays after an action that starts work.",
+        output_schema = crate::schema::action(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn wait_for(&self, Parameters(a): Parameters<WaitForArgs>) -> Result<CallToolResult, ErrorData> {
         let method = if a.gone.unwrap_or(false) { "wait_gone" } else { "wait_for" };
@@ -684,7 +748,9 @@ impl LvtServer {
     #[tool(
         description = "Click an element. Uses the element's Invoke pattern when it has one, \
                        falling back to a real mouse click at its centre. Set synthetic to force \
-                       the mouse path."
+                       the mouse path.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = true, open_world_hint = true)
     )]
     async fn click(&self, Parameters(a): Parameters<ClickArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
@@ -700,20 +766,28 @@ impl LvtServer {
 
     #[tool(
         description = "Invoke an element's default action via its UIA Invoke pattern, without \
-                       moving the mouse. Prefer this over click when the element supports it."
+                       moving the mouse. Prefer this over click when the element supports it.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = true, open_world_hint = true)
     )]
     async fn invoke(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
         forward("invoke", element_params(a), self.allow_input).await
     }
 
-    #[tool(description = "Toggle a checkbox or other togglable control to its next state.")]
+    #[tool(
+        description = "Toggle a checkbox or other togglable control to its next state.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = true, open_world_hint = true)
+    )]
     async fn toggle(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
         forward("toggle", element_params(a), self.allow_input).await
     }
 
     #[tool(
         description = "Set an element's value outright — the reliable way to fill a text box or \
-                       move a slider. Prefer this over type_text, which depends on focus."
+                       move a slider. Prefer this over type_text, which depends on focus.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn set_value(&self, Parameters(a): Parameters<SetValueArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
@@ -723,7 +797,11 @@ impl LvtServer {
             })), self.allow_input).await
     }
 
-    #[tool(description = "Expand or collapse a tree item, combo box, or other expandable control.")]
+    #[tool(
+        description = "Expand or collapse a tree item, combo box, or other expandable control.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = true)
+    )]
     async fn set_expanded(&self, Parameters(a): Parameters<SetExpandedArgs>) -> Result<CallToolResult, ErrorData> {
         let method = if a.expanded { "expand" } else { "collapse" };
         forward(
@@ -733,7 +811,9 @@ impl LvtServer {
 
     #[tool(
         description = "Select a list item, tab, or similar. mode 'replace' clears any other \
-                       selection, 'add' extends a multi-select, 'remove' deselects."
+                       selection, 'add' extends a multi-select, 'remove' deselects.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn select(&self, Parameters(a): Parameters<SelectArgs>) -> Result<CallToolResult, ErrorData> {
         let method = match a.mode.as_deref().unwrap_or("replace") {
@@ -741,9 +821,14 @@ impl LvtServer {
             "remove" => "remove_from_selection",
             "replace" => "select",
             other => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "{{\"ok\":false,\"error\":\"mode must be replace, add or remove, not '{other}'\"}}"
-                ))]))
+                return Ok(tool_result(
+                    json!({
+                        "ok": false,
+                        "error": format!("mode must be replace, add or remove, not '{other}'"),
+                    })
+                    .to_string(),
+                    false,
+                ))
             }
         };
         forward(
@@ -751,19 +836,29 @@ impl LvtServer {
             compact(json!({ "session": a.session, "element": a.element, "uia": a.uia, "view": a.view })), self.allow_input).await
     }
 
-    #[tool(description = "Give an element keyboard focus.")]
+    #[tool(
+        description = "Give an element keyboard focus.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = true)
+    )]
     async fn focus(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
         forward("focus", element_params(a), self.allow_input).await
     }
 
-    #[tool(description = "Select all of a text control's contents.")]
+    #[tool(
+        description = "Select all of a text control's contents.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = true)
+    )]
     async fn select_text(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
         forward("select_text", element_params(a), self.allow_input).await
     }
 
     #[tool(
         description = "Scroll an element. Uses its Scroll pattern when it has one, falling back \
-                       to mouse wheel input over the element."
+                       to mouse wheel input over the element.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = false, open_world_hint = true)
     )]
     async fn scroll(&self, Parameters(a): Parameters<ScrollArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
@@ -780,7 +875,9 @@ impl LvtServer {
     #[tool(
         description = "Type text as keystrokes. This goes to whatever has focus, so pass an \
                        element to focus first. set_value is more reliable where it works; use \
-                       this when the app must see real key events."
+                       this when the app must see real key events.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = true, open_world_hint = true)
     )]
     async fn type_text(&self, Parameters(a): Parameters<TypeTextArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
@@ -792,7 +889,9 @@ impl LvtServer {
 
     #[tool(
         description = "Press a key or chord, e.g. \"Enter\", \"Ctrl+S\", \"Alt+F4\", \"F5\". \
-                       Use this for shortcuts and for keys that have no element to click."
+                       Use this for shortcuts and for keys that have no element to click.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = true, open_world_hint = true)
     )]
     async fn press_key(&self, Parameters(a): Parameters<PressKeyArgs>) -> Result<CallToolResult, ErrorData> {
         forward(
@@ -802,7 +901,11 @@ impl LvtServer {
             })), self.allow_input).await
     }
 
-    #[tool(description = "Minimize, maximize, restore, or close the connected window.")]
+    #[tool(
+        description = "Minimize, maximize, restore, or close the connected window.",
+        output_schema = crate::schema::action(),
+        annotations(destructive_hint = true, open_world_hint = true)
+    )]
     async fn window_action(&self, Parameters(a): Parameters<WindowActionArgs>) -> Result<CallToolResult, ErrorData> {
         let method = match a.action.as_str() {
             "minimize" => "minimize_window",
@@ -810,9 +913,16 @@ impl LvtServer {
             "restore" => "restore_window",
             "close" => "close_window",
             other => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "{{\"ok\":false,\"error\":\"action must be minimize, maximize, restore or close, not '{other}'\"}}"
-                ))]))
+                return Ok(tool_result(
+                    json!({
+                        "ok": false,
+                        "error": format!(
+                            "action must be minimize, maximize, restore or close, not '{other}'"
+                        ),
+                    })
+                    .to_string(),
+                    false,
+                ))
             }
         };
         forward(method, json!({ "session": a.session }), self.allow_input).await
@@ -834,6 +944,7 @@ impl LvtServer {
 
     /// Tool names this server is currently exposing, sorted. Exists so tests
     /// can assert the `--allow-input` gate without standing up a transport.
+    #[cfg(test)]
     pub fn tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> =
             self.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
@@ -888,6 +999,7 @@ impl ServerHandler for LvtServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     const INSPECT_TOOLS: [&str; 11] = [
         "connect",
@@ -941,6 +1053,119 @@ mod tests {
             INSPECT_TOOLS.iter().chain(INPUT_TOOLS.iter()).map(|s| s.to_string()).collect();
         expected.sort();
         assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn every_tool_declares_an_output_schema_that_admits_a_failure() {
+        // Declaring `outputSchema` is a promise that `structuredContent` conforms
+        // to it, and a client may validate and reject anything that does not.
+        // lvt reports failures as data — `{"ok": false, "error": "..."}` with none
+        // of the success fields — so a schema that only described success would
+        // be violated by a perfectly correct refusal.
+        let failure = json!({ "ok": false, "error": "no element matched" });
+        for tool in LvtServer::new(true).tool_router.list_all() {
+            let schema = tool
+                .output_schema
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool '{}' declares no output schema", tool.name));
+            let schema = serde_json::to_value(schema.as_ref()).unwrap();
+
+            let branches = schema
+                .get("anyOf")
+                .and_then(|b| b.as_array())
+                .unwrap_or_else(|| panic!("tool '{}' should accept success or failure", tool.name));
+            assert_eq!(branches.len(), 2, "tool '{}'", tool.name);
+
+            // The failure branch has to actually admit a failure payload. This
+            // is the assertion that would fail if someone "tightened" the
+            // schemas by dropping it.
+            let error_branch = &branches[1];
+            let required = error_branch
+                .get("required")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                required.iter().all(|field| failure.get(field.as_str().unwrap()).is_some()),
+                "tool '{}' would reject its own failure result: {error_branch}",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_tools_say_so_and_input_tools_admit_what_they_do() {
+        // Annotations are how a client decides whether to prompt before a call.
+        // Getting them backwards is worse than omitting them, so the two halves
+        // are asserted against each other rather than tool by tool.
+        let server = LvtServer::new(true);
+        let read_only = LvtServer::new(false).tool_names();
+        for tool in server.tool_router.list_all() {
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("tool '{}' carries no annotations", tool.name));
+            // Every tool reaches outside this process into another application.
+            assert_eq!(
+                annotations.open_world_hint,
+                Some(true),
+                "tool '{}' drives another process",
+                tool.name
+            );
+            if read_only.iter().any(|name| name == tool.name.as_ref()) {
+                assert_eq!(
+                    annotations.read_only_hint,
+                    Some(true),
+                    "tool '{}' is exposed without --allow-input, so it must be marked read-only",
+                    tool.name
+                );
+            } else {
+                assert_ne!(
+                    annotations.read_only_hint,
+                    Some(true),
+                    "tool '{}' changes the target application",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_result_carries_the_same_answer_as_text_and_as_structure() {
+        // The text block is for clients that predate structured content; the
+        // structured copy is for everything else. They must not drift, or a
+        // client sees one answer and a log shows another.
+        let payload = r#"{"tree":"uia","elements":[{"id":"e1"}]}"#;
+        let result = tool_result(payload.to_string(), true);
+        let structured = result.structured_content.expect("structured content is missing");
+        assert_eq!(structured, serde_json::from_str::<Value>(payload).unwrap());
+
+        let ContentBlock::Text(text) = &result.content[0] else {
+            panic!("the first content block should still be text");
+        };
+        assert_eq!(serde_json::from_str::<Value>(&text.text).unwrap(), structured);
+    }
+
+    #[test]
+    fn a_failure_is_still_structured() {
+        // A model reading "no element matched" should get it as data like any
+        // other answer, so the error path carries structured content too.
+        let result = tool_result(r#"{"ok":false,"error":"nope"}"#.to_string(), false);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.and_then(|v| v.get("error").cloned()),
+            Some(Value::String("nope".into()))
+        );
+    }
+
+    #[test]
+    fn a_non_object_answer_still_travels_as_text() {
+        // structuredContent is specified as an object, so anything else must not
+        // be forced into the field — the text block still carries it rather than
+        // the call failing.
+        let result = tool_result("[1,2,3]".to_string(), true);
+        assert!(result.structured_content.is_none());
+        assert_eq!(result.content.len(), 1);
     }
 
     #[test]

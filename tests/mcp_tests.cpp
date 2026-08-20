@@ -162,6 +162,16 @@ public:
         return response["result"].value("content", json::array());
     }
 
+    // The whole `result` object, including `structuredContent` and `isError`.
+    // The other helpers deliberately hide the envelope, which is exactly what a
+    // test about the envelope needs to see.
+    json call_tool_result(const std::string& name, const json& args) {
+        auto response = request("tools/call", json{{"name", name}, {"arguments", args}});
+        if (response.is_null() || !response.contains("result"))
+            return json::object();
+        return response["result"];
+    }
+
     // initialize + initialized, the handshake every session begins with.
     bool handshake(json* serverInfo = nullptr) {
         auto response = request("initialize",
@@ -252,6 +262,99 @@ void collect_json_elements(const json& element, std::vector<const json*>& out) {
         return;
     for (const auto& child : *children)
         collect_json_elements(child, out);
+}
+
+// A JSON Schema checker covering exactly the keywords lvt's output schemas use:
+// type, const, enum, required, properties, items, additionalProperties, anyOf.
+//
+// Pulling in a full validator would be a dependency for one test. The point here
+// is not to be a conformant validator but to catch the mistake that matters:
+// declaring an `outputSchema` a real response does not satisfy. A client that
+// does validate will apply these same keywords, so checking them is checking the
+// promise we made.
+bool schema_allows(const json& schema, const json& value, std::string& why,
+                   const std::string& path = "") {
+    const auto fail = [&](const std::string& message) {
+        why = (path.empty() ? std::string("<root>") : path) + ": " + message;
+        return false;
+    };
+
+    if (schema.contains("anyOf")) {
+        std::string first;
+        for (const auto& branch : schema["anyOf"]) {
+            std::string ignored;
+            if (schema_allows(branch, value, ignored, path))
+                return true;
+            if (first.empty())
+                first = ignored;
+        }
+        return fail("matched none of the anyOf branches (" + first + ")");
+    }
+
+    if (schema.contains("const") && value != schema["const"])
+        return fail("expected the constant " + schema["const"].dump());
+
+    if (schema.contains("enum")) {
+        bool found = false;
+        for (const auto& allowed : schema["enum"])
+            found = found || allowed == value;
+        if (!found)
+            return fail("value " + value.dump() + " is not one of " + schema["enum"].dump());
+    }
+
+    if (schema.contains("type")) {
+        const auto expected = schema["type"].get<std::string>();
+        const bool ok = (expected == "object" && value.is_object()) ||
+                        (expected == "array" && value.is_array()) ||
+                        (expected == "string" && value.is_string()) ||
+                        (expected == "boolean" && value.is_boolean()) ||
+                        (expected == "integer" && value.is_number_integer()) ||
+                        (expected == "number" && value.is_number());
+        if (!ok)
+            return fail("expected type " + expected + " but got " + std::string(value.type_name()));
+    }
+
+    if (value.is_object()) {
+        for (const auto& field : schema.value("required", json::array())) {
+            if (!value.contains(field.get<std::string>()))
+                return fail("missing required field '" + field.get<std::string>() + "'");
+        }
+        const auto properties = schema.value("properties", json::object());
+        for (const auto& [name, member] : value.items()) {
+            const auto declared = properties.find(name);
+            if (declared != properties.end()) {
+                if (!schema_allows(*declared, member, why, path + "/" + name))
+                    return false;
+            } else if (schema.contains("additionalProperties") &&
+                       schema["additionalProperties"].is_object()) {
+                if (!schema_allows(schema["additionalProperties"], member, why, path + "/" + name))
+                    return false;
+            }
+        }
+    }
+
+    if (value.is_array() && schema.contains("items")) {
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (!schema_allows(schema["items"], value[i], why,
+                               path + "[" + std::to_string(i) + "]"))
+                return false;
+        }
+    }
+    return true;
+}
+
+std::map<std::string, json> output_schemas(McpClient& client) {
+    // The response is bound to a named value first. Iterating directly over
+    // `request(...)["result"]["tools"]` binds a reference into a temporary that
+    // dies at the end of the statement, and the loop then reads freed memory —
+    // which showed up as a map full of garbage keys rather than as a crash.
+    const auto response = client.request("tools/list");
+    std::map<std::string, json> schemas;
+    for (const auto& tool : response["result"]["tools"]) {
+        if (tool.contains("outputSchema"))
+            schemas[tool.value("name", "")] = tool["outputSchema"];
+    }
+    return schemas;
 }
 
 std::vector<std::string> tool_names(const json& toolsResult) {    std::vector<std::string> names;
@@ -2759,4 +2862,189 @@ TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {
     const auto elapsed = GetTickCount64() - start;
     EXPECT_FALSE(isError);
     EXPECT_LT(elapsed, 4000u) << "an element that is already there must not be waited for";
+}
+
+
+TEST(McpServer, EveryToolDeclaresAnOutputSchemaAndAnnotations) {
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    // A model decides whether it may call a tool from its annotations, and what
+    // shape the answer has from its output schema. Both were missing entirely:
+    // every result went out as a JSON string in a text block, so a client had to
+    // re-parse a string we already had as JSON, and nothing said which tools
+    // change the target application.
+    auto tools = client.request("tools/list")["result"]["tools"];
+    ASSERT_FALSE(tools.empty());
+
+    for (const auto& tool : tools) {
+        const auto name = tool.value("name", "");
+        ASSERT_TRUE(tool.contains("outputSchema")) << name << " declares no output schema";
+        const auto& schema = tool["outputSchema"];
+        // Success or failure: lvt reports refusals as data, so a schema that only
+        // described success would be violated by a correct refusal.
+        ASSERT_TRUE(schema.contains("anyOf")) << name << ": " << schema.dump(2);
+        EXPECT_EQ(schema["anyOf"].size(), 2u) << name;
+
+        ASSERT_TRUE(tool.contains("annotations")) << name << " carries no annotations";
+        const auto& annotations = tool["annotations"];
+        EXPECT_TRUE(annotations.value("openWorldHint", false))
+            << name << " reaches into another application";
+        EXPECT_TRUE(annotations.contains("readOnlyHint") || annotations.contains("destructiveHint"))
+            << name << " should say whether it changes the target: " << annotations.dump();
+    }
+}
+
+TEST(McpServer, ReadOnlyToolsAreMarkedReadOnly) {
+    McpClient readOnly(false);
+    ASSERT_TRUE(readOnly.started());
+    ASSERT_TRUE(readOnly.handshake());
+
+    // Everything a read-only server exposes must say it is read-only. Getting
+    // this backwards is worse than omitting it: a client that trusts the hint
+    // would skip confirmation for something that changes the user's app.
+    const auto readOnlyList = readOnly.request("tools/list");
+    for (const auto& tool : readOnlyList["result"]["tools"]) {
+        EXPECT_TRUE(tool["annotations"].value("readOnlyHint", false))
+            << tool.value("name", "") << " is exposed without --allow-input";
+    }
+
+    McpClient full(true);
+    ASSERT_TRUE(full.started());
+    ASSERT_TRUE(full.handshake());
+    const auto inspectNames = tool_names(readOnlyList["result"]);
+    const auto fullList = full.request("tools/list");
+    for (const auto& tool : fullList["result"]["tools"]) {
+        const auto name = tool.value("name", "");
+        if (std::find(inspectNames.begin(), inspectNames.end(), name) != inspectNames.end())
+            continue;
+        EXPECT_FALSE(tool["annotations"].value("readOnlyHint", false))
+            << name << " changes the target application";
+    }
+}
+
+TEST(McpServer, AFailureIsStructuredAndMatchesItsSchema) {
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto schemas = output_schemas(client);
+
+    // The failure branch is the half most likely to rot, because the happy path
+    // is what gets exercised. Connecting to nothing is a refusal every build can
+    // produce without an app.
+    auto result = client.call_tool_result("connect", json{{"name", "no.such.process.exe"}});
+    ASSERT_TRUE(result.value("isError", false)) << result.dump(2);
+    ASSERT_TRUE(result.contains("structuredContent"))
+        << "a failure is an answer too, and must travel as structure: " << result.dump(2);
+
+    const auto& structured = result["structuredContent"];
+    EXPECT_FALSE(structured.value("ok", true));
+    EXPECT_FALSE(structured.value("error", "").empty());
+
+    std::string why;
+    EXPECT_TRUE(schema_allows(schemas.at("connect"), structured, why))
+        << "a real failure does not match the declared schema: " << why << "\n"
+        << structured.dump(2);
+}
+
+TEST_F(McpSampleFixture, StructuredContentMatchesTheTextAndTheDeclaredSchema) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto schemas = output_schemas(client);
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_FALSE(found["elements"].empty()) << found.dump(2);
+    const auto ref = found["elements"][0].value("ref", "");
+    const auto& bounds = found["elements"][0]["bounds"];
+
+    // One call per distinct response shape, exercised against a real app. A
+    // schema is only worth declaring if it is checked against what actually
+    // comes back, so this is the test that makes declaring them defensible.
+    const std::vector<std::pair<std::string, json>> calls{
+        {"list_apps", json::object()},
+        {"connect", json{{"hwnd", hwnd_string()}}},
+        {"get_frameworks", json{{"session", session}}},
+        {"get_uia_tree", json{{"session", session}, {"depth", 3}}},
+        {"get_visual_tree", json{{"session", session}, {"depth", 3}, {"correlate", true}}},
+        {"find_elements", json{{"session", session}, {"type", "Button"}}},
+        {"get_element_properties", json{{"session", session}, {"element", ref}}},
+        {"get_element_properties",
+         json{{"session", session}, {"element", ref}, {"properties", json::array({"Name"})}}},
+        {"hit_test", json{{"session", session},
+                          {"x", bounds.value("x", 0) + bounds.value("width", 0) / 2},
+                          {"y", bounds.value("y", 0) + bounds.value("height", 0) / 2}}},
+        {"screenshot", json{{"session", session}}},
+        {"wait_for", json{{"session", session}, {"element", ref}, {"timeoutMs", 2000}}},
+        {"focus", json{{"session", session}, {"element", ref}}},
+        {"click", json{{"session", session}, {"element", ref}}},
+    };
+
+    for (const auto& [name, args] : calls) {
+        auto result = client.call_tool_result(name, args);
+        ASSERT_TRUE(result.contains("content")) << name << ": " << result.dump(2);
+        ASSERT_TRUE(result.contains("structuredContent"))
+            << name << " returned no structured content: " << result.dump(2);
+
+        // The text block exists for clients that predate structured content, so
+        // the two must say the same thing. Screenshot is the one exception: its
+        // image travels as an image block, and the base64 is stripped from both
+        // the text and the structure rather than duplicated.
+        std::string text;
+        for (const auto& block : result["content"]) {
+            if (block.value("type", "") == "text")
+                text = block.value("text", "");
+        }
+        ASSERT_FALSE(text.empty()) << name;
+        auto parsed = json::parse(text, nullptr, false);
+        ASSERT_FALSE(parsed.is_discarded()) << name << ": text block is not JSON";
+        EXPECT_EQ(parsed, result["structuredContent"])
+            << name << ": the text and structured copies disagree";
+
+        const auto schema = schemas.find(name);
+        ASSERT_NE(schema, schemas.end()) << name << " declares no output schema";
+        std::string why;
+        EXPECT_TRUE(schema_allows(schema->second, result["structuredContent"], why))
+            << name << " does not match its declared output schema: " << why << "\n"
+            << result["structuredContent"].dump(2).substr(0, 2000);
+    }
+}
+
+TEST_F(McpSampleFixture, ARefusedActionIsStructuredToo) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto schemas = output_schemas(client);
+
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    // The refusals this server does most — a reference from the wrong tree, and
+    // an action a mode cannot express — must still come back as data a model can
+    // branch on, not only as prose in a text block.
+    const std::vector<std::pair<std::string, json>> refusals{
+        {"click", json{{"session", session}, {"element", "uia:e6"}}},
+        {"toggle", json{{"session", session}, {"element", "visual:e30"}}},
+    };
+
+    for (const auto& [name, args] : refusals) {
+        auto result = client.call_tool_result(name, args);
+        ASSERT_TRUE(result.value("isError", false)) << name << ": " << result.dump(2);
+        ASSERT_TRUE(result.contains("structuredContent")) << name << ": " << result.dump(2);
+        const auto& structured = result["structuredContent"];
+        EXPECT_FALSE(structured.value("ok", true)) << name;
+        EXPECT_FALSE(structured.value("error", "").empty()) << name;
+
+        std::string why;
+        EXPECT_TRUE(schema_allows(schemas.at(name), structured, why))
+            << name << ": " << why << "\n" << structured.dump(2);
+    }
 }

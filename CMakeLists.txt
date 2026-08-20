@@ -196,14 +196,21 @@ if(LVT_ENABLE_MCP)
     set(LVT_MCP_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/mcp-target")
     set(LVT_MCP_LIB "${LVT_MCP_TARGET_DIR}/${LVT_RUST_TARGET}/release/lvt_mcp.lib")
 
-    file(GLOB LVT_MCP_SOURCES "${LVT_MCP_DIR}/src/*.rs")
+    # GLOB_RECURSE with CONFIGURE_DEPENDS, not a plain GLOB. A plain GLOB is
+    # evaluated once at configure time, so a Rust file added afterwards is not a
+    # dependency of anything: cargo is never re-run, lvt.exe keeps the previous
+    # MCP layer, and the build reports success. That silence is the problem —
+    # tests then exercise a binary that does not contain the change under test,
+    # and pass. CONFIGURE_DEPENDS makes the build re-check the file set, and
+    # RECURSE covers any future subdirectory.
+    file(GLOB_RECURSE LVT_MCP_SOURCES CONFIGURE_DEPENDS "${LVT_MCP_DIR}/src/*.rs")
     add_custom_command(
         OUTPUT "${LVT_MCP_LIB}"
         COMMAND "${CMAKE_COMMAND}" -E env
                 "CARGO_TARGET_DIR=${LVT_MCP_TARGET_DIR}"
                 "${LVT_CARGO_EXE}" build --release --target ${LVT_RUST_TARGET}
                 --manifest-path "${LVT_MCP_DIR}/Cargo.toml"
-        DEPENDS ${LVT_MCP_SOURCES} "${LVT_MCP_DIR}/Cargo.toml"
+        DEPENDS ${LVT_MCP_SOURCES} "${LVT_MCP_DIR}/Cargo.toml" "${LVT_MCP_DIR}/Cargo.lock"
         WORKING_DIRECTORY "${LVT_MCP_DIR}"
         COMMENT "Building the MCP server (cargo, ${LVT_RUST_TARGET})"
         VERBATIM)

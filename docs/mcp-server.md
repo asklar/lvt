@@ -77,6 +77,33 @@ work across them.
 | `press_key` | A key or chord: `Enter`, `Ctrl+S`, `Alt+F4`, `F5` |
 | `window_action` | `minimize`, `maximize`, `restore`, `close` |
 
+### What a tool returns
+
+Every tool answers twice, with the same content:
+
+- a **text block** holding the JSON, for clients that predate structured output;
+- **`structuredContent`**, the same JSON as data.
+
+They are always equal, so read whichever suits you — but prefer
+`structuredContent` rather than re-parsing a string that was JSON already. The
+one asymmetry is `screenshot`: the image travels as an image content block, and
+the base64 appears in neither the text nor the structure.
+
+Each tool also declares an **`outputSchema`**. Because lvt reports failures as
+data rather than as protocol errors, every schema is
+`anyOf: [success, failure]` — a refusal comes back as
+`{"ok": false, "error": "..."}` with none of the success fields, and it is still
+a valid result. A schema that only described success would be violated by a
+perfectly correct refusal, so none of them do. `additionalProperties` is never
+closed either: adding a field to a response should not break a client that
+validates.
+
+Tools carry **annotations** as well, so a host can decide whether to confirm
+before calling: everything exposed without `--allow-input` is marked
+`readOnlyHint`, the tools that change the target app are marked
+`destructiveHint`, and all of them set `openWorldHint` because they reach into
+another process.
+
 ## Which tree to ask for
 
 `get_uia_tree` is the right default. It carries `AutomationId`s, control types

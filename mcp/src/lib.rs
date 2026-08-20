@@ -7,6 +7,7 @@
 //! without touching any of lvt's real logic.
 
 mod ffi;
+mod schema;
 mod server;
 
 use std::ffi::c_int;
