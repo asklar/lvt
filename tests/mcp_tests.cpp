@@ -2064,29 +2064,64 @@ TEST_F(McpSampleFixture, CorrelationMapsVisualElementsToTheirUiaCounterpart) {
     ASSERT_GT(nodes.size(), 20u);
 
     std::map<std::string, int> perCounterpart;
-    int withRef = 0;
+    int withOwnRef = 0;
+    int withAncestorRef = 0;
     for (const auto* node : nodes) {
-        const auto ref = node->value("uiaRef", "");
-        if (ref.empty())
-            continue;
-        ++withRef;
-        ++perCounterpart[ref];
-        EXPECT_EQ(ref.rfind("uia:", 0), 0u) << "a counterpart must be a UIA reference: " << ref;
+        const auto own = node->value("uiaRef", "");
+        const auto ancestor = node->value("uiaAncestorRef", "");
+        if (!own.empty()) {
+            ++withOwnRef;
+            ++perCounterpart[own];
+            EXPECT_EQ(own.rfind("uia:", 0), 0u) << "a counterpart must be a UIA reference: " << own;
+        }
+        if (!ancestor.empty()) {
+            ++withAncestorRef;
+            // The two are mutually exclusive: a node either has a counterpart
+            // of its own or is reported as sitting inside one.
+            EXPECT_TRUE(own.empty())
+                << "a node reported both its own counterpart and an ancestor's: " << node->dump();
+        }
     }
-    EXPECT_GT(withRef * 100 / static_cast<int>(nodes.size()), 50)
-        << "only " << withRef << " of " << nodes.size() << " visual nodes were correlated";
+    EXPECT_GT(withOwnRef, 0) << "nothing correlated at all";
+    EXPECT_GT(withAncestorRef, 0)
+        << "no node was reported as sitting inside a correlated control, which is what most of "
+           "a visual tree is";
 
-    // The many-to-one shape is the point: if every counterpart were unique the
-    // two trees would be the same size, and the ids would have lined up all
-    // along.
-    int shared = 0;
+    // The assertion that matters, and the one this test originally lacked:
+    // `uiaRef` is documented as the thing you can act on, so **no two distinct
+    // visual elements may claim the same one**. Before this was enforced, all
+    // 28 of the sample's ListViewItem nodes advertised the ListView itself,
+    // and clicking "item 002" clicked the middle of the whole list and
+    // reported success.
     for (const auto& [ref, count] : perCounterpart) {
-        if (count > 1)
-            ++shared;
+        EXPECT_EQ(count, 1) << count << " different visual elements all claim " << ref
+                            << " as their own counterpart; at most one of them can be right";
     }
-    EXPECT_GT(shared, 0)
-        << "no UIA element was the counterpart of more than one visual node, which is not "
-           "what these trees look like";
+
+    // Repeated list rows are the case that exposed it, so check them directly
+    // rather than relying on the aggregate above.
+    std::vector<const json*> rows;
+    for (const auto* node : nodes) {
+        if (node->value("type", "").find("ListViewItem") != std::string::npos)
+            rows.push_back(node);
+    }
+    if (rows.size() > 1) {
+        std::set<std::string> rowRefs;
+        for (const auto* row : rows) {
+            const auto own = row->value("uiaRef", "");
+            if (!own.empty())
+                rowRefs.insert(own);
+        }
+        EXPECT_EQ(rowRefs.size(), rows.size() - (rows.size() - rowRefs.size()))
+            << "sanity";
+        for (const auto& ref : rowRefs) {
+            int claimants = 0;
+            for (const auto* row : rows)
+                claimants += row->value("uiaRef", "") == ref ? 1 : 0;
+            EXPECT_EQ(claimants, 1)
+                << claimants << " list rows all claim " << ref << " as their own counterpart";
+        }
+    }
 
     // And the counterpart is directly actionable — no second lookup, no flag.
     const json* button = nullptr;
@@ -2148,12 +2183,15 @@ TEST_F(McpSampleFixture, VisualModeDrivesTheAppWithRealInput) {
             break;
         }
     }
-    if (!button)
-        GTEST_SKIP() << "the sample's button was not in the visual tree";
+    // Not a skip. The visual tree carrying x:Name as `properties.name` is the
+    // precondition this whole mode is built on, so its absence is a failure to
+    // report, not a reason to pass quietly.
+    ASSERT_NE(button, nullptr)
+        << "the sample's PrimaryButton is not in the visual tree, so visual mode has nothing "
+           "to act on";
 
     const auto before = status_text(client, uiaSession);
     ASSERT_FALSE(before.empty());
-
     bool isError = false;
     auto result = client.call_tool(
         "click", json{{"session", visualSession}, {"element", button->value("ref", "")}},
@@ -2318,8 +2356,11 @@ TEST_F(McpSampleFixture, AVisualSessionNeverHandsOutReferencesItWouldRefuse) {
         "hit_test", json{{"session", session},
                          {"x", bounds.value("x", 0) + bounds.value("width", 0) / 2},
                          {"y", bounds.value("y", 0) + bounds.value("height", 0) / 2}});
-    if (hit.contains("tree"))
-        EXPECT_EQ(hit.value("tree", ""), "visual") << hit.dump(2);
+    // Not conditional: if hit_test fails in a visual session there is no
+    // `tree` key, and guarding on its presence would skip the assertion in
+    // exactly the case it exists to catch.
+    ASSERT_TRUE(hit.contains("tree")) << "hit_test failed in a visual session: " << hit.dump(2);
+    EXPECT_EQ(hit.value("tree", ""), "visual") << hit.dump(2);
 }
 
 TEST_F(McpSampleFixture, AnExplicitTreeArgumentStillOverridesTheSessionMode) {
@@ -2342,6 +2383,159 @@ TEST_F(McpSampleFixture, AnExplicitTreeArgumentStillOverridesTheSessionMode) {
     EXPECT_EQ(forced.value("tree", ""), "uia") << forced.dump(2);
     ASSERT_FALSE(forced["elements"].empty());
     EXPECT_EQ(forced["elements"][0].value("ref", "").rfind("uia:", 0), 0u);
+}
+
+TEST_F(McpSampleFixture, VisualModeRefusesAnElementScrolledOutOfView) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    // A realized but scrolled-out list item has perfectly valid on-monitor
+    // coordinates outside its viewport. Aiming at them delivered the click to
+    // whatever was really there — measured landing outside the application
+    // entirely, and reported as success.
+    auto tree = client.call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto& rootBounds = tree["root"]["bounds"];
+    const int bottom = rootBounds.value("y", 0) + rootBounds.value("height", 0);
+
+    std::vector<const json*> all;
+    collect_json_elements(tree["root"], all);
+    const json* below = nullptr;
+    for (const auto* node : all) {
+        const auto& b = (*node)["bounds"];
+        if (b.value("height", 0) > 0 && b.value("y", 0) > bottom &&
+            !node->value("ref", "").empty()) {
+            below = node;
+            break;
+        }
+    }
+    if (!below)
+        GTEST_SKIP() << "nothing in this tree lies below the window to test with";
+
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", session}, {"element", below->value("ref", "")}}, &isError);
+    EXPECT_TRUE(isError) << "clicking an element outside the window must be refused, not "
+                            "delivered to whatever is there: " << result.dump(2);
+}
+
+TEST_F(McpSampleFixture, VisualModeSupportsWaiting) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    // Waits observe rather than drive, so they belong in either mode. They were
+    // falling through to "no equivalent in visual mode", which left a visual
+    // session with no way at all to synchronise after an action — and advised
+    // "use click/type here", which is not a wait.
+    bool isError = false;
+    auto gone = client.call_tool(
+        "wait_for",
+        json{{"session", session}, {"element", "visual:e99999"}, {"gone", true},
+             {"timeoutMs", 3000}},
+        &isError);
+    EXPECT_FALSE(isError) << "wait-gone on an absent element must succeed: " << gone.dump(2);
+
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_FALSE(found["elements"].empty());
+    auto present = client.call_tool(
+        "wait_for",
+        json{{"session", session}, {"element", found["elements"][0].value("ref", "")},
+             {"timeoutMs", 3000}},
+        &isError);
+    EXPECT_FALSE(isError) << "wait-for on a present element must succeed: " << present.dump(2);
+}
+
+TEST_F(McpSampleFixture, ARefusedVisualActionLeavesTheDesktopAlone) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    // Refusing used to happen after the window had already been restored and
+    // raised, so a call that did nothing the caller asked for still rearranged
+    // what they were looking at.
+    ShowWindow(s_hwnd, SW_MINIMIZE);
+    Sleep(800);
+    ASSERT_TRUE(IsIconic(s_hwnd)) << "could not minimize the sample to set up the test";
+
+    bool isError = false;
+    client.call_tool("toggle", json{{"session", session}, {"element", "visual:e30"}}, &isError);
+    EXPECT_TRUE(isError);
+    Sleep(400);
+    EXPECT_TRUE(IsIconic(s_hwnd))
+        << "a refused action brought the window back — it should not have touched it";
+
+    ShowWindow(s_hwnd, SW_RESTORE);
+    Sleep(600);
+}
+
+TEST_F(McpSampleFixture, VisualModeClicksAMinimizedWindowOnTheFirstTry) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    // Two bugs met here. bring_to_foreground returned early when the window was
+    // already foreground — which a *minimized* window can be — so it never
+    // restored it; and the tree was read before the window was raised, so the
+    // bounds captured were the -32000 ones a minimized window has. The result
+    // was a deterministic "fails the first time, works afterwards".
+    ShowWindow(s_hwnd, SW_MINIMIZE);
+    Sleep(800);
+    ASSERT_TRUE(IsIconic(s_hwnd));
+
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_FALSE(found["elements"].empty()) << found.dump(2);
+
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", session}, {"element", found["elements"][0].value("ref", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << "the first click on a minimized window failed: " << result.dump(2);
+    EXPECT_EQ(result.value("method", ""), "SendInput");
+}
+
+TEST_F(McpSampleFixture, CorrelationSaysWhenItCouldNotRead) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    // "nothing correlated" and "the UIA side could not be read" look identical
+    // from a count alone, and only one of them is a statement about the app. A
+    // deadline too small to finish forces the second.
+    auto result = client.call_tool(
+        "get_visual_tree", json{{"session", session}, {"correlate", true}, {"timeoutMs", 1}});
+    ASSERT_TRUE(result.contains("root")) << result.dump(2);
+    if (result.value("correlated", 1u) == 0u) {
+        EXPECT_TRUE(result.contains("correlationFailed") || result.contains("correlationPartial"))
+            << "zero correlations with no explanation is indistinguishable from a failed read: "
+            << result.dump(2);
+    }
 }
 
 TEST_F(McpSampleFixture, WaitForReturnsPromptlyWhenAlreadySatisfied) {

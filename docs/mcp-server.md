@@ -119,7 +119,7 @@ A session declares which tree it speaks, and that determines how it acts.
 | typing is | the Value pattern, or keystrokes | real keystrokes |
 | needs the window in front | no | yes |
 | works across architectures | yes | no — it injects |
-| available actions | all of them | click, scroll, type, press_key, focus, window_action |
+| available actions | all of them | click, scroll, type, press_key, focus, wait_for, window_action |
 
 ```json
 { "name": "connect", "arguments": { "hwnd": "0x1A0B3C", "mode": "visual" } }
@@ -174,19 +174,28 @@ and refuses one aimed at the wrong tree instead of resolving it to something
 else. A bare `eN` still works and means "this tool's default tree".
 
 **`get_visual_tree` can report the correlation directly.** Pass
-`correlate: true` and each element gains a `uiaRef` naming its UI Automation
-counterpart — the thing you can actually act on:
+`correlate: true` and each element gains:
+
+- **`uiaRef`** — this element's *own* UI Automation counterpart, matched by
+  identity. This is the one you can act on.
+- **`uiaAncestorRef`** — the counterpart of the control it sits *inside*, for
+  elements that have none of their own. Context, not a target.
 
 ```json
 { "ref": "visual:e30", "type": "Button",           "uiaRef": "uia:e6" }
-{ "ref": "visual:e31", "type": "ContentPresenter", "uiaRef": "uia:e6" }
-{ "ref": "visual:e32", "type": "TextBlock",        "uiaRef": "uia:e6" }
+{ "ref": "visual:e31", "type": "ContentPresenter", "uiaAncestorRef": "uia:e6" }
+{ "ref": "visual:e32", "type": "TextBlock",        "uiaAncestorRef": "uia:e6" }
 ```
 
-All three share one counterpart, which is the many-to-one relationship made
-explicit. Template children inherit their control's counterpart, since acting on
-one means acting on it. Correlation needs both trees, so it costs a second walk
-and is off by default.
+The distinction matters. Reporting an inherited counterpart as `uiaRef` meant
+every one of a ListView's 28 item nodes advertised the *ListView* as the thing
+to act on, so "click item 002" clicked the middle of the whole list. A template
+part genuinely has no counterpart of its own, and saying so is more useful than
+pointing at its container.
+
+Correlation needs both trees, so it costs a second walk and is off by default.
+If the UIA side cannot be read, the response says so (`correlationFailed`)
+rather than reporting zero matches.
 
 ### Acting on a visual-tree element
 

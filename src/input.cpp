@@ -290,7 +290,11 @@ bool bring_to_foreground(HWND hwnd) {
     HWND root = GetAncestor(hwnd, GA_ROOT);
     if (!root)
         root = hwnd;
-    if (GetForegroundWindow() == root)
+    // Being foreground is not enough on its own: a minimized window can hold
+    // the foreground, and its contents are then nowhere on screen, so input
+    // aimed at them lands on whatever is at those coordinates instead. Both
+    // conditions have to hold before there is nothing to do.
+    if (GetForegroundWindow() == root && !IsIconic(root))
         return true;
 
     if (IsIconic(root))

@@ -267,7 +267,16 @@ ParsedRef parse_ref(const std::string& ref) {
 
 const char* tree_name(bool uia) { return uia ? "uia" : "visual"; }
 
-using CorrelationMap = std::map<const lvt::Element*, std::string>;
+// How a visual element relates to the UI Automation tree. `own` is this
+// element's own counterpart and is safe to act on; `ancestor` is the
+// counterpart of the control it sits inside, which is context rather than a
+// target.
+struct Correlation {
+    std::string own;
+    std::string ancestor;
+};
+
+using CorrelationMap = std::map<const lvt::Element*, Correlation>;
 
 json element_fields(const lvt::Element& element, const char* tree = nullptr,
                     const CorrelationMap* correlation = nullptr) {
@@ -277,13 +286,16 @@ json element_fields(const lvt::Element& element, const char* tree = nullptr,
     // silently resolved against the other.
     if (tree)
         j["ref"] = std::string(tree) + ":" + element.id;
-    // The corresponding element in the other tree, when one could be found.
-    // Several visual nodes commonly share one UIA counterpart, which is exactly
-    // why their ids never lined up.
     if (correlation) {
         const auto found = correlation->find(&element);
-        if (found != correlation->end())
-            j["uiaRef"] = found->second;
+        if (found != correlation->end()) {
+            // Only a counterpart of this element's own is actionable. An
+            // ancestor's is reported separately and named for what it is.
+            if (!found->second.own.empty())
+                j["uiaRef"] = found->second.own;
+            else if (!found->second.ancestor.empty())
+                j["uiaAncestorRef"] = found->second.ancestor;
+        }
     }
     j["key"] = element.key;
     j["type"] = element.type;
@@ -628,7 +640,7 @@ std::vector<std::string> visual_identity_values(const lvt::Element& visual) {
 // Doing that for a whole tree is much cheaper than bridging element by element:
 // the UIA side is indexed once and reused, rather than re-walked per node.
 void correlate_visual_to_uia(const lvt::Element& uiaTree, const lvt::Element& visualRoot,
-                             std::map<const lvt::Element*, std::string>& out) {
+                             CorrelationMap& out) {
     std::vector<const lvt::Element*> uiaNodes;
     collect_elements(uiaTree, uiaNodes);
 
@@ -647,26 +659,39 @@ void correlate_visual_to_uia(const lvt::Element& uiaTree, const lvt::Element& vi
     for (const auto& id : duplicateIds)
         byAutomationId.erase(id);
 
-    // Walk depth-first carrying the nearest correlated ancestor. A control's
-    // template children — the ContentPresenter and TextBlock inside a Button —
-    // have no identity of their own, but they belong to that control and
-    // acting on one means acting on it. Passing the ancestor's counterpart
-    // down is what makes the relationship visible: several visual nodes, one
-    // UIA element, which is exactly why the ids never lined up.
+    // Walk depth-first carrying the nearest correlated ancestor.
+    //
+    // Two different relationships get recorded, and conflating them was a bug:
+    //
+    //  - `uiaRef` is *this* node's own counterpart, matched by identity. Only
+    //    this is safe to act on.
+    //  - `uiaAncestorRef` is the counterpart of the control this node sits
+    //    inside. Useful context, but not the node itself.
+    //
+    // Reporting an inherited counterpart as `uiaRef` meant every one of a
+    // ListView's 28 item nodes advertised the ListView as the thing to act on,
+    // so clicking "item 002" clicked the middle of the whole list and reported
+    // success. A template part genuinely has no counterpart of its own; saying
+    // so is more useful than pointing at its container and calling it the same
+    // thing.
     const std::function<void(const lvt::Element&, const std::string&)> visit =
         [&](const lvt::Element& element, const std::string& inherited) {
-            std::string current = inherited;
+            std::string own;
             for (const auto& identity : visual_identity_values(element)) {
                 const auto found = byAutomationId.find(identity);
                 if (found != byAutomationId.end()) {
-                    current = "uia:" + found->second->id;
+                    own = "uia:" + found->second->id;
                     break;
                 }
             }
-            if (!current.empty())
-                out[&element] = current;
+            if (!own.empty())
+                out[&element] = Correlation{own, std::string()};
+            else if (!inherited.empty())
+                out[&element] = Correlation{std::string(), inherited};
+
+            const auto& carry = own.empty() ? inherited : own;
             for (const auto& child : element.children)
-                visit(child, current);
+                visit(child, carry);
         };
     visit(visualRoot, std::string());
 }
@@ -706,10 +731,12 @@ json method_get_tree(const json& params, bool uia) {
     // what do I act on?
     CorrelationMap correlation;
     const bool wantCorrelation = !uia && get_bool(params, "correlate", false);
+    std::string correlationError;
+    bool correlationTruncated = false;
     if (wantCorrelation) {
         lvt::Element uiaTree;
-        std::string uiaError;
-        if (build_tree_for(session, params, true, uiaTree, uiaError))
+        if (build_tree_for(session, params, true, uiaTree, correlationError,
+                           &correlationTruncated))
             correlate_visual_to_uia(uiaTree, *root, correlation);
     }
 
@@ -718,8 +745,16 @@ json method_get_tree(const json& params, bool uia) {
     // Naming the tree makes the ids self-describing even for a caller that
     // only reads the top of the response.
     out["tree"] = tree_name(uia);
-    if (wantCorrelation)
+    if (wantCorrelation) {
         out["correlated"] = static_cast<uint64_t>(correlation.size());
+        // "nothing correlated" and "the UIA side could not be read" look
+        // identical from a count alone, and the second is not a statement about
+        // the app.
+        if (!correlationError.empty())
+            out["correlationFailed"] = correlationError;
+        else if (correlationTruncated)
+            out["correlationPartial"] = truncation_note();
+    }
     if (truncated)
         out["truncated"] = truncation_note();
     return out;
@@ -1249,31 +1284,131 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
             "Connect with mode 'uia' to act through UI Automation patterns, or use a reference "
             "from get_visual_tree.");
 
-    // Synthetic input goes to the foreground window, so this is a prerequisite
-    // rather than a nicety. Refusing is better than typing into whatever else
-    // happens to be on top.
-    const bool needsForeground = kind != lvt::ActionKind::waitFor &&
-                                 kind != lvt::ActionKind::waitGone;
-
-    // No TargetGuard here: build_tree_for takes it for the read, and the mutex
-    // is not recursive. Injection afterwards is desktop-wide anyway — it goes
-    // through the foreground window, not through this target's provider — so
-    // holding a per-target lock across it would buy nothing.
-    lvt::Element tree;
-    std::string error;
-    if (!build_tree_for(session, params, false, tree, error))
-        throw std::runtime_error(error);
-
-    const lvt::Element* element = nullptr;
-    if (!parsed.ref.empty()) {
-        element = lvt::find_element_by_ref(tree, parsed.ref);
-        if (!element)
-            throw std::runtime_error("element '" + ref + "' not found in the visual tree");
+    // Classify before doing anything observable. An action this mode cannot
+    // express used to be refused only after the window had been restored and
+    // raised, so a call that did nothing the caller asked for still rearranged
+    // their desktop.
+    const bool isWait = kind == lvt::ActionKind::waitFor || kind == lvt::ActionKind::waitGone;
+    bool injects = false;
+    switch (kind) {
+    case lvt::ActionKind::click:
+    case lvt::ActionKind::scroll:
+    case lvt::ActionKind::typeText:
+    case lvt::ActionKind::pressKey:
+    case lvt::ActionKind::focus:
+        injects = true;
+        break;
+    case lvt::ActionKind::windowClose:
+    case lvt::ActionKind::windowMinimize:
+    case lvt::ActionKind::windowMaximize:
+    case lvt::ActionKind::windowRestore:
+    case lvt::ActionKind::waitFor:
+    case lvt::ActionKind::waitGone:
+        break;
+    default:
+        // Toggling, setting a value, expanding, selecting, invoking — these
+        // describe what a control *means*, which the visual tree does not know.
+        // Saying so is more useful than approximating them with a click that
+        // may do something else entirely.
+        throw std::runtime_error(
+            std::string("'") + actionName +
+            "' has no equivalent in visual mode, which drives by geometry rather than by "
+            "control semantics. Connect with mode 'uia' to use it, or use click, type, "
+            "press_key, scroll or focus here.");
     }
 
     json out{{"action", actionName}, {"mode", "visual"}};
     if (!ref.empty())
         out["element"] = ref;
+
+    // Waiting observes the visual tree rather than driving anything, so it
+    // neither injects nor needs the window in front. It polls the same way the
+    // UIA path does, just against the tree this session speaks.
+    if (isWait) {
+        if (parsed.ref.empty())
+            throw std::runtime_error("wait needs an element reference");
+        const auto wantPresent = kind == lvt::ActionKind::waitFor;
+        const auto property = get_string(params, "waitProperty");
+        const auto value = get_string(params, "waitValue");
+        const auto deadline =
+            GetTickCount64() + static_cast<ULONGLONG>((std::max)(0, get_int(params, "timeoutMs", 5000)));
+        for (;;) {
+            if (!IsWindow(session.hwnd)) {
+                if (!wantPresent) {
+                    out["ok"] = true;
+                    out["method"] = "window-closed";
+                    return out;
+                }
+                throw std::runtime_error("the window closed while waiting for '" + ref + "'");
+            }
+            lvt::Element tree;
+            std::string error;
+            if (build_tree_for(session, params, false, tree, error)) {
+                const auto* found = lvt::find_element_by_ref(tree, parsed.ref);
+                bool satisfied = wantPresent ? found != nullptr : found == nullptr;
+                if (satisfied && wantPresent && found && !property.empty())
+                    satisfied = element_property(*found, property) == value;
+                if (satisfied) {
+                    out["ok"] = true;
+                    out["method"] = wantPresent ? "wait-for" : "wait-gone";
+                    if (found)
+                        out["result"] = element_fields(*found, "visual");
+                    return out;
+                }
+            }
+            if (GetTickCount64() >= deadline)
+                break;
+            Sleep(static_cast<DWORD>((std::max)(10, get_int(params, "pollIntervalMs", 200))));
+        }
+        throw std::runtime_error(wantPresent
+                                     ? "timed out waiting for '" + ref + "'"
+                                     : "timed out waiting for '" + ref + "' to disappear");
+    }
+
+    // Synthetic input goes to the foreground window, so raising it is a
+    // prerequisite rather than a nicety — and it must happen *before* the tree
+    // is read, or the bounds captured are the ones the window had while
+    // minimized and the first click of a session always misses.
+    if (injects && !lvt::bring_to_foreground(session.hwnd))
+        throw std::runtime_error("the target window could not be brought to the foreground, so "
+                                 "synthetic input would go somewhere else");
+
+    // No TargetGuard here: build_tree_for takes it for the read, and the mutex
+    // is not recursive. Injection afterwards is desktop-wide anyway — it goes
+    // through the foreground window, not through this target's provider — so
+    // holding a per-target lock across it would buy nothing.
+    //
+    // Restoring a window is not instantaneous, and the framework's cached
+    // layout lags further behind: a XAML tree read straight after a restore
+    // still reports the -32000 coordinates a minimized window has. Waiting on
+    // the window rect is not enough, because that updates first. So the wait is
+    // on the thing actually needed — the element being somewhere clickable —
+    // and only for an action that is going to aim at it.
+    lvt::Element tree;
+    std::string error;
+    const lvt::Element* element = nullptr;
+    const int attempts = injects && !parsed.ref.empty() ? 12 : 1;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        if (attempt > 0)
+            Sleep(100);
+        tree = lvt::Element{};
+        if (!build_tree_for(session, params, false, tree, error))
+            throw std::runtime_error(error);
+        if (parsed.ref.empty())
+            break;
+        element = lvt::find_element_by_ref(tree, parsed.ref);
+        if (!element)
+            continue;  // the tree may still be settling; the check below reports it
+        const auto& b = element->bounds;
+        if (b.width <= 0 || b.height <= 0)
+            continue;
+        const POINT centre{b.x + b.width / 2, b.y + b.height / 2};
+        if (lvt::point_is_on_screen(centre))
+            break;
+    }
+
+    if (!parsed.ref.empty() && !element)
+        throw std::runtime_error("element '" + ref + "' not found in the visual tree");
 
     const auto requireElement = [&]() -> const lvt::Element& {
         if (!element)
@@ -1283,6 +1418,19 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
     };
 
     const auto centreOf = [&](const lvt::Element& target) {
+        // The provider says when an element is not really showing. WPF and
+        // WinForms set "visible", Win32 derives it from IsWindowVisible.
+        for (const char* key : {"visible", "IsOffscreen", "winforms.visible"}) {
+            const auto value = element_property(target, key);
+            if (value.empty())
+                continue;
+            const bool hidden = equals_ci(key, "IsOffscreen") ? equals_ci(value, "true")
+                                                              : equals_ci(value, "false");
+            if (hidden)
+                throw std::runtime_error("element '" + ref +
+                                         "' is not visible, so there is nothing to click");
+        }
+
         const auto& b = target.bounds;
         if (b.width <= 0 || b.height <= 0)
             throw std::runtime_error("element '" + ref +
@@ -1291,16 +1439,28 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
         if (!lvt::point_is_on_screen(centre))
             throw std::runtime_error("element '" + ref +
                                      "' is not on any monitor, so it cannot be clicked");
+
+        // Bounds alone do not mean the element is reachable. A realized but
+        // scrolled-out list item has perfectly valid on-monitor coordinates
+        // outside its viewport, and clicking them delivers the input to
+        // whatever is really at that point — measured landing outside the
+        // application altogether while reporting success. Asking the system
+        // what is actually at the point is the cheap, decisive check.
+        HWND atPoint = WindowFromPoint(centre);
+        if (atPoint) {
+            HWND root = GetAncestor(atPoint, GA_ROOT);
+            if (root && root != session.hwnd) {
+                throw std::runtime_error(
+                    "element '" + ref +
+                    "' is at a point covered by another window — it is probably scrolled out of "
+                    "view or clipped. Scroll it into view first.");
+            }
+        }
         return centre;
     };
 
-    if (needsForeground && !lvt::bring_to_foreground(session.hwnd))
-        throw std::runtime_error("the target window could not be brought to the foreground, so "
-                                 "synthetic input would go somewhere else");
-
     switch (kind) {
-    case lvt::ActionKind::click:
-    case lvt::ActionKind::invoke: {
+    case lvt::ActionKind::click: {
         const auto centre = centreOf(requireElement());
         const int button = get_int(params, "button", 0);
         if (!lvt::send_click(centre, button, 1))
@@ -1383,20 +1543,16 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
     }
 
     default:
-        // Toggling, setting a value, expanding, selecting — these describe what
-        // a control *means*, which the visual tree does not know. Saying so is
-        // more useful than approximating them with a click that may do
-        // something else entirely.
-        throw std::runtime_error(
-            std::string("'") + actionName +
-            "' has no equivalent in visual mode, which drives by geometry rather than by "
-            "control semantics. Connect with mode 'uia' to use it, or use click/type here.");
+        // Unreachable: the classification above already refused anything this
+        // mode cannot express, before touching the window.
+        throw std::runtime_error(std::string("'") + actionName +
+                                 "' has no equivalent in visual mode");
     }
 
     out["ok"] = true;
     // Synthetic input needed the window on top, which is worth reporting: it
     // changes what the user sees.
-    if (needsForeground)
+    if (injects)
         out["broughtToForeground"] = true;
     return out;
 }
