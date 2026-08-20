@@ -1036,6 +1036,75 @@ bool WpfSampleFixture::s_ready = false;
 std::string WpfSampleFixture::s_sample_exe;
 std::string WpfSampleFixture::s_skip_reason;
 
+TEST_F(WpfSampleFixture, ChildBoundsAreInTheSameCoordinateSpaceAsTheWindow) {
+    SkipIfNotReady();
+    auto lvt = get_lvt_path();
+
+    // The WPF walker read sizes from ActualWidth/Height, which are
+    // device-independent units, but positions from PointToScreen, which are
+    // device pixels. At 100% scaling those coincide and nothing looks wrong; at
+    // 150% every child was reported 1.5x further from the origin than it really
+    // is — outside the window rect lvt reads — so screenshot annotations landed
+    // off-image and the bounds were unusable to any caller.
+    //
+    // Asserting containment rather than exact numbers keeps this meaningful at
+    // any scaling, including the 100% where the bug is invisible.
+    auto wpfReady = [](const json& j) {
+        return frameworks_contain_wpf(j) &&
+               json_tree_has_named_control(j["root"], "OkButton");
+    };
+    auto tree = dump_ready_tree(lvt, get_pid_arg(), wpfReady);
+    ASSERT_TRUE(wpfReady(tree)) << "WPF tree never became ready";
+
+    const auto& rootBounds = tree["root"]["bounds"];
+    const int rx = rootBounds.value("x", 0);
+    const int ry = rootBounds.value("y", 0);
+    const int rw = rootBounds.value("width", 0);
+    const int rh = rootBounds.value("height", 0);
+    ASSERT_GT(rw, 0);
+    ASSERT_GT(rh, 0);
+
+    std::vector<const json*> elements;
+    collect_json_elements(tree["root"], elements);
+    ASSERT_GT(elements.size(), 1u);
+
+    // Each sized element's centre should sit inside the window. A small margin
+    // absorbs borders and shadows; it is deliberately far tighter than a DPI
+    // factor, which displaces things by a third of the window or more.
+    const int slackX = rw / 20 + 4;
+    const int slackY = rh / 20 + 4;
+    int sized = 0;
+    int inside = 0;
+    std::string worst;
+    for (const auto* element : elements) {
+        const auto& b = (*element)["bounds"];
+        const int w = b.value("width", 0);
+        const int h = b.value("height", 0);
+        if (w <= 0 || h <= 0)
+            continue;
+        ++sized;
+        const int cx = b.value("x", 0) + w / 2;
+        const int cy = b.value("y", 0) + h / 2;
+        if (cx >= rx - slackX && cx <= rx + rw + slackX && cy >= ry - slackY &&
+            cy <= ry + rh + slackY) {
+            ++inside;
+        } else if (worst.empty()) {
+            worst = element->value("id", "?") + " (" + element->value("type", "") + " \"" +
+                    element->value("text", "") + "\") centre " + std::to_string(cx) + "," +
+                    std::to_string(cy);
+        }
+    }
+
+    ASSERT_GT(sized, 2) << "no sized WPF elements were checked";
+    // A popup or adorner may legitimately fall outside, so this is a
+    // proportion rather than an absolute — but a coordinate-space mismatch
+    // moves nearly everything at once, which no amount of slack absorbs.
+    EXPECT_GE(inside * 100 / sized, 90)
+        << inside << " of " << sized << " WPF elements have their centre inside the window "
+        << rx << "," << ry << " " << rw << "x" << rh << ". First outlier: " << worst
+        << ". Element positions are probably in a different coordinate space than their sizes.";
+}
+
 TEST_F(WpfSampleFixture, DurableKeyContract) {
     SkipIfNotReady();
 

@@ -142,6 +142,56 @@ involves many responses. The 10s default sits comfortably above a real app's
 walk — the heaviest measured, a WebView2 host with ~380 elements, takes about
 1.3s — while staying well under UIA's own 20s default.
 
+## MCP server (`lvt_api.cpp` + `mcp/`)
+
+`lvt mcp` serves the Model Context Protocol over stdio from inside `lvt.exe`.
+It is not a fifth pipeline stage but a second front end: it drives the same
+target resolution, tree building and action machinery the CLI does, only with a
+session held open between requests instead of one process per command.
+
+It is split across a language boundary:
+
+```
+mcp/src/server.rs     tool schemas, MCP protocol      (Rust, rmcp)
+mcp/src/ffi.rs        the only unsafe code            (Rust)
+        ↕  extern "C" — one function, JSON in, JSON out
+src/lvt_api.cpp       sessions, dispatch, all logic   (C++)
+src/providers/…       unchanged
+```
+
+**Why Rust.** `lvt mcp` has to be served by `lvt.exe` itself — a second binary
+or a DLL would defeat the point of a single-executable release. That rules out
+running the MCP SDK as a separate process, and of the options that link into an
+existing MSVC binary, a Rust `staticlib` is the mainstream one. The alternative
+considered, C# NativeAOT with `NativeLib=Static`, is documented by Microsoft as
+implemented but unsupported.
+
+**Why the seam is one function.** `lvt_api_call(method, params_json, &result)`
+is the entire ABI. Adding a tool never changes it, the FFI surface is small
+enough to audit at a glance, and if the Rust layer ever needed replacing the C++
+side would not move.
+
+**Memory ownership.** Rust always links the release CRT while lvt may be built
+against the debug one, so the two can genuinely have different heaps. The rule
+is therefore absolute: each side frees only what it allocated. `result_json` is
+malloc'd by lvt and released only through `lvt_api_free`, which on the Rust side
+is enforced by a `Drop` impl rather than by remembering to call it.
+
+**Neither runtime unwinds into the other.** `lvt_api_call` wraps its body so no
+C++ exception escapes; the Rust entry point uses `catch_unwind` and the crate is
+built with `panic = "abort"`.
+
+**stdout is the protocol.** Every diagnostic goes to stderr — this is why the
+WIL logging callback was made stderr-only before any of this was written.
+
+**Input gating** happens at registration, not at call time: `--allow-input`
+selects which tool routers are composed, so a withheld tool is absent from
+`tools/list` and not merely refused.
+
+**Sessions** live in `lvt_api.cpp` behind a mutex, keyed `s1`, `s2`, …. Each
+holds a resolved HWND, pid and architecture, so later calls skip target
+resolution — which is ambiguous when several windows match a process name.
+
 ## Stage 4: Serialization (`json_serializer.cpp`, `screenshot.cpp`)
 ### JSON output
 

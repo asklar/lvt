@@ -26,8 +26,26 @@ jobs:
       - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
         run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
 
+      # The MCP server is a Rust staticlib linked into lvt.exe. Windows runners
+      # ship rustup, so this only pins the target and keeps the cache warm.
+      - name: Set up Rust (for the MCP server)
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/mcp-target
+          key: cargo-${{ runner.os }}-${{ hashFiles('mcp/Cargo.toml', 'mcp/src/**') }}
+          restore-keys: cargo-${{ runner.os }}-
+
       - name: Configure
-        run: cmake --preset default
+        run: cmake --preset default -DLVT_ENABLE_MCP=ON
 
       - name: Build managed WPF assembly
         run: msbuild src/tap_wpf/LvtWpfTap.csproj /p:Configuration=Release /p:Platform=AnyCPU /restore /v:minimal
@@ -41,6 +59,9 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      - name: MCP server unit tests
+        run: cargo test --manifest-path mcp/Cargo.toml
+
       - name: Unit tests
         run: build\lvt_unit_tests.exe --gtest_output=xml:build\unit_test_results.xml
 
@@ -49,6 +70,9 @@ jobs:
 
       - name: Integration tests
         run: build\lvt_integration_tests.exe --gtest_output=xml:build\integration_test_results.xml
+
+      - name: MCP server tests
+        run: build\lvt_mcp_tests.exe --gtest_output=xml:build\mcp_test_results.xml
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
@@ -114,10 +138,11 @@ jobs:
         with:
           vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
-      # No Windows App SDK install step and no dotnet: this configuration must
-      # build from source alone, exactly as it does inside vcpkg. The Windows
-      # App SDK winmds come from the NuGet package the portfile downloads, so
-      # WinUI 3 enrichment is reduced here - that is expected.
+      # No Windows App SDK install step, no dotnet, and no Rust: this
+      # configuration must build from source alone, exactly as it does inside
+      # vcpkg — where the MCP server is off, so consumers of the port never
+      # need a Rust toolchain. Keeping this leg faithful is the point of it.
+      # The multi-architecture MCP build is covered by release.yml.
       - name: Configure (no managed, no tests)
         run: >
           cmake --preset ${{ matrix.preset }}

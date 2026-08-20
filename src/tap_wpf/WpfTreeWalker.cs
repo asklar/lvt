@@ -123,7 +123,24 @@ namespace LvtWpfTap
                         var source = PresentationSource.FromVisual(fe);
                         if (source != null)
                         {
+                            // PointToScreen returns *device* pixels, while
+                            // ActualWidth/Height above are device-independent
+                            // units. Reporting one of each leaves the origin
+                            // scaled by the DPI factor and the size not, so at
+                            // 150% an element 613 units across the window is
+                            // reported at 920 — outside the window rect lvt
+                            // reads, which puts every annotation in the wrong
+                            // place and makes the bounds useless to a caller.
+                            //
+                            // TransformFromDevice converts back to the same
+                            // units as the size, which is also the space lvt
+                            // works in: it is DPI-unaware, so the window rect
+                            // and the UIA bounds it reads are already scaled.
+                            // On a DPI-unaware WPF app the transform is
+                            // identity, so this is a no-op there.
                             Point screenPos = fe.PointToScreen(new Point(0, 0));
+                            var fromDevice = source.CompositionTarget.TransformFromDevice;
+                            screenPos = fromDevice.Transform(screenPos);
                             sb.AppendFormat(",\"offsetX\":{0:F1},\"offsetY\":{1:F1}",
                                 screenPos.X, screenPos.Y);
                         }

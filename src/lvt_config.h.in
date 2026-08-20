@@ -7,6 +7,9 @@
 // those frameworks is unavailable unless the assemblies are deployed alongside
 // the TAP DLLs. See LVT_WITH_MANAGED.
 
+// Version of the lvt this library was built from.
+#define LVT_VERSION "@PROJECT_VERSION@"
+
 #cmakedefine01 LVT_ENABLE_XAML
 #cmakedefine01 LVT_ENABLE_WINUI3
 #cmakedefine01 LVT_ENABLE_WPF

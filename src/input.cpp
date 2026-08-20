@@ -290,14 +290,37 @@ bool bring_to_foreground(HWND hwnd) {
     HWND root = GetAncestor(hwnd, GA_ROOT);
     if (!root)
         root = hwnd;
-    if (GetForegroundWindow() == root)
+
+    // Raising is separate from focusing. SetForegroundWindow gives the window
+    // the input focus, but on its own it does not reliably put it at the top
+    // of the z-order, and a focused-but-obscured window is the worst case for
+    // synthetic input: the clicks are aimed at coordinates the user cannot see
+    // and land in whatever is drawn there. Asking for both, every time, costs
+    // nothing when the window is already on top.
+    const auto raise = [](HWND target) {
+        BringWindowToTop(target);
+        SetWindowPos(target, HWND_TOP, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    };
+
+    // Being foreground is not enough on its own: a minimized window can hold
+    // the foreground, and its contents are then nowhere on screen, so input
+    // aimed at them lands on whatever is at those coordinates instead. Both
+    // conditions have to hold before there is nothing to do — and even then
+    // the window is raised, because holding the focus does not guarantee
+    // being on top.
+    if (GetForegroundWindow() == root && !IsIconic(root)) {
+        raise(root);
         return true;
+    }
 
     if (IsIconic(root))
         ShowWindow(root, SW_RESTORE);
 
-    if (SetForegroundWindow(root))
+    if (SetForegroundWindow(root)) {
+        raise(root);
         return wait_for_foreground(root);
+    }
 
     // SetForegroundWindow is advisory: the shell refuses a process that does
     // not already own the foreground. That is the normal case for lvt — an
@@ -321,7 +344,7 @@ bool bring_to_foreground(HWND hwnd) {
     auto detach = wil::scope_exit([&] { AttachThreadInput(self, other, FALSE); });
 
     SetForegroundWindow(root);
-    BringWindowToTop(root);
+    raise(root);
     return wait_for_foreground(root);
 }
 

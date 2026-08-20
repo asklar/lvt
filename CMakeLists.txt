@@ -31,6 +31,9 @@ option(LVT_ENABLE_WINFORMS "WinForms support"                                   
 option(LVT_ENABLE_AVALONIA "Avalonia plugin"                                     ON)
 option(LVT_ENABLE_CHROMIUM "Chromium (Chrome/Edge DOM) plugin"                   ON)
 option(LVT_ENABLE_UIA      "UI Automation tree output (--uia)"                    ON)
+# The MCP server needs a Rust toolchain, which not every contributor has, so it
+# is opt-in locally. CI and the release build turn it on explicitly.
+option(LVT_ENABLE_MCP      "MCP server mode (lvt mcp); requires a Rust toolchain" OFF)
 
 option(LVT_BUILD_TOOL    "Build the lvt command-line tool"                     ON)
 option(LVT_BUILD_MANAGED "Build managed .NET assemblies (requires .NET SDK)"   ON)
@@ -67,6 +70,7 @@ set(LVT_PUBLIC_HEADERS
     src/plugin.h
     src/plugin_loader.h
     src/input.h
+    src/lvt_api.h
     src/screenshot.h
     src/target.h
     src/tree_builder.h
@@ -86,6 +90,7 @@ set(LVT_CORE_SOURCES
     src/screenshot.cpp
     src/module_util.cpp
     src/input.cpp
+    src/lvt_api.cpp
     src/plugin_loader.cpp
     src/wil_diagnostics.cpp
     src/providers/win32_provider.cpp
@@ -158,6 +163,69 @@ target_compile_definitions(lvt_core PUBLIC
 if(LVT_BUILD_TOOL)
     add_executable(lvt src/main.cpp)
     target_link_libraries(lvt PRIVATE lvt_core WIL::WIL nlohmann_json::nlohmann_json)
+endif()
+
+# --- MCP server (Rust) -----------------------------------------------------
+# The MCP protocol layer is a Rust staticlib linked into lvt.exe, so `lvt mcp`
+# is served by the same binary the rest of the CLI is — no second executable and
+# no DLL in the release zip. Corrosion would work here too, but a single
+# staticlib with no generated bindings does not justify the extra dependency.
+if(LVT_ENABLE_MCP)
+    find_program(LVT_CARGO_EXE NAMES cargo)
+    if(NOT LVT_CARGO_EXE)
+        message(FATAL_ERROR
+            "LVT_ENABLE_MCP is ON but cargo was not found. Install Rust from https://rustup.rs, "
+            "or configure with -DLVT_ENABLE_MCP=OFF to build without the MCP server.")
+    endif()
+
+    # Rust's target triple has to follow the C++ one or the objects will not
+    # link; the release matrix builds all three.
+    if(VCPKG_TARGET_TRIPLET MATCHES "arm64")
+        set(LVT_RUST_TARGET "aarch64-pc-windows-msvc")
+    elseif(VCPKG_TARGET_TRIPLET MATCHES "x86")
+        set(LVT_RUST_TARGET "i686-pc-windows-msvc")
+    else()
+        set(LVT_RUST_TARGET "x86_64-pc-windows-msvc")
+    endif()
+
+    # Always the release profile. Rust links the release CRT regardless of
+    # profile, so a debug build would buy nothing but a CRT mismatch and a much
+    # larger binary; the MCP layer is thin enough that stepping through it is
+    # not the debugging strategy anyway.
+    set(LVT_MCP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/mcp")
+    set(LVT_MCP_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/mcp-target")
+    set(LVT_MCP_LIB "${LVT_MCP_TARGET_DIR}/${LVT_RUST_TARGET}/release/lvt_mcp.lib")
+
+    # GLOB_RECURSE with CONFIGURE_DEPENDS, not a plain GLOB. A plain GLOB is
+    # evaluated once at configure time, so a Rust file added afterwards is not a
+    # dependency of anything: cargo is never re-run, lvt.exe keeps the previous
+    # MCP layer, and the build reports success. That silence is the problem —
+    # tests then exercise a binary that does not contain the change under test,
+    # and pass. CONFIGURE_DEPENDS makes the build re-check the file set, and
+    # RECURSE covers any future subdirectory.
+    file(GLOB_RECURSE LVT_MCP_SOURCES CONFIGURE_DEPENDS "${LVT_MCP_DIR}/src/*.rs")
+    add_custom_command(
+        OUTPUT "${LVT_MCP_LIB}"
+        COMMAND "${CMAKE_COMMAND}" -E env
+                "CARGO_TARGET_DIR=${LVT_MCP_TARGET_DIR}"
+                "${LVT_CARGO_EXE}" build --release --target ${LVT_RUST_TARGET}
+                --manifest-path "${LVT_MCP_DIR}/Cargo.toml"
+        DEPENDS ${LVT_MCP_SOURCES} "${LVT_MCP_DIR}/Cargo.toml" "${LVT_MCP_DIR}/Cargo.lock"
+        WORKING_DIRECTORY "${LVT_MCP_DIR}"
+        COMMENT "Building the MCP server (cargo, ${LVT_RUST_TARGET})"
+        VERBATIM)
+    add_custom_target(lvt_mcp_rust DEPENDS "${LVT_MCP_LIB}")
+
+    if(LVT_BUILD_TOOL)
+        add_dependencies(lvt lvt_mcp_rust)
+        # These are what `cargo rustc -- --print=native-static-libs` reports for
+        # this dependency set; tokio and rmcp pull in sockets, RNG and the
+        # backtrace machinery.
+        target_link_libraries(lvt PRIVATE
+            "${LVT_MCP_LIB}"
+            ws2_32 userenv ntdll dbghelp bcrypt advapi32)
+        target_compile_definitions(lvt PRIVATE LVT_ENABLE_MCP)
+    endif()
 endif()
 
 # Determine TAP DLL architecture suffix from vcpkg triplet
@@ -626,8 +694,30 @@ add_test(NAME integration_tests COMMAND lvt_integration_tests)
 
 # Chromium plugin tests — DOM JSON format and native messaging protocol
 if(LVT_ENABLE_CHROMIUM)
-add_executable(lvt_chromium_tests
-    tests/chromium_tests.cpp
+# --- MCP server tests ------------------------------------------------------
+# A separate binary because it needs a live JSON-RPC conversation over pipes
+# rather than the one-shot commands the other integration tests run, and
+# because it only exists when the MCP server was built.
+if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
+    add_executable(lvt_mcp_tests tests/mcp_tests.cpp)
+    target_include_directories(lvt_mcp_tests PRIVATE src)
+    target_compile_definitions(lvt_mcp_tests PRIVATE
+        WIN32_LEAN_AND_MEAN NOMINMAX
+        WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
+    )
+    target_link_libraries(lvt_mcp_tests PRIVATE
+        GTest::gtest GTest::gtest_main
+        WIL::WIL
+        nlohmann_json::nlohmann_json
+    )
+    add_dependencies(lvt_mcp_tests lvt)
+    if(TARGET winui3_sample_app)
+        add_dependencies(lvt_mcp_tests winui3_sample_app)
+    endif()
+    add_test(NAME mcp_tests COMMAND lvt_mcp_tests)
+endif()
+
+add_executable(lvt_chromium_tests    tests/chromium_tests.cpp
     src/element_key.cpp
 )
 target_include_directories(lvt_chromium_tests PRIVATE src)

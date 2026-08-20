@@ -250,6 +250,47 @@ Pattern state is only emitted where the pattern is supported, so the presence of
 4. **Drill into a subtree** with `--element <id> --depth <n>` if the tree is large
 5. **Use element IDs and bounds** to plan any UI interactions (clicks, keyboard input)
 
+## MCP server mode
+
+`lvt mcp` serves the Model Context Protocol over stdio, which is usually a
+better fit than shelling out repeatedly: it keeps a session open on the target,
+so it walks the tree once per request rather than once per command, and it
+returns screenshots as inline images.
+
+```powershell
+lvt mcp                  # inspection only
+lvt mcp --allow-input    # also expose click, type, set-value and the rest
+```
+
+Configure it in an MCP host with `"command": "lvt.exe", "args": ["mcp", "--allow-input"]`.
+
+The flow is `connect` (returns a session id) → `get_uia_tree` or `find_elements`
+(returns element ids) → act on those ids. Without `--allow-input` the tools that
+change the target app are not registered at all.
+
+**Pick a mode when you connect.** The default `mode: "uia"` acts through UI
+Automation patterns: no cursor movement, no focus stealing, and it works whatever
+the target's architecture. `mode: "visual"` acts through the framework-native
+tree instead, aiming real clicks and keystrokes at where an element is - use it
+for custom-drawn UIs that UI Automation cannot see properly, or when the app must
+observe genuine input.
+
+A session only accepts references from its own tree. A `visual:e33` passed to a
+uia session is refused rather than matched to something similar, and vice versa,
+because the two trees describe different sets of nodes - one button is a single
+UIA element but often three visual ones. Open a second session if you need both;
+they are independent and cheap. A session's mode cannot be changed afterwards.
+
+`get_visual_tree` with `correlate: true` reports which visual elements UI
+Automation exposes (`uiaRef`) and which it does not - a quick way to tell whether
+something is automatable through patterns at all.
+
+Every result carries `structuredContent` as well as the text block, and each tool
+declares an `outputSchema`, so answers can be consumed as data rather than
+re-parsed.
+
+See `docs/mcp-server.md` in the repository for the full tool reference.
+
 ## Tips
 
 - Use `--format xml` for human-readable output and `--format json` for programmatic parsing

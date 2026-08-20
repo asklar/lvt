@@ -12,6 +12,8 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 - Detects UI frameworks in use: Win32, ComCtl, Windows XAML (UWP), WinUI 3, WPF, [Avalonia](docs/avalonia-plugin.md), [Chrome/Edge](docs/chromium-plugin.md)
 - Outputs a unified element tree as JSON or XML markup
 - Optionally emits the app's [UI Automation tree](#ui-automation-tree---uia) instead, with `AutomationId`s, control types and supported patterns
+- Drives applications: click, type, toggle, set values, scroll — through UI Automation patterns where possible
+- Runs as an [MCP server](docs/mcp-server.md) (`lvt mcp`), so agents can inspect and operate Windows apps as a computer-use tool
 - Captures annotated PNG screenshots with element IDs overlaid
 - Elements get stable IDs (`e0`, `e1`, …) so AI agents can reference specific parts of the UI
 
@@ -39,6 +41,7 @@ This gives Copilot the ability to inspect any running Windows app's UI when you 
 - [vcpkg](https://vcpkg.io) with `VCPKG_ROOT` environment variable set
 - CMake 3.20+
 - x64 Developer Command Prompt
+- [Rust](https://rustup.rs) — only for the MCP server, which is off by default
 
 #### Build
 
@@ -50,6 +53,10 @@ cmake --build build
 # ARM64 build
 cmake --preset arm64
 cmake --build build-arm64
+
+# With the MCP server (needs a Rust toolchain)
+cmake --preset default -DLVT_ENABLE_MCP=ON
+cmake --build build
 ```
 
 Produces `build/lvt.exe` and `build/lvt_tap_x64.dll` (or `build-arm64/lvt.exe` and `build-arm64/lvt_tap_arm64.dll` for ARM64).
@@ -202,6 +209,7 @@ lvt wait-for e9 --wait-prop IsEnabled=true --name myapp
 | `frameworks` | List the UI frameworks the target uses |
 | `watch` | Emit live JSON tree diff events until Ctrl+C |
 | `query <ref> [prop]` | Output one element, or one of its properties |
+| `mcp` | Serve the [Model Context Protocol](docs/mcp-server.md) over stdio |
 
 ### Options
 
@@ -346,6 +354,51 @@ not merely its values. Expanding a combo box, for instance, reparents it into a
 popup: its `eN` moves and its `RuntimeId` changes, while its durable key does
 not. Use `eN` for one-shot commands against a static UI, and the **durable key**
 for anything that acts across a structural change.
+
+## MCP server
+
+`lvt mcp` serves the [Model Context Protocol](https://modelcontextprotocol.io)
+over stdio, so an agent can inspect and drive Windows applications through the
+same machinery the CLI uses — making lvt a general-purpose computer-use tool for
+Windows. It is served by `lvt.exe` itself; there is no second binary and no
+daemon.
+
+```powershell
+lvt mcp                  # inspection only
+lvt mcp --allow-input    # also expose the tools that change the target app
+```
+
+```json
+{
+  "mcpServers": {
+    "lvt": { "command": "C:\\tools\\lvt\\lvt.exe", "args": ["mcp", "--allow-input"] }
+  }
+}
+```
+
+An agent calls `connect` to open a session on a window, then `get_uia_tree` or
+`find_elements` to get element ids, then acts on them with `click`, `set_value`,
+`toggle` and the rest. `hit_test` turns a screen coordinate into an element, and
+`screenshot` returns an annotated PNG inline.
+
+A session declares which tree it speaks. The default, `mode: "uia"`, drives
+controls through their UI Automation patterns — no cursor movement, no focus
+stealing, and it works across architectures. `mode: "visual"` drives the
+framework-native tree instead, aiming real clicks and keystrokes at where an
+element is, which is what custom-drawn UIs need. A session only accepts
+references from its own tree and refuses the other's rather than guessing, so
+hold one session of each if you need both.
+
+Results come back as `structuredContent` as well as text, every tool declares an
+`outputSchema`, and tools are annotated read-only or destructive so a host can
+decide what to confirm.
+
+Without `--allow-input` the mutating tools are not registered at all, so a model
+cannot be talked into using one. See **[docs/mcp-server.md](docs/mcp-server.md)**
+for the full tool reference and the security model.
+
+Building it from source needs a Rust toolchain and is opt-in
+(`-DLVT_ENABLE_MCP=ON`); released binaries have it built in.
 
 ## Output format
 

@@ -1,0 +1,27 @@
+[package]
+name = "lvt_mcp"
+version = "0.3.0"
+edition = "2021"
+description = "MCP server surface for lvt, linked into lvt.exe"
+publish = false
+
+[lib]
+name = "lvt_mcp"
+# A staticlib, not a cdylib or a second binary: `lvt mcp` has to be served by
+# lvt.exe itself, so the release zip stays one executable plus its TAP DLLs.
+crate-type = ["staticlib"]
+
+[dependencies]
+rmcp = { version = "3.1", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-std", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+[profile.release]
+# A Rust panic unwinding across the FFI boundary into C++ is undefined
+# behaviour. Every entry point catches panics explicitly; abort is the backstop
+# for anything that escapes, including panics in a panic handler.
+panic = "abort"
+opt-level = "s"
+strip = "debuginfo"
