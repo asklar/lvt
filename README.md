@@ -381,6 +381,18 @@ An agent calls `connect` to open a session on a window, then `get_uia_tree` or
 `toggle` and the rest. `hit_test` turns a screen coordinate into an element, and
 `screenshot` returns an annotated PNG inline.
 
+A session declares which tree it speaks. The default, `mode: "uia"`, drives
+controls through their UI Automation patterns — no cursor movement, no focus
+stealing, and it works across architectures. `mode: "visual"` drives the
+framework-native tree instead, aiming real clicks and keystrokes at where an
+element is, which is what custom-drawn UIs need. A session only accepts
+references from its own tree and refuses the other's rather than guessing, so
+hold one session of each if you need both.
+
+Results come back as `structuredContent` as well as text, every tool declares an
+`outputSchema`, and tools are annotated read-only or destructive so a host can
+decide what to confirm.
+
 Without `--allow-input` the mutating tools are not registered at all, so a model
 cannot be talked into using one. See **[docs/mcp-server.md](docs/mcp-server.md)**
 for the full tool reference and the security model.

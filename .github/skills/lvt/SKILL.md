@@ -268,6 +268,27 @@ The flow is `connect` (returns a session id) → `get_uia_tree` or `find_element
 (returns element ids) → act on those ids. Without `--allow-input` the tools that
 change the target app are not registered at all.
 
+**Pick a mode when you connect.** The default `mode: "uia"` acts through UI
+Automation patterns: no cursor movement, no focus stealing, and it works whatever
+the target's architecture. `mode: "visual"` acts through the framework-native
+tree instead, aiming real clicks and keystrokes at where an element is - use it
+for custom-drawn UIs that UI Automation cannot see properly, or when the app must
+observe genuine input.
+
+A session only accepts references from its own tree. A `visual:e33` passed to a
+uia session is refused rather than matched to something similar, and vice versa,
+because the two trees describe different sets of nodes - one button is a single
+UIA element but often three visual ones. Open a second session if you need both;
+they are independent and cheap. A session's mode cannot be changed afterwards.
+
+`get_visual_tree` with `correlate: true` reports which visual elements UI
+Automation exposes (`uiaRef`) and which it does not - a quick way to tell whether
+something is automatable through patterns at all.
+
+Every result carries `structuredContent` as well as the text block, and each tool
+declares an `outputSchema`, so answers can be consumed as data rather than
+re-parsed.
+
 See `docs/mcp-server.md` in the repository for the full tool reference.
 
 ## Tips
