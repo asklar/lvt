@@ -105,6 +105,22 @@ jobs:
           if (Test-Path ${{ matrix.build_dir }}\LvtWpfTap.dll) {
             Copy-Item ${{ matrix.build_dir }}\LvtWpfTap.dll release\
           }
+          if (Test-Path ${{ matrix.build_dir }}\LvtWpfTap.runtimeconfig.json) {
+            Copy-Item ${{ matrix.build_dir }}\LvtWpfTap.runtimeconfig.json release\
+          }
+          # WinForms TAP DLL + managed assembly - same shape as WPF above. These
+          # used to be missing from the release zip entirely, so every release
+          # silently shipped without WinForms enrichment even though it was
+          # built and tested.
+          if (Test-Path ${{ matrix.build_dir }}\lvt_winforms_tap_${{ matrix.arch }}.dll) {
+            Copy-Item ${{ matrix.build_dir }}\lvt_winforms_tap_${{ matrix.arch }}.dll release\
+          }
+          if (Test-Path ${{ matrix.build_dir }}\LvtWinFormsTap.dll) {
+            Copy-Item ${{ matrix.build_dir }}\LvtWinFormsTap.dll release\
+          }
+          if (Test-Path ${{ matrix.build_dir }}\LvtWinFormsTap.runtimeconfig.json) {
+            Copy-Item ${{ matrix.build_dir }}\LvtWinFormsTap.runtimeconfig.json release\
+          }
           if (Test-Path ${{ matrix.build_dir }}\plugins) {
             Copy-Item -Recurse ${{ matrix.build_dir }}\plugins release\plugins
           }

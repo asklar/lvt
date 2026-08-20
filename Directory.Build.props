@@ -1,0 +1,22 @@
+<Project>
+  <!--
+    Shared MSBuild metadata for every managed .NET helper assembly under this
+    repo (WPF/WinForms/Avalonia tree walkers, and the sample test apps).
+    MSBuild auto-discovers Directory.Build.props in ancestor directories, so
+    no individual .csproj needs to reference this file.
+
+    The version comes from the repo-root VERSION file - the single source of
+    truth also read by CMakeLists.txt - so there is exactly one place to edit
+    when cutting a release, instead of one per ecosystem (CMake/MSBuild/Cargo).
+  -->
+  <PropertyGroup>
+    <LvtVersionFile>$(MSBuildThisFileDirectory)VERSION</LvtVersionFile>
+    <Version>$([System.IO.File]::ReadAllText('$(LvtVersionFile)').Trim())</Version>
+    <FileVersion>$(Version).0</FileVersion>
+    <AssemblyVersion>$(Version).0</AssemblyVersion>
+    <InformationalVersion>$(Version)</InformationalVersion>
+    <Company>Alexander Sklar</Company>
+    <Product>lvt (Live Visual Tree)</Product>
+    <Copyright>Copyright (C) Alexander Sklar</Copyright>
+  </PropertyGroup>
+</Project>

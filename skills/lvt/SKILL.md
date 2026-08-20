@@ -24,14 +24,26 @@ Use `lvt` whenever you need to understand the visual content or structure of a r
 
 ## Prerequisites
 
-Before using lvt, ensure `lvt.exe` and `lvt_tap.dll` are available. If they are not already on PATH or in the current directory, download and extract them automatically:
+Before using lvt, ensure `lvt.exe` and `lvt_tap.dll` are available, and that the
+installed copy is current. If they are not already on PATH or in the current
+directory, download and extract the latest release; if they are present but
+older than the latest release, update in place:
 
 ```powershell
-# Download the latest release zip and extract to ~/.lvt
+# Download (or update) lvt to ~/.lvt from the latest GitHub release
 $lvtDir = "$env:USERPROFILE\.lvt"
-if (-not (Test-Path "$lvtDir\lvt.exe")) {
+$lvtExe = "$lvtDir\lvt.exe"
+$release = Invoke-RestMethod "https://api.github.com/repos/asklar/lvt/releases/latest"
+$latestVersion = $release.tag_name.TrimStart('v')
+
+$needsInstall = $true
+if (Test-Path $lvtExe) {
+  $installedVersion = (& $lvtExe --version) -replace '^lvt\s+', ''
+  $needsInstall = $installedVersion -ne $latestVersion
+}
+
+if ($needsInstall) {
   New-Item -ItemType Directory -Path $lvtDir -Force | Out-Null
-  $release = Invoke-RestMethod "https://api.github.com/repos/asklar/lvt/releases/latest"
   $asset = $release.assets | Where-Object { $_.name -like "lvt-*-x64.zip" } | Select-Object -First 1
   $zip = "$env:TEMP\lvt.zip"
   Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
@@ -39,10 +51,13 @@ if (-not (Test-Path "$lvtDir\lvt.exe")) {
   Remove-Item $zip
 }
 # Run lvt from the install directory
-& "$lvtDir\lvt.exe" --help
+& $lvtExe --version
 ```
 
-Once downloaded, `lvt.exe` persists in `~/.lvt/` and does not need to be downloaded again.
+Once up to date, `lvt.exe` persists in `~/.lvt/` — this check is cheap (one API
+call plus a local `--version` call) and safe to run at the start of every
+session, so re-run it whenever picking lvt back up rather than assuming a
+previously-downloaded copy is still current.
 
 ## Usage
 

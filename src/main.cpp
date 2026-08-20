@@ -7,6 +7,7 @@
 #include "plugin_loader.h"
 #include "debug.h"
 #include "wil_diagnostics.h"
+#include "lvt_config.h"
 #ifdef LVT_ENABLE_UIA
 #include "providers/uia_provider.h"
 #include "providers/uia_actions.h"
@@ -112,6 +113,7 @@ static void print_usage() {
         "\n"
         "  --debug              Show verbose diagnostic output\n"
         "  --help               Show this help\n"
+        "  --version            Show the lvt version\n"
     );
 }
 
@@ -314,6 +316,11 @@ static Args parse_args(int argc, char* argv[]) {
 
         if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
             print_usage();
+            exit(0);
+        }
+
+        if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
+            printf("lvt %s\n", LVT_VERSION);
             exit(0);
         }
 
