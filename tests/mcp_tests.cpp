@@ -2229,6 +2229,189 @@ TEST_F(McpSampleFixture, ModesRefuseEachOthersReferences) {
     EXPECT_NE(result.value("error", "").find("visual mode"), std::string::npos) << result.dump(2);
     EXPECT_NE(result.value("error", "").find("uia"), std::string::npos)
         << "the message should say how to do what was asked: " << result.dump(2);
+
+    // The qualified form is the easy case. The dangerous one is a *bare* `eN`
+    // read off a UIA tree and then used in a visual session: there is nothing
+    // in the string to refuse, and `e15` exists in both trees while meaning
+    // different controls in each. This is precisely how a "Go back" button in
+    // one tree became an unrelated element in the other.
+    //
+    // Two things have to hold for that to be safe, and both are asserted here.
+    auto uiaTree = client.call_tool("get_uia_tree", json{{"session", visualSession}});
+    ASSERT_TRUE(uiaTree.contains("root")) << uiaTree.dump(2);
+    std::vector<const json*> uiaNodes;
+    collect_json_elements(uiaTree["root"], uiaNodes);
+    ASSERT_GT(uiaNodes.size(), 1u) << uiaTree.dump(2);
+
+    // First: the bare form is never what a caller is handed. Every element
+    // carries a qualified `ref`, so following the protocol cannot produce the
+    // ambiguity in the first place.
+    for (const auto* node : uiaNodes) {
+        ASSERT_EQ(node->value("ref", "").rfind("uia:", 0), 0u)
+            << "an element from the UIA tree must name its tree: " << node->dump();
+    }
+
+    // Second: if a caller supplies the bare form anyway, lvt says which tree
+    // it read it against instead of resolving silently. A stated answer can be
+    // checked; a silent one cannot.
+    const auto bare = uiaNodes[1]->value("id", "");
+    ASSERT_FALSE(bare.empty());
+    ASSERT_EQ(bare.rfind("e", 0), 0u) << "expected a bare element id, got " << bare;
+    auto resolved = client.call_tool(
+        "get_element_properties", json{{"session", visualSession}, {"element", bare}});
+    if (resolved.contains("tree")) {
+        EXPECT_EQ(resolved.value("tree", ""), "visual")
+            << "a bare id in a visual session must be read against the visual tree, and said so: "
+            << resolved.dump(2);
+        // The full-element response nests the qualified reference inside
+        // `element`; the named-subset response carries it at the top level.
+        const auto echoed = resolved.contains("element") && resolved["element"].is_object()
+                                ? resolved["element"].value("ref", "")
+                                : resolved.value("ref", "");
+        EXPECT_EQ(echoed.rfind("visual:", 0), 0u)
+            << "the echoed reference must be qualified so the caller can see the reading: "
+            << resolved.dump(2);
+    } else {
+        // Not found is equally acceptable — what is not acceptable is a
+        // confident answer about the wrong tree.
+        EXPECT_TRUE(resolved.contains("error")) << resolved.dump(2);
+    }
+}
+
+TEST_F(McpSampleFixture, CorrelationStillWorksUnderAnElementScope) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto whole = client.call_tool(
+        "get_visual_tree", json{{"session", session}, {"correlate", true}});
+    if (!whole.contains("root"))
+        GTEST_SKIP() << "the visual tree is unavailable here";
+
+    // Find a node deep enough that its correlated ancestor sits above it, then
+    // ask for that node as a scope. Correlation used to start its walk at the
+    // scoped root, so everything the subtree inherited from above was thrown
+    // away and a scoped request reported far less than the same nodes did in
+    // an unscoped one — the caller narrowing the output lost the very field
+    // they narrowed it to read.
+    std::vector<const json*> all;
+    collect_json_elements(whole["root"], all);
+    const json* scope = nullptr;
+    for (const auto* node : all) {
+        if (!node->value("uiaAncestorRef", "").empty() && node->contains("children") &&
+            !(*node)["children"].empty()) {
+            scope = node;
+            break;
+        }
+    }
+    ASSERT_NE(scope, nullptr)
+        << "no nested node inherited a counterpart, so the scoped case cannot be tested";
+
+    const auto scopeId = scope->value("id", "");
+    std::vector<const json*> expected;
+    collect_json_elements(*scope, expected);
+    int expectedCorrelated = 0;
+    for (const auto* node : expected) {
+        if (!node->value("uiaRef", "").empty() || !node->value("uiaAncestorRef", "").empty())
+            ++expectedCorrelated;
+    }
+    ASSERT_GT(expectedCorrelated, 0);
+
+    auto scoped = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}, {"element", scopeId}, {"correlate", true}});
+    ASSERT_TRUE(scoped.contains("root")) << scoped.dump(2);
+
+    std::vector<const json*> scopedNodes;
+    collect_json_elements(scoped["root"], scopedNodes);
+    int actualCorrelated = 0;
+    for (const auto* node : scopedNodes) {
+        if (!node->value("uiaRef", "").empty() || !node->value("uiaAncestorRef", "").empty())
+            ++actualCorrelated;
+    }
+    EXPECT_EQ(actualCorrelated, expectedCorrelated)
+        << "scoping the request changed what correlated; the same elements must correlate the "
+           "same way however they were asked for";
+
+    // The reported count describes this response, not the whole-tree pass it
+    // was computed from, or a scoped caller is told about matches they cannot
+    // see.
+    EXPECT_EQ(scoped.value("correlated", -1), actualCorrelated) << scoped.dump(2);
+    EXPECT_LT(scoped.value("correlated", -1), whole.value("correlated", -1))
+        << "a subtree cannot have correlated as much as the whole tree: " << scoped.dump(2);
+}
+
+TEST_F(McpSampleFixture, FindingByPatternInAVisualSessionSaysWhyItCannot) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    // Patterns describe what a control can *do*, which only UI Automation
+    // knows; the visual tree records how it is built. Filtering a visual tree
+    // by pattern therefore matched nothing and came back as an empty list,
+    // which reads as "this app has no invokable controls" — a statement about
+    // the app, when the truth is a statement about the tree.
+    bool isError = false;
+    auto result = client.call_tool(
+        "find_elements", json{{"session", session}, {"pattern", "Invoke"}}, &isError);
+    ASSERT_TRUE(isError) << "an unanswerable query must not come back as an empty answer: "
+                         << result.dump(2);
+    const auto message = result.value("error", "");
+    EXPECT_NE(message.find("pattern"), std::string::npos) << message;
+    EXPECT_NE(message.find("uia"), std::string::npos)
+        << "the message should say how to ask the question properly: " << message;
+
+    // The rest of find_elements still works in this session, so the refusal is
+    // about the one argument and not the tool.
+    auto byName = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    EXPECT_FALSE(byName["elements"].empty()) << byName.dump(2);
+
+    // And the same query is answerable in the mode that owns the concept.
+    const auto uiaSession = connect(client);
+    auto uiaResult = client.call_tool(
+        "find_elements", json{{"session", uiaSession}, {"pattern", "Invoke"}});
+    EXPECT_FALSE(uiaResult["elements"].empty()) << uiaResult.dump(2);
+}
+
+TEST(McpServer, OnlyTheVisualTreeOffersCorrelation) {
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    // Both tree tools shared one argument type, so get_uia_tree advertised
+    // `correlate` and then ignored it: the caller asked for counterparts, got
+    // a tree without them, and was told nothing. A flag a tool cannot honour
+    // should not appear in its schema at all.
+    auto tools = client.request("tools/list")["result"]["tools"];
+    bool sawUia = false;
+    bool sawVisual = false;
+    for (const auto& tool : tools) {
+        const auto name = tool.value("name", "");
+        if (name != "get_uia_tree" && name != "get_visual_tree")
+            continue;
+        const auto& properties = tool["inputSchema"]["properties"];
+        if (name == "get_uia_tree") {
+            sawUia = true;
+            EXPECT_FALSE(properties.contains("correlate"))
+                << "the UIA tree cannot correlate to itself: " << tool["inputSchema"].dump(2);
+        } else {
+            sawVisual = true;
+            EXPECT_TRUE(properties.contains("correlate"))
+                << "the visual tree must still offer it: " << tool["inputSchema"].dump(2);
+        }
+    }
+    EXPECT_TRUE(sawUia);
+    EXPECT_TRUE(sawVisual);
 }
 
 TEST_F(McpSampleFixture, VisualModeSaysWhatItCannotExpress) {
@@ -2515,6 +2698,160 @@ TEST_F(McpSampleFixture, VisualModeClicksAMinimizedWindowOnTheFirstTry) {
         &isError);
     EXPECT_FALSE(isError) << "the first click on a minimized window failed: " << result.dump(2);
     EXPECT_EQ(result.value("method", ""), "SendInput");
+}
+
+TEST_F(McpSampleFixture, VisualModeClicksThroughAWindowSittingOnTopOfTheTarget) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    // Visual mode aims real input at screen coordinates, so it only works if
+    // the target is actually the thing drawn there. bring_to_foreground gave
+    // the window the input focus but never fixed its z-order, so whenever
+    // anything else happened to be covering the app — a chat window, a browser,
+    // the terminal running this suite — every click was refused as "covered by
+    // another window". It worked on a clean desktop and failed on a real one,
+    // which is the worst possible failure mode: it looks like flakiness.
+    //
+    // Setting that up deliberately is the only way to test it. A second sample
+    // instance is used as the obstruction because it has its own message pump.
+    STARTUPINFOA si{sizeof(si)};
+    PROCESS_INFORMATION pi{};
+    std::string cmd = WINUI3_SAMPLE_EXE_PATH;
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                        fs::path(WINUI3_SAMPLE_EXE_PATH).parent_path().string().c_str(), &si, &pi))
+        GTEST_SKIP() << "could not launch a second sample instance to act as an obstruction";
+    wil::unique_process_handle blocker(pi.hProcess);
+    wil::unique_handle blockerThread(pi.hThread);
+    auto killBlocker = wil::scope_exit([&] { TerminateProcess(blocker.get(), 0); });
+    WaitForInputIdle(blocker.get(), 10000);
+
+    struct Search {
+        DWORD pid;
+        HWND found;
+    } search{pi.dwProcessId, nullptr};
+    HWND obstruction = nullptr;
+    for (int attempt = 0; attempt < 20 && !obstruction; ++attempt) {
+        search.found = nullptr;
+        EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+            auto* state = reinterpret_cast<Search*>(lParam);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(hwnd, &owner);
+            if (owner != state->pid || !IsWindowVisible(hwnd))
+                return TRUE;
+            char title[256];
+            GetWindowTextA(hwnd, title, sizeof(title));
+            if (!strstr(title, "LVT WinUI3 Sample"))
+                return TRUE;
+            state->found = hwnd;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&search));
+        obstruction = search.found;
+        if (!obstruction)
+            Sleep(500);
+    }
+    if (!obstruction)
+        GTEST_SKIP() << "the second sample instance never showed a window";
+
+    // Find the target element *before* setting up the obstruction. Building a
+    // visual tree injects into the target, which can disturb z-order, so doing
+    // it afterwards would sometimes undo the very setup being tested.
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_FALSE(found["elements"].empty()) << found.dump(2);
+    const auto& b = found["elements"][0]["bounds"];
+    const POINT centre{b.value("x", 0) + b.value("width", 0) / 2,
+                       b.value("y", 0) + b.value("height", 0) / 2};
+
+    const auto uiaSession = connect(client);
+    const auto before = status_text(client, uiaSession);
+
+    // Park the obstruction exactly over the target and keep asking until it is
+    // genuinely the window at the point. Raising another process's window above
+    // the *foreground* window is not permitted, and after a preceding test the
+    // sample usually is the foreground window — so the target is pushed to the
+    // bottom as well, which needs no such permission. Either way the end state
+    // is the one being tested: the target is behind something.
+    RECT target{};
+    ASSERT_TRUE(GetWindowRect(s_hwnd, &target));
+    bool covered = false;
+    for (int attempt = 0; attempt < 20 && !covered; ++attempt) {
+        SetWindowPos(obstruction, HWND_TOP, target.left, target.top,
+                     target.right - target.left, target.bottom - target.top, SWP_SHOWWINDOW);
+        SetWindowPos(s_hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        Sleep(250);
+        covered = GetAncestor(WindowFromPoint(centre), GA_ROOT) == obstruction;
+    }
+    // Not a skip. If the obstruction cannot be put on top there is no way to
+    // run this test, but silently passing would leave a z-order regression
+    // undetected for exactly as long as the setup stayed broken.
+    ASSERT_TRUE(covered)
+        << "could not place a window over the target, so the occlusion case was never exercised";
+
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", session}, {"element", found["elements"][0].value("ref", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << "a click was refused because another window was on top; visual mode "
+                             "is supposed to raise the target first: "
+                          << result.dump(2);
+    EXPECT_EQ(result.value("method", ""), "SendInput") << result.dump(2);
+
+    // Reporting success is not enough — the click has to have reached the app
+    // we targeted rather than the one that was covering it.
+    EXPECT_NE(status_text(client, uiaSession), before)
+        << "the click did not reach the target application";
+}
+
+TEST_F(McpSampleFixture, AnOccludedElementNamesWhatIsInTheWay) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto visual = client.call_tool(
+        "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+    const auto session = visual.value("session", "");
+    ASSERT_FALSE(session.empty());
+
+    // "covered by another window" is true but unactionable: scrolling a list
+    // and closing an app that is sitting on top need opposite responses, and
+    // the caller cannot tell which they are looking at. The refusal has to name
+    // the window in the way.
+    auto tree = client.call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto& rootBounds = tree["root"]["bounds"];
+    const int bottom = rootBounds.value("y", 0) + rootBounds.value("height", 0);
+
+    std::vector<const json*> all;
+    collect_json_elements(tree["root"], all);
+    const json* below = nullptr;
+    for (const auto* node : all) {
+        const auto& b = (*node)["bounds"];
+        if (b.value("height", 0) > 0 && b.value("width", 0) > 0 && b.value("y", 0) > bottom &&
+            !node->value("ref", "").empty()) {
+            below = node;
+            break;
+        }
+    }
+    if (!below)
+        GTEST_SKIP() << "no element sits outside the window, so nothing is occluded";
+
+    bool isError = false;
+    auto result = client.call_tool(
+        "click", json{{"session", session}, {"element", below->value("ref", "")}}, &isError);
+    ASSERT_TRUE(isError) << result.dump(2);
+    const auto message = result.value("error", "");
+    EXPECT_NE(message.find("covered by"), std::string::npos) << message;
+    EXPECT_EQ(message.find("covered by another window"), std::string::npos)
+        << "the refusal must name the window in the way, not just say there is one: " << message;
+    EXPECT_NE(message.find(".exe"), std::string::npos)
+        << "the occluding window should be identified by its process: " << message;
 }
 
 TEST_F(McpSampleFixture, CorrelationSaysWhenItCouldNotRead) {

@@ -39,6 +39,53 @@ using json = nlohmann::json;
 
 namespace {
 
+std::string to_utf8(const std::wstring& text) {
+    if (text.empty())
+        return {};
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (size <= 0)
+        return {};
+    std::string out(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), out.data(), size,
+                        nullptr, nullptr);
+    return out;
+}
+
+// Identify a window well enough for a human or an agent to act on the answer.
+// A refusal that says only "another window" leaves the caller guessing between
+// "scroll the list" and "that chat window is covering the app".
+std::string describe_window(HWND hwnd) {
+    std::wstring title;
+    const int length = GetWindowTextLengthW(hwnd);
+    if (length > 0) {
+        title.resize(static_cast<size_t>(length) + 1);
+        title.resize(static_cast<size_t>(GetWindowTextW(hwnd, title.data(), length + 1)));
+    }
+
+    std::string process;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != 0) {
+        wil::unique_handle handle(
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+        if (handle) {
+            wchar_t path[MAX_PATH]{};
+            DWORD size = MAX_PATH;
+            if (QueryFullProcessImageNameW(handle.get(), 0, path, &size)) {
+                const std::wstring full(path, size);
+                const auto slash = full.find_last_of(L'\\');
+                process = to_utf8(slash == std::wstring::npos ? full : full.substr(slash + 1));
+            }
+        }
+    }
+
+    std::string described = process.empty() ? std::string("another window") : process;
+    if (!title.empty())
+        described += " (\"" + to_utf8(title) + "\")";
+    return described;
+}
+
 // --- session registry ---------------------------------------------------
 // The MCP server can hold several targets at once, so a connection is a named
 // handle rather than an implicit "current" window. Keeping the resolved HWND
@@ -730,14 +777,26 @@ json method_get_tree(const json& params, bool uia) {
     // otherwise has to work out for themselves: given this visual element,
     // what do I act on?
     CorrelationMap correlation;
-    const bool wantCorrelation = !uia && get_bool(params, "correlate", false);
+    const bool wantCorrelation = get_bool(params, "correlate", false);
+    // Correlation answers "given this visual element, what do I act on?".
+    // Asked of the UIA tree it has no meaning — those elements are already the
+    // ones you act on. Ignoring the flag would hand back a tree missing the
+    // field the caller asked for, with nothing to say why.
+    if (wantCorrelation && uia)
+        throw std::runtime_error(
+            "'correlate' relates visual elements to their UI Automation counterparts, so it "
+            "applies to the visual tree only; UI Automation elements are already actionable");
     std::string correlationError;
     bool correlationTruncated = false;
     if (wantCorrelation) {
         lvt::Element uiaTree;
         if (build_tree_for(session, params, true, uiaTree, correlationError,
                            &correlationTruncated))
-            correlate_visual_to_uia(uiaTree, *root, correlation);
+            // Correlate from the whole tree, not the scoped subtree. The
+            // ancestor a node inherits its context from usually sits *above*
+            // the scope, so starting at the subtree root threw that away and
+            // left a scoped request reporting far less than an unscoped one.
+            correlate_visual_to_uia(uiaTree, tree, correlation);
     }
 
     json out{{"root", element_to_json(*root, true, tree_name(uia),
@@ -746,7 +805,16 @@ json method_get_tree(const json& params, bool uia) {
     // only reads the top of the response.
     out["tree"] = tree_name(uia);
     if (wantCorrelation) {
-        out["correlated"] = static_cast<uint64_t>(correlation.size());
+        // Count what this response actually reports, not what the whole-tree
+        // pass happened to find, or a scoped request would claim credit for
+        // correlations the caller cannot see.
+        std::vector<const lvt::Element*> reported;
+        collect_elements(*root, reported);
+        uint64_t inScope = 0;
+        for (const auto* element : reported)
+            if (correlation.count(element) != 0)
+                ++inScope;
+        out["correlated"] = inScope;
         // "nothing correlated" and "the UIA side could not be read" look
         // identical from a count alone, and the second is not a statement about
         // the app.
@@ -785,6 +853,16 @@ json method_find_elements(const json& params) {
     const auto type = get_string(params, "type");
     const auto pattern = get_string(params, "pattern");
     const int limit = get_int(params, "limit", 50);
+
+    // Patterns are a UI Automation concept; the visual tree records how a
+    // control is built, not what it can do. Filtering on one here matched
+    // nothing and returned an empty list, which reads as "no such control"
+    // rather than "this tree cannot answer that".
+    if (!pattern.empty() && !uia)
+        throw std::runtime_error(
+            "'pattern' filters on UI Automation patterns, which the visual tree does not "
+            "carry; connect with mode 'uia' to search by pattern, or search this tree by "
+            "'type' or 'name'");
 
     std::vector<const lvt::Element*> all;
     collect_elements(tree, all);
@@ -1450,10 +1528,14 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
         if (atPoint) {
             HWND root = GetAncestor(atPoint, GA_ROOT);
             if (root && root != session.hwnd) {
-                throw std::runtime_error(
-                    "element '" + ref +
-                    "' is at a point covered by another window — it is probably scrolled out of "
-                    "view or clipped. Scroll it into view first.");
+                // Naming the window that is in the way turns an unactionable
+                // refusal into something a caller can respond to: "scroll the
+                // list" and "a chat window is sitting on top of the app" need
+                // opposite reactions, and the message used to fit both.
+                throw std::runtime_error("element '" + ref + "' is at a point covered by " +
+                                         describe_window(root) +
+                                         " — either it is scrolled out of view or clipped, or "
+                                         "that window is on top of the target");
             }
         }
         return centre;

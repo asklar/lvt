@@ -144,6 +144,12 @@ app by geometry while driving a normal one by patterns.
 note pointing at `uia` mode, rather than approximated by a click that might do
 something else.
 
+`find_elements` follows the same rule. Its `pattern` filter asks what a control
+can *do*, which only UI Automation knows, so in a visual session it is refused
+with a note rather than answered with an empty list — "no matches" would read
+as a statement about the app when it is really a statement about the tree.
+`automationId`, `name` and `type` work in both modes.
+
 ## The two trees are different shapes, not different numbering
 
 This is the thing to internalise: the UIA tree and the visual tree are not one
@@ -196,6 +202,14 @@ pointing at its container.
 Correlation needs both trees, so it costs a second walk and is off by default.
 If the UIA side cannot be read, the response says so (`correlationFailed`)
 rather than reporting zero matches.
+
+`correlate` belongs to `get_visual_tree` alone — a UIA element is already the
+thing you act on, so there is nothing to correlate it to. Scoping the request
+with `element` does not change any element's counterpart: correlation is
+computed over the whole tree and then reported for the part you asked for, so a
+subtree says the same thing about its nodes as the full tree does. The
+`correlated` count describes the response you got, not the whole-tree pass
+behind it.
 
 ### Acting on a visual-tree element
 

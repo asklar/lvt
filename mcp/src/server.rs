@@ -86,9 +86,35 @@ pub struct TreeArgs {
     /// 10000). Raise this if a result comes back marked "truncated".
     #[serde(rename = "timeoutMs")]
     pub timeout_ms: Option<i32>,
-    /// get_visual_tree only: also report each element's UI Automation
-    /// counterpart as "uiaRef", so you can act on what you find without
-    /// looking it up again. Several visual nodes often share one counterpart.
+}
+
+/// The visual tree takes everything TreeArgs does plus `correlate`. The two
+/// are separate types rather than one shared type with an ignored field: a
+/// flag the UIA tool advertises but cannot honour is an invitation to pass it.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VisualTreeArgs {
+    /// Session id returned by connect.
+    pub session: String,
+    /// Element reference. Prefer the qualified "ref" a tool gave you
+    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
+    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
+    /// ambiguous and is read against this tool's default tree.
+    pub element: Option<String>,
+    /// Maximum depth below the root. Omit for the whole tree.
+    pub depth: Option<i32>,
+    /// UIA tree view applied to the correlation walk: "control" (default),
+    /// "content", or "raw".
+    pub view: Option<String>,
+    /// Extra UIA properties to include beyond the default set.
+    pub properties: Option<Vec<String>>,
+    /// How long the UI Automation walk may take, in milliseconds (default
+    /// 10000). Raise this if a result comes back marked "truncated".
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<i32>,
+    /// Also report each element's UI Automation counterpart. "uiaRef" is the
+    /// element's own counterpart and is safe to act on; "uiaAncestorRef" is
+    /// the counterpart of the control it sits inside, which is context only.
+    /// Many visual nodes are template parts with no counterpart of their own.
     /// Costs a second walk, so it is off by default.
     pub correlate: Option<bool>,
 }
@@ -481,8 +507,8 @@ impl LvtServer {
                        to get each one's UI Automation counterpart and act on that. Requires lvt \
                        and the target to share an architecture."
     )]
-    async fn get_visual_tree(&self, Parameters(a): Parameters<TreeArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("get_visual_tree", tree_params(a), self.allow_input).await
+    async fn get_visual_tree(&self, Parameters(a): Parameters<VisualTreeArgs>) -> Result<CallToolResult, ErrorData> {
+        forward("get_visual_tree", visual_tree_params(a), self.allow_input).await
     }
 
     #[tool(description = "List the UI frameworks detected in the connected application, with versions.")]
@@ -604,6 +630,17 @@ impl LvtServer {
 }
 
 fn tree_params(a: TreeArgs) -> serde_json::Value {
+    compact(json!({
+        "session": a.session,
+        "element": a.element,
+        "depth": a.depth,
+        "view": a.view,
+        "properties": a.properties,
+        "timeoutMs": a.timeout_ms,
+    }))
+}
+
+fn visual_tree_params(a: VisualTreeArgs) -> serde_json::Value {
     compact(json!({
         "session": a.session,
         "element": a.element,
