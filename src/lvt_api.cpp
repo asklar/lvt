@@ -657,8 +657,8 @@ bool tree_for_session(const Session& session, const json& params) {
 // AutomationId. Providers spell this differently: XAML and WPF both surface
 // x:Name / Name as "name", and XAML additionally keeps automation properties
 // under their literal XAML names. Looking only for "AutomationId" — which no
-// provider emits — meant the identity path never ran at all, and every bridge
-// fell through to matching on text.
+// provider emits — meant the identity path never ran at all, so no real control
+// ever correlated and the fallbacks did all the work.
 std::vector<std::string> visual_identity_values(const lvt::Element& visual) {
     static constexpr const char* kKeys[] = {
         "AutomationProperties.AutomationId",
@@ -684,8 +684,10 @@ std::vector<std::string> visual_identity_values(const lvt::Element& visual) {
 // renumbering could ever make the ids line up; the relationship is many-to-one
 // and partial, and the only way to express it is to compute it and say so.
 //
-// Doing that for a whole tree is much cheaper than bridging element by element:
-// the UIA side is indexed once and reused, rather than re-walked per node.
+// This is reported, never acted on. Actions resolve references only within the
+// session's own tree; correlation exists so a caller can see which framework
+// elements UI Automation exposes — an element with no counterpart is invisible
+// to assistive tech, which is usually a defect in the app being inspected.
 void correlate_visual_to_uia(const lvt::Element& uiaTree, const lvt::Element& visualRoot,
                              CorrelationMap& out) {
     std::vector<const lvt::Element*> uiaNodes;
@@ -1112,21 +1114,24 @@ json method_hit_test(const json& params) {
 
 #ifdef LVT_ENABLE_UIA
 
-// --- bridging visual-tree references to UIA ------------------------------
+// --- keeping the two trees' references apart ------------------------------
 //
-// Actions are carried out through UI Automation, so they need a UIA element.
-// But an `eN` id or a durable key can just as easily have come from
+// Actions in a uia session are carried out through UI Automation, so they need
+// a UIA element. An `eN` id or a durable key can just as easily have come from
 // get_visual_tree, and the two trees are independent: their `eN` numbering
 // covers different nodes, and their durable keys are built from different
-// framework paths. Handing a visual reference to the UIA resolver therefore
-// either fails outright — "element not found", for a `wpf|…` key that has no
-// counterpart — or, worse, silently matches a *different* element that happens
-// to occupy the same `eN` slot, and acts on that.
+// framework paths. Handing a visual reference to the UIA resolver either fails
+// outright — "element not found", for a `wpf|…` key with no counterpart — or,
+// worse, silently matches a *different* element that happens to occupy the
+// same `eN` slot, and acts on that.
 //
-// Both are unacceptable when every action tool documents that it takes "an eN
-// id, a durable key, or uia:<RuntimeId>". So a visual reference is resolved
-// against the visual tree and then bridged to the UIA element occupying the
-// same place on screen.
+// lvt used to bridge such a reference: resolve it in the visual tree, then find
+// the UIA element it corresponded to by identity, then by text, then by
+// position. That is a heuristic making a choice inside an action, where the
+// caller cannot see it — and when it chose wrong it clicked something else and
+// reported success. Session modes replaced it: a session speaks one tree, hands
+// out qualified references from that tree, and refuses the other tree's. This
+// is the uia half of that rule; visual_mode_action is the other half.
 
 // Durable keys name the framework that produced them, so they say which tree
 // they belong to. `uia|…` is a UIA key; anything else with a path separator is
@@ -1139,192 +1144,6 @@ bool looks_like_visual_key(const std::string& ref) {
     return bar != std::string::npos && bar > 0;
 }
 
-bool is_actionable(const lvt::Element& element) {
-    const auto patterns = element_property(element, "SupportedPatterns");
-    return contains_ci(patterns, "Invoke") || contains_ci(patterns, "Toggle") ||
-           contains_ci(patterns, "SelectionItem") || contains_ci(patterns, "ExpandCollapse") ||
-           contains_ci(patterns, "Value");
-}
-
-// Is this element somewhere a user could actually interact with? Offscreen and
-// zero-area elements are excluded from matching entirely. That is not a
-// refinement: ranking by area made a zero-area candidate beat every visible
-// one, so a list of rows sharing an icon name all bridged to the same
-// offscreen element — three different rows, one target, every call reporting
-// success.
-bool is_visible_candidate(const lvt::Element& element) {
-    if (element.bounds.width <= 0 || element.bounds.height <= 0)
-        return false;
-    return !equals_ci(element_property(element, "IsOffscreen"), "true");
-}
-
-// Where an element sits inside its own tree's root, as a fraction. Comparing
-// these lets a visual element be matched to a UIA one despite the two trees
-// not sharing a coordinate space at non-100% display scaling.
-bool relative_centre(const lvt::Element& element, const lvt::Element& root, double& fx,
-                     double& fy) {
-    if (root.bounds.width <= 0 || root.bounds.height <= 0)
-        return false;
-    fx = (element.bounds.x + element.bounds.width / 2.0 - root.bounds.x) / root.bounds.width;
-    fy = (element.bounds.y + element.bounds.height / 2.0 - root.bounds.y) / root.bounds.height;
-    return true;
-}
-
-// Choose the UIA element corresponding to a visual-tree element.
-//
-// Identity first, and position only ever as a tie-break between candidates that
-// are otherwise equally good. `ambiguous` is filled when the choice cannot be
-// made confidently, so the caller can refuse and say what it saw rather than
-// picking one and acting on it.
-const lvt::Element* match_visual_to_uia(const lvt::Element& uiaTree,
-                                        const lvt::Element& visualRoot,
-                                        const lvt::Element& visual, std::string& how,
-                                        std::vector<const lvt::Element*>& ambiguous) {
-    std::vector<const lvt::Element*> all;
-    collect_elements(uiaTree, all);
-
-    // 1. AutomationId, which frameworks map through and which is meant to be
-    //    unique. Ambiguity here is a genuine app-level collision, so report it
-    //    rather than guessing.
-    for (const auto& identity : visual_identity_values(visual)) {
-        std::vector<const lvt::Element*> hits;
-        for (const auto* candidate : all) {
-            if (element_property(*candidate, "AutomationId") == identity)
-                hits.push_back(candidate);
-        }
-        if (hits.size() == 1) {
-            how = "AutomationId";
-            return hits.front();
-        }
-        if (hits.size() > 1) {
-            ambiguous = hits;
-            return nullptr;
-        }
-    }
-
-    // 2. Otherwise the visible text, over elements a user could actually reach.
-    if (visual.text.empty())
-        return nullptr;
-
-    std::vector<const lvt::Element*> candidates;
-    for (const auto* candidate : all) {
-        if (equals_ci(candidate->text, visual.text) && is_visible_candidate(*candidate))
-            candidates.push_back(candidate);
-    }
-    if (candidates.empty())
-        return nullptr;
-    if (candidates.size() == 1) {
-        how = "name";
-        return candidates.front();
-    }
-
-    // A templated control contributes several nodes with the same text — the
-    // Button, its ContentPresenter, its TextBlock — and only the outer one
-    // responds to Invoke, so an actionable candidate is always the intended
-    // one.
-    std::vector<const lvt::Element*> actionable;
-    for (const auto* candidate : candidates) {
-        if (is_actionable(*candidate))
-            actionable.push_back(candidate);
-    }
-    auto& pool = actionable.empty() ? candidates : actionable;
-    if (pool.size() == 1) {
-        how = actionable.empty() ? "name" : "name and an actionable pattern";
-        return pool.front();
-    }
-
-    // Several equally plausible candidates — repeated list rows, say. Position
-    // within the window decides, compared as a fraction of each tree's own root
-    // so the differing coordinate spaces do not matter.
-    double vx = 0, vy = 0;
-    if (relative_centre(visual, visualRoot, vx, vy)) {
-        const lvt::Element* nearest = nullptr;
-        double best = 0;
-        double runnerUp = 0;
-        for (const auto* candidate : pool) {
-            double cx = 0, cy = 0;
-            if (!relative_centre(*candidate, uiaTree, cx, cy))
-                continue;
-            const double distance = (cx - vx) * (cx - vx) + (cy - vy) * (cy - vy);
-            if (!nearest || distance < best) {
-                runnerUp = nearest ? best : 0;
-                nearest = candidate;
-                best = distance;
-            } else if (runnerUp == 0 || distance < runnerUp) {
-                runnerUp = distance;
-            }
-        }
-        // Only trust position when one candidate is clearly closer; two
-        // elements at almost the same place cannot be told apart this way.
-        if (nearest && best < 0.0004 && (runnerUp == 0 || runnerUp > best * 4)) {
-            how = "name and position";
-            return nearest;
-        }
-    }
-
-    ambiguous = pool;
-    return nullptr;
-}
-
-// Turn a visual-tree reference into a `uia:<RuntimeId>` one. `note` records
-// what the bridge did, so the result can say which element was really acted on
-// rather than leaving the caller to wonder.
-std::string bridge_visual_ref_to_uia(const Session& session, const json& params,
-                                     const std::string& ref, json& note) {
-    lvt::Element visualTree;
-    std::string error;
-    if (!build_tree_for(session, params, false, visualTree, error))
-        throw std::runtime_error("this reference looks like it came from the visual tree, but "
-                                 "that tree could not be read: " + error);
-
-    const auto* visual = lvt::find_element_by_ref(visualTree, ref);
-    if (!visual)
-        throw std::runtime_error("element '" + ref + "' not found in either the UI Automation "
-                                 "tree or the visual tree");
-
-    lvt::Element uiaTree;
-    if (!build_tree_for(session, params, true, uiaTree, error))
-        throw std::runtime_error(error);
-
-    std::string how;
-    std::vector<const lvt::Element*> ambiguous;
-    const auto* uia = match_visual_to_uia(uiaTree, visualTree, *visual, how, ambiguous);
-
-    if (!uia && !ambiguous.empty()) {
-        // Several candidates fit. Naming them lets the caller pick, which is
-        // the same choice `connect` offers for an ambiguous title — and far
-        // better than acting on one of them and reporting success.
-        json options = json::array();
-        for (const auto* candidate : ambiguous) {
-            options.push_back({{"ref", "uia:" + candidate->id},
-                               {"type", candidate->type},
-                               {"name", candidate->text}});
-        }
-        throw std::runtime_error("'" + ref + "' matches more than one UI Automation element, so "
-                                 "acting on it would be a guess; use one of these instead: " +
-                                 options.dump());
-    }
-    if (!uia)
-        throw std::runtime_error(
-            "'" + ref + "' is a visual-tree element (" + visual->type +
-            (visual->text.empty() ? "" : " \"" + visual->text + "\"") +
-            ") with no UI Automation counterpart, so it cannot be acted on. Visual-tree nodes "
-            "are often presentation-only; find the element in the UI Automation tree instead, "
-            "which is what actions resolve against.");
-
-    const auto runtimeId = element_property(*uia, "RuntimeId");
-    if (runtimeId.empty())
-        throw std::runtime_error("the UI Automation element matching '" + ref + "' has no "
-                                 "RuntimeId, so it cannot be acted on");
-
-    note = json{{"from", "visual"},
-                {"matchedBy", how},
-                {"visualElement", visual->id},
-                {"uiaElement", uia->id},
-                {"type", uia->type},
-                {"name", uia->text}};
-    return "uia:" + runtimeId;
-}
 
 json action_result_to_json(const lvt::ActionResult& result, const std::string& action,
                            const std::string& ref) {
@@ -1665,24 +1484,32 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     request.waitValue = get_string(params, "waitValue");
     request.waitTimeoutMs = get_int(params, "timeoutMs", 5000);
 
-    // A reference can come from either tree, so work out which and bridge if
-    // needed. "uia:eN" / "visual:eN" and durable keys say which tree they came
-    // from; a bare "eN" does not, so the caller states it with uia:false.
+    // A reference has to belong to the tree this session speaks. "uia:eN" /
+    // "visual:eN" and durable keys say which tree they came from; a bare "eN"
+    // does not, and is read against the session's default tree.
     //
-    // wait-gone is exempt: its success condition is the element being absent,
-    // and perform_action already treats an unresolvable reference as satisfied.
-    // Bridging first would throw "not found in either tree" in exactly the case
-    // the caller is waiting for, so `close` then `wait_gone` would fail.
-    json bridge;
+    // wait-gone is exempt from the check: its success condition is the element
+    // being absent, and perform_action already treats an unresolvable reference
+    // as satisfied. Refusing first would fail in exactly the case the caller is
+    // waiting for, so `close` then `wait_gone` would break.
     const auto originalRef = request.elementRef;
     if (!originalRef.empty() && kind != lvt::ActionKind::waitGone) {
         const auto parsed = parse_ref(originalRef);
         const bool fromVisual = parsed.tree == RefTree::visual ||
                                 (parsed.tree == RefTree::unspecified &&
                                  !tree_for_session(session, params));
-        request.elementRef = parsed.ref;
+        // The mirror image of the refusal in visual_mode_action. lvt used to
+        // guess a UIA counterpart here; the guess was invisible to the caller
+        // and wrong often enough to click the wrong control and report success.
+        // Refusing costs one extra call and cannot be wrong.
         if (fromVisual)
-            request.elementRef = bridge_visual_ref_to_uia(session, params, parsed.ref, bridge);
+            throw std::runtime_error(
+                "'" + originalRef +
+                "' is a visual-tree reference, but this session is in uia mode. Use a reference "
+                "from get_uia_tree or find_elements, or connect with mode 'visual' to drive the "
+                "app by geometry. get_visual_tree with correlate:true reports each visual "
+                "element's UI Automation counterpart as 'uiaRef' if you need to look one up.");
+        request.elementRef = parsed.ref;
     } else if (!originalRef.empty()) {
         // Still strip any qualifier so the reference reaches the resolver in
         // the form it understands.
@@ -1712,10 +1539,6 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
 
     const auto result = lvt::perform_action(session.hwnd, options, request);
     auto out = action_result_to_json(result, actionName, get_string(params, "element"));
-    // Say so when the reference was bridged, so a surprising outcome can be
-    // traced back to the element that was actually chosen.
-    if (!bridge.is_null())
-        out["resolvedVia"] = bridge;
     if (!result.ok)
         throw std::runtime_error(out.dump());
     return out;

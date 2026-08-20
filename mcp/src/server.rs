@@ -70,10 +70,12 @@ pub struct SessionArgs {
 pub struct TreeArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference. Prefer the qualified "ref" a tool gave you
-    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
-    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
-    /// ambiguous and is read against this tool's default tree.
+    /// Element reference. Use the "ref" a tool in this session gave you
+    /// ("uia:e15" or "visual:e33"): it names the tree it came from, and a
+    /// session only accepts its own tree's references — the other tree's are
+    /// refused, never matched to something that looks similar. A durable key
+    /// or "uia:<RuntimeId>" also works. A bare "eN" is read against this
+    /// session's tree.
     pub element: Option<String>,
     /// Maximum depth below the root. Omit for the whole tree.
     pub depth: Option<i32>,
@@ -95,10 +97,12 @@ pub struct TreeArgs {
 pub struct VisualTreeArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference. Prefer the qualified "ref" a tool gave you
-    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
-    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
-    /// ambiguous and is read against this tool's default tree.
+    /// Element reference. Use the "ref" a tool in this session gave you
+    /// ("uia:e15" or "visual:e33"): it names the tree it came from, and a
+    /// session only accepts its own tree's references — the other tree's are
+    /// refused, never matched to something that looks similar. A durable key
+    /// or "uia:<RuntimeId>" also works. A bare "eN" is read against this
+    /// session's tree.
     pub element: Option<String>,
     /// Maximum depth below the root. Omit for the whole tree.
     pub depth: Option<i32>,
@@ -112,9 +116,17 @@ pub struct VisualTreeArgs {
     #[serde(rename = "timeoutMs")]
     pub timeout_ms: Option<i32>,
     /// Also report each element's UI Automation counterpart. "uiaRef" is the
-    /// element's own counterpart and is safe to act on; "uiaAncestorRef" is
-    /// the counterpart of the control it sits inside, which is context only.
-    /// Many visual nodes are template parts with no counterpart of their own.
+    /// element's own counterpart; "uiaAncestorRef" is the counterpart of the
+    /// control it sits inside, which is context only. Many visual nodes are
+    /// template parts with no counterpart of their own.
+    ///
+    /// Use this to find out what UI Automation can and cannot see: an element
+    /// with no "uiaRef" is not exposed to assistive tech at all, which is
+    /// usually an accessibility gap in the app, and tells you that element can
+    /// only be driven in "visual" mode. References are never translated between
+    /// trees, so this is information, not a way to make another tool accept a
+    /// visual reference.
+    ///
     /// Costs a second walk, so it is off by default.
     pub correlate: Option<bool>,
 }
@@ -149,10 +161,12 @@ pub struct FindArgs {
 pub struct ElementPropertiesArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference. Prefer the qualified "ref" a tool gave you
-    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
-    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
-    /// ambiguous and is read against this tool's default tree.
+    /// Element reference. Use the "ref" a tool in this session gave you
+    /// ("uia:e15" or "visual:e33"): it names the tree it came from, and a
+    /// session only accepts its own tree's references — the other tree's are
+    /// refused, never matched to something that looks similar. A durable key
+    /// or "uia:<RuntimeId>" also works. A bare "eN" is read against this
+    /// session's tree.
     pub element: String,
     /// Specific properties to return. Omit for the element's standard fields.
     pub properties: Option<Vec<String>>,
@@ -208,10 +222,12 @@ pub struct HitTestArgs {
 pub struct ElementArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference. Prefer the qualified "ref" a tool gave you
-    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
-    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
-    /// ambiguous and is read against this tool's default tree.
+    /// Element reference. Use the "ref" a tool in this session gave you
+    /// ("uia:e15" or "visual:e33"): it names the tree it came from, and a
+    /// session only accepts its own tree's references — the other tree's are
+    /// refused, never matched to something that looks similar. A durable key
+    /// or "uia:<RuntimeId>" also works. A bare "eN" is read against this
+    /// session's tree.
     pub element: String,
     /// UIA tree view used to resolve the element: "control" (default),
     /// "content", or "raw". Must match the view the id came from.
@@ -227,10 +243,12 @@ pub struct ElementArgs {
 pub struct ClickArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference. Prefer the qualified "ref" a tool gave you
-    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
-    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
-    /// ambiguous and is read against this tool's default tree.
+    /// Element reference. Use the "ref" a tool in this session gave you
+    /// ("uia:e15" or "visual:e33"): it names the tree it came from, and a
+    /// session only accepts its own tree's references — the other tree's are
+    /// refused, never matched to something that looks similar. A durable key
+    /// or "uia:<RuntimeId>" also works. A bare "eN" is read against this
+    /// session's tree.
     pub element: String,
     /// Mouse button: 0 left (default), 1 right, 2 middle.
     pub button: Option<i32>,
@@ -250,10 +268,12 @@ pub struct ClickArgs {
 pub struct SetValueArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference. Prefer the qualified "ref" a tool gave you
-    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
-    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
-    /// ambiguous and is read against this tool's default tree.
+    /// Element reference. Use the "ref" a tool in this session gave you
+    /// ("uia:e15" or "visual:e33"): it names the tree it came from, and a
+    /// session only accepts its own tree's references — the other tree's are
+    /// refused, never matched to something that looks similar. A durable key
+    /// or "uia:<RuntimeId>" also works. A bare "eN" is read against this
+    /// session's tree.
     pub element: String,
     /// The value to set. Replaces the element's current value outright.
     pub text: String,
@@ -304,10 +324,12 @@ pub struct PressKeyArgs {
 pub struct ScrollArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference. Prefer the qualified "ref" a tool gave you
-    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
-    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
-    /// ambiguous and is read against this tool's default tree.
+    /// Element reference. Use the "ref" a tool in this session gave you
+    /// ("uia:e15" or "visual:e33"): it names the tree it came from, and a
+    /// session only accepts its own tree's references — the other tree's are
+    /// refused, never matched to something that looks similar. A durable key
+    /// or "uia:<RuntimeId>" also works. A bare "eN" is read against this
+    /// session's tree.
     pub element: String,
     /// Direction: "up", "down", "left", or "right". Defaults to "down".
     pub direction: Option<String>,
@@ -326,10 +348,12 @@ pub struct ScrollArgs {
 pub struct SelectArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference. Prefer the qualified "ref" a tool gave you
-    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
-    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
-    /// ambiguous and is read against this tool's default tree.
+    /// Element reference. Use the "ref" a tool in this session gave you
+    /// ("uia:e15" or "visual:e33"): it names the tree it came from, and a
+    /// session only accepts its own tree's references — the other tree's are
+    /// refused, never matched to something that looks similar. A durable key
+    /// or "uia:<RuntimeId>" also works. A bare "eN" is read against this
+    /// session's tree.
     pub element: String,
     /// "replace" (default) clears any other selection, "add" extends it,
     /// "remove" deselects just this element.
@@ -372,10 +396,12 @@ pub struct WindowActionArgs {
 pub struct WaitForArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference. Prefer the qualified "ref" a tool gave you
-    /// ("uia:e15" or "visual:e33"), which says which tree it came from.
-    /// A durable key or "uia:<RuntimeId>" also works. A bare "eN" is
-    /// ambiguous and is read against this tool's default tree.
+    /// Element reference. Use the "ref" a tool in this session gave you
+    /// ("uia:e15" or "visual:e33"): it names the tree it came from, and a
+    /// session only accepts its own tree's references — the other tree's are
+    /// refused, never matched to something that looks similar. A durable key
+    /// or "uia:<RuntimeId>" also works. A bare "eN" is read against this
+    /// session's tree.
     pub element: String,
     /// Wait for the element to disappear instead of for a property value.
     pub gone: Option<bool>,
@@ -503,9 +529,10 @@ impl LvtServer {
         description = "Get the framework-native visual tree (Win32 windows, XAML/WPF/WinForms/\
                        Avalonia/Chromium elements). Use this to understand how a UI is built — \
                        it shows implementation structure the UIA tree hides. Its elements are a \
-                       different, finer-grained set than the UIA tree's, so pass correlate:true \
-                       to get each one's UI Automation counterpart and act on that. Requires lvt \
-                       and the target to share an architecture."
+                       different, finer-grained set than the UIA tree's, and its references only \
+                       work in a session connected with mode 'visual'. Pass correlate:true to see \
+                       which of these elements UI Automation exposes and which it does not. \
+                       Requires lvt and the target to share an architecture."
     )]
     async fn get_visual_tree(&self, Parameters(a): Parameters<VisualTreeArgs>) -> Result<CallToolResult, ErrorData> {
         forward("get_visual_tree", visual_tree_params(a), self.allow_input).await
@@ -831,6 +858,12 @@ impl ServerHandler for LvtServer {
                  Call connect first to open a session, then pass its session id to every other \
                  tool. get_uia_tree and find_elements give you element ids; the action tools take \
                  those ids.\n\n\
+                 A session speaks one tree. In the default \"uia\" mode, use references from \
+                 get_uia_tree and find_elements; references from get_visual_tree are refused, \
+                 because the two trees describe different sets of nodes and matching between them \
+                 would be a guess. To drive an app by geometry instead, connect a second session \
+                 with mode \"visual\". A session's mode cannot be changed after connecting, but \
+                 sessions are cheap and you can hold several at once.\n\n\
                  Element ids like \"e12\" are positions in the tree you fetched, so re-fetch after \
                  anything that changes the UI's structure. An element's durable key or \
                  \"uia:<RuntimeId>\" survives more change and is worth preferring for anything \

@@ -1559,7 +1559,7 @@ TEST(McpServer, BlockingToolCallsDoNotStarveTheServer) {
         client.await_response(id);
 }
 
-TEST_F(McpSampleFixture, ActionsAcceptVisualTreeReferencesNotJustUiaOnes) {
+TEST_F(McpSampleFixture, AUiaSessionRefusesVisualReferencesInsteadOfGuessing) {
     SkipIfNotReady();
     McpClient client(true);
     ASSERT_TRUE(client.started());
@@ -1567,130 +1567,56 @@ TEST_F(McpSampleFixture, ActionsAcceptVisualTreeReferencesNotJustUiaOnes) {
     const auto session = connect(client);
     ASSERT_FALSE(session.empty());
 
-    // Every action tool documents that it takes "an eN id, a durable key, or
-    // uia:<RuntimeId>", but resolution only ever consulted the UIA tree. The
-    // two trees are independent, so a reference from get_visual_tree either
-    // failed with "element not found" — the durable-key case, reported against
-    // a real app — or silently matched whatever occupied the same eN slot in
-    // the UIA tree and acted on *that*.
-    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
-    if (!visual.contains("root"))
-        GTEST_SKIP() << "the visual tree is unavailable here: " << visual.dump(2);
-
-    std::vector<const json*> all;
-    collect_json_elements(visual["root"], all);
-    const json* button = nullptr;
-    for (const auto* element : all) {
-        // The label, not the Button: in a XAML visual tree the text lives on a
-        // TextBlock inside the control's template, so that is what a caller
-        // actually finds and picks. Bridging has to cope with being handed the
-        // presentation node and still act on the control around it.
-        if (element->value("text", "") == "Primary action" &&
-            !element->value("key", "").empty()) {
-            button = element;
-            break;
-        }
-    }
-    if (!button)
-        GTEST_SKIP() << "no labelled visual element to act on";
-
-    const auto before = status_text(client, session);
-
-    // A durable key names the framework that produced it, so it is
-    // self-describing and needs no hint from the caller.
-    bool isError = false;
-    auto byKey = client.call_tool(
-        "click", json{{"session", session}, {"element", button->value("key", "")}}, &isError);
-    EXPECT_FALSE(isError) << "a visual-tree durable key must be actionable: " << byKey.dump(2);
-    ASSERT_TRUE(byKey.contains("resolvedVia"))
-        << "a bridged reference must say which element it really acted on: " << byKey.dump(2);
-    EXPECT_EQ(byKey["resolvedVia"].value("from", ""), "visual");
-    EXPECT_EQ(byKey["resolvedVia"].value("name", ""), button->value("text", ""))
-        << "the bridge matched an element with different text: " << byKey.dump(2);
-
-    EXPECT_NE(status_text(client, session), before)
-        << "the click reported success but the app did not react";
-}
-
-TEST_F(McpSampleFixture, AmbiguousVisualElementIdsNeedTheUiaFlag) {
-    SkipIfNotReady();
-    McpClient client(true);
-    ASSERT_TRUE(client.started());
-    ASSERT_TRUE(client.handshake());
-    const auto session = connect(client);
-    ASSERT_FALSE(session.empty());
-
+    // lvt used to bridge a visual reference here: resolve it in the visual
+    // tree, then find the UIA element it corresponded to by identity, then by
+    // text, then by position. That is a heuristic making a choice inside an
+    // action, where the caller cannot see it -- and when it chose wrong it
+    // clicked a different control and reported success. Modes replaced it, so
+    // this is now a refusal, and the mirror image of a visual session refusing
+    // "uia:e6".
     auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
     if (!visual.contains("root"))
         GTEST_SKIP() << "the visual tree is unavailable here";
 
     std::vector<const json*> all;
     collect_json_elements(visual["root"], all);
-    const json* button = nullptr;
+    const json* labelled = nullptr;
     for (const auto* element : all) {
-        if (element->value("text", "") == "Primary action" &&
-            !element->value("id", "").empty()) {
-            button = element;
+        if (element->value("text", "") == "Primary action" && !element->value("key", "").empty()) {
+            labelled = element;
             break;
         }
     }
-    if (!button)
+    if (!labelled)
         GTEST_SKIP() << "no labelled visual element to act on";
 
-    // Unlike a durable key, a bare "eN" carries no marker saying which tree it
-    // came from, so the caller has to say. With the flag it is bridged; without
-    // it, it is treated as a UIA id — which is the documented default and must
-    // stay that way, since that is where ids normally come from.
     const auto before = status_text(client, session);
-    bool isError = false;
-    auto bridged = client.call_tool(
-        "click",
-        json{{"session", session}, {"element", button->value("id", "")}, {"uia", false}},
-        &isError);
-    EXPECT_FALSE(isError) << bridged.dump(2);
-    ASSERT_TRUE(bridged.contains("resolvedVia")) << bridged.dump(2);
-    EXPECT_EQ(bridged["resolvedVia"].value("name", ""), button->value("text", ""));
-    EXPECT_NE(status_text(client, session), before);
-}
 
-TEST_F(McpSampleFixture, AVisualElementWithNoUiaCounterpartSaysSoClearly) {
-    SkipIfNotReady();
-    McpClient client(true);
-    ASSERT_TRUE(client.started());
-    ASSERT_TRUE(client.handshake());
-    const auto session = connect(client);
-    ASSERT_FALSE(session.empty());
+    // All three spellings of "this came from the visual tree" are refused: the
+    // qualified ref, the self-describing durable key, and a bare id the caller
+    // has explicitly said to read against the visual tree.
+    const std::vector<std::pair<std::string, json>> forms{
+        {"qualified ref", json{{"element", labelled->value("ref", "")}}},
+        {"durable key", json{{"element", labelled->value("key", "")}}},
+        {"bare id with uia:false",
+         json{{"element", labelled->value("id", "")}, {"uia", false}}},
+    };
 
-    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
-    if (!visual.contains("root"))
-        GTEST_SKIP() << "the visual tree is unavailable here";
-
-    // Most visual-tree nodes are presentation-only — borders, grids, content
-    // presenters — with nothing in UIA to act on. That has to be explained,
-    // not reported as a bare "not found", or the caller cannot tell the
-    // difference between a bad reference and an unactionable one.
-    std::vector<const json*> all;
-    collect_json_elements(visual["root"], all);
-    const json* layout = nullptr;
-    for (const auto* element : all) {
-        const auto type = element->value("type", "");
-        if ((type == "Border" || type == "Grid" || type == "ContentPresenter") &&
-            element->value("text", "").empty() && !element->value("key", "").empty()) {
-            layout = element;
-            break;
-        }
+    for (const auto& [label, extra] : forms) {
+        json args{{"session", session}};
+        args.update(extra);
+        bool isError = false;
+        auto result = client.call_tool("click", args, &isError);
+        EXPECT_TRUE(isError) << label << " was accepted by a uia session: " << result.dump(2);
+        const auto message = result.value("error", "");
+        EXPECT_NE(message.find("visual"), std::string::npos) << label << ": " << message;
+        // A refusal has to say how to do what was asked, or it just blocks.
+        EXPECT_NE(message.find("uia mode"), std::string::npos) << label << ": " << message;
     }
-    if (!layout)
-        GTEST_SKIP() << "no presentation-only visual element to test with";
 
-    bool isError = false;
-    auto result = client.call_tool(
-        "click", json{{"session", session}, {"element", layout->value("key", "")}}, &isError);
-    EXPECT_TRUE(isError) << result.dump(2);
-    const auto message = result.value("error", "");
-    EXPECT_NE(message.find("visual-tree element"), std::string::npos)
-        << "the message should explain what kind of element this is: " << result.dump(2);
-    EXPECT_NE(message.find("UI Automation"), std::string::npos) << result.dump(2);
+    // And nothing was driven while all that was refused.
+    EXPECT_EQ(status_text(client, session), before)
+        << "a refused action still reached the application";
 }
 
 TEST_F(McpSampleFixture, ElementsCarryAQualifiedRefNamingTheirTree) {
@@ -1784,7 +1710,7 @@ TEST_F(McpSampleFixture, AQualifiedRefFromTheWrongTreeIsRefusedNotMisresolved) {
     EXPECT_NE(result.value("error", "").find("visual tree"), std::string::npos) << result.dump(2);
 }
 
-TEST_F(McpSampleFixture, ActionsAcceptQualifiedRefsFromEitherTree) {
+TEST_F(McpSampleFixture, AQualifiedRefIsAcceptedOnlyByItsOwnTreesSession) {
     SkipIfNotReady();
     McpClient client(true);
     ASSERT_TRUE(client.started());
@@ -1792,48 +1718,32 @@ TEST_F(McpSampleFixture, ActionsAcceptQualifiedRefsFromEitherTree) {
     const auto session = connect(client);
     ASSERT_FALSE(session.empty());
 
-    auto visualTree = client.call_tool("get_visual_tree", json{{"session", session}});
-    if (!visualTree.contains("root"))
-        GTEST_SKIP() << "the visual tree is unavailable here";
+    // The positive half of the rule. A uia session drives a "uia:" reference
+    // through patterns and says which pattern it used; the refusal of the other
+    // tree's references is only defensible if this keeps working.
+    auto found = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
+    ASSERT_EQ(found["elements"].size(), 1u) << found.dump(2);
+    const auto ref = found["elements"][0].value("ref", "");
+    EXPECT_EQ(ref.rfind("uia:", 0), 0u) << "expected a UIA reference, got " << ref;
 
-    std::vector<const json*> all;
-    collect_json_elements(visualTree["root"], all);
-    const json* labelled = nullptr;
-    for (const auto* element : all) {
-        if (element->value("text", "") == "Primary action") {
-            labelled = element;
-            break;
-        }
-    }
-    if (!labelled)
-        GTEST_SKIP() << "no labelled visual element";
-
-    // "visual:eN" is enough on its own — no uia:false needed — and it is
-    // bridged to the UIA element that can actually be invoked.
     const auto before = status_text(client, session);
     bool isError = false;
     auto result = client.call_tool(
-        "click", json{{"session", session}, {"element", labelled->value("ref", "")}}, &isError);
+        "click", json{{"session", session}, {"element", ref}}, &isError);
     EXPECT_FALSE(isError) << result.dump(2);
-    ASSERT_TRUE(result.contains("resolvedVia")) << result.dump(2);
-    EXPECT_EQ(result["resolvedVia"].value("from", ""), "visual");
+    EXPECT_EQ(result.value("method", ""), "InvokePattern")
+        << "a uia session must act through patterns: " << result.dump(2);
     EXPECT_NE(status_text(client, session), before)
         << "the click reported success but the app did not react";
 
-    // And the UIA-qualified form works without any bridging at all.
-    auto found = client.call_tool(
-        "find_elements", json{{"session", session}, {"automationId", "PrimaryButton"}});
-    ASSERT_EQ(found["elements"].size(), 1u);
-    const auto after = status_text(client, session);
-    auto direct = client.call_tool(
-        "click", json{{"session", session}, {"element", found["elements"][0].value("ref", "")}},
-        &isError);
-    EXPECT_FALSE(isError) << direct.dump(2);
-    EXPECT_FALSE(direct.contains("resolvedVia")) << "a UIA ref should need no bridging";
-    EXPECT_NE(status_text(client, session), after);
+    // Nothing is left over from the bridge: a successful action reports the
+    // pattern it used and nothing about resolving between trees.
+    EXPECT_FALSE(result.contains("resolvedVia"))
+        << "references are no longer translated between trees: " << result.dump(2);
 }
 
-TEST_F(McpSampleFixture, BridgingWorksForRealControlsNotJustTextNodes) {
+TEST_F(McpSampleFixture, CorrelationCoversRealControlsNotJustTextNodes) {
     SkipIfNotReady();
     McpClient client(true);
     ASSERT_TRUE(client.started());
@@ -1841,29 +1751,29 @@ TEST_F(McpSampleFixture, BridgingWorksForRealControlsNotJustTextNodes) {
     const auto session = connect(client);
     ASSERT_FALSE(session.empty());
 
-    // The controls a caller actually names. Bridging originally matched only
-    // on a property no visual provider emits ("AutomationId"), so the identity
-    // path never ran and every one of these failed with "no UI Automation
-    // counterpart" — while the one test that existed picked a TextBlock label
-    // and stayed green. Each of these carries x:Name, surfaced as "name", which
-    // is what the UIA AutomationId is built from.
+    // Correlation matches on identity, and identity matching once looked up a
+    // property no visual provider emits ("AutomationId"), so the path never ran
+    // for any real control -- while the only test that existed picked a
+    // TextBlock label and stayed green. Each control below carries x:Name,
+    // surfaced as "name", which is what the UIA AutomationId is built from.
+    //
+    // This is also the scenario correlation exists for now that references are
+    // never translated: answering "is the control I can see actually
+    // automatable, and as what?" in one read.
     static constexpr const char* kControls[] = {
         "InputBox", "PrimaryButton", "ReadyCheckBox", "LevelSlider", "ChoiceCombo",
     };
 
-    int bridged = 0;
-    int looked = 0;
-    for (const char* wanted : kControls) {
-        // Re-read the tree for each control. Focusing changes visual state, and
-        // XAML rebuilds template parts when it does, so ids captured before the
-        // previous iteration no longer describe the same nodes — the same
-        // staleness the docs warn callers about.
-        auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
-        if (!visual.contains("root"))
-            GTEST_SKIP() << "the visual tree is unavailable here";
-        std::vector<const json*> all;
-        collect_json_elements(visual["root"], all);
+    auto visual = client.call_tool(
+        "get_visual_tree", json{{"session", session}, {"correlate", true}});
+    if (!visual.contains("root"))
+        GTEST_SKIP() << "the visual tree is unavailable here";
+    std::vector<const json*> all;
+    collect_json_elements(visual["root"], all);
 
+    int looked = 0;
+    int correlated = 0;
+    for (const char* wanted : kControls) {
         const json* element = nullptr;
         for (const auto* candidate : all) {
             const auto properties = candidate->value("properties", json::object());
@@ -1875,74 +1785,26 @@ TEST_F(McpSampleFixture, BridgingWorksForRealControlsNotJustTextNodes) {
         if (!element)
             continue;
         ++looked;
-
-        // focus rather than click: enough to prove the reference resolved to a
-        // real UIA element, without driving the app through five state changes.
-        bool isError = false;
-        auto result = client.call_tool(
-            "focus", json{{"session", session}, {"element", element->value("ref", "")}}, &isError);
-        EXPECT_FALSE(isError) << wanted << " (visual " << element->value("id", "")
-                              << " " << element->value("type", "") << ") did not bridge: "
-                              << result.dump(2);
-        if (isError)
+        const auto own = element->value("uiaRef", "");
+        EXPECT_FALSE(own.empty())
+            << wanted << " (visual " << element->value("id", "") << " "
+            << element->value("type", "")
+            << ") has no counterpart of its own; identity matching is not working: "
+            << element->dump(2);
+        if (own.empty())
             continue;
-        ASSERT_TRUE(result.contains("resolvedVia")) << result.dump(2);
-        EXPECT_EQ(result["resolvedVia"].value("matchedBy", ""), "AutomationId")
-            << wanted << " should match on identity, not fall through to text: " << result.dump(2);
-        ++bridged;
+        ++correlated;
+
+        // A counterpart is only useful if it is real, so spend it: the whole
+        // point is that the caller can take this reference to a uia session.
+        auto properties = client.call_tool(
+            "get_element_properties", json{{"session", session}, {"element", own}});
+        EXPECT_EQ(properties.value("tree", ""), "uia") << properties.dump(2);
     }
 
     ASSERT_GT(looked, 2) << "the sample app did not expose the named controls";
-    EXPECT_EQ(bridged, looked) << "only " << bridged << " of " << looked
-                               << " named controls bridged; the identity path is not working";
-}
-
-TEST_F(McpSampleFixture, BridgingRefusesRatherThanGuessBetweenIdenticalCandidates) {
-    SkipIfNotReady();
-    McpClient client(true);
-    ASSERT_TRUE(client.started());
-    ASSERT_TRUE(client.handshake());
-    const auto session = connect(client);
-    ASSERT_FALSE(session.empty());
-
-    // The 200-row list gives many rows the same text. Ranking candidates by
-    // area made a zero-area offscreen element beat every visible one, so
-    // several different rows all bridged onto the same target and each
-    // reported success. Whatever happens now, two different visual elements
-    // must never resolve to the same UIA element.
-    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
-    if (!visual.contains("root"))
-        GTEST_SKIP() << "the visual tree is unavailable here";
-
-    std::vector<const json*> all;
-    collect_json_elements(visual["root"], all);
-    std::vector<std::string> rowRefs;
-    for (const auto* element : all) {
-        const auto text = element->value("text", "");
-        if (text.rfind("Item ", 0) == 0 && !element->value("ref", "").empty())
-            rowRefs.push_back(element->value("ref", ""));
-        if (rowRefs.size() >= 4)
-            break;
-    }
-    if (rowRefs.size() < 2)
-        GTEST_SKIP() << "not enough repeated rows to test with";
-
-    std::map<std::string, std::string> targets;  // uia element -> first visual ref
-    for (const auto& ref : rowRefs) {
-        bool isError = false;
-        auto result = client.call_tool(
-            "focus", json{{"session", session}, {"element", ref}, {"view", "raw"}}, &isError);
-        if (isError)
-            continue;  // refusing is a fine outcome; guessing is not
-        const auto target = result.value("resolvedVia", json::object()).value("uiaElement", "");
-        if (target.empty())
-            continue;
-        const auto existing = targets.find(target);
-        EXPECT_EQ(existing, targets.end())
-            << "visual " << ref << " and " << (existing != targets.end() ? existing->second : "")
-            << " both bridged to " << target << "; distinct elements must not share a target";
-        targets[target] = ref;
-    }
+    EXPECT_EQ(correlated, looked) << "only " << correlated << " of " << looked
+                                  << " named controls correlated";
 }
 
 TEST_F(McpSampleFixture, WaitGoneOnAVisualRefSucceedsWhenTheElementIsAlreadyAbsent) {

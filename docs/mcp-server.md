@@ -52,7 +52,7 @@ work across them.
 | `connect` | Open a session on a window, by `hwnd`, `pid`, `name` or `title` |
 | `disconnect` | Close a session |
 | `get_uia_tree` | The UI Automation tree — AutomationIds, control types, states, patterns. **This is the tree to automate against.** |
-| `get_visual_tree` | The framework-native tree — Win32/XAML/WPF/WinForms/Avalonia/Chromium. Shows *how a UI is built*; cannot be used to drive it |
+| `get_visual_tree` | The framework-native tree — Win32/XAML/WPF/WinForms/Avalonia/Chromium. Shows *how a UI is built*; drive it from a `visual`-mode session |
 | `get_frameworks` | UI frameworks detected in the target, with versions |
 | `find_elements` | Match by AutomationId, name, control type or supported pattern |
 | `get_element_properties` | One element's properties, or a named subset |
@@ -81,22 +81,32 @@ work across them.
 
 `get_uia_tree` is the right default. It carries `AutomationId`s, control types
 and the patterns each element supports, it works against any process regardless
-of architecture, and its elements are the ones the action tools can operate on.
+of architecture, and its elements are the ones a `uia` session acts on.
 
 `get_visual_tree` answers a different question: *how is this UI implemented?* It
 shows HWNDs, XAML types, WPF elements and Chromium DOM nodes — implementation
-structure the UIA tree deliberately hides. It cannot drive anything, and because
-it works by injecting into the target it needs lvt and the target to share an
-architecture. When they do not, it says so and names the right binary.
+structure the UIA tree deliberately hides. Its elements can be driven too, but
+only from a session connected with `mode: "visual"`, which acts by aiming real
+input at where an element is. Because it works by injecting into the target it
+needs lvt and the target to share an architecture; when they do not, it says so
+and names the right binary.
 
 ## Addressing elements
 
-Every tool that takes an element accepts three forms:
+Every tool that takes an element accepts these forms:
 
-- **`e12`** — the element's position in the tree you fetched. Compact, and what
-  `find_elements` returns.
-- **A durable key** — a path-based identifier that survives more change.
+- **`visual:e33` / `uia:e15`** — a qualified reference. This is what every tool
+  hands back as `ref`, and the form to prefer: it names the tree it came from,
+  so it can be checked rather than assumed.
+- **`e12`** — the element's position in the tree you fetched, read against the
+  session's own tree.
+- **A durable key** — a path-based identifier that survives more change. Also
+  self-describing: it names the framework that produced it.
 - **`uia:<RuntimeId>`** — the UIA runtime identifier.
+
+**A session only accepts references from its own tree.** The other tree's are
+refused with a note, never matched to something similar — see
+[Modes](#modes-how-a-session-drives-the-app).
 
 `eN` ids are positions, so they are only valid while the tree has the shape it
 had when you fetched it. Anything that changes structure — expanding a combo
@@ -138,6 +148,18 @@ similar. That is what stops an action landing on the wrong element.
 Modes are per session, so you can hold one of each — read an app's structure
 through the visual tree while driving it through UIA, or drive a custom-drawn
 app by geometry while driving a normal one by patterns.
+
+**A session's mode is fixed once it is connected**, and there is no tool to
+change it. To work the other way round, call `connect` again with the other
+mode and keep both sessions; `disconnect` whichever you finish with. Connecting
+is cheap — it resolves the window and detects frameworks, and injects nothing —
+so a second session costs about as much as one extra call.
+
+The mode is fixed on purpose. Flipping a live session would silently invalidate
+every reference already handed out: `e30` is a `Button` in the visual tree and
+something else entirely in the UIA tree, so an id that was correct when issued
+would quietly start meaning a different control. That is precisely the confusion
+modes were introduced to remove. Two sessions keep two id-spaces, both valid.
 
 `toggle`, `set_value`, `select`, `expand` and `invoke` describe what a control
 *means*, which geometry cannot express. In visual mode they are refused with a
@@ -183,7 +205,7 @@ else. A bare `eN` still works and means "this tool's default tree".
 `correlate: true` and each element gains:
 
 - **`uiaRef`** — this element's *own* UI Automation counterpart, matched by
-  identity. This is the one you can act on.
+  identity.
 - **`uiaAncestorRef`** — the counterpart of the control it sits *inside*, for
   elements that have none of their own. Context, not a target.
 
@@ -211,32 +233,35 @@ subtree says the same thing about its nodes as the full tree does. The
 `correlated` count describes the response you got, not the whole-tree pass
 behind it.
 
-### Acting on a visual-tree element
+### What correlation is for
 
-If your session is in `visual` mode, just use the visual reference — that is
-what the mode is for, and the action is real input aimed at where the element
-is.
+It answers questions *about* an app, not "which element should this click go
+to". Two it answers well:
 
-In a `uia` session, a visual reference is bridged to its UIA counterpart as a
-convenience. If you have a `uiaRef` from `correlate: true`, use that instead —
-it needs no bridging.
+**"Why can't I automate this control?"** A visual element with no `uiaRef` is
+not exposed to UI Automation at all — a missing `AutomationProperties.Name`, an
+element in the wrong `AccessibilityView`, a custom-drawn surface with no
+automation peer. That is an accessibility gap in the app, and lvt can point at
+it precisely because it reads both trees. The WinUI 3 sample has 74 UIA nodes
+against 314 visual ones; correlation is how you see which of the 314 made it
+across.
 
-The bridge matches on **identity** (the element's `x:Name`/`Name`, which is what
-a UIA `AutomationId` is built from), falling back to visible text and preferring
-a candidate that exposes an actionable pattern. It does not match on screen
-position, because the two trees do not share a coordinate space at non-100%
-display scaling.
+**"Which mode should I use?"** One read tells you whether the thing you want to
+drive is in the UIA tree. If it is, connect `uia` and use patterns. If it is
+not, connect `visual` and drive it by geometry.
 
-When several candidates fit equally well — repeated list rows, say — it
-**refuses and lists them** rather than picking one. Acting on a guess is the
-worst thing this tool can do.
-
-When it bridges, the result includes `resolvedVia` naming the UIA element
-actually acted on and how it was matched. A node with no actionable counterpart
-is reported as such rather than as a bare "not found".
+What it is deliberately *not* for is translating a reference so another tool
+will accept it. lvt used to do that — a visual reference passed to an action in
+a `uia` session was matched to a UIA element by identity, then text, then screen
+position. It was a heuristic making a choice inside an action, where the caller
+could not see it, and when it chose wrong it clicked a different control and
+reported success. Modes replaced it: **each session speaks one tree, and refuses
+the other's references** rather than guessing what you meant. If you want to
+work the other way round, open a second session — they are independent and cheap.
 
 Durable keys are self-describing — they name the framework that produced them
-(`wpf|…`, `uia|…`) — so they need no qualifier.
+(`wpf|…`, `uia|…`) — so they need no qualifier, and they are refused by the
+wrong session just as `eN` refs are.
 
 ## Prefer patterns over synthetic input
 
