@@ -223,9 +223,19 @@ if(LVT_BUILD_VIEWER)
         COMMENT "Building lvt Viewer (WPF)"
     )
     if(LVT_BUILD_TOOL)
-        # LvtLocator also finds lvt.exe by walking up to this repo's own
-        # build/ directory, but copying it alongside the viewer means a
-        # packaged/xcopy-deployed viewer build works with zero setup too.
+        # A copy of lvt.exe with none of its TAP DLLs/plugins next to it is
+        # actively worse than no copy: it resolves (get_tap_directory() finds
+        # this directory first) but every framework-specific enrichment it
+        # would have provided silently stops working, indistinguishable from
+        # the target simply not using that framework - exactly the failure
+        # mode a user hit the first time this copied everything but the TAP
+        # DLLs. The rest of that copying (mirroring the release packaging
+        # step in .github/workflows/release.yml and the install() rules
+        # below) lives further down this file, after the TAP DLL and plugin
+        # targets it references are actually defined - if(TARGET ...) can
+        # only see targets CMake has already processed by that point in the
+        # file, so doing it here (before those add_library() calls) would
+        # silently no-op every one of those checks.
         add_custom_command(TARGET lvt_viewer POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:lvt>" "${LVT_VIEWER_OUTPUT_DIR}/lvt.exe"
@@ -655,6 +665,89 @@ add_custom_command(TARGET lvt_chromium_plugin POST_BUILD
         "${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium/extension"
     COMMENT "Copying Chromium extension files"
 )
+endif()
+
+# lvt Viewer: copy the TAP DLLs and plugins lvt.exe needs, alongside it.
+# Deliberately placed here rather than in the LVT_BUILD_VIEWER block above:
+# if(TARGET lvt_tap) and friends can only see targets CMake has already
+# processed by this point in the file, so this has to come after every
+# add_library()/add_executable() call it references.
+if(LVT_BUILD_VIEWER AND LVT_BUILD_TOOL)
+    foreach(_tap lvt_tap lvt_wpf_tap lvt_winforms_tap)
+        if(TARGET ${_tap})
+            add_custom_command(TARGET lvt_viewer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:${_tap}>" "${LVT_VIEWER_OUTPUT_DIR}/"
+                COMMENT "Copying ${_tap} next to the viewer"
+            )
+            add_dependencies(lvt_viewer ${_tap})
+        endif()
+    endforeach()
+    unset(_tap)
+
+    if(TARGET lvt_wpf_tap AND LVT_BUILD_MANAGED)
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.dll" "${LVT_VIEWER_OUTPUT_DIR}/LvtWpfTap.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.runtimeconfig.json"
+                "${LVT_VIEWER_OUTPUT_DIR}/LvtWpfTap.runtimeconfig.json"
+            COMMENT "Copying the managed WPF tree walker assembly next to the viewer"
+        )
+    endif()
+
+    if(TARGET lvt_winforms_tap AND LVT_BUILD_MANAGED)
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.dll" "${LVT_VIEWER_OUTPUT_DIR}/LvtWinFormsTap.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.runtimeconfig.json"
+                "${LVT_VIEWER_OUTPUT_DIR}/LvtWinFormsTap.runtimeconfig.json"
+            COMMENT "Copying the managed WinForms tree walker assembly next to the viewer"
+        )
+    endif()
+
+    foreach(_plugin lvt_avalonia_plugin lvt_chromium_plugin)
+        if(TARGET ${_plugin})
+            add_custom_command(TARGET lvt_viewer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${LVT_VIEWER_OUTPUT_DIR}/plugins"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:${_plugin}>" "${LVT_VIEWER_OUTPUT_DIR}/plugins/"
+                COMMENT "Copying ${_plugin} next to the viewer"
+            )
+            add_dependencies(lvt_viewer ${_plugin})
+        endif()
+    endforeach()
+    unset(_plugin)
+
+    if(TARGET lvt_avalonia_tap)
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:lvt_avalonia_tap>" "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/"
+            COMMENT "Copying the Avalonia TAP DLL next to the viewer"
+        )
+        add_dependencies(lvt_viewer lvt_avalonia_tap)
+        if(LVT_BUILD_MANAGED)
+            add_custom_command(TARGET lvt_viewer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
+                    "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+                    "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+                COMMENT "Copying the managed Avalonia tree walker assembly next to the viewer"
+            )
+        endif()
+    endif()
+
+    if(TARGET lvt_chromium_plugin)
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium" "${LVT_VIEWER_OUTPUT_DIR}/plugins/chromium"
+            COMMENT "Copying the Chromium native host + extension next to the viewer"
+        )
+    endif()
 endif()
 
 # --- Tests ---
