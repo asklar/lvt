@@ -385,6 +385,25 @@ bool inject_and_collect_xaml_tree(
     if (treeJson.is_array()) {
         std::set<std::string> usedBridges;
 
+        // InitializeXamlDiagnosticsEx targets a whole process, not a single
+        // HWND: when several top-level windows of the same app share one
+        // process (multiple Notepad or File Explorer windows are common —
+        // and were exactly how this was found), every window's XAML content
+        // comes back in one combined stream, and more than one
+        // DesktopWindowXamlSource root here means there is real ambiguity
+        // about which root belongs to *this* window's bridges. Only then is
+        // it worth rejecting a low-confidence match (see the tolerance
+        // check below): with a single root there is nothing else it could
+        // be, no matter how poorly its content size happens to match, so
+        // the legacy graft-under-root fallback stays exactly as
+        // conservative as before for the overwhelmingly common case.
+        size_t xamlSourceRootCount = 0;
+        for (auto& node : treeJson) {
+            if (sanitize(node.value("type", "")).find("DesktopWindowXamlSource") != std::string::npos)
+                xamlSourceRootCount++;
+        }
+        const bool multipleRootsAmbiguous = xamlSourceRootCount > 1;
+
         for (auto& node : treeJson) {
             std::string typeName = sanitize(node.value("type", ""));
             if (typeName.find("DesktopWindowXamlSource") == std::string::npos) {
@@ -412,9 +431,18 @@ bool inject_and_collect_xaml_tree(
                 }
             }
 
-            // Skip bridge matching for roots with no measurable content
+            // Skip strict bridge matching for roots with no measurable
+            // content when there is no ambiguity to resolve: fall back to
+            // the legacy graft-under-root behavior, same as before this
+            // window's-worth-of-contamination fix existed, since with a
+            // single root there is no sibling window's content it could be
+            // confused with — dropping it here would only lose real
+            // structure (e.g. a not-yet-laid-out tab strip) for no safety
+            // benefit. Only drop outright when multiple roots are actually
+            // competing for the same bridges.
             if (contentW <= 0 && contentH <= 0) {
-                graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
+                if (!multipleRootsAmbiguous)
+                    graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
                 continue;
             }
 
@@ -443,6 +471,38 @@ bool inject_and_collect_xaml_tree(
                 }
             }
 
+            // Reject a "best" match that still isn't actually close — but
+            // only when multiple roots are genuinely competing (see
+            // multipleRootsAmbiguous above). Without a tolerance, the loop
+            // above always finds *some* bridge — including bridges
+            // belonging to *this* window that just happen to be the
+            // least-bad leftover for a completely different window's root —
+            // silently grafting one window's content (and its Text/bounds)
+            // onto a sibling window's tree. Requiring the winning candidate
+            // to be within a size-relative tolerance of its own bridge is
+            // what tells "this genuinely is that bridge's content" apart
+            // from "this is a foreign root that merely didn't lose by
+            // much"; anything else is dropped instead of misattached. When
+            // there is only one root, skip this check entirely and keep the
+            // legacy behavior of accepting whatever the single bridge is,
+            // however poor the size match — there is no other candidate it
+            // could rightfully belong to.
+            if (multipleRootsAmbiguous && bestIdx >= 0) {
+                double bw = bridges[bestIdx]->bounds.width;
+                double bh = bridges[bestIdx]->bounds.height;
+                constexpr double kMinAbsoluteToleragePx = 40.0;
+                constexpr double kRelativeTolerance = 0.25;
+                double tolerance = std::max(kMinAbsoluteToleragePx, (bw + bh) * kRelativeTolerance);
+                if (bestScore > tolerance) {
+                    if (g_debug) {
+                        fprintf(stderr, "lvt: rejecting XAML root match (score=%.0f > tolerance=%.0f); "
+                                        "likely belongs to a different window sharing this process\n",
+                                bestScore, tolerance);
+                    }
+                    bestIdx = -1;
+                }
+            }
+
             if (bestIdx >= 0) {
                 auto* bridge = bridges[bestIdx];
                 auto identity = bridge_identity(*bridge);
@@ -451,9 +511,19 @@ bool inject_and_collect_xaml_tree(
                 double baseX = bridge->bounds.x;
                 double baseY = bridge->bounds.y;
                 graft_json_node(node, *bridge, frameworkLabel, baseX, baseY);
-            } else {
+            } else if (!multipleRootsAmbiguous) {
+                // No DesktopChildSiteBridge matched at all — including the
+                // case where this window has none to begin with (classic
+                // system XAML doesn't use the WinUI3 Islands bridge model,
+                // so `bridges` is always empty there). With only one root in
+                // play there is no sibling window's content to confuse this
+                // with, so fall back to the legacy graft-under-root
+                // behavior exactly as before this fix.
                 graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
             }
+            // Otherwise: multiple roots were genuinely competing and none
+            // matched confidently enough — drop this root rather than
+            // misattach it to the wrong window.
         }
     } else if (treeJson.is_object()) {
         graft_json_node(treeJson, root, frameworkLabel);
