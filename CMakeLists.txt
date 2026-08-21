@@ -48,6 +48,11 @@ option(LVT_ENABLE_MCP      "MCP server mode (lvt mcp); requires a Rust toolchain
 
 option(LVT_BUILD_TOOL    "Build the lvt command-line tool"                     ON)
 option(LVT_BUILD_MANAGED "Build managed .NET assemblies (requires .NET SDK)"   ON)
+# Off by default: it's a separate WPF app built by its own `dotnet build`, not
+# something most contributors touching lvt_core need. See src/viewer/README.md
+# for the architecture (it drives lvt.exe as a subprocess; it never links
+# lvt_core) and why it is not part of the default build.
+option(LVT_BUILD_VIEWER  "Build the lvt Viewer WPF app (requires .NET SDK)"    OFF)
 # LVT_BUILD_TESTS is declared above project(), before the vcpkg toolchain runs.
 
 if(LVT_BUILD_MANAGED AND NOT (LVT_ENABLE_WPF OR LVT_ENABLE_WINFORMS OR LVT_ENABLE_AVALONIA))
@@ -194,6 +199,40 @@ if(LVT_BUILD_TOOL)
     target_link_libraries(lvt PRIVATE lvt_core WIL::WIL nlohmann_json::nlohmann_json)
     lvt_add_version_resource(lvt
         "lvt - Live Visual Tree CLI" "lvt" "lvt.exe" VFT_APP)
+endif()
+
+# --- lvt Viewer (WPF, .NET) --------------------------------------------------
+# A separate desktop GUI, built by its own `dotnet build` rather than CMake
+# compiling anything: it drives lvt.exe as a subprocess (dump/watch/action
+# verbs) instead of linking lvt_core, so nothing here needs a C++/.NET
+# interop seam. See src/viewer/README.md for the architecture.
+if(LVT_BUILD_VIEWER)
+    find_program(LVT_DOTNET_EXE NAMES dotnet)
+    if(NOT LVT_DOTNET_EXE)
+        message(FATAL_ERROR
+            "LVT_BUILD_VIEWER is ON but dotnet was not found. Install the .NET SDK, "
+            "or configure with -DLVT_BUILD_VIEWER=OFF to build without the viewer.")
+    endif()
+
+    set(LVT_VIEWER_PROJECT "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer/LvtViewer.csproj")
+    set(LVT_VIEWER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/viewer")
+    add_custom_target(lvt_viewer ALL
+        COMMAND "${LVT_DOTNET_EXE}" build "${LVT_VIEWER_PROJECT}" -c Release -o "${LVT_VIEWER_OUTPUT_DIR}"
+        BYPRODUCTS "${LVT_VIEWER_OUTPUT_DIR}/LvtViewer.exe"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Building lvt Viewer (WPF)"
+    )
+    if(LVT_BUILD_TOOL)
+        # LvtLocator also finds lvt.exe by walking up to this repo's own
+        # build/ directory, but copying it alongside the viewer means a
+        # packaged/xcopy-deployed viewer build works with zero setup too.
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:lvt>" "${LVT_VIEWER_OUTPUT_DIR}/lvt.exe"
+            COMMENT "Copying lvt.exe next to the viewer"
+        )
+        add_dependencies(lvt_viewer lvt)
+    endif()
 endif()
 
 # --- MCP server (Rust) -----------------------------------------------------
