@@ -44,7 +44,14 @@ public partial class MainWindow : Window
 
         _viewModel.PropertyChanged += (_, e) =>
         {
-            if (e.PropertyName == nameof(MainViewModel.HighlightSelected))
+            // HighlightSelected: the user toggled the checkbox. SelectedElement:
+            // covers MainViewModel clearing it itself (e.g. on watch.Exited,
+            // when the target process crashed or closed — see MainViewModel's
+            // constructor) as well as the TreeView.SelectedItemChanged case
+            // already handled above; without this, a programmatic clear would
+            // leave the overlay pointing at a now-gone window's last-known
+            // bounds forever.
+            if (e.PropertyName is nameof(MainViewModel.HighlightSelected) or nameof(MainViewModel.SelectedElement))
                 UpdateSelectionHighlight();
         };
 

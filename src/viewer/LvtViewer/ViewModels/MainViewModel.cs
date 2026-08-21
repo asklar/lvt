@@ -36,7 +36,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _watch.EventReceived += evt => _dispatcher.BeginInvoke(() => OnWatchEvent(evt));
         _watch.DiagnosticReceived += line => _dispatcher.BeginInvoke(() => StatusText = line);
         _watch.Exited += code => _dispatcher.BeginInvoke(() =>
-            StatusText = $"lvt watch exited (code {code}) — target likely closed. Re-pick a window to reconnect.");
+        {
+            StatusText = $"lvt watch exited (code {code}) — target likely closed. Re-pick a window to reconnect.";
+            // The target's own process may have crashed or been closed: its
+            // tree is no longer meaningful, and clearing SelectedElement is
+            // what tells MainWindow's highlight overlay (item 1) to hide
+            // rather than being left pointing at the last-known bounds of a
+            // now-gone window forever. IsConnected also drops, disabling
+            // the element-pick crosshair (item 2) until a fresh connection
+            // gives it something live to pick from again.
+            _liveTree.Reset();
+            SelectedElement = null;
+            IsConnected = false;
+        });
 
         ToggleCommand = new RelayCommand(p => _ = ToggleAsync(p as PropertyRowViewModel));
         SetValueCommand = new RelayCommand(p => _ = SetValueAsync(p as PropertyRowViewModel));
@@ -210,6 +222,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         _liveTree.Reset();
         StatusText = "Reconnecting…";
+        IsConnected = true;
         _watch.Start(LvtExePath, _currentHwndHex, UseUia);
         StatusText = UseUia
             ? "Watching the UI Automation tree live."
