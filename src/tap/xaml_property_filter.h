@@ -9,19 +9,11 @@
 
 namespace lvt {
 
-// Free-text properties lvt captures when their value looks like a real string
-// (see xaml_looks_like_handle / xaml_is_string_value_type).
-inline bool xaml_is_text_property(const std::wstring& name) {
-    return name == L"Text" || name == L"Content" || name == L"Header" ||
-           name == L"PlaceholderText" || name == L"Description" ||
-           name == L"Title" || name == L"Glyph";
-}
-
 // State/identity properties lvt captures regardless of value shape: their
 // value being "0", or a long numeric string that would otherwise look like a
 // handle, is legitimate data, not noise. xaml_should_capture_property skips
 // the handle heuristic entirely for names in this list, rather than relying
-// on ValueType the way text properties do — see its comment for why.
+// on ValueType the way every other property does — see its comment for why.
 inline bool xaml_is_state_property(const std::wstring& name) {
     return name == L"AutomationProperties.Name" ||
            name == L"AutomationProperties.AutomationId" ||
@@ -102,24 +94,37 @@ inline bool xaml_should_capture_property(const std::wstring& name, const std::ws
                                           const std::wstring& valueType) {
     if (value.empty())
         return false;
-    // The handle heuristic only ever applies to text properties. State
-    // properties (Tag, Source, AutomationProperties.*, Visibility, ...) are
-    // captured regardless of value shape, per xaml_is_state_property's
-    // contract: AutomationProperties.Name/AutomationId/HelpText are always
-    // genuinely string-typed in XAML, so a long numeric AutomationId (a
-    // very plausible generated id) must not be mistaken for a handle. Tag
-    // and Source can hold arbitrary reference-typed values too, but this
-    // function has no ValueType-independent way to tell "Tag holds a real
-    // long numeric string" from "Tag holds a handle" once the pattern-backed
-    // exemption above does not apply — capturing it as-is (possibly a raw
-    // handle string) is the lesser failure next to silently dropping an
+    // State properties (Tag, Source, AutomationProperties.*, Visibility,
+    // ...) are captured regardless of value shape, per
+    // xaml_is_state_property's contract: AutomationProperties.Name/
+    // AutomationId/HelpText are always genuinely string-typed in XAML, so a
+    // long numeric AutomationId (a very plausible generated id) must not be
+    // mistaken for a handle. Tag and Source can hold arbitrary
+    // reference-typed values too, but this function has no
+    // ValueType-independent way to tell "Tag holds a real long numeric
+    // string" from "Tag holds a handle" once the pattern-backed exemption
+    // above does not apply — capturing it as-is (possibly a raw handle
+    // string) is the lesser failure next to silently dropping an
     // AutomationId, which is the property this list exists to protect.
-    if (xaml_is_text_property(name)) {
-        if (xaml_looks_like_handle(value, valueType))
-            return false;
-        return xaml_is_string_value_type(valueType);
-    }
-    return xaml_is_state_property(name);
+    if (xaml_is_state_property(name))
+        return true;
+    // Every other property — not just the curated text-property list
+    // (Text/Content/Header/...), but *any* named property XAML diagnostics
+    // reports — goes through the same check: this is what makes the
+    // property panel show a control's full set of properties (FontSize,
+    // Opacity, Margin, a custom DP, ...) rather than a handful of
+    // hand-picked names, while still guarding against XAML's opaque
+    // reference-typed handle IDs the same way a text property always has.
+    // A confirmed primitive ValueType (String/Boolean/Int32/Double/Enum, or
+    // empty/unconfirmed) is accepted outright unless the value's shape
+    // looks like a handle; anything with a ValueType naming an actual
+    // reference type (a control, a brush, a transform, ...) is excluded by
+    // xaml_is_string_value_type returning false for it — there is no
+    // meaningful flat string to show for those anyway.
+    if (xaml_looks_like_handle(value, valueType))
+        return false;
+    return xaml_is_string_value_type(valueType);
 }
 
 } // namespace lvt
+

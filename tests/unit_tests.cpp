@@ -1522,8 +1522,24 @@ TEST(XamlPropertyFilter, EmptyValueIsNeverCaptured) {
     EXPECT_FALSE(lvt::xaml_should_capture_property(L"Text", L"", L"String"));
 }
 
-TEST(XamlPropertyFilter, NonTextNonStatePropertiesAreIgnored) {
-    EXPECT_FALSE(lvt::xaml_should_capture_property(L"SomeRandomProperty", L"42", L"Int32"));
+TEST(XamlPropertyFilter, ArbitraryPropertiesAreCapturedWithRecognizedValueTypes) {
+    // Broadened capture: any named property is captured (not just a curated
+    // text/state allowlist) as long as its ValueType is a recognized
+    // primitive shape — this is what makes the property panel show a
+    // control's full property set (FontSize, Opacity, a custom DP, ...)
+    // rather than a handful of hand-picked names.
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"FontSize", L"14", L"Double"));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Opacity", L"0.5", L"Double"));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"SomeRandomProperty", L"42", L"Int32"));
+}
+
+TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {
+    // A reference-typed property (a Brush, a Transform, another control) has
+    // no meaningful flat string value to show, and its serialized value is
+    // an opaque handle — excluded because its ValueType names an actual
+    // class rather than one of the recognized primitive shapes.
+    EXPECT_FALSE(lvt::xaml_should_capture_property(L"Foreground", L"123456789012", L"Brush"));
+    EXPECT_FALSE(lvt::xaml_should_capture_property(L"RenderTransform", L"987654321098", L"TransformGroup"));
 }
 
 TEST(XamlPropertyFilter, LongDigitTextIsKeptWhenValueTypeIsConfirmedString) {
