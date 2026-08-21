@@ -35,7 +35,6 @@ public partial class MainWindow : Window
         InitializeComponent();
         _viewModel = new MainViewModel(Dispatcher);
         DataContext = _viewModel;
-        _selectionHighlight.Owner = this;
 
         Tree.SelectedItemChanged += (_, e) =>
         {
@@ -51,6 +50,13 @@ public partial class MainWindow : Window
 
         Loaded += (_, _) =>
         {
+            // WPF requires a window to have been shown before it can be
+            // assigned as another window's Owner, so this can only happen
+            // once MainWindow itself is loaded — setting it in the
+            // constructor throws InvalidOperationException immediately on
+            // every launch.
+            _selectionHighlight.Owner = this;
+
             _picker = new CrosshairPicker(CrosshairHandle, this);
             _picker.TargetPicked += hwnd => _viewModel.ConnectTo(hwnd);
             _picker.HintChanged += hint => _viewModel.StatusText = hint;
