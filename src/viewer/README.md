@@ -143,31 +143,35 @@ exact HWND (`lvt ... --hwnd 0x...`), not by process name/PID, so the specific
 window under the cursor is what gets inspected even for a multi-window
 process.
 
-## What's verified, and a sandbox caveat
+## What's verified
 
 Verified end-to-end against a real, live Notepad instance: connecting,
 live tree population, live property-panel population (including
 `SupportedPatterns`, `AutomationId`, `Toggle.ToggleState` where present), a
 live text-value change (via `set-value`, reflected in the property panel with
 no manual refresh), and a live bounds update (resizing the target window,
-reflected the same way). The crosshair's own *resolution* logic
-(`WindowFromPoint`/`GetAncestor`/`GetWindowThreadProcessId`) was verified
-directly against a real, moved/resized window and resolves to the exact
-right HWND/PID whenever that window is actually topmost at the tested point.
+reflected the same way).
 
-What could **not** be verified in the sandbox this was built in: physically
-dragging the crosshair with the mouse. That sandbox's interactive desktop is
-locked (a secure desktop is active), which blocks real input end-to-end —
-confirmed by testing multiple injection paths (`mouse_event`/`SendInput`-style
-hardware injection, and direct `PostMessage`/`SendMessage` to the window)
-against the same window, none of which were delivered. The gesture itself
-(`Mouse.Capture` + `MouseMove` + `MouseLeftButtonUp`) is a standard, widely
-used WPF idiom with nothing target-specific about it; reviewing it and
-independently confirming the resolution logic it calls into was the
-available substitute for a literal drag in that environment. **Please
-re-verify the physical drag on a normal, unlocked desktop before relying on
-this** — it is the one piece of the feature that could not be exercised
-end-to-end here.
+The crosshair-drag gesture itself has been verified with a real mouse on an
+unlocked desktop: a genuine mouse-down on the crosshair, drag over a real
+window, and mouse-up correctly starts the drag, tracks the window under the
+cursor while held, and resolves + connects on release — done twice against
+two different Notepad windows, with the resolved HWND/PID cross-checked both
+times against an independent, ground-truth `WindowFromPoint`/
+`GetAncestor(GA_ROOT)`/`GetWindowThreadProcessId` call at the same screen
+point (exact match both times).
+
+One thing worth knowing rather than a bug: if another window is on top of
+the viewer's own crosshair at the moment you press down (e.g. a just-opened
+window happens to cover it), the mouse-down goes to that window instead —
+ordinary window z-order, identical to Inspect.exe's own constraint. Bring
+the viewer to the front before starting the drag if that happens.
+
+(This was first verified with the resolution logic alone, independent of a
+literal mouse drag, in a sandbox whose interactive desktop was locked at the
+time — locked-desktop sessions block all real input injection, which was
+confirmed by testing multiple paths. That limitation no longer applies; the
+full gesture has since been exercised directly.)
 
 ## Stretch/incomplete
 
