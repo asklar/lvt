@@ -7,6 +7,8 @@
     <Window.Resources>
         <conv:FrameworkToBrushConverter x:Key="FrameworkToBrush"/>
         <conv:EditKindToVisibilityConverter x:Key="EditKindToVisibility"/>
+        <conv:InverseBooleanToVisibilityConverter x:Key="InverseBoolToVisibility"/>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility"/>
 
         <HierarchicalDataTemplate DataType="{x:Type vm:ElementNodeViewModel}" ItemsSource="{Binding Children}">
             <StackPanel Orientation="Horizontal">
@@ -30,8 +32,41 @@
                         <Ellipse Canvas.Left="5" Canvas.Top="5" Width="10" Height="10" Stroke="Red" StrokeThickness="2"/>
                     </Canvas>
                 </Border>
+
+                <!-- Point-to-select an element within the already-connected target (item 2) -->
+                <Border x:Name="ElementPickHandle" Width="30" Height="30" Background="White"
+                        BorderBrush="#FF808080" BorderThickness="1" Cursor="Hand" Margin="0,0,12,0"
+                        IsEnabled="{Binding IsConnected}"
+                        ToolTip="Press and drag onto the target's UI to select that element in the tree">
+                    <Canvas Width="20" Height="20">
+                        <Line X1="10" Y1="0" X2="10" Y2="20" Stroke="Black" StrokeThickness="2"/>
+                        <Line X1="0" Y1="10" X2="20" Y2="10" Stroke="Black" StrokeThickness="2"/>
+                        <Ellipse Canvas.Left="5" Canvas.Top="5" Width="10" Height="10" Stroke="#FF2AA1F0" StrokeThickness="2"/>
+                    </Canvas>
+                </Border>
+
                 <CheckBox Content="UI Automation tree" IsChecked="{Binding UseUia}"
                           VerticalAlignment="Center" Margin="0,0,16,0"/>
+                <CheckBox Content="Highlight selection" IsChecked="{Binding HighlightSelected}"
+                          VerticalAlignment="Center" Margin="0,0,16,0"/>
+
+                <!-- Framework/content-type filter: visual-tree mode only (item 7) -->
+                <ToggleButton x:Name="FrameworkFilterToggle" Content="Filter by type ▾" Padding="10,3" Margin="0,0,16,0"
+                              Visibility="{Binding IsFrameworkFilterActive, Converter={StaticResource BoolToVisibility}}"/>
+                <Popup PlacementTarget="{Binding ElementName=FrameworkFilterToggle}" Placement="Bottom"
+                       IsOpen="{Binding IsChecked, ElementName=FrameworkFilterToggle, Mode=TwoWay}"
+                       StaysOpen="False">
+                    <Border Background="White" BorderBrush="#FF808080" BorderThickness="1" Padding="8">
+                        <ItemsControl ItemsSource="{Binding FrameworkFilters}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <CheckBox Content="{Binding Name}" IsChecked="{Binding IsChecked}" Margin="0,2,0,2"/>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Border>
+                </Popup>
+
                 <Button Content="Reconnect" Command="{Binding ReconnectCommand}" Padding="10,3" Margin="0,0,16,0"/>
                 <TextBlock Text="{Binding TargetText}" VerticalAlignment="Center" FontWeight="SemiBold"/>
             </StackPanel>
@@ -54,6 +89,7 @@
                 <TreeView.ItemContainerStyle>
                     <Style TargetType="TreeViewItem">
                         <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=OneWay}"/>
+                        <Setter Property="Visibility" Value="{Binding IsVisible, Converter={StaticResource BoolToVisibility}}"/>
                     </Style>
                 </TreeView.ItemContainerStyle>
             </TreeView>
@@ -96,6 +132,9 @@
                     </Grid>
                     <Separator Margin="0,8,0,4"/>
                     <TextBlock Text="Properties" FontWeight="Bold"/>
+                    <TextBlock Text="Switch on &quot;UI Automation tree&quot; above to edit Toggle/Value properties — the visual tree is read-only."
+                               Foreground="#FF808080" FontStyle="Italic" TextWrapping="Wrap" Margin="0,2,0,0"
+                               Visibility="{Binding DataContext.UseUia, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource InverseBoolToVisibility}}"/>
                 </StackPanel>
 
                 <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="10,0,10,10">

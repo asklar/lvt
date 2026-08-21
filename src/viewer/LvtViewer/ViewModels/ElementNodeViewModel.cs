@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
@@ -29,6 +30,14 @@ public sealed class ElementNodeViewModel : ObservableObject
     /// parent/child relationships from the flat event stream. Not bound to UI.
     /// </summary>
     public string Path { get; internal set; } = "";
+
+    /// <summary>
+    /// This node's parent in the current hierarchy, kept in sync by
+    /// LiveTree.RebuildHierarchy. Null for a root. Used to expand a node's
+    /// ancestor chain when programmatically selecting it in the TreeView
+    /// (see MainWindow.SelectElementInTree, item 2's point-to-select).
+    /// </summary>
+    public ElementNodeViewModel? Parent { get; internal set; }
 
     public string Id
     {
@@ -94,8 +103,36 @@ public sealed class ElementNodeViewModel : ObservableObject
 
     public string BoundsText => $"{BoundsX}, {BoundsY}, {BoundsWidth} x {BoundsHeight}";
 
+    // Checked in priority order when Text is empty, so structural containers
+    // (Grid, Border, StackPanel, ...) that never carry visible text still
+    // show *something* identifying in the tree — a UIA/AutomationProperties
+    // name, an AutomationId, or the XAML developer's x:Name — rather than a
+    // bare, indistinguishable "Grid" repeated at every level.
+    private static readonly string[] IdentifyingPropertyPriority =
+    {
+        "AutomationProperties.Name",
+        "Name",
+        "AutomationProperties.AutomationId",
+        "AutomationId",
+        "name", // x:Name, captured as a plain property by the XAML TAP (see xaml_diag_common.cpp)
+    };
+
     /// <summary>What the TreeView shows for this node.</summary>
-    public string DisplayName => string.IsNullOrEmpty(Text) ? Type : $"{Type} \"{Text}\"";
+    public string DisplayName
+    {
+        get
+        {
+            if (!string.IsNullOrEmpty(Text))
+                return $"{Type} \"{Text}\"";
+            foreach (var propName in IdentifyingPropertyPriority)
+            {
+                var row = FindProperty(propName);
+                if (row != null && !string.IsNullOrEmpty(row.Value))
+                    return $"{Type} \"{row.Value}\"";
+            }
+            return Type;
+        }
+    }
 
     public ObservableCollection<PropertyRowViewModel> PropertyRows { get; } = new();
 
@@ -108,6 +145,21 @@ public sealed class ElementNodeViewModel : ObservableObject
     {
         get => _isExpanded;
         set => SetField(ref _isExpanded, value);
+    }
+
+    private bool _isVisible = true;
+
+    /// <summary>
+    /// Whether the framework filter (MainViewModel.ApplyFrameworkFilter)
+    /// keeps this node in the TreeView. True whenever no filter is active
+    /// (e.g. UIA mode), this node's own framework passes the filter, or any
+    /// descendant's does — a container should stay visible to reach a
+    /// matching descendant even if its own type was filtered out.
+    /// </summary>
+    public bool IsVisible
+    {
+        get => _isVisible;
+        set => SetField(ref _isVisible, value);
     }
 
     /// <summary>Applies a full element snapshot (from an "added" event or a full dump).</summary>
@@ -173,15 +225,30 @@ public sealed class ElementNodeViewModel : ObservableObject
             if (value.Length == 0)
                 return; // never was there; nothing to show
             PropertyRows.Add(new PropertyRowViewModel(name, value));
+            NotifyIfIdentifyingProperty(name);
             return;
         }
 
         if (value.Length == 0 && !row.IsEditable)
         {
             PropertyRows.Remove(row);
+            NotifyIfIdentifyingProperty(name);
             return;
         }
         row.Value = value;
+        NotifyIfIdentifyingProperty(name);
+    }
+
+    /// <summary>
+    /// DisplayName reads PropertyRows directly rather than being a bound
+    /// field of its own, so a live update to one of the properties it falls
+    /// back to (when Text is empty) needs its own change notification —
+    /// unlike Type/Text, which already raise this via their own setters.
+    /// </summary>
+    private void NotifyIfIdentifyingProperty(string name)
+    {
+        if (Array.IndexOf(IdentifyingPropertyPriority, name) >= 0)
+            OnPropertyChanged(nameof(DisplayName));
     }
 
     public PropertyRowViewModel? FindProperty(string name) =>

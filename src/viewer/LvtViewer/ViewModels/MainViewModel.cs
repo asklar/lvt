@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Linq;
 using System.Windows.Threading;
 using LvtViewer.Models;
 using LvtViewer.Services;
@@ -31,7 +33,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         LvtExePath = LvtLocator.Find();
         _cli = new LvtCli(LvtExePath);
 
-        _watch.EventReceived += evt => _dispatcher.BeginInvoke(() => _liveTree.Apply(evt));
+        _watch.EventReceived += evt => _dispatcher.BeginInvoke(() => OnWatchEvent(evt));
         _watch.DiagnosticReceived += line => _dispatcher.BeginInvoke(() => StatusText = line);
         _watch.Exited += code => _dispatcher.BeginInvoke(() =>
             StatusText = $"lvt watch exited (code {code}) — target likely closed. Re-pick a window to reconnect.");
@@ -42,6 +44,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     public string LvtExePath { get; }
+
 
     public ObservableCollection<ElementNodeViewModel> Roots => _liveTree.Roots;
 
@@ -62,10 +65,39 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         get => _useUia;
         set
         {
-            if (SetField(ref _useUia, value) && _currentHwndHex != null)
-                Reconnect();
+            if (SetField(ref _useUia, value))
+            {
+                OnPropertyChanged(nameof(IsFrameworkFilterActive));
+                ApplyFrameworkFilter();
+                if (_currentHwndHex != null)
+                    Reconnect();
+            }
         }
     }
+
+    private bool _isConnected;
+
+    /// <summary>Whether a target window is currently connected — gates the element-pick gesture (item 2).</summary>
+    public bool IsConnected
+    {
+        get => _isConnected;
+        private set => SetField(ref _isConnected, value);
+    }
+
+    /// <summary>
+    /// Discovered framework/content types (win32, xaml, winui3, wpf, comctl,
+    /// dui, ...) for the current target, each with its own include/exclude
+    /// checkbox. Populated lazily as watch events report elements with a
+    /// framework value not seen yet this session.
+    /// </summary>
+    public ObservableCollection<FrameworkFilterOption> FrameworkFilters { get; } = new();
+
+    /// <summary>
+    /// UIA's tree has no per-node framework distinction the way the visual
+    /// tree does (see docs/mcp-server.md's "Modes"), so the filter only
+    /// applies — and only needs to be shown — in visual-tree mode.
+    /// </summary>
+    public bool IsFrameworkFilterActive => !UseUia;
 
     public ElementNodeViewModel? SelectedElement
     {
@@ -73,9 +105,76 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         set => SetField(ref _selectedElement, value);
     }
 
+    private bool _highlightSelected = true;
+
+    /// <summary>
+    /// Whether MainWindow draws a highlight overlay around SelectedElement's
+    /// bounds on the target app, the same visual style the crosshair-drag
+    /// gesture already uses to show which window it is over (item 1).
+    /// </summary>
+    public bool HighlightSelected
+    {
+        get => _highlightSelected;
+        set => SetField(ref _highlightSelected, value);
+    }
+
     public RelayCommand ToggleCommand { get; }
     public RelayCommand SetValueCommand { get; }
     public RelayCommand ReconnectCommand { get; }
+
+    private void OnWatchEvent(WatchEventDto evt)
+    {
+        _liveTree.Apply(evt);
+        DiscoverFrameworks(evt);
+        ApplyFrameworkFilter();
+    }
+
+    /// <summary>Adds a checkbox (default checked) for any not-yet-seen framework value in this event.</summary>
+    private void DiscoverFrameworks(WatchEventDto evt)
+    {
+        string? framework = evt.Element?.Framework;
+        if (evt.Fields != null && evt.Fields.TryGetValue("framework", out var change))
+            framework = change.New;
+        if (string.IsNullOrEmpty(framework))
+            return;
+        if (FrameworkFilters.Any(f => f.Name == framework))
+            return;
+
+        var option = new FrameworkFilterOption(framework);
+        option.PropertyChanged += (_, _) => ApplyFrameworkFilter();
+        FrameworkFilters.Add(option);
+    }
+
+    /// <summary>
+    /// Recomputes ElementNodeViewModel.IsVisible across the whole tree from
+    /// the current FrameworkFilters selection. A container stays visible if
+    /// any descendant is visible, even when its own framework was excluded,
+    /// so excluding one type never hides an unrelated matching descendant
+    /// deeper in the same branch.
+    /// </summary>
+    private void ApplyFrameworkFilter()
+    {
+        HashSet<string>? enabled = IsFrameworkFilterActive
+            ? new HashSet<string>(FrameworkFilters.Where(f => f.IsChecked).Select(f => f.Name))
+            : null; // null = no filtering (UIA mode, or nothing discovered yet)
+
+        bool Visit(ElementNodeViewModel node)
+        {
+            bool childVisible = false;
+            foreach (var child in node.Children)
+                childVisible |= Visit(child);
+
+            bool selfMatches = enabled == null ||
+                                string.IsNullOrEmpty(node.Framework) ||
+                                enabled.Contains(node.Framework);
+            bool visible = selfMatches || childVisible;
+            node.IsVisible = visible;
+            return visible;
+        }
+
+        foreach (var root in Roots)
+            Visit(root);
+    }
 
     /// <summary>Called by the crosshair picker once a target window is resolved.</summary>
     public void ConnectTo(IntPtr hwnd)
@@ -83,6 +182,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         NativeMethodsWindowInfo(hwnd, out var pid, out var title);
 
         _currentHwndHex = "0x" + hwnd.ToInt64().ToString("X", CultureInfo.InvariantCulture);
+        IsConnected = true;
 
         string processName = "?";
         try
@@ -97,6 +197,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         TargetText = $"{processName} (pid {pid})  —  hwnd {_currentHwndHex}  —  \"{title}\"";
         StatusText = "Connecting…";
         _liveTree.Reset();
+        FrameworkFilters.Clear(); // new target: fresh discovery, previous app's types no longer apply
         _watch.Start(LvtExePath, _currentHwndHex, UseUia);
         StatusText = UseUia
             ? "Watching the UI Automation tree live."

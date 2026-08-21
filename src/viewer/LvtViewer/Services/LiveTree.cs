@@ -171,11 +171,15 @@ public sealed class LiveTree
                 : new List<ElementNodeViewModel>();
             SyncCollection(node.Children, desired);
             foreach (var child in desired)
+            {
+                child.Parent = node;
                 Apply(child);
+            }
         }
 
         if (rootKey != null && _byKey.TryGetValue(rootKey, out var root))
         {
+            root.Parent = null;
             root.IsExpanded = true;
             SyncCollection(Roots, new List<ElementNodeViewModel> { root });
             Apply(root);
