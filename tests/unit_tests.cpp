@@ -542,22 +542,24 @@ TEST(WpfTreeJson, ZeroSizeIsMarkedRatherThanSilentlyOmitted) {
     // really is zero".
     auto roots = lvt::wpf_parse_tree_json(
         R"([{"type":"System.Windows.Controls.Border","zeroSize":true}])", "wpf");
-    ASSERT_EQ(roots.size(), 1u);
-    EXPECT_EQ(roots[0].properties["zeroSize"], "true");
-    EXPECT_EQ(roots[0].bounds.width, 0);
-    EXPECT_EQ(roots[0].bounds.height, 0);
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].properties["zeroSize"], "true");
+    EXPECT_EQ((*roots)[0].bounds.width, 0);
+    EXPECT_EQ((*roots)[0].bounds.height, 0);
 }
 
 TEST(WpfTreeJson, NonZeroBoundsAreGraftedNormally) {
     auto roots = lvt::wpf_parse_tree_json(
         R"([{"type":"System.Windows.Controls.Button","width":100.0,"height":24.0,)"
         R"("offsetX":10.0,"offsetY":20.0}])", "wpf");
-    ASSERT_EQ(roots.size(), 1u);
-    EXPECT_EQ(roots[0].bounds.width, 100);
-    EXPECT_EQ(roots[0].bounds.height, 24);
-    EXPECT_EQ(roots[0].bounds.x, 10);
-    EXPECT_EQ(roots[0].bounds.y, 20);
-    EXPECT_TRUE(roots[0].properties["zeroSize"].empty());
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].bounds.width, 100);
+    EXPECT_EQ((*roots)[0].bounds.height, 24);
+    EXPECT_EQ((*roots)[0].bounds.x, 10);
+    EXPECT_EQ((*roots)[0].bounds.y, 20);
+    EXPECT_TRUE((*roots)[0].properties["zeroSize"].empty());
 }
 
 TEST(WpfTreeJson, HiddenAndCollapsedAreDistinguishedByWpfVisibility) {
@@ -568,20 +570,23 @@ TEST(WpfTreeJson, HiddenAndCollapsedAreDistinguishedByWpfVisibility) {
         R"([{"type":"TextBox","visible":false,"wpf.visibility":"Hidden"}])", "wpf");
     auto collapsed = lvt::wpf_parse_tree_json(
         R"([{"type":"TextBox","visible":false,"wpf.visibility":"Collapsed"}])", "wpf");
-    ASSERT_EQ(hidden.size(), 1u);
-    ASSERT_EQ(collapsed.size(), 1u);
-    EXPECT_EQ(hidden[0].properties["visible"], "false");
-    EXPECT_EQ(collapsed[0].properties["visible"], "false");
-    EXPECT_EQ(hidden[0].properties["wpf.visibility"], "Hidden");
-    EXPECT_EQ(collapsed[0].properties["wpf.visibility"], "Collapsed");
-    EXPECT_NE(hidden[0].properties["wpf.visibility"], collapsed[0].properties["wpf.visibility"]);
+    ASSERT_TRUE(hidden.has_value());
+    ASSERT_TRUE(collapsed.has_value());
+    ASSERT_EQ(hidden->size(), 1u);
+    ASSERT_EQ(collapsed->size(), 1u);
+    EXPECT_EQ((*hidden)[0].properties["visible"], "false");
+    EXPECT_EQ((*collapsed)[0].properties["visible"], "false");
+    EXPECT_EQ((*hidden)[0].properties["wpf.visibility"], "Hidden");
+    EXPECT_EQ((*collapsed)[0].properties["wpf.visibility"], "Collapsed");
+    EXPECT_NE((*hidden)[0].properties["wpf.visibility"], (*collapsed)[0].properties["wpf.visibility"]);
 }
 
 TEST(WpfTreeJson, VisibleElementsCarryNoVisibilityOverride) {
     auto roots = lvt::wpf_parse_tree_json(R"([{"type":"TextBox"}])", "wpf");
-    ASSERT_EQ(roots.size(), 1u);
-    EXPECT_TRUE(roots[0].properties["visible"].empty());
-    EXPECT_TRUE(roots[0].properties["wpf.visibility"].empty());
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_TRUE((*roots)[0].properties["visible"].empty());
+    EXPECT_TRUE((*roots)[0].properties["wpf.visibility"].empty());
 }
 
 TEST(WpfTreeJson, EmptyTextIsPreservedRatherThanFallingBackToTheName) {
@@ -591,20 +596,31 @@ TEST(WpfTreeJson, EmptyTextIsPreservedRatherThanFallingBackToTheName) {
     // and must survive as the element's text, not be overwritten by name.
     auto roots = lvt::wpf_parse_tree_json(
         R"([{"type":"TextBox","name":"searchBox","text":""}])", "wpf");
-    ASSERT_EQ(roots.size(), 1u);
-    EXPECT_EQ(roots[0].properties["name"], "searchBox");
-    EXPECT_EQ(roots[0].text, "");
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].properties["name"], "searchBox");
+    EXPECT_EQ((*roots)[0].text, "");
 }
 
 TEST(WpfTreeJson, MissingTextKeyFallsBackToName) {
     auto roots = lvt::wpf_parse_tree_json(
         R"([{"type":"Border","name":"outerBorder"}])", "wpf");
-    ASSERT_EQ(roots.size(), 1u);
-    EXPECT_EQ(roots[0].text, "outerBorder");
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].text, "outerBorder");
 }
 
-TEST(WpfTreeJson, InvalidJsonYieldsNoRoots) {
-    EXPECT_TRUE(lvt::wpf_parse_tree_json("{not json", "wpf").empty());
+TEST(WpfTreeJson, InvalidJsonIsDistinctFromAValidEmptyTree) {
+    // Before this fix, a parse failure and "[]" (a real, empty tree) were
+    // both represented as an empty vector - indistinguishable from each
+    // other, and from the caller's point of view, from success. nullopt is
+    // reserved for the actual parse failure; "[]" still parses to a
+    // present-but-empty vector.
+    EXPECT_FALSE(lvt::wpf_parse_tree_json("{not json", "wpf").has_value());
+
+    auto emptyButValid = lvt::wpf_parse_tree_json("[]", "wpf");
+    ASSERT_TRUE(emptyButValid.has_value());
+    EXPECT_TRUE(emptyButValid->empty());
 }
 
 // ---- Watch diff ----
@@ -1538,6 +1554,18 @@ TEST(XamlPropertyFilter, ShortDigitTextIsNeverTreatedAsAHandle) {
 TEST(XamlPropertyFilter, NonNumericLongTextIsNeverTreatedAsAHandle) {
     EXPECT_TRUE(lvt::xaml_should_capture_property(
         L"Text", L"Order confirmation pending", L""));
+}
+
+TEST(XamlPropertyFilter, StatePropertiesBypassTheHandleHeuristicEntirely) {
+    // AutomationProperties.AutomationId is always genuinely string-typed in
+    // XAML, and a long numeric id (a generated GUID-as-string, say) is a very
+    // plausible real value - it must not be mistaken for a handle just
+    // because ValueType did not come through as a confirmed "String". State
+    // properties skip the handle heuristic entirely, unlike text properties.
+    EXPECT_TRUE(lvt::xaml_should_capture_property(
+        L"AutomationProperties.AutomationId", L"123456789012", L""));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Tag", L"123456789012", L"Object"));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Source", L"123456789012", L""));
 }
 
 TEST(UiaCulture, FallsBackToTheNumberWhenUnresolvable) {

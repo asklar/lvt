@@ -18,7 +18,10 @@ inline bool xaml_is_text_property(const std::wstring& name) {
 }
 
 // State/identity properties lvt captures regardless of value shape: their
-// value being "0" or a short numeric string is legitimate data, not noise.
+// value being "0", or a long numeric string that would otherwise look like a
+// handle, is legitimate data, not noise. xaml_should_capture_property skips
+// the handle heuristic entirely for names in this list, rather than relying
+// on ValueType the way text properties do — see its comment for why.
 inline bool xaml_is_state_property(const std::wstring& name) {
     return name == L"AutomationProperties.Name" ||
            name == L"AutomationProperties.AutomationId" ||
@@ -99,10 +102,23 @@ inline bool xaml_should_capture_property(const std::wstring& name, const std::ws
                                           const std::wstring& valueType) {
     if (value.empty())
         return false;
-    if (xaml_looks_like_handle(value, valueType))
-        return false;
-    if (xaml_is_text_property(name))
+    // The handle heuristic only ever applies to text properties. State
+    // properties (Tag, Source, AutomationProperties.*, Visibility, ...) are
+    // captured regardless of value shape, per xaml_is_state_property's
+    // contract: AutomationProperties.Name/AutomationId/HelpText are always
+    // genuinely string-typed in XAML, so a long numeric AutomationId (a
+    // very plausible generated id) must not be mistaken for a handle. Tag
+    // and Source can hold arbitrary reference-typed values too, but this
+    // function has no ValueType-independent way to tell "Tag holds a real
+    // long numeric string" from "Tag holds a handle" once the pattern-backed
+    // exemption above does not apply — capturing it as-is (possibly a raw
+    // handle string) is the lesser failure next to silently dropping an
+    // AutomationId, which is the property this list exists to protect.
+    if (xaml_is_text_property(name)) {
+        if (xaml_looks_like_handle(value, valueType))
+            return false;
         return xaml_is_string_value_type(valueType);
+    }
     return xaml_is_state_property(name);
 }
 

@@ -118,13 +118,14 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     parent.children.push_back(std::move(el));
 }
 
-std::vector<Element> wpf_parse_tree_json(const std::string& jsonText, const std::string& framework) {
+std::optional<std::vector<Element>> wpf_parse_tree_json(const std::string& jsonText,
+                                                          const std::string& framework) {
     json treeJson;
     try {
         treeJson = json::parse(jsonText);
     } catch (const json::parse_error& e) {
         fprintf(stderr, "lvt: failed to parse WPF tree JSON: %s\n", e.what());
-        return {};
+        return std::nullopt;
     }
 
     // graft_json_node appends to a parent's children, so a synthetic parent
@@ -339,7 +340,9 @@ bool inject_and_collect_wpf_tree(Element& root, HWND /*hwnd*/, DWORD pid) {
     // Graft WPF elements. The JSON is an array of Window roots, each mapping
     // to an HwndWrapper HWND in the Win32 tree.
     auto parsed = wpf_parse_tree_json(data, "wpf");
-    for (auto& el : parsed) {
+    if (!parsed)
+        return false;
+    for (auto& el : *parsed) {
         root.children.push_back(std::move(el));
     }
 
