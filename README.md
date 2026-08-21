@@ -400,6 +400,25 @@ for the full tool reference and the security model.
 Building it from source needs a Rust toolchain and is opt-in
 (`-DLVT_ENABLE_MCP=ON`); released binaries have it built in.
 
+## lvt Viewer
+
+A graphical, live element-tree browser for Windows — think Visual Studio's
+Live Visual Tree or the Windows SDK's Inspect.exe. Drag a crosshair onto a
+window to target it; a tree on one side and a property panel on the other
+both update live as the target's UI changes.
+
+```powershell
+cmake --preset default -DLVT_BUILD_VIEWER=ON
+cmake --build build
+.\build\viewer\LvtViewer.exe
+```
+
+It's a separate WPF (.NET) app that drives `lvt.exe` as a subprocess (`watch`
+for live updates, `toggle`/`set-value` for editing) rather than linking
+`lvt_core`. See **[src/viewer/README.md](src/viewer/README.md)** for the
+architecture, why `watch` was chosen over MCP for live updates, and how to
+build/run it.
+
 ## Output format
 
 ### Watch mode
