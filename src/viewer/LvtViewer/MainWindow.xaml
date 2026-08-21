@@ -1,0 +1,138 @@
+﻿<Window x:Class="LvtViewer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:LvtViewer.ViewModels"
+        xmlns:conv="clr-namespace:LvtViewer.Converters"
+        Title="lvt Viewer" Height="760" Width="1150" WindowStartupLocation="CenterScreen">
+    <Window.Resources>
+        <conv:FrameworkToBrushConverter x:Key="FrameworkToBrush"/>
+        <conv:EditKindToVisibilityConverter x:Key="EditKindToVisibility"/>
+
+        <HierarchicalDataTemplate DataType="{x:Type vm:ElementNodeViewModel}" ItemsSource="{Binding Children}">
+            <StackPanel Orientation="Horizontal">
+                <Ellipse Width="8" Height="8" Margin="0,0,6,0" VerticalAlignment="Center"
+                         Fill="{Binding Framework, Converter={StaticResource FrameworkToBrush}}"/>
+                <TextBlock Text="{Binding DisplayName}"/>
+            </StackPanel>
+        </HierarchicalDataTemplate>
+    </Window.Resources>
+
+    <DockPanel>
+        <!-- Toolbar: crosshair target picker, tree mode, reconnect, current target -->
+        <Border DockPanel.Dock="Top" Background="#FFF3F3F3" BorderBrush="#FFD5D5D5" BorderThickness="0,0,0,1" Padding="8">
+            <StackPanel Orientation="Horizontal">
+                <Border x:Name="CrosshairHandle" Width="30" Height="30" Background="White"
+                        BorderBrush="#FF808080" BorderThickness="1" Cursor="Hand" Margin="0,0,12,0"
+                        ToolTip="Press and drag onto a window to inspect it">
+                    <Canvas Width="20" Height="20">
+                        <Line X1="10" Y1="0" X2="10" Y2="20" Stroke="Black" StrokeThickness="2"/>
+                        <Line X1="0" Y1="10" X2="20" Y2="10" Stroke="Black" StrokeThickness="2"/>
+                        <Ellipse Canvas.Left="5" Canvas.Top="5" Width="10" Height="10" Stroke="Red" StrokeThickness="2"/>
+                    </Canvas>
+                </Border>
+                <CheckBox Content="UI Automation tree" IsChecked="{Binding UseUia}"
+                          VerticalAlignment="Center" Margin="0,0,16,0"/>
+                <Button Content="Reconnect" Command="{Binding ReconnectCommand}" Padding="10,3" Margin="0,0,16,0"/>
+                <TextBlock Text="{Binding TargetText}" VerticalAlignment="Center" FontWeight="SemiBold"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Status bar -->
+        <Border DockPanel.Dock="Bottom" Background="#FFEFEFEF" BorderBrush="#FFD5D5D5" BorderThickness="0,1,0,0" Padding="6,3">
+            <TextBlock Text="{Binding StatusText}" TextTrimming="CharacterEllipsis"/>
+        </Border>
+
+        <!-- Two-pane view: element tree | property panel -->
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" MinWidth="220"/>
+                <ColumnDefinition Width="5"/>
+                <ColumnDefinition Width="1.2*" MinWidth="280"/>
+            </Grid.ColumnDefinitions>
+
+            <TreeView x:Name="Tree" Grid.Column="0" ItemsSource="{Binding Roots}" BorderThickness="0">
+                <TreeView.ItemContainerStyle>
+                    <Style TargetType="TreeViewItem">
+                        <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=OneWay}"/>
+                    </Style>
+                </TreeView.ItemContainerStyle>
+            </TreeView>
+
+            <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch" Background="#FFD5D5D5"/>
+
+            <Grid Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <StackPanel Grid.Row="0" DataContext="{Binding SelectedElement}" Margin="10,10,10,4">
+                    <TextBlock Text="{Binding DisplayName}" FontSize="16" FontWeight="Bold" TextWrapping="Wrap"/>
+                    <Grid Margin="0,6,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Id:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding Id}" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Key:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Key}" TextWrapping="Wrap" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="2" Grid.Column="0" Text="Framework:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding Framework}" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="3" Grid.Column="0" Text="Class:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding ClassName}" TextWrapping="Wrap" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="4" Grid.Column="0" Text="Text:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding Text}" TextWrapping="Wrap" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="5" Grid.Column="0" Text="Bounds:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding BoundsText}" Margin="0,0,0,2"/>
+                    </Grid>
+                    <Separator Margin="0,8,0,4"/>
+                    <TextBlock Text="Properties" FontWeight="Bold"/>
+                </StackPanel>
+
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="10,0,10,10">
+                    <ItemsControl ItemsSource="{Binding SelectedElement.PropertyRows}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,2,0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="160"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="{Binding Name}" FontWeight="SemiBold"
+                                               TextWrapping="Wrap" VerticalAlignment="Top" Margin="0,3,8,0"/>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="{Binding Value}" TextWrapping="Wrap" Margin="0,3,0,0"
+                                                   Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=None}"/>
+                                        <StackPanel Orientation="Horizontal"
+                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=Toggle}">
+                                            <TextBlock Text="{Binding Value}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                            <Button Content="Toggle" Padding="10,1"
+                                                    Command="{Binding DataContext.ToggleCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                    CommandParameter="{Binding}"/>
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal"
+                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=TextValue}">
+                                            <TextBox Text="{Binding EditText, UpdateSourceTrigger=PropertyChanged}" Width="160" Margin="0,0,8,0"/>
+                                            <Button Content="Set" Padding="10,1"
+                                                    Command="{Binding DataContext.SetValueCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                    CommandParameter="{Binding}"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </Grid>
+        </Grid>
+    </DockPanel>
+</Window>
