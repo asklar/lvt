@@ -61,8 +61,13 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     if (!name.empty())
         el.properties["name"] = name;
 
-    el.text = sanitize(j.value("text", ""));
-    if (el.text.empty())
+    // A "text" key present but empty (WpfTreeWalker sends this for a real
+    // string-typed Text/Content/Header property that just happens to be
+    // empty) is real data and must not be overwritten by the name fallback;
+    // only an absent key - no such property at all - falls back to name.
+    if (j.contains("text") && j["text"].is_string())
+        el.text = sanitize(j["text"].get<std::string>());
+    else
         el.text = name;
 
     double w = j.value("width", 0.0);
@@ -80,11 +85,27 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
             el.bounds.width = *sw;
             el.bounds.height = *sh;
         }
+    } else if (j.contains("zeroSize") && j["zeroSize"].is_boolean() && j["zeroSize"].get<bool>()) {
+        // WpfTreeWalker read ActualWidth/ActualHeight and they really were
+        // zero (or negative, pre-layout) - distinct from bounds being absent
+        // for some other reason (e.g. its PresentationSource lookup threw).
+        el.properties["zeroSize"] = "true";
     }
 
-    // Visibility/enabled as properties
+    // Visibility/enabled as properties.
+    //
+    // "visible" stays exactly as before: it is the generic, provider-agnostic
+    // signal lvt_api.cpp's click-safety check reads across Win32/WinForms/WPF
+    // alike, so its boolean shape cannot change here in isolation.
+    //
+    // "wpf.visibility" is additive: WPF has three visibilities, and this is
+    // the only place that carries Hidden vs Collapsed through to the Element
+    // tree, matching the "winforms.visible" precedent for framework-specific
+    // detail that the generic key does not carry.
     if (j.contains("visible") && j["visible"].is_boolean() && !j["visible"].get<bool>())
         el.properties["visible"] = "false";
+    if (j.contains("wpf.visibility") && j["wpf.visibility"].is_string())
+        el.properties["wpf.visibility"] = j["wpf.visibility"].get<std::string>();
     if (j.contains("enabled") && j["enabled"].is_boolean() && !j["enabled"].get<bool>())
         el.properties["enabled"] = "false";
 
@@ -95,6 +116,29 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     }
 
     parent.children.push_back(std::move(el));
+}
+
+std::vector<Element> wpf_parse_tree_json(const std::string& jsonText, const std::string& framework) {
+    json treeJson;
+    try {
+        treeJson = json::parse(jsonText);
+    } catch (const json::parse_error& e) {
+        fprintf(stderr, "lvt: failed to parse WPF tree JSON: %s\n", e.what());
+        return {};
+    }
+
+    // graft_json_node appends to a parent's children, so a synthetic parent
+    // collects the top-level roots (the JSON is an array of Window roots, or
+    // occasionally a single object) without needing a second code path here.
+    Element syntheticParent;
+    if (treeJson.is_array()) {
+        for (auto& node : treeJson) {
+            graft_json_node(node, syntheticParent, framework);
+        }
+    } else if (treeJson.is_object()) {
+        graft_json_node(treeJson, syntheticParent, framework);
+    }
+    return std::move(syntheticParent.children);
 }
 
 // Write pipe name to a sidecar file next to the TAP DLL so it can read it
@@ -292,22 +336,11 @@ bool inject_and_collect_wpf_tree(Element& root, HWND /*hwnd*/, DWORD pid) {
         return false;
     }
 
-    json treeJson;
-    try {
-        treeJson = json::parse(data);
-    } catch (const json::parse_error& e) {
-        fprintf(stderr, "lvt: failed to parse WPF tree JSON: %s\n", e.what());
-        return false;
-    }
-
-    // Graft WPF elements. The JSON is an array of Window roots.
-    // Each maps to an HwndWrapper HWND in the Win32 tree.
-    if (treeJson.is_array()) {
-        for (auto& node : treeJson) {
-            graft_json_node(node, root, "wpf");
-        }
-    } else if (treeJson.is_object()) {
-        graft_json_node(treeJson, root, "wpf");
+    // Graft WPF elements. The JSON is an array of Window roots, each mapping
+    // to an HwndWrapper HWND in the Win32 tree.
+    auto parsed = wpf_parse_tree_json(data, "wpf");
+    for (auto& el : parsed) {
+        root.children.push_back(std::move(el));
     }
 
     return true;

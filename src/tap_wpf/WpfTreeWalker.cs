@@ -147,15 +147,50 @@ namespace LvtWpfTap
                     }
                     catch { /* PointToScreen can fail for non-rendered elements */ }
                 }
+                else
+                {
+                    // w<=0 or h<=0 used to mean total silence here: no width,
+                    // no height, no offset, indistinguishable from an element
+                    // that was never laid out at all or whose PresentationSource
+                    // lookup threw. zeroSize says explicitly "lvt read
+                    // ActualWidth/ActualHeight and they really are zero (or
+                    // negative before layout)", which is exactly the case a
+                    // user investigating a missing/invisible element needs to
+                    // be able to tell apart from a different failure.
+                    sb.Append(",\"zeroSize\":true");
+                }
 
-                // Text content for common controls
-                string text = GetTextContent(fe);
-                if (!string.IsNullOrEmpty(text))
-                    sb.Append(",\"text\":\"").Append(EscapeJson(text)).Append('"');
+                // Text content for common controls. hasTextProperty distinguishes
+                // "no Text/Content/Header string property exists on this type"
+                // (key omitted) from "the property exists and is an empty
+                // string" (key emitted as ""), which GetTextContent's caller
+                // must be able to tell apart — collapsing them the way a plain
+                // IsNullOrEmpty check does means an empty TextBox is
+                // unrecoverably identical to a Border with no text at all.
+                string text = GetTextContent(fe, out bool hasTextProperty);
+                if (hasTextProperty)
+                    sb.Append(",\"text\":\"").Append(EscapeJson(text ?? "")).Append('"');
 
-                // Visibility/enabled
+                // Visibility/enabled.
+                //
+                // "visible":false / absent is kept exactly as before: lvt's
+                // generic click-safety check (see lvt_api.cpp centreOf) reads
+                // this boolean across every provider, so its shape cannot
+                // change here without touching every other provider too.
+                //
+                // "wpf.visibility" is new and additive, named like
+                // "winforms.visible" is for WinForms: WPF has three
+                // visibilities, and collapsing Hidden and Collapsed into the
+                // same boolean loses the answer to the single most common
+                // WPF layout question there is — Hidden still reserves its
+                // layout space and Collapsed does not, so "why is there a gap
+                // where nothing is showing" has opposite answers depending on
+                // which one this was.
                 if (fe.Visibility != Visibility.Visible)
+                {
                     sb.Append(",\"visible\":false");
+                    sb.Append(",\"wpf.visibility\":\"").Append(fe.Visibility.ToString()).Append('"');
+                }
                 if (!fe.IsEnabled)
                     sb.Append(",\"enabled\":false");
             }
@@ -176,37 +211,52 @@ namespace LvtWpfTap
             sb.Append('}');
         }
 
-        private static string GetTextContent(FrameworkElement fe)
+        private static string GetTextContent(FrameworkElement fe, out bool hasTextProperty)
         {
-            // Use reflection to get common text properties without hard type deps
+            // Use reflection to get common text properties without hard type deps.
+            //
+            // hasTextProperty distinguishes "this element has no string-valued
+            // Text/Content/Header at all" from "it has one and it happens to be
+            // empty" - SerializeElement needs that to decide whether to omit the
+            // "text" key entirely or emit it as "". Content/Header are declared
+            // as `object`, so an empty string there is still a real answer;
+            // null or a non-string object is not, and we fall through to the
+            // next candidate rather than reporting a false "has no text".
             try
             {
                 var textProp = fe.GetType().GetProperty("Text");
-                if (textProp != null)
+                if (textProp != null && textProp.PropertyType == typeof(string))
                 {
-                    var val = textProp.GetValue(fe) as string;
-                    if (!string.IsNullOrEmpty(val))
-                        return val.Length > 200 ? val.Substring(0, 200) : val;
+                    var val = textProp.GetValue(fe) as string ?? "";
+                    hasTextProperty = true;
+                    return val.Length > 200 ? val.Substring(0, 200) : val;
                 }
 
                 var contentProp = fe.GetType().GetProperty("Content");
                 if (contentProp != null)
                 {
                     var val = contentProp.GetValue(fe);
-                    if (val is string s && !string.IsNullOrEmpty(s))
+                    if (val is string s)
+                    {
+                        hasTextProperty = true;
                         return s.Length > 200 ? s.Substring(0, 200) : s;
+                    }
                 }
 
                 var headerProp = fe.GetType().GetProperty("Header");
                 if (headerProp != null)
                 {
                     var val = headerProp.GetValue(fe);
-                    if (val is string s && !string.IsNullOrEmpty(s))
+                    if (val is string s)
+                    {
+                        hasTextProperty = true;
                         return s.Length > 200 ? s.Substring(0, 200) : s;
+                    }
                 }
             }
             catch { }
 
+            hasTextProperty = false;
             return null;
         }
 
