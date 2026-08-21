@@ -10,7 +10,18 @@ if(LVT_BUILD_TESTS)
     list(APPEND VCPKG_MANIFEST_FEATURES "tests")
 endif()
 
-project(lvt VERSION 0.3.0 LANGUAGES CXX)
+# VERSION is the single source of truth for lvt's product version: every part
+# of the build (LVT_VERSION / --version, the Win32 VERSIONINFO resources
+# stamped onto lvt.exe and its DLLs, the MCP server's reported version, and
+# Directory.Build.props for the managed .NET tree walkers) derives from this
+# one file, so bumping a release means editing it in exactly one place. See
+# also mcp/Cargo.toml, which cannot read this file for its own manifest
+# version (Cargo has no equivalent to configure_file) and is documented there
+# as decorative rather than authoritative.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" LVT_VERSION_STRING LIMIT_COUNT 1)
+string(STRIP "${LVT_VERSION_STRING}" LVT_VERSION_STRING)
+
+project(lvt VERSION ${LVT_VERSION_STRING} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,6 +61,24 @@ configure_file(
     "${CMAKE_CURRENT_BINARY_DIR}/include/lvt/lvt_config.h"
     @ONLY
 )
+
+# Stamps a Win32 VERSIONINFO resource (CompanyName, FileDescription, version
+# numbers, etc.) onto an EXE or DLL target so Explorer's Properties dialog and
+# tools like `Get-Item .\lvt.exe | Select VersionInfo` show real metadata
+# instead of blanks. filetype is VFT_APP for an .exe or VFT_DLL for a .dll.
+function(lvt_add_version_resource target description internal_name original_filename filetype)
+    set(LVT_VERSION_RC_DESCRIPTION "${description}")
+    set(LVT_VERSION_RC_INTERNALNAME "${internal_name}")
+    set(LVT_VERSION_RC_ORIGINALFILENAME "${original_filename}")
+    set(LVT_VERSION_RC_FILETYPE "${filetype}")
+    set(_lvt_version_rc "${CMAKE_CURRENT_BINARY_DIR}/${target}_version.rc")
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/cmake/version_resource.rc.in"
+        "${_lvt_version_rc}"
+        @ONLY
+    )
+    target_sources(${target} PRIVATE "${_lvt_version_rc}")
+endfunction()
 
 # The TAP DLLs and plugins must sit next to the consuming binary at runtime.
 # Keep this independent of the lvt target so they still build with LVT_BUILD_TOOL=OFF.
@@ -163,6 +192,8 @@ target_compile_definitions(lvt_core PUBLIC
 if(LVT_BUILD_TOOL)
     add_executable(lvt src/main.cpp)
     target_link_libraries(lvt PRIVATE lvt_core WIL::WIL nlohmann_json::nlohmann_json)
+    lvt_add_version_resource(lvt
+        "lvt - Live Visual Tree CLI" "lvt" "lvt.exe" VFT_APP)
 endif()
 
 # --- MCP server (Rust) -----------------------------------------------------
@@ -400,6 +431,9 @@ set_target_properties(lvt_tap PROPERTIES
     OUTPUT_NAME "lvt_tap_${TAP_ARCH_SUFFIX}"
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}
 )
+lvt_add_version_resource(lvt_tap
+    "lvt XAML/WinUI3 TAP DLL (injected diagnostics helper)"
+    "lvt_tap" "lvt_tap_${TAP_ARCH_SUFFIX}.dll" VFT_DLL)
 endif()
 
 # WPF TAP DLL — native loader injected into WPF target process
@@ -419,6 +453,9 @@ set_target_properties(lvt_wpf_tap PROPERTIES
     OUTPUT_NAME "lvt_wpf_tap_${TAP_ARCH_SUFFIX}"
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}
 )
+lvt_add_version_resource(lvt_wpf_tap
+    "lvt WPF TAP DLL (injected diagnostics helper)"
+    "lvt_wpf_tap" "lvt_wpf_tap_${TAP_ARCH_SUFFIX}.dll" VFT_DLL)
 
 # Build managed WPF tree walker assembly and copy to output
 # Pre-build with: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release
@@ -451,6 +488,9 @@ set_target_properties(lvt_winforms_tap PROPERTIES
     OUTPUT_NAME "lvt_winforms_tap_${TAP_ARCH_SUFFIX}"
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}
 )
+lvt_add_version_resource(lvt_winforms_tap
+    "lvt WinForms TAP DLL (injected diagnostics helper)"
+    "lvt_winforms_tap" "lvt_winforms_tap_${TAP_ARCH_SUFFIX}.dll" VFT_DLL)
 
 if(LVT_BUILD_MANAGED)
 set(LVT_WINFORMS_MANAGED_DLL "${CMAKE_SOURCE_DIR}/src/tap_winforms/bin/Release/LvtWinFormsTap.dll")
@@ -492,6 +532,9 @@ set_target_properties(lvt_avalonia_plugin PROPERTIES
     OUTPUT_NAME "lvt_avalonia_plugin"
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins
 )
+lvt_add_version_resource(lvt_avalonia_plugin
+    "lvt Avalonia plugin DLL"
+    "lvt_avalonia_plugin" "lvt_avalonia_plugin.dll" VFT_DLL)
 
 # Avalonia TAP DLL — injected into Avalonia target process
 # Uses static CRT (/MT) to avoid CRT version conflicts in the target process
@@ -506,6 +549,9 @@ set_target_properties(lvt_avalonia_tap PROPERTIES
     OUTPUT_NAME "lvt_avalonia_tap_${TAP_ARCH_SUFFIX}"
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia
 )
+lvt_add_version_resource(lvt_avalonia_tap
+    "lvt Avalonia TAP DLL (injected diagnostics helper)"
+    "lvt_avalonia_tap" "lvt_avalonia_tap_${TAP_ARCH_SUFFIX}.dll" VFT_DLL)
 
 # Build managed Avalonia tree walker assembly and copy to output
 # Pre-build with: dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj -c Release
@@ -546,6 +592,9 @@ set_target_properties(lvt_chromium_plugin PROPERTIES
     OUTPUT_NAME "lvt_chromium_plugin"
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins
 )
+lvt_add_version_resource(lvt_chromium_plugin
+    "lvt Chromium (Chrome/Edge DOM) plugin DLL"
+    "lvt_chromium_plugin" "lvt_chromium_plugin.dll" VFT_DLL)
 
 # Chromium native messaging host — relay between Chrome extension and lvt
 add_executable(lvt_chromium_host
@@ -556,6 +605,9 @@ target_link_libraries(lvt_chromium_host PRIVATE WIL::WIL advapi32)
 set_target_properties(lvt_chromium_host PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium
 )
+lvt_add_version_resource(lvt_chromium_host
+    "lvt Chromium native messaging host"
+    "lvt_chromium_host" "lvt_chromium_host.exe" VFT_APP)
 
 # Copy Chromium extension files to output
 add_custom_command(TARGET lvt_chromium_plugin POST_BUILD

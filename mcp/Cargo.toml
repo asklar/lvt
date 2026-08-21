@@ -1,5 +1,11 @@
 [package]
 name = "lvt_mcp"
+# Cargo requires a version here, but it is never the version anyone sees:
+# publish = false means it never reaches crates.io, and the MCP server reports
+# lvt's real version at runtime via ffi::version() -> lvt_api_version(), which
+# reads LVT_VERSION - itself generated from the repo-root VERSION file (see
+# CMakeLists.txt). This field is decorative; there is no need to bump it in
+# lockstep with a release.
 version = "0.3.0"
 edition = "2021"
 description = "MCP server surface for lvt, linked into lvt.exe"
