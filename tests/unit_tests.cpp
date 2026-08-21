@@ -10,10 +10,12 @@
 #include "framework_detector.h"
 #include "target.h"
 #include "providers/winforms_inject.h"
+#include "providers/wpf_inject.h"
 #include "providers/uia_provider.h"
 #include "providers/uia_props.h"
 #include "input.h"
 #include "providers/uia_actions.h"
+#include "tap/xaml_property_filter.h"
 #include <oleacc.h>
 #include <UIAutomation.h>
 #include "wil_diagnostics.h"
@@ -531,6 +533,94 @@ TEST(WinFormsEnrichment, InvalidJsonDoesNotModifyTree) {
     EXPECT_FALSE(apply_winforms_control_json(root, "{not json"));
     EXPECT_EQ(root.framework, "win32");
     EXPECT_EQ(root.type, "Window");
+}
+
+TEST(WpfTreeJson, ZeroSizeIsMarkedRatherThanSilentlyOmitted) {
+    // Before the fix, w<=0 || h<=0 meant no width/height/offset/zeroSize at
+    // all: indistinguishable from PresentationSource throwing or the element
+    // never having been laid out. zeroSize says explicitly "measured, and it
+    // really is zero".
+    auto roots = lvt::wpf_parse_tree_json(
+        R"([{"type":"System.Windows.Controls.Border","zeroSize":true}])", "wpf");
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].properties["zeroSize"], "true");
+    EXPECT_EQ((*roots)[0].bounds.width, 0);
+    EXPECT_EQ((*roots)[0].bounds.height, 0);
+}
+
+TEST(WpfTreeJson, NonZeroBoundsAreGraftedNormally) {
+    auto roots = lvt::wpf_parse_tree_json(
+        R"([{"type":"System.Windows.Controls.Button","width":100.0,"height":24.0,)"
+        R"("offsetX":10.0,"offsetY":20.0}])", "wpf");
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].bounds.width, 100);
+    EXPECT_EQ((*roots)[0].bounds.height, 24);
+    EXPECT_EQ((*roots)[0].bounds.x, 10);
+    EXPECT_EQ((*roots)[0].bounds.y, 20);
+    EXPECT_TRUE((*roots)[0].properties["zeroSize"].empty());
+}
+
+TEST(WpfTreeJson, HiddenAndCollapsedAreDistinguishedByWpfVisibility) {
+    // "visible":false stays the same across both, matching every other
+    // provider's generic click-safety signal. wpf.visibility is what
+    // actually answers "does this reserve layout space or not".
+    auto hidden = lvt::wpf_parse_tree_json(
+        R"([{"type":"TextBox","visible":false,"wpf.visibility":"Hidden"}])", "wpf");
+    auto collapsed = lvt::wpf_parse_tree_json(
+        R"([{"type":"TextBox","visible":false,"wpf.visibility":"Collapsed"}])", "wpf");
+    ASSERT_TRUE(hidden.has_value());
+    ASSERT_TRUE(collapsed.has_value());
+    ASSERT_EQ(hidden->size(), 1u);
+    ASSERT_EQ(collapsed->size(), 1u);
+    EXPECT_EQ((*hidden)[0].properties["visible"], "false");
+    EXPECT_EQ((*collapsed)[0].properties["visible"], "false");
+    EXPECT_EQ((*hidden)[0].properties["wpf.visibility"], "Hidden");
+    EXPECT_EQ((*collapsed)[0].properties["wpf.visibility"], "Collapsed");
+    EXPECT_NE((*hidden)[0].properties["wpf.visibility"], (*collapsed)[0].properties["wpf.visibility"]);
+}
+
+TEST(WpfTreeJson, VisibleElementsCarryNoVisibilityOverride) {
+    auto roots = lvt::wpf_parse_tree_json(R"([{"type":"TextBox"}])", "wpf");
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_TRUE((*roots)[0].properties["visible"].empty());
+    EXPECT_TRUE((*roots)[0].properties["wpf.visibility"].empty());
+}
+
+TEST(WpfTreeJson, EmptyTextIsPreservedRatherThanFallingBackToTheName) {
+    // graft_json_node falls back el.text = name only when the walker never
+    // sent a "text" key at all. When it did send one - even "" - that is a
+    // real answer (an empty TextBox is not the same as an unnamed Border)
+    // and must survive as the element's text, not be overwritten by name.
+    auto roots = lvt::wpf_parse_tree_json(
+        R"([{"type":"TextBox","name":"searchBox","text":""}])", "wpf");
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].properties["name"], "searchBox");
+    EXPECT_EQ((*roots)[0].text, "");
+}
+
+TEST(WpfTreeJson, MissingTextKeyFallsBackToName) {
+    auto roots = lvt::wpf_parse_tree_json(
+        R"([{"type":"Border","name":"outerBorder"}])", "wpf");
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].text, "outerBorder");
+}
+
+TEST(WpfTreeJson, InvalidJsonIsDistinctFromAValidEmptyTree) {
+    // Before this fix, a parse failure and "[]" (a real, empty tree) were
+    // both represented as an empty vector - indistinguishable from each
+    // other, and from the caller's point of view, from success. nullopt is
+    // reserved for the actual parse failure; "[]" still parses to a
+    // present-but-empty vector.
+    EXPECT_FALSE(lvt::wpf_parse_tree_json("{not json", "wpf").has_value());
+
+    auto emptyButValid = lvt::wpf_parse_tree_json("[]", "wpf");
+    ASSERT_TRUE(emptyButValid.has_value());
+    EXPECT_TRUE(emptyButValid->empty());
 }
 
 // ---- Watch diff ----
@@ -1415,6 +1505,67 @@ TEST(UiaCulture, RendersLcidAsLocaleName) {
     // "Culture=1033" is opaque; "Culture=en-US" is not.
     EXPECT_EQ(lvt::uia_culture_name(1033), "en-US");
     EXPECT_EQ(lvt::uia_culture_name(1036), "fr-FR");
+}
+
+TEST(XamlPropertyFilter, ZeroIsCapturedForStateProperties) {
+    // Windows.UI.Xaml.Visibility::Visible and Orientation::Vertical are both
+    // 0. A blanket "0 means unset" filter would drop exactly the common case
+    // for these two, silently, while leaving Collapsed/Horizontal untouched.
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Visibility", L"0", L"Enum"));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Orientation", L"0", L"Enum"));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"IsChecked", L"0", L"Boolean"));
+}
+
+TEST(XamlPropertyFilter, EmptyValueIsNeverCaptured) {
+    // Empty string is the only "nothing came back" signal this API gives us.
+    EXPECT_FALSE(lvt::xaml_should_capture_property(L"Visibility", L"", L"Enum"));
+    EXPECT_FALSE(lvt::xaml_should_capture_property(L"Text", L"", L"String"));
+}
+
+TEST(XamlPropertyFilter, NonTextNonStatePropertiesAreIgnored) {
+    EXPECT_FALSE(lvt::xaml_should_capture_property(L"SomeRandomProperty", L"42", L"Int32"));
+}
+
+TEST(XamlPropertyFilter, LongDigitTextIsKeptWhenValueTypeIsConfirmedString) {
+    // A phone number, order id, or timestamp in a real Text/Content property
+    // must not be discarded just because it is long and all-digits: that
+    // shape is indistinguishable from a XAML reference handle UNLESS
+    // ValueType has already told us this is a real string.
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Text", L"5551234567890", L"String"));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Content", L"20260821113000000", L"String"));
+}
+
+TEST(XamlPropertyFilter, LongDigitTextWithUnconfirmedTypeIsTreatedAsAHandle) {
+    // Without a confirmed String ValueType, the shape heuristic is the only
+    // signal available, so it still applies — this is the conservative
+    // fallback, not a bug: it only ever suppresses text whose ValueType is
+    // missing/unknown, never a value XAML has confirmed is a real string.
+    EXPECT_FALSE(lvt::xaml_should_capture_property(L"Text", L"12345678901", L""));
+    EXPECT_FALSE(lvt::xaml_should_capture_property(L"Content", L"12345678901", L"Object"));
+}
+
+TEST(XamlPropertyFilter, ShortDigitTextIsNeverTreatedAsAHandle) {
+    // The >10-characters threshold exists so short numeric text (a 4-digit
+    // PIN, a small order number) is never mistaken for a handle regardless
+    // of ValueType.
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Text", L"1234567890", L""));
+}
+
+TEST(XamlPropertyFilter, NonNumericLongTextIsNeverTreatedAsAHandle) {
+    EXPECT_TRUE(lvt::xaml_should_capture_property(
+        L"Text", L"Order confirmation pending", L""));
+}
+
+TEST(XamlPropertyFilter, StatePropertiesBypassTheHandleHeuristicEntirely) {
+    // AutomationProperties.AutomationId is always genuinely string-typed in
+    // XAML, and a long numeric id (a generated GUID-as-string, say) is a very
+    // plausible real value - it must not be mistaken for a handle just
+    // because ValueType did not come through as a confirmed "String". State
+    // properties skip the handle heuristic entirely, unlike text properties.
+    EXPECT_TRUE(lvt::xaml_should_capture_property(
+        L"AutomationProperties.AutomationId", L"123456789012", L""));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Tag", L"123456789012", L"Object"));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Source", L"123456789012", L""));
 }
 
 TEST(UiaCulture, FallsBackToTheNumberWhenUnresolvable) {
