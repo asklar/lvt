@@ -62,7 +62,7 @@ static void LogMsg(const char* fmt, ...) {
         logFile = _wfopen(tmp, L"a");
         if (!logFile) return;
     }
-    fprintf(logFile, "[%lu] ", GetCurrentThreadId());
+    fprintf(logFile, "[%llu][%lu] ", GetTickCount64(), GetCurrentThreadId());
     va_list ap;
     va_start(ap, fmt);
     vfprintf(logFile, fmt, ap);
@@ -260,6 +260,7 @@ public:
                 static_cast<IVisualTreeServiceCallback*>(
                     static_cast<IVisualTreeServiceCallback2*>(this));
 
+            LogMsg("Calling AdviseVisualTreeChange");
             HRESULT hr = m_vts->AdviseVisualTreeChange(cb);
             LogMsg("AdviseVisualTreeChange returned 0x%08X, nodes=%zu, roots=%zu",
                    hr, m_nodes.size(), m_roots.size());
@@ -297,6 +298,7 @@ public:
                                      reinterpret_cast<LPARAM>(&req));
                         Sleep(1);
                     }
+                    LogMsg("Finished CollectBounds dispatch");
                 }
                 // Get element positions via TransformToVisual (works around broken
                 // ActualOffset serialization in WinUI3). Must run on the UI thread.
@@ -308,6 +310,7 @@ public:
                                      reinterpret_cast<LPARAM>(&req));
                         Sleep(1);
                     }
+                    LogMsg("Finished CollectPositionsAndText dispatch");
                 }
 #endif
                 SerializeAndSend();
@@ -696,12 +699,14 @@ private:
             json += SerializeNode(m_roots[i]);
         }
         json += L"]";
+        LogMsg("SerializeAndSend: built JSON, %zu wchars", json.size());
 
         int len = WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
                                       nullptr, 0, nullptr, nullptr);
         std::string utf8(len, '\0');
         WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
                             utf8.data(), len, nullptr, nullptr);
+        LogMsg("SerializeAndSend: converted to UTF-8, %d bytes; opening pipe", len);
 
         wil::unique_hfile pipe(CreateFileW(m_pipeName.c_str(), GENERIC_WRITE, 0,
                                   nullptr, OPEN_EXISTING, 0, nullptr));
