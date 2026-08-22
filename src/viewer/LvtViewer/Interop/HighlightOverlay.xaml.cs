@@ -2,6 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Media;
 
 namespace LvtViewer.Interop;
 
@@ -80,5 +81,26 @@ public partial class HighlightOverlay : Window
         int height = Math.Max(0, physicalFrame.Height);
         SetWindowPos(hwnd, IntPtr.Zero, physicalFrame.Left, physicalFrame.Top, width, height,
                      SWP_NOACTIVATE | SWP_NOZORDER);
+
+        // SetWindowPos moves the raw HWND, but WPF's own composition/render
+        // pipeline tracks position and size through this Window's *own*
+        // Left/Top/Width/Height DPs, entirely independent of the HWND's
+        // actual Win32 position — SetWindowPos alone leaves that WPF-side
+        // state stale. Observed live: the highlight stopped visually
+        // following the target window as it moved, and only caught up once
+        // something else (refocusing the viewer) forced WPF to redraw from
+        // scratch. Syncing Left/Top/Width/Height here, right after the
+        // move, keeps WPF's own understanding of where it is consistent
+        // with reality, which is what makes it keep rendering continuously
+        // on its own. GetDpi is queried *after* SetWindowPos specifically
+        // so it reflects whichever monitor the window is on *now* — before
+        // the move, it would still reflect the old one, reintroducing the
+        // cross-monitor mismatch the physical-pixel-first design here
+        // exists to avoid.
+        var dpi = VisualTreeHelper.GetDpi(this);
+        Left = physicalFrame.Left / dpi.DpiScaleX;
+        Top = physicalFrame.Top / dpi.DpiScaleY;
+        Width = width / dpi.DpiScaleX;
+        Height = height / dpi.DpiScaleY;
     }
 }
