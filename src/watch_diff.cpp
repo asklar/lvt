@@ -74,6 +74,34 @@ static json element_to_json(const Element& el) {
     return j;
 }
 
+// Same fields as element_to_json, but never recurses into children. A watch
+// event ("added"/"removed") describes exactly one node; the client rebuilds
+// tree structure from the flat stream of per-node events and each event's
+// "path" field (see LiveTree.RebuildHierarchy in the viewer), never from
+// nested children on an individual event. Element::children on the copy
+// snapshot_added_events/diff_trees attaches to each ChangeEvent already
+// holds that node's full subtree (Element is a value type; a copy is deep),
+// so calling the recursive serializer here embedded every descendant's data
+// again inside every one of its ancestors' own "added" events — for a tree
+// with N nodes D levels deep, up to O(N*D) redundant data instead of O(N).
+// Measured against a real ~1400-node, ~20-level-deep WinUI3 tree (Microsoft
+// Store), that redundancy produced hundreds of megabytes of stdout for a
+// single tick and looked, from the client's side reading that flood, just
+// like a connection that would never finish.
+static json element_to_json_flat(const Element& el) {
+    json j;
+    j["id"] = el.id;
+    j["key"] = el.key;
+    j["type"] = el.type;
+    j["framework"] = el.framework;
+    if (!el.className.empty()) j["className"] = el.className;
+    if (!el.text.empty()) j["text"] = el.text;
+    j["bounds"] = bounds_to_json(el.bounds);
+    if (!el.properties.empty())
+        j["properties"] = el.properties;
+    return j;
+}
+
 static const char* event_type_name(ChangeEvent::Type type) {
     switch (type) {
     case ChangeEvent::Type::Added: return "added";
@@ -83,6 +111,28 @@ static const char* event_type_name(ChangeEvent::Type type) {
     return "changed";
 }
 
+// A ChangeEvent describes exactly one node; nothing reads its element's
+// children (see element_to_json_flat's comment). Element's copy constructor
+// deep-copies `children` (a std::vector<Element>) recursively, so
+// `event.element = *indexed.element` copies that node's *entire subtree*
+// just to immediately discard it at serialization time — for a tree N nodes
+// deep and D levels deep, that is wasted work up to O(N*D), not O(N), for
+// every event this file produces. Building the flat copy field-by-field
+// instead of via the copy constructor avoids ever touching `children` here.
+static Element element_without_children(const Element& el) {
+    Element flat;
+    flat.id = el.id;
+    flat.key = el.key;
+    flat.type = el.type;
+    flat.framework = el.framework;
+    flat.className = el.className;
+    flat.text = el.text;
+    flat.bounds = el.bounds;
+    flat.properties = el.properties;
+    flat.nativeHandle = el.nativeHandle;
+    return flat;
+}
+
 std::vector<ChangeEvent> snapshot_added_events(const Element& root) {
     std::vector<ChangeEvent> events;
     for (const auto& indexed : index_tree(root)) {
@@ -90,7 +140,7 @@ std::vector<ChangeEvent> snapshot_added_events(const Element& root) {
         event.type = ChangeEvent::Type::Added;
         event.key = indexed.key;
         event.path = indexed.path;
-        event.element = *indexed.element;
+        event.element = element_without_children(*indexed.element);
         events.push_back(std::move(event));
     }
     return events;
@@ -117,7 +167,7 @@ std::vector<ChangeEvent> diff_trees(const Element& before, const Element& after)
         event.type = ChangeEvent::Type::Added;
         event.key = key;
         event.path = indexed.path;
-        event.element = *indexed.element;
+        event.element = element_without_children(*indexed.element);
         events.push_back(std::move(event));
     }
 
@@ -128,7 +178,7 @@ std::vector<ChangeEvent> diff_trees(const Element& before, const Element& after)
         event.type = ChangeEvent::Type::Removed;
         event.key = key;
         event.path = indexed.path;
-        event.element = *indexed.element;
+        event.element = element_without_children(*indexed.element);
         events.push_back(std::move(event));
     }
 
@@ -143,7 +193,7 @@ std::vector<ChangeEvent> diff_trees(const Element& before, const Element& after)
         event.type = ChangeEvent::Type::Changed;
         event.key = key;
         event.path = afterIt->second.path;
-        event.element = *afterIt->second.element;
+        event.element = element_without_children(*afterIt->second.element);
         event.fields = std::move(fields);
         events.push_back(std::move(event));
     }
@@ -164,7 +214,7 @@ std::string serialize_change_event(const ChangeEvent& event) {
         }
         j["fields"] = fields;
     } else {
-        j["element"] = element_to_json(event.element);
+        j["element"] = element_to_json_flat(event.element);
     }
 
     return j.dump();

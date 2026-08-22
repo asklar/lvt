@@ -425,42 +425,43 @@ private:
 
     // Every "lvt watch" tick re-injects and walks the *entire* tree from
     // scratch (see run_watch_loop in main.cpp), and this loop runs on the
-    // target's UI thread via a blocking SendMessage (LvtTapMsgWndProc). For a
-    // rich production tree (hundreds to thousands of elements — e.g. File
-    // Explorer's or Settings' WinUI3 shell) an unbounded walk here can occupy
-    // the UI thread for long enough that unrelated, legitimate work on that
-    // same thread (e.g. a new top-level window's own startup handshake)
-    // appears to hang, repeating every poll interval for as long as `watch`
-    // runs. kUiThreadBudgetMs caps how long a single pass may run; any nodes
-    // past the budget simply keep whatever bounds they already had (none, on
-    // a fresh injection) and are retried on the next tick, same as a node
-    // this pass never got to for any other reason.
+    // target's UI thread via a blocking SendMessage (LvtTapMsgWndProc).
     //
-    // Measured cost per GetPropertyValuesChain call on a real, richly-styled
-    // WinUI3 app (Settings, 1104 nodes) is ~4ms — not cheap, so a small
-    // budget (200ms, tried first) only covered ~4% of a real app's tree,
-    // reintroducing the bounds/property/text gaps this budget exists
-    // alongside a fix for. 1500ms is comfortably clear of the ~5s threshold
-    // Windows itself uses to decide a window has stopped responding, so a
-    // pass at this budget never causes the target to be *reported* as hung,
-    // while covering several hundred nodes per tick — enough for most real
-    // apps' visible content. Trees larger than that still degrade
-    // gracefully (the same later nodes miss every tick, deterministically,
-    // rather than intermittently) rather than ever blocking indefinitely.
-    static constexpr DWORD64 kUiThreadBudgetMs = 1500;
-
+    // An earlier version of this code capped how long a single pass could
+    // run (kUiThreadBudgetMs), on the theory that an unbounded walk over a
+    // rich tree could occupy the UI thread long enough to make unrelated
+    // work on that thread look hung. That budget was a mistake: measured
+    // live against a real, large WinUI3 app (Microsoft Store, ~1100 nodes,
+    // ~4ms/node), the wall-clock cutoff meant a different, non-deterministic
+    // subset of nodes got bounds each tick — not because the UI changed, but
+    // because ordinary timing jitter shifted exactly how many nodes fit in
+    // the budget window. Every unaffected element's bounds/properties then
+    // flip-flopped between "known" and "absent" every tick, forever, which
+    // `watch`'s diffing correctly (and unhelpfully) reported as constant
+    // "changed" events — flooding stdout (250MB+ observed in minutes) and
+    // burning CPU on serialization for output nobody asked for, which looked
+    // to a client (the lvt Viewer) exactly like a connection that was
+    // stuck, not one that was overcorrecting on interpreting real data.
+    //
+    // The actual protection against a pathologically slow collection was
+    // already in place one layer up: xaml_diag_common.cpp's TAP DLL only
+    // calls CreateFileW to connect to lvt.exe's pipe *after*
+    // CollectBounds/CollectPositionsAndText/SerializeAndSend all finish (see
+    // SerializeAndSend below), so lvt.exe's own 15-second "TAP DLL did not
+    // connect" timeout on the other end of that pipe already bounds the
+    // combined cost of this walk — and it fails the *whole* tick cleanly
+    // (no partial data, no flapping) rather than partially collecting, which
+    // is exactly the property a per-node budget could not give without an
+    // architecture change (e.g. caching results across ticks by lvt's
+    // durable key, which nothing here does — every tick starts from an
+    // empty map). So: no cap here: run to completion, and let the existing,
+    // coarser, whole-tick timeout be the actual backstop for a target that
+    // is genuinely too large or too slow to finish in time.
     void CollectBounds(IVisualTreeService* vts) {
         LogMsg("CollectBounds: collecting layout for %zu nodes on thread %lu",
                m_nodes.size(), GetCurrentThreadId());
         int collected = 0;
-        int idx = 0;
-        const DWORD64 start = GetTickCount64();
         for (auto& [handle, node] : m_nodes) {
-            if (GetTickCount64() - start > kUiThreadBudgetMs) {
-                LogMsg("CollectBounds: time budget exceeded after %d/%zu nodes; "
-                       "remaining nodes will be retried next tick", idx, m_nodes.size());
-                break;
-            }
             bool logDetail = false;
             int code = CollectBoundsForNodeSEH(vts, node, handle, logDetail);
             if (code != 0) {
@@ -468,7 +469,6 @@ private:
                        (unsigned long long)handle, code);
             }
             if (node.hasBounds) collected++;
-            idx++;
         }
         LogMsg("CollectBounds: collected bounds for %d/%zu nodes", collected, m_nodes.size());
     }
@@ -477,6 +477,11 @@ private:
     // Use TransformToVisual to get each element's position relative to the XAML island root.
     // Also reads Text property from TextBlock elements.
     // Tries both WinUI3 (Microsoft.UI.Xaml) and system XAML (Windows.UI.Xaml) interfaces.
+    // No per-node time budget here either — see CollectBounds's comment for
+    // why: a wall-clock cutoff produces non-deterministic partial coverage
+    // across ticks (flapping "changed" events for unchanged elements), and
+    // the whole-tick 15-second pipe-connect timeout in xaml_diag_common.cpp
+    // already bounds pathologically slow collection without that downside.
     void CollectPositionsAndText() {
         namespace WUX = winrt::Windows::UI::Xaml;
         namespace WUXC = winrt::Windows::UI::Xaml::Controls;
@@ -484,16 +489,7 @@ private:
         if (!m_diag) return;
 
         int positioned = 0, textsRead = 0;
-        const DWORD64 start = GetTickCount64();
         for (auto& [handle, node] : m_nodes) {
-            // Same UI-thread time budget as CollectBounds, and for the same
-            // reason: this also runs on the target's UI thread via a blocking
-            // SendMessage, once per watch tick, forever.
-            if (GetTickCount64() - start > kUiThreadBudgetMs) {
-                LogMsg("CollectPositionsAndText: time budget exceeded; "
-                       "remaining nodes will be retried next tick");
-                break;
-            }
             if (!node.hasBounds) continue;
 
             // Keep raw to preserve XAML diagnostics' existing ABI lifetime behavior.
