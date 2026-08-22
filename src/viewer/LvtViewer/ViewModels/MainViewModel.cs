@@ -129,7 +129,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ElementNodeViewModel? SelectedElement
     {
         get => _selectedElement;
-        set => SetField(ref _selectedElement, value);
+        set
+        {
+            if (!SetField(ref _selectedElement, value))
+                return;
+            // The live tree only carries the fast/cheap property set by
+            // default (see ConnectTo's --fast comment) — a selected node's
+            // *exhaustive* set is worth the cost of one extra one-shot call,
+            // since it only happens when the user actually looks at one
+            // element, not for the whole tree on every tick.
+            _ = RefreshFullPropertiesAsync(value);
+        }
     }
 
     private bool _highlightSelected = true;
@@ -345,7 +355,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         StatusText = "Connecting…";
         _liveTree.Reset();
         FrameworkFilters.Clear(); // new target: fresh discovery, previous app's types no longer apply
-        _watch.Start(LvtExePath, _currentHwndHex, UseUia);
+        // --fast: the live tree only needs bounds/Text/Content/basic state to
+        // browse, search, and highlight/hit-test by (see MainWindow.xaml.cs) —
+        // it does not need every XAML/WinUI3 element's full property chain
+        // eagerly. A selected node's exhaustive property set is fetched
+        // on demand instead (see MainViewModel's property-panel wiring),
+        // so this trades nothing the viewer actually shows by default for a
+        // dramatically faster live connect on a rich tree.
+        _watch.Start(LvtExePath, _currentHwndHex, UseUia, fastProperties: true);
         ArmSlowConnectHint();
         StatusText = UseUia
             ? "Watching the UI Automation tree live."
@@ -359,7 +376,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _liveTree.Reset();
         StatusText = "Reconnecting…";
         IsConnected = true;
-        _watch.Start(LvtExePath, _currentHwndHex, UseUia);
+        _watch.Start(LvtExePath, _currentHwndHex, UseUia, fastProperties: true);
         ArmSlowConnectHint();
         StatusText = UseUia
             ? "Watching the UI Automation tree live."
@@ -370,6 +387,52 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         Interop.NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
         title = Interop.NativeMethods.GetWindowTitle(hwnd);
+    }
+
+    /// <summary>
+    /// Fetches <paramref name="node"/>'s full property set with a one-shot
+    /// "lvt query" call (no --fast, so this always gets everything the
+    /// exhaustive GetPropertyValuesChain walk reports, regardless of the
+    /// live tree's own fast/full mode) and merges it into the node's
+    /// PropertyRows. "query" without a property name dumps every property
+    /// as flat top-level JSON fields (main.cpp's query_element_to_json) —
+    /// a different shape from watch's nested {properties: {...}}, so this
+    /// is parsed directly rather than reusing ElementDto.
+    /// </summary>
+    private async System.Threading.Tasks.Task RefreshFullPropertiesAsync(ElementNodeViewModel? node)
+    {
+        if (node == null || _currentHwndHex == null)
+            return;
+
+        var result = await _cli.RunAsync("query", node.Key, "--hwnd", _currentHwndHex);
+        // The selection (or the connection) may have moved on while this
+        // one-shot call was in flight; a stale result must never overwrite
+        // whatever is selected now.
+        if (!result.Ok || SelectedElement != node)
+            return;
+
+        System.Text.Json.JsonDocument doc;
+        try
+        {
+            doc = System.Text.Json.JsonDocument.Parse(result.StdOut);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return; // tolerate a malformed/partial response rather than crashing the panel
+        }
+
+        using (doc)
+        {
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (prop.Name is "id" or "key" or "type" or "framework" or "className" or "text" or "bounds")
+                    continue; // already shown by dedicated ElementNodeViewModel fields, not a property row
+                var value = prop.Value.ValueKind == System.Text.Json.JsonValueKind.String
+                    ? prop.Value.GetString() ?? ""
+                    : prop.Value.ToString();
+                node.SetProperty(prop.Name, value);
+            }
+        }
     }
 
     private async System.Threading.Tasks.Task ToggleAsync(PropertyRowViewModel? row)

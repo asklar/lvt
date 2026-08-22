@@ -480,7 +480,8 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
     }
 
     auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
-    tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {});
+    const bool fastProperties = get_bool(params, "fast", false);
+    tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {}, fastProperties);
     return true;
 }
 

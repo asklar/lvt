@@ -222,6 +222,7 @@ lvt wait-for e9 --wait-prop IsEnabled=true --name myapp
 | `--output <file>` | Write to a file instead of stdout, or the PNG path for `screenshot` |
 | `--format <fmt>` | `json` (default) or `xml` |
 | `--interval <ms>` | Polling interval for `watch` (default: 500) |
+| `--fast` | Skip the XAML/WinUI3 property-chain walk (`GetPropertyValuesChain`) in favor of cheap direct property reads. Much faster on a rich tree — still reports bounds, `Text`, `Content`, and basic state, but not arbitrary custom properties. Default is off (today's exhaustive collection) |
 | `--element <ref>` | Scope to a specific element subtree by positional `eN` id, durable key, or `uia:<RuntimeId>` |
 | `--uia` | Use the UI Automation tree instead of the visual tree |
 | `--uia-view <view>` | UIA tree view: `control` (default), `raw`, or `content` |
@@ -429,6 +430,11 @@ ticks emit `added`, `removed`, and `changed` events with old/new field values.
 Element matching uses stable framework/type/class/path-derived keys instead of
 the positional `e0`, `e1`, ... ids, so unique moved elements are reported as
 `changed` events with a `path` field change.
+
+`--fast` applies to `watch` too: every tick collects the cheaper property set
+instead of the full XAML/WinUI3 property chain, so `changed` events on an
+arbitrary custom property outside bounds/Text/Content/basic state won't be
+reported — only those properties are tracked and diffed in fast mode.
 
 ### JSON
 

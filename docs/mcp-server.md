@@ -118,6 +118,17 @@ input at where an element is. Because it works by injecting into the target it
 needs lvt and the target to share an architecture; when they do not, it says so
 and names the right binary.
 
+On a rich XAML/WinUI3 tree, `get_visual_tree` walks every element's entire
+property inheritance chain by default (`IVisualTreeService::
+GetPropertyValuesChain`) — measured at ~4.5ms/element on a real app, which adds
+up on a tree of hundreds or thousands of elements. Pass `fast: true` to skip
+that walk and collect bounds/`Text`/`Content`/basic state the cheaper way
+instead (a few direct property reads per element, no property-chain walk).
+This is enough to browse or search a tree by, and to hit-test/highlight
+elements, but it will not report arbitrary custom properties the way the
+default (`fast: false`) walk does — use `get_element_properties` for a single
+element's exhaustive property set regardless of which mode built the tree.
+
 ## Addressing elements
 
 Every tool that takes an element accepts these forms:

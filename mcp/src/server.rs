@@ -129,6 +129,11 @@ pub struct VisualTreeArgs {
     ///
     /// Costs a second walk, so it is off by default.
     pub correlate: Option<bool>,
+    /// Skip the XAML/WinUI3 full property-chain walk in favor of cheaper
+    /// direct property reads. Much faster on a rich tree, but only reports
+    /// bounds/Text/Content/basic state — not arbitrary custom properties.
+    /// Off by default (full properties, matching get_element_properties).
+    pub fast: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -575,7 +580,10 @@ impl LvtServer {
                        it shows implementation structure the UIA tree hides. Its elements are a \
                        different, finer-grained set than the UIA tree's, and its references only \
                        work in a session connected with mode 'visual'. Pass correlate:true to see \
-                       which of these elements UI Automation exposes and which it does not. \
+                       which of these elements UI Automation exposes and which it does not. Pass \
+                       fast:true on a large XAML/WinUI3 tree to trade the full per-element \
+                       property set for a much quicker walk (still reports bounds, Text, Content, \
+                       and basic state — enough to browse or search by, not exhaustive). \
                        Requires lvt and the target to share an architecture.",
         output_schema = crate::schema::visual_tree(),
         annotations(read_only_hint = true, open_world_hint = true)
@@ -740,6 +748,7 @@ fn visual_tree_params(a: VisualTreeArgs) -> serde_json::Value {
         "properties": a.properties,
         "timeoutMs": a.timeout_ms,
         "correlate": a.correlate,
+        "fast": a.fast,
     }))
 }
 

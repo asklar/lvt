@@ -33,7 +33,8 @@ public sealed class WatchSession : IDisposable
 
     public bool IsRunning => _process is { HasExited: false };
 
-    public void Start(string exePath, string hwndHex, bool uia, int intervalMs = 500)
+    public void Start(string exePath, string hwndHex, bool uia, int intervalMs = 500,
+                      bool fastProperties = false)
     {
         Stop();
 
@@ -50,6 +51,8 @@ public sealed class WatchSession : IDisposable
         psi.ArgumentList.Add(hwndHex);
         if (uia)
             psi.ArgumentList.Add("--uia");
+        if (fastProperties)
+            psi.ArgumentList.Add("--fast");
         psi.ArgumentList.Add("--interval");
         psi.ArgumentList.Add(intervalMs.ToString(CultureInfo.InvariantCulture));
 

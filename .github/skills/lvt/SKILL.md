@@ -263,7 +263,10 @@ Pattern state is only emitted where the pattern is supported, so the presence of
 2. **Run `lvt --name <app> --format xml`** to get a quick overview of the UI tree
 3. **Take a screenshot** with `lvt screenshot --name <app> --output ui.png` to see the visual layout with element IDs
 4. **Drill into a subtree** with `--element <id> --depth <n>` if the tree is large
-5. **Use element IDs and bounds** to plan any UI interactions (clicks, keyboard input)
+5. **Add `--fast`** on a rich XAML/WinUI3 app if `dump`/`watch` feels slow — it
+   skips the full property-chain walk in favor of cheap bounds/Text/Content/
+   basic-state reads, at the cost of not reporting arbitrary custom properties
+6. **Use element IDs and bounds** to plan any UI interactions (clicks, keyboard input)
 
 ## MCP server mode
 
