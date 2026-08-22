@@ -75,7 +75,7 @@ public partial class MainWindow : Window
             _elementPicker.Dragging += pt => PreviewElementAt(pt);
             _elementPicker.Picked += pt =>
             {
-                var node = pt.HasValue ? FindDeepestElementAt(_viewModel.Roots, pt.Value.X, pt.Value.Y) : null;
+                var node = pt.HasValue ? FindDeepestElementAtPhysicalPoint(pt.Value) : null;
                 if (node != null)
                 {
                     SelectElementInTree(node);
@@ -103,19 +103,13 @@ public partial class MainWindow : Window
     /// </summary>
     private void PreviewElementAt(POINT pt)
     {
-        var node = FindDeepestElementAt(_viewModel.Roots, pt.X, pt.Y);
+        var node = FindDeepestElementAtPhysicalPoint(pt);
         if (node == null || IsTargetMinimized())
         {
             _selectionHighlight.Hide();
             return;
         }
-        var rect = new Interop.RECT
-        {
-            Left = node.BoundsX,
-            Top = node.BoundsY,
-            Right = node.BoundsX + node.BoundsWidth,
-            Bottom = node.BoundsY + node.BoundsHeight,
-        };
+        var rect = ToPhysicalRect(node);
         if (rect.Width <= 0 || rect.Height <= 0)
         {
             _selectionHighlight.Hide();
@@ -124,6 +118,47 @@ public partial class MainWindow : Window
         _selectionHighlight.MoveTo(rect);
         if (_selectionHighlight.Visibility != Visibility.Visible)
             _selectionHighlight.Show();
+    }
+
+    /// <summary>
+    /// GetCursorPos (which ElementPicker uses) returns true physical pixels
+    /// from this already-DPI-aware process; ElementNodeViewModel's Bounds*
+    /// fields are in lvt's virtualized 96-DPI-equivalent space (see
+    /// NativeMethods.LvtToPhysicalDpiScale). Hit-testing one against the
+    /// other directly would only work by accident at 100% scaling —
+    /// dividing the physical point down to lvt's space first is what makes
+    /// FindDeepestElementAt's comparisons apples-to-apples on any scaled
+    /// display.
+    /// </summary>
+    private ElementNodeViewModel? FindDeepestElementAtPhysicalPoint(POINT physicalPt)
+    {
+        double scale = NativeMethods.LvtToPhysicalDpiScale;
+        int lvtX = (int)Math.Round(physicalPt.X / scale);
+        int lvtY = (int)Math.Round(physicalPt.Y / scale);
+        return FindDeepestElementAt(_viewModel.Roots, lvtX, lvtY);
+    }
+
+    /// <summary>
+    /// Converts an ElementNodeViewModel's Bounds* (lvt's virtualized space)
+    /// to the true physical pixels HighlightOverlay.MoveTo requires — see
+    /// NativeMethods.LvtToPhysicalDpiScale for why this conversion exists at
+    /// all and why it belongs at this call site specifically, not inside
+    /// HighlightOverlay itself.
+    /// </summary>
+    private static Interop.RECT ToPhysicalRect(ElementNodeViewModel node)
+    {
+        double scale = NativeMethods.LvtToPhysicalDpiScale;
+        int left = (int)Math.Round(node.BoundsX * scale);
+        int top = (int)Math.Round(node.BoundsY * scale);
+        int width = (int)Math.Round(node.BoundsWidth * scale);
+        int height = (int)Math.Round(node.BoundsHeight * scale);
+        return new Interop.RECT
+        {
+            Left = left,
+            Top = top,
+            Right = left + width,
+            Bottom = top + height,
+        };
     }
 
     /// <summary>
@@ -262,17 +297,10 @@ public partial class MainWindow : Window
             return;
         }
 
-        // lvt's bounds are already absolute screen (physical) pixels — the
-        // same coordinate space HighlightOverlay.MoveTo expects, since it is
-        // also fed directly from GetVisibleFrame/GetWindowRect for the
-        // crosshair-drag case (see NativeMethods.GetVisibleFrame).
-        var rect = new Interop.RECT
-        {
-            Left = _highlightedNode.BoundsX,
-            Top = _highlightedNode.BoundsY,
-            Right = _highlightedNode.BoundsX + _highlightedNode.BoundsWidth,
-            Bottom = _highlightedNode.BoundsY + _highlightedNode.BoundsHeight,
-        };
+        // See ToPhysicalRect / NativeMethods.LvtToPhysicalDpiScale: lvt's
+        // bounds are in its own virtualized (DPI-unaware) coordinate space,
+        // not the true physical pixels HighlightOverlay.MoveTo requires.
+        var rect = ToPhysicalRect(_highlightedNode);
         if (rect.Width <= 0 || rect.Height <= 0)
         {
             // A collapsed or never-laid-out element reports zero bounds;

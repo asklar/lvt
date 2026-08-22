@@ -32,9 +32,6 @@ public partial class HighlightOverlay : Window
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
         int x, int y, int cx, int cy, uint uFlags);
 
-    [DllImport("user32.dll")]
-    private static extern uint GetDpiForSystem();
-
     public HighlightOverlay()
     {
         InitializeComponent();
@@ -50,46 +47,38 @@ public partial class HighlightOverlay : Window
     }
 
     /// <summary>
-    /// Repositions the highlight over the rectangle lvt.exe reports (see
-    /// NativeMethods.GetVisibleFrame / lvt's own "bounds" fields).
+    /// Repositions the highlight over an absolute-screen rectangle that is
+    /// already in true physical pixels — this class does no DPI conversion
+    /// of its own and must not, because its two callers' rects do not start
+    /// out in the same coordinate space:
     ///
-    /// lvt.exe is a plain console app with no DPI-awareness declaration, so
-    /// Windows silently virtualizes every Win32 coordinate query it makes
-    /// (GetWindowRect and friends) down to a 96-DPI-equivalent space — on
-    /// a system at 150% scaling, verified live, lvt.exe reported a Microsoft
-    /// Store window's rect as (161,319)-(702,826) while its true physical
-    /// rect was (242,479)-(1053,1240): exactly a 1/1.5 scale-down. This
-    /// viewer, on the other hand, is Per-Monitor-V2 DPI aware (the .NET
-    /// default), so positioning its own HWND via SetWindowPos needs true
-    /// physical pixels — using lvt's virtualized rect there directly (the
-    /// previous bug) put the highlight in the wrong place by exactly that
-    /// scale factor.
+    ///  - CrosshairPicker calls NativeMethods.GetVisibleFrame(hwnd) directly,
+    ///    from this (Per-Monitor-V2 DPI aware, the .NET default) process, so
+    ///    that rect is already true physical pixels with no conversion
+    ///    needed.
+    ///  - MainWindow builds a rect from ElementNodeViewModel's Bounds*
+    ///    fields, which ultimately came from lvt.exe — a plain console app
+    ///    with no DPI-awareness declaration, so Windows silently virtualizes
+    ///    every Win32 coordinate query it makes down to a 96-DPI-equivalent
+    ///    space. That rect needs scaling up to physical pixels *before* it
+    ///    reaches this method (see MainWindow.ToPhysicalRect).
     ///
-    /// Fixed by scaling the incoming rect up by the system DPI factor before
-    /// calling SetWindowPos. This assumes one scale factor system-wide,
-    /// which holds for a single monitor (this was reproduced and verified
-    /// fixed on one) or a uniformly-scaled multi-monitor setup — the same
-    /// assumption lvt.exe's own DPI-unaware status already makes, since
-    /// Windows' virtualization for an unaware process has already collapsed
-    /// away which specific monitor a coordinate came from by the time lvt
-    /// reports it. WPF's own Left/Top/Width/Height need no such conversion:
-    /// they are device-independent units, which is the same 96-DPI-
-    /// equivalent space lvt's own numbers are already in.
+    /// An earlier version of this method applied that lvt-specific scaling
+    /// unconditionally, which was correct for the second caller and broke
+    /// the first: it double-scaled CrosshairPicker's already-physical rect,
+    /// observed live as the crosshair-drag preview highlight landing
+    /// nowhere near the actual window boundary. Converting at each call
+    /// site instead, rather than here, is what lets this method make a
+    /// single unconditional assumption (true physical pixels in) instead of
+    /// somehow needing to know which caller it is being invoked from.
     /// </summary>
-    public void MoveTo(RECT lvtFrame)
+    public void MoveTo(RECT physicalFrame)
     {
         var hwnd = new WindowInteropHelper(this).EnsureHandle();
 
-        double dpiScale = GetDpiForSystem() / 96.0;
-        int left = (int)Math.Round(lvtFrame.Left * dpiScale);
-        int top = (int)Math.Round(lvtFrame.Top * dpiScale);
-        int width = Math.Max(0, (int)Math.Round(lvtFrame.Width * dpiScale));
-        int height = Math.Max(0, (int)Math.Round(lvtFrame.Height * dpiScale));
-        SetWindowPos(hwnd, IntPtr.Zero, left, top, width, height, SWP_NOACTIVATE | SWP_NOZORDER);
-
-        Left = lvtFrame.Left;
-        Top = lvtFrame.Top;
-        Width = Math.Max(0, lvtFrame.Width);
-        Height = Math.Max(0, lvtFrame.Height);
+        int width = Math.Max(0, physicalFrame.Width);
+        int height = Math.Max(0, physicalFrame.Height);
+        SetWindowPos(hwnd, IntPtr.Zero, physicalFrame.Left, physicalFrame.Top, width, height,
+                     SWP_NOACTIVATE | SWP_NOZORDER);
     }
 }
