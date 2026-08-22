@@ -37,6 +37,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         LvtExePath = LvtLocator.Find();
         _cli = new LvtCli(LvtExePath);
 
+        // 60ms: short enough that a live filter refresh still feels
+        // immediate, long enough to reliably span the few-ms gaps between
+        // the separate OS read completions one `watch` poll's output can
+        // arrive in (see ScheduleFilterRefresh's comment) — chosen well
+        // under `watch`'s own --interval default (500ms) so this never
+        // itself becomes the visible lag.
+        _filterDebounceTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(60),
+        };
+        _filterDebounceTimer.Tick += (_, _) =>
+        {
+            _filterDebounceTimer.Stop();
+            ApplyFrameworkFilter();
+        };
+
         _watch.EventReceived += evt => _dispatcher.BeginInvoke(() => OnWatchEvent(evt));
         _watch.DiagnosticReceived += line => _dispatcher.BeginInvoke(() => StatusText = line);
         _watch.Exited += code => _dispatcher.BeginInvoke(() =>
@@ -184,7 +200,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RelayCommand FindNextCommand { get; }
     public RelayCommand FindPreviousCommand { get; }
 
-    private bool _flushScheduled;
+    private readonly DispatcherTimer _filterDebounceTimer;
 
     private void OnWatchEvent(WatchEventDto evt)
     {
@@ -192,40 +208,40 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // to say (or already said) no longer applies — the first tick
         // finished, however long it took.
         _slowConnectHintCts?.Cancel();
+        // Applied immediately, synchronously, every time — LiveTree.Apply
+        // only ever patches the one node (or one parent/child edge) an
+        // event actually names, so there is no "whole tree" cost here to
+        // batch in the first place; see LiveTree's class comment for why an
+        // earlier version of this needed to defer a full-hierarchy rebuild
+        // and why that approach was replaced rather than merely debounced
+        // further.
         _liveTree.Apply(evt);
         DiscoverFrameworks(evt);
-        ScheduleFlush();
+        ScheduleFilterRefresh();
     }
 
     /// <summary>
-    /// Coalesces LiveTree.Flush() (the hierarchy rebuild) and
-    /// ApplyFrameworkFilter() (an IsVisible walk over the whole tree) so a
-    /// burst of N events — the initial connect's whole tree is one such
-    /// burst, and so is any tick on a target with animated/live content —
-    /// costs one pass of each instead of N. Both were previously run after
-    /// *every single* watch event; measured live, that was 5454 full
-    /// hierarchy rebuilds in one ~140s session and is what "the tree
-    /// refreshes as I navigate" actually was — WPF re-laying-out the whole
-    /// TreeView many times a second, not any actual state corruption.
+    /// ApplyFrameworkFilter walks every currently-known node to recompute
+    /// IsVisible — genuinely O(tree size), unlike LiveTree.Apply above, and
+    /// unlike IsVisible it does not need to be current after every single
+    /// event, only eventually. Debouncing this (instead of running it after
+    /// every event) is what actually still needs a timer here.
     ///
-    /// Dispatcher.BeginInvoke at Background priority is what does the
-    /// coalescing: OnWatchEvent's own dispatch (from WatchSession.
-    /// EventReceived) runs at the default Normal priority, so as long as
-    /// more events are already queued, this callback keeps getting pushed
-    /// behind them and does not fire until the queue actually drains —
-    /// exactly the point where there is nothing more to batch in.
+    /// A true debounce, not "run once the dispatcher queue drains": an
+    /// earlier version used Dispatcher.BeginInvoke at Background priority,
+    /// reasoning that it would only fire once nothing higher-priority was
+    /// still queued — that helped but was not enough, because `watch`'s one
+    /// poll can still deliver its events to stdout in a few separate OS read
+    /// completions a handful of milliseconds apart, each queuing its own
+    /// OnWatchEvent dispatch — draining *completely* in between, meaning the
+    /// queue-drain trick could still fire several times per poll. Resetting
+    /// an actual timer on every event and only running once it elapses
+    /// without a new one arriving tolerates gaps like that.
     /// </summary>
-    private void ScheduleFlush()
+    private void ScheduleFilterRefresh()
     {
-        if (_flushScheduled)
-            return;
-        _flushScheduled = true;
-        _dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
-        {
-            _flushScheduled = false;
-            _liveTree.Flush();
-            ApplyFrameworkFilter();
-        });
+        _filterDebounceTimer.Stop();
+        _filterDebounceTimer.Start();
     }
 
     /// <summary>
@@ -500,6 +516,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public void Dispose()
     {
+        _filterDebounceTimer.Stop();
         _slowConnectHintCts?.Cancel();
         _watch.Dispose();
     }

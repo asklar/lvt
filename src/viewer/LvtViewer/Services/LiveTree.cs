@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Linq;
 using LvtViewer.Models;
 using LvtViewer.ViewModels;
 
@@ -13,14 +12,18 @@ namespace LvtViewer.Services;
 /// viewer's tree and property panel — see README.md for why watch (rather
 /// than polling dump, or MCP) was chosen as the live-update mechanism.
 ///
-/// Design: nodes are indexed by lvt's durable "key" (never changes for a
-/// given node) in a flat dictionary. Scalar field changes ("changed" events)
-/// are applied directly to the existing ElementNodeViewModel's bound
-/// properties, which is what makes the UI refresh live without disturbing
-/// TreeView selection/expansion. Structural changes (add/remove, or a
-/// "changed" event whose "path" field moved — a reorder/reparent) mark the
-/// tree dirty and trigger a lightweight rebuild of the parent/child edges,
-/// reusing existing view-model instances by key wherever possible.
+/// Design principle, non-negotiable: an event that only concerns already-
+/// enumerated elements must only ever touch those elements. "added" inserts
+/// one node into its parent's Children at the right position; "removed"
+/// removes one node from wherever it currently sits; a "changed" reorder
+/// moves one node from its old parent to its new one. Nothing here ever
+/// recomputes the whole hierarchy from scratch — an earlier version of this
+/// class did exactly that (a full walk of every known node, every time
+/// anything anywhere added/removed/reordered), and even though it reused
+/// ElementNodeViewModel instances by identity, doing that walk at all again
+/// and again is what "the tree refreshes as I navigate" turned out to be:
+/// each one is real, visible WPF layout work across the *entire* TreeView,
+/// not just near whatever actually changed.
 ///
 /// lvt's "path" is a dot-separated, depth-first child-index string
 /// (element_key.cpp): the root is "0", its children are "0.0", "0.1", ...
@@ -29,14 +32,23 @@ namespace LvtViewer.Services;
 /// (run_watch_loop -> snapshot_added_events) already arrives in
 /// parent-before-child order — but later ticks diff by sorting on *key*
 /// (diff_trees uses std::map&lt;key,...&gt;), so a brand new subtree's
-/// "added" events are not guaranteed to arrive parent-first. The rebuild
-/// below tolerates arbitrary arrival order because it only runs once all
-/// currently-known nodes are indexed by path.
+/// "added" events are not guaranteed to arrive parent-first. AttachToParent
+/// tolerates arbitrary arrival order by queuing a child whose parent has not
+/// been seen yet in _pendingChildren, keyed by the parent path it is
+/// waiting for, and resolving it the moment that parent itself attaches.
 /// </summary>
 public sealed class LiveTree
 {
     private readonly Dictionary<string, ElementNodeViewModel> _byKey = new();
-    private bool _dirty;
+
+    /// <summary>Currently-attached nodes only, keyed by their current Path — the lookup AttachToParent uses to find a node's parent.</summary>
+    private readonly Dictionary<string, ElementNodeViewModel> _byPath = new();
+
+    /// <summary>Which keys are actually attached (in Roots or some parent's Children) right now, as opposed to merely known — see DetachFromParent.</summary>
+    private readonly HashSet<string> _attachedKeys = new();
+
+    /// <summary>Children waiting on a parent path that has not attached yet, keyed by that parent path.</summary>
+    private readonly Dictionary<string, List<ElementNodeViewModel>> _pendingChildren = new();
 
     /// <summary>0 or 1 items: the root element of the watched window.</summary>
     public ObservableCollection<ElementNodeViewModel> Roots { get; } = new();
@@ -45,8 +57,10 @@ public sealed class LiveTree
     {
         Logger.Log("tree", $"Reset() — clearing {_byKey.Count} known nodes");
         _byKey.Clear();
+        _byPath.Clear();
+        _attachedKeys.Clear();
+        _pendingChildren.Clear();
         Roots.Clear();
-        _dirty = false;
     }
 
     public void Apply(WatchEventDto evt)
@@ -63,33 +77,6 @@ public sealed class LiveTree
                 ApplyRemoved(evt);
                 break;
         }
-        // Deliberately does NOT rebuild here — see Flush(). watch emits one
-        // JSON line per *element*, not one per tick: a single tick (let
-        // alone the very first burst, which is the whole initial tree) can
-        // be hundreds or thousands of lines. Rebuilding after every single
-        // one of them was measured live doing 5454 full-hierarchy rebuilds
-        // in one ~140s session — the real cause of "the tree refreshes as I
-        // navigate": it was not any one rebuild corrupting state, it was
-        // WPF re-laying-out the whole TreeView many times a second while
-        // the target's own animated/live content kept ticking, which reads
-        // exactly like the view resetting even though the underlying model
-        // was fine. The caller is expected to call Flush() once after
-        // draining all events currently available, not after each one.
-    }
-
-    /// <summary>
-    /// Rebuilds the hierarchy if anything Applied since the last Flush
-    /// actually requires it. Call this once per drained batch of events —
-    /// never per individual event — so a burst of N related changes costs
-    /// one rebuild instead of N.
-    /// </summary>
-    public void Flush()
-    {
-        if (!_dirty)
-            return;
-        Logger.Log("tree", $"flush — rebuilding hierarchy over {_byKey.Count} known nodes");
-        RebuildHierarchy();
-        _dirty = false;
     }
 
     private ElementNodeViewModel GetOrCreate(string key)
@@ -106,10 +93,18 @@ public sealed class LiveTree
     {
         if (evt.Element == null)
             return;
+        var alreadyKnown = _byKey.ContainsKey(evt.Key);
         var node = GetOrCreate(evt.Key);
+        if (alreadyKnown)
+        {
+            // Should not happen per the protocol ("added" only ever names a
+            // genuinely new key) — defensive only, so a violation of that
+            // does not leave a duplicate/dangling entry rather than crashing.
+            DetachFromParent(node);
+        }
         node.UpdateFrom(evt.Element, evt.Key, evt.Path);
-        Logger.Log("tree", $"added key={evt.Key} path={evt.Path} -> dirty");
-        _dirty = true;
+        Logger.Log("tree", $"added key={evt.Key} path={evt.Path}");
+        AttachToParent(node);
     }
 
     private void ApplyChanged(WatchEventDto evt)
@@ -121,9 +116,13 @@ public sealed class LiveTree
         {
             if (fieldName == "path")
             {
-                Logger.Log("tree", $"changed key={evt.Key} path {node.Path} -> {change.New} -> dirty");
+                // A reorder/reparent: move exactly this one node from
+                // wherever it currently sits to wherever it belongs now —
+                // never a reason to touch any other node.
+                Logger.Log("tree", $"changed key={evt.Key} path {node.Path} -> {change.New}");
+                DetachFromParent(node);
                 node.Path = change.New;
-                _dirty = true;
+                AttachToParent(node);
             }
             else if (fieldName == "bounds")
             {
@@ -142,79 +141,101 @@ public sealed class LiveTree
 
     private void ApplyRemoved(WatchEventDto evt)
     {
-        if (_byKey.Remove(evt.Key))
+        if (_byKey.TryGetValue(evt.Key, out var node))
         {
-            Logger.Log("tree", $"removed key={evt.Key} -> dirty");
-            _dirty = true;
+            DetachFromParent(node);
+            _byKey.Remove(evt.Key);
+            Logger.Log("tree", $"removed key={evt.Key}");
         }
     }
 
     /// <summary>
-    /// Recomputes parent/child edges from each node's current Path, reusing
-    /// existing ElementNodeViewModel instances so the TreeView keeps
-    /// selection and expansion state for nodes that did not move.
+    /// Inserts <paramref name="node"/> into the hierarchy at the position
+    /// its own Path says it belongs — Roots if it is the root, its parent's
+    /// Children (found via _byPath, sorted-inserted by child index) if the
+    /// parent is already attached, or _pendingChildren if it is not (yet).
     /// </summary>
-    private void RebuildHierarchy()
+    private void AttachToParent(ElementNodeViewModel node)
     {
-        var pathToKey = new Dictionary<string, string>(_byKey.Count);
-        foreach (var (key, node) in _byKey)
-            pathToKey[node.Path] = key;
+        _byPath[node.Path] = node;
+        _attachedKeys.Add(node.Key);
 
-        var childrenOfPath = new Dictionary<string, List<ElementNodeViewModel>>();
-        string? rootKey = null;
-
-        foreach (var (key, node) in _byKey)
+        // Any children that were waiting specifically on this path can
+        // resolve now — including transitively: attaching one of them below
+        // registers *its* path, which the next AttachToParent call (for a
+        // grandchild already queued on that path) will find.
+        if (_pendingChildren.Remove(node.Path, out var waiting))
         {
-            if (node.Path == "0")
-            {
-                rootKey = key;
-                continue;
-            }
-
-            var lastDot = node.Path.LastIndexOf('.');
-            var parentPath = lastDot < 0 ? "" : node.Path[..lastDot];
-            if (!childrenOfPath.TryGetValue(parentPath, out var list))
-                childrenOfPath[parentPath] = list = new List<ElementNodeViewModel>();
-            list.Add(node);
+            foreach (var child in waiting)
+                AttachAsChild(node, child);
         }
 
-        // Order each parent's children by their own path's last numeric
-        // segment, so display order matches the original DFS child order
-        // rather than dictionary iteration order.
-        foreach (var list in childrenOfPath.Values)
+        if (node.Path == "0")
         {
-            list.Sort((a, b) =>
-            {
-                var ai = ChildIndex(a.Path);
-                var bi = ChildIndex(b.Path);
-                return ai.CompareTo(bi);
-            });
+            node.Parent = null;
+            node.IsExpanded = true; // start expanded — only happens once, when the root first attaches
+            if (!Roots.Contains(node))
+                Roots.Add(node);
+            return;
         }
 
-        void Apply(ElementNodeViewModel node)
+        var parentPath = ParentPathOf(node.Path);
+        if (_byPath.TryGetValue(parentPath, out var parent))
         {
-            var desired = childrenOfPath.TryGetValue(node.Path, out var list)
-                ? list
-                : new List<ElementNodeViewModel>();
-            SyncCollection(node.Children, desired);
-            foreach (var child in desired)
-            {
-                child.Parent = node;
-                Apply(child);
-            }
-        }
-
-        if (rootKey != null && _byKey.TryGetValue(rootKey, out var root))
-        {
-            root.Parent = null;
-            root.IsExpanded = true;
-            SyncCollection(Roots, new List<ElementNodeViewModel> { root });
-            Apply(root);
+            AttachAsChild(parent, node);
         }
         else
         {
-            Roots.Clear();
+            if (!_pendingChildren.TryGetValue(parentPath, out var list))
+                _pendingChildren[parentPath] = list = new List<ElementNodeViewModel>();
+            list.Add(node);
         }
+    }
+
+    /// <summary>
+    /// Removes <paramref name="node"/> from wherever it currently sits —
+    /// Roots, its parent's Children, or (if its own parent never attached)
+    /// the pending-children queue it was waiting in — without touching
+    /// anything else. A no-op site (Roots.Remove / Children.Remove /
+    /// list.Remove on an item not present) is intentionally tolerated
+    /// rather than pre-checked, since which one applies depends on state
+    /// this method itself does not need to branch on separately.
+    /// </summary>
+    private void DetachFromParent(ElementNodeViewModel node)
+    {
+        if (_attachedKeys.Remove(node.Key))
+        {
+            _byPath.Remove(node.Path);
+            if (node.Parent != null)
+            {
+                node.Parent.Children.Remove(node);
+                node.Parent = null;
+            }
+            else
+            {
+                Roots.Remove(node);
+            }
+        }
+        else if (_pendingChildren.TryGetValue(ParentPathOf(node.Path), out var list))
+        {
+            list.Remove(node);
+        }
+    }
+
+    private static void AttachAsChild(ElementNodeViewModel parent, ElementNodeViewModel child)
+    {
+        child.Parent = parent;
+        var index = ChildIndex(child.Path);
+        var insertAt = 0;
+        while (insertAt < parent.Children.Count && ChildIndex(parent.Children[insertAt].Path) < index)
+            insertAt++;
+        parent.Children.Insert(insertAt, child);
+    }
+
+    private static string ParentPathOf(string path)
+    {
+        var lastDot = path.LastIndexOf('.');
+        return lastDot < 0 ? "" : path[..lastDot];
     }
 
     private static int ChildIndex(string path)
@@ -222,37 +243,5 @@ public sealed class LiveTree
         var lastDot = path.LastIndexOf('.');
         var segment = lastDot < 0 ? path : path[(lastDot + 1)..];
         return int.TryParse(segment, out var value) ? value : 0;
-    }
-
-    /// <summary>
-    /// Updates <paramref name="existing"/> in place to match
-    /// <paramref name="desired"/> by object identity, minimizing removes/
-    /// inserts/moves so WPF's ItemContainerGenerator can preserve as much
-    /// TreeViewItem state (expansion) as possible.
-    /// </summary>
-    private static void SyncCollection(ObservableCollection<ElementNodeViewModel> existing,
-                                        IReadOnlyList<ElementNodeViewModel> desired)
-    {
-        // Remove items no longer present.
-        for (var i = existing.Count - 1; i >= 0; i--)
-        {
-            if (!desired.Contains(existing[i]))
-                existing.RemoveAt(i);
-        }
-
-        // Insert/move so the final order and membership matches `desired`.
-        for (var i = 0; i < desired.Count; i++)
-        {
-            var item = desired[i];
-            var currentIndex = existing.IndexOf(item);
-            if (currentIndex < 0)
-            {
-                existing.Insert(i, item);
-            }
-            else if (currentIndex != i)
-            {
-                existing.Move(currentIndex, i);
-            }
-        }
     }
 }

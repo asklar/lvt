@@ -33,9 +33,10 @@ public sealed class ElementNodeViewModel : ObservableObject
 
     /// <summary>
     /// This node's parent in the current hierarchy, kept in sync by
-    /// LiveTree.RebuildHierarchy. Null for a root. Used to expand a node's
-    /// ancestor chain when programmatically selecting it in the TreeView
-    /// (see MainWindow.SelectElementInTree, item 2's point-to-select).
+    /// LiveTree.AttachToParent/DetachFromParent. Null for a root. Used to
+    /// expand a node's ancestor chain when programmatically selecting it in
+    /// the TreeView (see MainWindow.SelectElementInTree, item 2's
+    /// point-to-select).
     /// </summary>
     public ElementNodeViewModel? Parent { get; internal set; }
 

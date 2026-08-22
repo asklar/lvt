@@ -115,17 +115,15 @@
                 <TreeView.ItemContainerStyle>
                     <Style TargetType="TreeViewItem">
                         <!--
-                            TwoWay, not OneWay: a rebuild (LiveTree.RebuildHierarchy,
-                            triggered by *any* add/remove/reorder anywhere in the
-                            tree, not just near the node the user is looking at) can
-                            regenerate a node's TreeViewItem container. A OneWay
-                            binding has no way to know the user expanded that node
-                            by hand — ElementNodeViewModel.IsExpanded never heard
-                            about it — so the regenerated container came back
-                            collapsed every time, which is what "the tree resets as
-                            I navigate" actually was. TwoWay keeps the ViewModel in
-                            sync with whatever the user actually did, so a
-                            regenerated container restores the same state.
+                            TwoWay, not OneWay: LiveTree only ever regenerates a
+                            node's TreeViewItem container when that specific node
+                            is added, removed, or reparented (see LiveTree.cs) — but
+                            even then, a OneWay binding has no way to know the user
+                            expanded that node by hand, since ElementNodeViewModel.
+                            IsExpanded never heard about it. TwoWay keeps the
+                            ViewModel in sync with whatever the user actually did,
+                            so a regenerated container restores the same state
+                            instead of coming back collapsed.
                         -->
                         <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}"/>
                         <Setter Property="Visibility" Value="{Binding IsVisible, Converter={StaticResource BoolToVisibility}}"/>
