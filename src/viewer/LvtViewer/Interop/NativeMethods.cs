@@ -60,6 +60,9 @@ public static class NativeMethods
     [DllImport("user32.dll")]
     public static extern bool IsWindow(IntPtr hwnd);
 
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hwnd);
+
     [DllImport("dwmapi.dll")]
     public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RECT value, int size);
 

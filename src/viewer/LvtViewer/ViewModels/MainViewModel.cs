@@ -28,6 +28,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _useUia = true;
     private ElementNodeViewModel? _selectedElement;
     private string? _currentHwndHex;
+    private IntPtr _currentHwnd;
     private CancellationTokenSource? _slowConnectHintCts;
 
     public MainViewModel(Dispatcher dispatcher)
@@ -58,6 +59,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         SetValueCommand = new RelayCommand(p => _ = SetValueAsync(p as PropertyRowViewModel));
         ReconnectCommand = new RelayCommand(_ => Reconnect(), _ => _currentHwndHex != null);
         FindNextCommand = new RelayCommand(_ => FindNext());
+        FindPreviousCommand = new RelayCommand(_ => FindPrevious());
     }
 
     public string LvtExePath { get; }
@@ -100,6 +102,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         get => _isConnected;
         private set => SetField(ref _isConnected, value);
     }
+
+    /// <summary>
+    /// The connected target's HWND, so MainWindow can check IsIconic before
+    /// showing a highlight overlay — a minimized target's last-known bounds
+    /// are meaningless to draw a rectangle around. IntPtr.Zero when nothing
+    /// is connected.
+    /// </summary>
+    public IntPtr CurrentHwnd => _currentHwnd;
 
     /// <summary>
     /// Discovered framework/content types (win32, xaml, winui3, wpf, comctl,
@@ -157,6 +167,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RelayCommand SetValueCommand { get; }
     public RelayCommand ReconnectCommand { get; }
     public RelayCommand FindNextCommand { get; }
+    public RelayCommand FindPreviousCommand { get; }
 
     private void OnWatchEvent(WatchEventDto evt)
     {
@@ -249,10 +260,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// case-insensitively against Text, ClassName, Type, and every property
     /// name/value — so a search for a property like an AutomationId or a
     /// UIA pattern name finds elements the Text/ClassName alone would miss.
-    /// Cycles through matches in tree (depth-first) order on repeated calls;
-    /// a changed SearchQuery resets the cursor to start over from the top.
+    /// Cycles through matches in tree (depth-first) order on repeated calls
+    /// (forward for FindNext, backward for FindPrevious, both wrapping); a
+    /// changed SearchQuery resets the cursor so the next call starts fresh.
     /// </summary>
-    private void FindNext()
+    private void FindNext() => Find(step: 1);
+
+    private void FindPrevious() => Find(step: -1);
+
+    private void Find(int step)
     {
         var query = SearchQuery?.Trim();
         if (string.IsNullOrEmpty(query))
@@ -278,7 +294,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _searchCursor = (_searchCursor + 1) % matches.Count;
+        // A fresh search (cursor reset by a changed query, or never searched
+        // this session) starts at the natural end for the requested
+        // direction — the first match for Next, the last for Previous —
+        // rather than both directions starting from the same spot.
+        _searchCursor = _searchCursor < 0
+            ? (step > 0 ? 0 : matches.Count - 1)
+            : ((_searchCursor + step) % matches.Count + matches.Count) % matches.Count;
+
         var match = matches[_searchCursor];
         StatusText = $"Match {_searchCursor + 1}/{matches.Count}: {match.DisplayName}";
         SearchMatchFound?.Invoke(match);
@@ -304,6 +327,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         NativeMethodsWindowInfo(hwnd, out var pid, out var title);
 
+        _currentHwnd = hwnd;
         _currentHwndHex = "0x" + hwnd.ToInt64().ToString("X", CultureInfo.InvariantCulture);
         IsConnected = true;
 

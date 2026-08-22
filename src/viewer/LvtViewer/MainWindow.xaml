@@ -33,11 +33,24 @@
                     </Canvas>
                 </Border>
 
-                <!-- Point-to-select an element within the already-connected target (item 2) -->
+                <!-- Point-to-select an element within the already-connected target (item 2).
+                     Border has no built-in disabled visual the way Button does, so IsEnabled=false
+                     (nothing connected yet) needs an explicit Opacity trigger — otherwise a disabled
+                     crosshair that simply does not respond to clicks looks identical to a broken one. -->
                 <Border x:Name="ElementPickHandle" Width="30" Height="30" Background="White"
                         BorderBrush="#FF808080" BorderThickness="1" Cursor="Hand" Margin="0,0,12,0"
                         IsEnabled="{Binding IsConnected}"
-                        ToolTip="Press and drag onto the target's UI to select that element in the tree">
+                        ToolTip="Press and drag onto the target's UI to select that element in the tree (connect to a target first)">
+                    <Border.Style>
+                        <Style TargetType="Border">
+                            <Setter Property="Opacity" Value="1"/>
+                            <Style.Triggers>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.35"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
                     <Canvas Width="20" Height="20">
                         <Line X1="10" Y1="0" X2="10" Y2="20" Stroke="Black" StrokeThickness="2"/>
                         <Line X1="0" Y1="10" X2="20" Y2="10" Stroke="Black" StrokeThickness="2"/>
@@ -80,7 +93,8 @@
                          Text="{Binding SearchQuery, UpdateSourceTrigger=PropertyChanged}"
                          ToolTip="Matches Text, Class, Type, or any property name/value (case-insensitive)"
                          KeyDown="SearchBox_KeyDown"/>
-                <Button Content="Find Next" Command="{Binding FindNextCommand}" Padding="10,3"/>
+                <Button Content="Find Next" Command="{Binding FindNextCommand}" Padding="10,3" Margin="0,0,6,0"/>
+                <Button Content="Find Previous" Command="{Binding FindPreviousCommand}" Padding="10,3"/>
             </StackPanel>
         </Border>
 

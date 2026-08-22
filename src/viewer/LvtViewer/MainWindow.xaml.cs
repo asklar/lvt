@@ -104,7 +104,7 @@ public partial class MainWindow : Window
     private void PreviewElementAt(POINT pt)
     {
         var node = FindDeepestElementAt(_viewModel.Roots, pt.X, pt.Y);
-        if (node == null)
+        if (node == null || IsTargetMinimized())
         {
             _selectionHighlight.Hide();
             return;
@@ -256,6 +256,12 @@ public partial class MainWindow : Window
         if (_highlightedNode == null)
             return;
 
+        if (IsTargetMinimized())
+        {
+            _selectionHighlight.Hide();
+            return;
+        }
+
         // lvt's bounds are already absolute screen (physical) pixels — the
         // same coordinate space HighlightOverlay.MoveTo expects, since it is
         // also fed directly from GetVisibleFrame/GetWindowRect for the
@@ -280,12 +286,30 @@ public partial class MainWindow : Window
             _selectionHighlight.Show();
     }
 
-    /// <summary>Enter in the search box triggers "Find Next" without needing to tab to the button.</summary>
+    /// <summary>
+    /// A minimized target's bounds are meaningless to draw a highlight
+    /// around (Windows moves a minimized window to a fixed off-screen
+    /// "iconic" position, which is itself what naturally triggers this via
+    /// the live tree's bounds-change wiring — the target's own window
+    /// minimizing is a real bounds change, no separate polling needed).
+    /// </summary>
+    private bool IsTargetMinimized()
+    {
+        var hwnd = _viewModel.CurrentHwnd;
+        return hwnd != IntPtr.Zero && NativeMethods.IsIconic(hwnd);
+    }
+
+    /// <summary>Enter finds the next match; Shift+Enter finds the previous — no need to tab to a button.</summary>
     private void SearchBox_KeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Enter && _viewModel.FindNextCommand.CanExecute(null))
+        if (e.Key != Key.Enter)
+            return;
+        var command = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)
+            ? _viewModel.FindPreviousCommand
+            : _viewModel.FindNextCommand;
+        if (command.CanExecute(null))
         {
-            _viewModel.FindNextCommand.Execute(null);
+            command.Execute(null);
             e.Handled = true;
         }
     }
