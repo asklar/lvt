@@ -186,7 +186,7 @@ lvt frameworks --hwnd 0x1A0B3C
 lvt dump --name myapp --element e5 --depth 3
 
 # Query an element by durable key or eN id
-lvt query "win32|Window|MyWindow/win32|Button|Button|Name:OK" text --name myapp
+lvt query "win32|MyWindow/win32|Button|Name:OK" text --name myapp
 
 # Watch for live tree changes as JSON diff events
 lvt watch --name notepad --interval 250
