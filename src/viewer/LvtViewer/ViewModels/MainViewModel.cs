@@ -57,6 +57,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ToggleCommand = new RelayCommand(p => _ = ToggleAsync(p as PropertyRowViewModel));
         SetValueCommand = new RelayCommand(p => _ = SetValueAsync(p as PropertyRowViewModel));
         ReconnectCommand = new RelayCommand(_ => Reconnect(), _ => _currentHwndHex != null);
+        FindNextCommand = new RelayCommand(_ => FindNext());
     }
 
     public string LvtExePath { get; }
@@ -134,9 +135,28 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         set => SetField(ref _highlightSelected, value);
     }
 
+    private string _searchQuery = "";
+
+    /// <summary>Free-text search over Text/ClassName/Type/properties, case-insensitive substring match.</summary>
+    public string SearchQuery
+    {
+        get => _searchQuery;
+        set
+        {
+            if (SetField(ref _searchQuery, value))
+                _searchCursor = -1; // a changed query starts a fresh search from the first match
+        }
+    }
+
+    private int _searchCursor = -1;
+
+    /// <summary>Fired when FindNext resolves a match, so MainWindow can select+highlight it in the TreeView.</summary>
+    public event Action<ElementNodeViewModel>? SearchMatchFound;
+
     public RelayCommand ToggleCommand { get; }
     public RelayCommand SetValueCommand { get; }
     public RelayCommand ReconnectCommand { get; }
+    public RelayCommand FindNextCommand { get; }
 
     private void OnWatchEvent(WatchEventDto evt)
     {
@@ -223,6 +243,61 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         foreach (var root in Roots)
             Visit(root);
     }
+
+    /// <summary>
+    /// Free-text search over the live tree (item: search bar), matched
+    /// case-insensitively against Text, ClassName, Type, and every property
+    /// name/value — so a search for a property like an AutomationId or a
+    /// UIA pattern name finds elements the Text/ClassName alone would miss.
+    /// Cycles through matches in tree (depth-first) order on repeated calls;
+    /// a changed SearchQuery resets the cursor to start over from the top.
+    /// </summary>
+    private void FindNext()
+    {
+        var query = SearchQuery?.Trim();
+        if (string.IsNullOrEmpty(query))
+        {
+            StatusText = "Enter a search term (matches Text, Class, Type, or any property).";
+            return;
+        }
+
+        var matches = new List<ElementNodeViewModel>();
+        void Visit(ElementNodeViewModel node)
+        {
+            if (ElementMatchesQuery(node, query))
+                matches.Add(node);
+            foreach (var child in node.Children)
+                Visit(child);
+        }
+        foreach (var root in Roots)
+            Visit(root);
+
+        if (matches.Count == 0)
+        {
+            StatusText = $"No elements match \"{query}\".";
+            return;
+        }
+
+        _searchCursor = (_searchCursor + 1) % matches.Count;
+        var match = matches[_searchCursor];
+        StatusText = $"Match {_searchCursor + 1}/{matches.Count}: {match.DisplayName}";
+        SearchMatchFound?.Invoke(match);
+    }
+
+    private static bool ElementMatchesQuery(ElementNodeViewModel node, string query)
+    {
+        if (Contains(node.Text, query) || Contains(node.ClassName, query) || Contains(node.Type, query))
+            return true;
+        foreach (var row in node.PropertyRows)
+        {
+            if (Contains(row.Name, query) || Contains(row.Value, query))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool Contains(string? haystack, string needle) =>
+        !string.IsNullOrEmpty(haystack) && haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
 
     /// <summary>Called by the crosshair picker once a target window is resolved.</summary>
     public void ConnectTo(IntPtr hwnd)

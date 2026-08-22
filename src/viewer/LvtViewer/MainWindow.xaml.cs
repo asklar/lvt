@@ -2,6 +2,7 @@
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Threading;
 using LvtViewer.Interop;
 using LvtViewer.ViewModels;
@@ -35,6 +36,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         _viewModel = new MainViewModel(Dispatcher);
         DataContext = _viewModel;
+        _viewModel.SearchMatchFound += SelectElementInTree;
 
         Tree.SelectedItemChanged += (_, e) =>
         {
@@ -129,15 +131,26 @@ public partial class MainWindow : Window
     /// live tree client-side — lvt's bounds are already absolute screen
     /// pixels, so no round-trip to lvt.exe is needed for this (item 2).
     /// An element with zero/unknown bounds (a collapsed or never-laid-out
-    /// node — see the XAML/WinUI3 bounds-collection budget in lvt_tap.cpp)
-    /// cannot be ruled out as "outside", so its children are still checked;
-    /// among siblings that do match, the last one wins, which lines up with
-    /// lvt's enumeration order generally reporting later/topmost content last.
+    /// node — see the XAML/WinUI3 bounds-collection path in lvt_tap.cpp)
+    /// cannot be ruled out as "outside", so its children are still checked.
+    ///
+    /// A match with real matching descendants (bestDeep) always wins over a
+    /// sibling that only matches itself (bestShallow), regardless of which
+    /// one comes later in iteration order. This matters for exactly the
+    /// case that surfaced it: UWP/ApplicationFrameHost windows carry a
+    /// full-bounds "ApplicationFrameInputSinkWindow" utility HWND (a bare
+    /// win32 leaf, no children of interest) as a *later* sibling of the
+    /// actual XAML-hosting bridge — naively preferring "the last sibling
+    /// that matches" (treating later-in-order as topmost/most-specific)
+    /// picked the input sink over real content underneath it every time.
+    /// Only among siblings in the *same* tier (both deep, or both shallow)
+    /// does later-wins still apply, as a same-tier z-order tiebreaker.
     /// </summary>
     private static ElementNodeViewModel? FindDeepestElementAt(
         IEnumerable<ElementNodeViewModel> nodes, int x, int y)
     {
-        ElementNodeViewModel? best = null;
+        ElementNodeViewModel? bestDeep = null;
+        ElementNodeViewModel? bestShallow = null;
         foreach (var node in nodes)
         {
             bool hasBounds = node.BoundsWidth > 0 && node.BoundsHeight > 0;
@@ -149,11 +162,11 @@ public partial class MainWindow : Window
 
             var childMatch = FindDeepestElementAt(node.Children, x, y);
             if (childMatch != null)
-                best = childMatch;
+                bestDeep = childMatch;
             else if (inside)
-                best = node;
+                bestShallow = node;
         }
-        return best;
+        return bestDeep ?? bestShallow;
     }
 
     /// <summary>
@@ -265,6 +278,16 @@ public partial class MainWindow : Window
         _selectionHighlight.MoveTo(rect);
         if (_selectionHighlight.Visibility != Visibility.Visible)
             _selectionHighlight.Show();
+    }
+
+    /// <summary>Enter in the search box triggers "Find Next" without needing to tab to the button.</summary>
+    private void SearchBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter && _viewModel.FindNextCommand.CanExecute(null))
+        {
+            _viewModel.FindNextCommand.Execute(null);
+            e.Handled = true;
+        }
     }
 }
 

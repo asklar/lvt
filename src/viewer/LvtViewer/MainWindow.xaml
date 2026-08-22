@@ -72,6 +72,18 @@
             </StackPanel>
         </Border>
 
+        <!-- Search bar: find an element by text, class name, type, or any property value/name -->
+        <Border DockPanel.Dock="Top" Background="#FFFAFAFA" BorderBrush="#FFD5D5D5" BorderThickness="0,0,0,1" Padding="8,4">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="Find:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBox x:Name="SearchBox" Width="260" Margin="0,0,6,0"
+                         Text="{Binding SearchQuery, UpdateSourceTrigger=PropertyChanged}"
+                         ToolTip="Matches Text, Class, Type, or any property name/value (case-insensitive)"
+                         KeyDown="SearchBox_KeyDown"/>
+                <Button Content="Find Next" Command="{Binding FindNextCommand}" Padding="10,3"/>
+            </StackPanel>
+        </Border>
+
         <!-- Status bar -->
         <Border DockPanel.Dock="Bottom" Background="#FFEFEFEF" BorderBrush="#FFD5D5D5" BorderThickness="0,1,0,0" Padding="6,3">
             <TextBlock Text="{Binding StatusText}" TextTrimming="CharacterEllipsis"/>
