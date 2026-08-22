@@ -56,6 +56,8 @@ public sealed class WatchSession : IDisposable
         psi.ArgumentList.Add("--interval");
         psi.ArgumentList.Add(intervalMs.ToString(CultureInfo.InvariantCulture));
 
+        Logger.Log("watch", $"Starting: {exePath} {string.Join(' ', psi.ArgumentList)}");
+
         var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
         var cts = new CancellationTokenSource();
         _process = process;
@@ -63,6 +65,12 @@ public sealed class WatchSession : IDisposable
 
         process.Exited += (_, _) =>
         {
+            // This is the #1 suspect for "the crosshair sometimes goes
+            // disabled for no reason" (ElementPickHandle.IsEnabled is bound
+            // to IsConnected, which MainViewModel clears on this event) — an
+            // unexpected watch exit looks to the user like nothing happened,
+            // but it is exactly this.
+            Logger.Log("watch", $"Process exited, ExitCode={SafeExitCode(process)}");
             try
             {
                 Exited?.Invoke(process.ExitCode);
@@ -76,9 +84,11 @@ public sealed class WatchSession : IDisposable
         try
         {
             process.Start();
+            Logger.Log("watch", $"Started, pid={process.Id}");
         }
         catch (Exception ex)
         {
+            Logger.LogException("watch", $"Could not start '{exePath}'", ex);
             DiagnosticReceived?.Invoke($"could not start '{exePath}': {ex.Message}");
             _process = null;
             return;
@@ -86,6 +96,11 @@ public sealed class WatchSession : IDisposable
 
         _ = PumpStdOutAsync(process, cts.Token);
         _ = PumpStdErrAsync(process, cts.Token);
+    }
+
+    private static int SafeExitCode(Process process)
+    {
+        try { return process.ExitCode; } catch { return -1; }
     }
 
     public void Stop()
@@ -98,6 +113,7 @@ public sealed class WatchSession : IDisposable
         if (process == null)
             return;
 
+        Logger.Log("watch", $"Stop() called, pid={SafePid(process)}");
         try
         {
             if (!process.HasExited)
@@ -113,6 +129,11 @@ public sealed class WatchSession : IDisposable
         }
     }
 
+    private static int SafePid(Process process)
+    {
+        try { return process.Id; } catch { return -1; }
+    }
+
     private async Task PumpStdOutAsync(Process process, CancellationToken token)
     {
         try
@@ -121,7 +142,10 @@ public sealed class WatchSession : IDisposable
             {
                 var line = await process.StandardOutput.ReadLineAsync(token).ConfigureAwait(false);
                 if (line == null)
+                {
+                    Logger.Log("watch", "stdout closed (process exiting)");
                     break; // stdout closed: the process is exiting
+                }
                 if (string.IsNullOrWhiteSpace(line))
                     continue;
 
@@ -130,12 +154,16 @@ public sealed class WatchSession : IDisposable
                 {
                     evt = JsonSerializer.Deserialize<WatchEventDto>(line, JsonDefaults.Options);
                 }
-                catch (JsonException)
+                catch (JsonException ex)
                 {
+                    Logger.Log("watch", $"non-JSON/malformed line ignored: {ex.Message}; line={Truncate(line)}");
                     continue; // tolerate a stray non-JSON line rather than tearing down the session
                 }
                 if (evt != null)
+                {
+                    Logger.Log("watch", $"event={evt.Event} key={Truncate(evt.Key, 60)} path={evt.Path}");
                     EventReceived?.Invoke(evt);
+                }
             }
         }
         catch (OperationCanceledException)
@@ -143,6 +171,9 @@ public sealed class WatchSession : IDisposable
             // Expected on Stop().
         }
     }
+
+    private static string Truncate(string? s, int max = 200) =>
+        s == null ? "" : (s.Length <= max ? s : s[..max] + "…");
 
     private async Task PumpStdErrAsync(Process process, CancellationToken token)
     {
@@ -154,7 +185,10 @@ public sealed class WatchSession : IDisposable
                 if (line == null)
                     break;
                 if (!string.IsNullOrWhiteSpace(line))
+                {
+                    Logger.Log("watch", $"stderr: {line}");
                     DiagnosticReceived?.Invoke(line);
+                }
             }
         }
         catch (OperationCanceledException)

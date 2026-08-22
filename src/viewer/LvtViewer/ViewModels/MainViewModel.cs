@@ -41,6 +41,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _watch.DiagnosticReceived += line => _dispatcher.BeginInvoke(() => StatusText = line);
         _watch.Exited += code => _dispatcher.BeginInvoke(() =>
         {
+            Logger.Log("viewmodel", $"watch Exited(code={code}) -> IsConnected=false, clearing tree/selection");
             _slowConnectHintCts?.Cancel(); // don't let a pending hint override this status
             StatusText = $"lvt watch exited (code {code}) — target likely closed. Re-pick a window to reconnect.";
             // The target's own process may have crashed or been closed: its
@@ -100,7 +101,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool IsConnected
     {
         get => _isConnected;
-        private set => SetField(ref _isConnected, value);
+        private set
+        {
+            if (SetField(ref _isConnected, value))
+                Logger.Log("viewmodel", $"IsConnected -> {value} (crosshair {(value ? "enabled" : "disabled")})");
+        }
     }
 
     /// <summary>
@@ -336,6 +341,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public void ConnectTo(IntPtr hwnd)
     {
         NativeMethodsWindowInfo(hwnd, out var pid, out var title);
+        Logger.Log("viewmodel", $"ConnectTo hwnd=0x{hwnd.ToInt64():X} pid={pid} title=\"{title}\" uia={UseUia}");
 
         _currentHwnd = hwnd;
         _currentHwndHex = "0x" + hwnd.ToInt64().ToString("X", CultureInfo.InvariantCulture);
@@ -373,6 +379,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (_currentHwndHex == null)
             return;
+        Logger.Log("viewmodel", $"Reconnect hwnd={_currentHwndHex} uia={UseUia}");
         _liveTree.Reset();
         StatusText = "Reconnecting…";
         IsConnected = true;

@@ -43,6 +43,7 @@ public sealed class LiveTree
 
     public void Reset()
     {
+        Logger.Log("tree", $"Reset() — clearing {_byKey.Count} known nodes");
         _byKey.Clear();
         Roots.Clear();
         _dirty = false;
@@ -65,6 +66,16 @@ public sealed class LiveTree
 
         if (_dirty)
         {
+            // This is the #1 suspect for "the tree refreshes as I navigate,
+            // resetting my place" — RebuildHierarchy resyncs Roots/Children
+            // via SyncCollection, which should preserve TreeViewItem
+            // expansion/scroll for untouched nodes by reusing the same
+            // ElementNodeViewModel instances, but any node that legitimately
+            // *did* move/add/remove triggers this for the *entire* tree, not
+            // just its own subtree. A target with any frequently-changing
+            // element (a clock, a spinner, virtualized list recycling) can
+            // set _dirty on nearly every tick.
+            Logger.Log("tree", $"dirty — rebuilding hierarchy over {_byKey.Count} known nodes");
             RebuildHierarchy();
             _dirty = false;
         }
@@ -86,6 +97,7 @@ public sealed class LiveTree
             return;
         var node = GetOrCreate(evt.Key);
         node.UpdateFrom(evt.Element, evt.Key, evt.Path);
+        Logger.Log("tree", $"added key={evt.Key} path={evt.Path} -> dirty");
         _dirty = true;
     }
 
@@ -98,6 +110,7 @@ public sealed class LiveTree
         {
             if (fieldName == "path")
             {
+                Logger.Log("tree", $"changed key={evt.Key} path {node.Path} -> {change.New} -> dirty");
                 node.Path = change.New;
                 _dirty = true;
             }
@@ -119,7 +132,10 @@ public sealed class LiveTree
     private void ApplyRemoved(WatchEventDto evt)
     {
         if (_byKey.Remove(evt.Key))
+        {
+            Logger.Log("tree", $"removed key={evt.Key} -> dirty");
             _dirty = true;
+        }
     }
 
     /// <summary>
