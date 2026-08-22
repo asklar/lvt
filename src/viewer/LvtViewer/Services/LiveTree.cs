@@ -63,22 +63,33 @@ public sealed class LiveTree
                 ApplyRemoved(evt);
                 break;
         }
+        // Deliberately does NOT rebuild here — see Flush(). watch emits one
+        // JSON line per *element*, not one per tick: a single tick (let
+        // alone the very first burst, which is the whole initial tree) can
+        // be hundreds or thousands of lines. Rebuilding after every single
+        // one of them was measured live doing 5454 full-hierarchy rebuilds
+        // in one ~140s session — the real cause of "the tree refreshes as I
+        // navigate": it was not any one rebuild corrupting state, it was
+        // WPF re-laying-out the whole TreeView many times a second while
+        // the target's own animated/live content kept ticking, which reads
+        // exactly like the view resetting even though the underlying model
+        // was fine. The caller is expected to call Flush() once after
+        // draining all events currently available, not after each one.
+    }
 
-        if (_dirty)
-        {
-            // This is the #1 suspect for "the tree refreshes as I navigate,
-            // resetting my place" — RebuildHierarchy resyncs Roots/Children
-            // via SyncCollection, which should preserve TreeViewItem
-            // expansion/scroll for untouched nodes by reusing the same
-            // ElementNodeViewModel instances, but any node that legitimately
-            // *did* move/add/remove triggers this for the *entire* tree, not
-            // just its own subtree. A target with any frequently-changing
-            // element (a clock, a spinner, virtualized list recycling) can
-            // set _dirty on nearly every tick.
-            Logger.Log("tree", $"dirty — rebuilding hierarchy over {_byKey.Count} known nodes");
-            RebuildHierarchy();
-            _dirty = false;
-        }
+    /// <summary>
+    /// Rebuilds the hierarchy if anything Applied since the last Flush
+    /// actually requires it. Call this once per drained batch of events —
+    /// never per individual event — so a burst of N related changes costs
+    /// one rebuild instead of N.
+    /// </summary>
+    public void Flush()
+    {
+        if (!_dirty)
+            return;
+        Logger.Log("tree", $"flush — rebuilding hierarchy over {_byKey.Count} known nodes");
+        RebuildHierarchy();
+        _dirty = false;
     }
 
     private ElementNodeViewModel GetOrCreate(string key)

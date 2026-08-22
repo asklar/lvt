@@ -184,6 +184,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public RelayCommand FindNextCommand { get; }
     public RelayCommand FindPreviousCommand { get; }
 
+    private bool _flushScheduled;
+
     private void OnWatchEvent(WatchEventDto evt)
     {
         // Data has arrived: whatever the slow-connect hint below was about
@@ -192,7 +194,38 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _slowConnectHintCts?.Cancel();
         _liveTree.Apply(evt);
         DiscoverFrameworks(evt);
-        ApplyFrameworkFilter();
+        ScheduleFlush();
+    }
+
+    /// <summary>
+    /// Coalesces LiveTree.Flush() (the hierarchy rebuild) and
+    /// ApplyFrameworkFilter() (an IsVisible walk over the whole tree) so a
+    /// burst of N events — the initial connect's whole tree is one such
+    /// burst, and so is any tick on a target with animated/live content —
+    /// costs one pass of each instead of N. Both were previously run after
+    /// *every single* watch event; measured live, that was 5454 full
+    /// hierarchy rebuilds in one ~140s session and is what "the tree
+    /// refreshes as I navigate" actually was — WPF re-laying-out the whole
+    /// TreeView many times a second, not any actual state corruption.
+    ///
+    /// Dispatcher.BeginInvoke at Background priority is what does the
+    /// coalescing: OnWatchEvent's own dispatch (from WatchSession.
+    /// EventReceived) runs at the default Normal priority, so as long as
+    /// more events are already queued, this callback keeps getting pushed
+    /// behind them and does not fire until the queue actually drains —
+    /// exactly the point where there is nothing more to batch in.
+    /// </summary>
+    private void ScheduleFlush()
+    {
+        if (_flushScheduled)
+            return;
+        _flushScheduled = true;
+        _dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+        {
+            _flushScheduled = false;
+            _liveTree.Flush();
+            ApplyFrameworkFilter();
+        });
     }
 
     /// <summary>
