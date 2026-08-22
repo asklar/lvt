@@ -604,8 +604,31 @@ static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
 static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
+    // The very first tree build did not get the same tolerance the tick loop
+    // below already has for a transient failure — it would fail outright
+    // and exit this whole process on one bad injection attempt. Observed
+    // live: a viewer connecting to a XAML/WinUI3 app can hit
+    // "InitializeXamlDiagnosticsEx failed" on the very first try even
+    // though a retry moments later succeeds (the same transient-connection
+    // flakiness the tick loop's own comment already describes), and from
+    // the viewer's side that looked exactly like "the crosshair picker
+    // sometimes goes disabled for no reason" — this process exiting
+    // immediately at startup is indistinguishable, from IsConnected's point
+    // of view, from a deliberate disconnect. A few retries here costs
+    // nothing on the ordinary path (the first attempt still succeeds
+    // almost always) and turns a transient hiccup into a normal, silent
+    // recovery instead of a dead connection.
     lvt::Element previous;
-    if (!build_output_tree(target, args, previous))
+    bool built = false;
+    for (int attempt = 0; attempt < 5 && !built; ++attempt) {
+        if (attempt > 0) {
+            if (lvt::g_debug)
+                fprintf(stderr, "lvt: retrying initial watch connection (attempt %d)\n", attempt + 1);
+            Sleep(static_cast<DWORD>(300 * attempt));
+        }
+        built = build_output_tree(target, args, previous);
+    }
+    if (!built)
         return 1;
 
     for (const auto& event : lvt::snapshot_added_events(previous))
