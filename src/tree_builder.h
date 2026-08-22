@@ -8,8 +8,15 @@
 namespace lvt {
 
 // Build a unified visual tree from the given HWND using detected frameworks.
+// `fastProperties` skips IVisualTreeService::GetPropertyValuesChain for
+// XAML/WinUI3 elements (the dominant per-element cost of a rich tree) in
+// favor of cheaper direct WinRT property reads — see
+// xaml_diag_common.h's inject_and_collect_xaml_tree for exactly what that
+// trades away. Defaults to false (today's exhaustive property collection),
+// unaffected for every non-XAML/WinUI3 provider.
 Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frameworks,
-                   int maxDepth = -1, const std::string& pluginOption = {});
+                   int maxDepth = -1, const std::string& pluginOption = {},
+                   bool fastProperties = false);
 
 // Assign deterministic element IDs (e0, e1, ...) in depth-first order.
 void assign_element_ids(Element& root);

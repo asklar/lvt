@@ -215,7 +215,8 @@ bool inject_and_collect_xaml_tree(
     const std::wstring& xamlDiagDll,
     const std::wstring& initDllPath,
     const std::string& frameworkLabel,
-    const std::wstring& connPrefix)
+    const std::wstring& connPrefix,
+    bool fastProperties)
 {
     std::wstring tapDll = tap_dll_path(L"lvt_tap");
 
@@ -289,6 +290,11 @@ bool inject_and_collect_xaml_tree(
     DWORD connectErr = GetLastError();
 
     HRESULT hr = E_FAIL;
+    // The TAP DLL parses its GetInitializationData() BSTR as "pipe_name" or
+    // "pipe_name|FAST" (see lvt_tap.cpp's SetSiteImpl) — this is the only
+    // channel available to tell it which mode to collect in, since
+    // InitializeXamlDiagnosticsEx's own parameter list is fixed.
+    std::wstring initData = fastProperties ? pipeName + L"|FAST" : pipeName;
     for (int i = 0; i < 10; i++) {
         wchar_t endPoint[64];
         swprintf_s(endPoint, L"%s%d", connPrefix.c_str(), i + 1);
@@ -299,7 +305,7 @@ bool inject_and_collect_xaml_tree(
             xamlDiagDll.c_str(),
             tapDll.c_str(),
             CLSID_LvtTap,
-            pipeName.c_str());
+            initData.c_str());
 
         if (g_debug)
             fprintf(stderr, "lvt: %ls pid=%lu -> 0x%08lX\n", endPoint, pid, hr);

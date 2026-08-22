@@ -1280,6 +1280,51 @@ TEST_F(WinUI3SampleFixture, DurableKeysDeterministicAndQueryable) {
     EXPECT_EQ(byKey, "PrimaryButton");
 }
 
+// --fast skips IVisualTreeService::GetPropertyValuesChain (the dominant
+// per-element cost of a rich WinUI3 tree, ~4.5ms/element measured live
+// against Microsoft Store/Calculator) and collects bounds/Text/Content the
+// cheaper way instead — see lvt_tap.cpp's CollectBounds/CollectPositionsAndText.
+// This only checks the one thing that actually matters for a caller: the
+// same named controls, with the same identity, still show up — not that
+// every property matches (--fast is documented to report fewer of them).
+TEST_F(WinUI3SampleFixture, FastModeStillFindsNamedControlsAndBounds) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto winui3Ready = [](const json& j) {
+        return frameworks_contain_winui3(j) &&
+               has_winui3_stitched_under_bridge(j["root"]) &&
+               json_tree_has_named_control(j["root"], "PrimaryButton");
+    };
+    auto j = dump_ready_tree(lvt, get_pid_arg() + " --fast", winui3Ready);
+    ASSERT_TRUE(winui3Ready(j)) << "WinUI3 tree never became ready in --fast mode";
+
+    auto* button = find_named_control(j["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr);
+    EXPECT_EQ(button->value("framework", ""), "winui3");
+    EXPECT_EQ(button->value("type", ""), "Button");
+    ASSERT_FALSE(button->value("key", "").empty());
+
+    // Bounds still need to come from somewhere in fast mode — from the
+    // direct FrameworkElement.ActualWidth/ActualHeight read in
+    // CollectPositionsAndText, since CollectBounds (GetPropertyValuesChain)
+    // is skipped entirely. At least some elements in a real, rendered
+    // window must report non-zero size, or fast mode would be useless for
+    // the highlight/hit-test use cases it exists to serve.
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+    bool anyNonZeroBounds = false;
+    for (auto* el : elements) {
+        if (!el->contains("bounds")) continue;
+        auto& b = (*el)["bounds"];
+        if (b.value("width", 0) > 0 && b.value("height", 0) > 0) {
+            anyNonZeroBounds = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(anyNonZeroBounds) << "no element reported non-zero bounds in --fast mode";
+}
+
 TEST_F(NotepadFixture, Win32BoundsReasonable) {
     // Every element in the Win32 tree should have reasonable (non-extreme) bounds
     auto lvt = get_lvt_path();

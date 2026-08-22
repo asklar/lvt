@@ -6,7 +6,7 @@
 
 namespace lvt {
 
-void XamlProvider::enrich(Element& root, HWND hwnd, DWORD pid) {
+void XamlProvider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties) {
     Element* coreWindow = nullptr;
     std::function<void(Element&)> findCoreWindow = [&](Element& el) {
         if (el.className == "Windows.UI.Core.CoreWindow") {
@@ -29,7 +29,8 @@ void XamlProvider::enrich(Element& root, HWND hwnd, DWORD pid) {
         GetWindowThreadProcessId(coreHwnd, &corePid);
     }
 
-    inject_and_collect_xaml_tree(*coreWindow, hwnd, corePid, L"", L"Windows.UI.Xaml.dll", "xaml");
+    inject_and_collect_xaml_tree(*coreWindow, hwnd, corePid, L"", L"Windows.UI.Xaml.dll", "xaml",
+                               L"VisualDiagConnection", fastProperties);
 }
 
 } // namespace lvt

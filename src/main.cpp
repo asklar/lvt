@@ -96,6 +96,10 @@ static void print_usage() {
         "  --element <ref>      Scope the tree to one element's subtree\n"
         "  --depth <n>          Max tree traversal depth (default: unlimited)\n"
         "  --interval <ms>      Watch polling interval (default: 500)\n"
+        "  --fast               Skip the XAML/WinUI3 full property chain walk;\n"
+        "                       collect bounds/Text/Content the cheap way instead.\n"
+        "                       Much faster on rich trees; misses custom properties\n"
+        "                       outside Text/Content/bounds/basic state.\n"
 #ifndef NDEBUG
         "  --annotations-json <file>  Write annotation rectangles as JSON (test hook)\n"
 #endif
@@ -155,6 +159,12 @@ struct Args {
     int waitTimeoutMs = 5000;
     int depth = -1;
     int intervalMs = 500;
+    // Skips IVisualTreeService::GetPropertyValuesChain for XAML/WinUI3
+    // elements (the dominant per-element cost of a rich tree) in favor of
+    // cheaper direct WinRT property reads — see build_tree's fastProperties
+    // parameter. Off by default to keep today's exhaustive property
+    // collection as the default behavior.
+    bool fastProperties = false;
     // MCP only: expose the tools that can change the target application.
     bool allowInput = false;
 };
@@ -368,6 +378,8 @@ static Args parse_args(int argc, char* argv[]) {
             args.depth = parse_non_negative_int(argv[++i], "--depth");
         } else if (strcmp(arg, "--interval") == 0 && i + 1 < argc) {
             args.intervalMs = parse_non_negative_int(argv[++i], "--interval");
+        } else if (strcmp(arg, "--fast") == 0) {
+            args.fastProperties = true;
         } else if (strcmp(arg, "--uia") == 0) {
             args.uia = true;
         } else if (strcmp(arg, "--allow-input") == 0) {
@@ -562,7 +574,8 @@ static bool build_root_tree(const lvt::TargetInfo& target, const Args& args,
     }
 
     auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
-    tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption);
+    tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption,
+                          args.fastProperties);
     return true;
 }
 

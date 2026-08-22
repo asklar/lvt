@@ -49,7 +49,7 @@ static std::wstring find_framework_udk(DWORD pid) {
     return {};
 }
 
-void WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid) {
+void WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties) {
     label_winui3_windows(root);
 
     // Try XAML diagnostics injection for the full visual tree
@@ -66,7 +66,7 @@ void WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid) {
     }
 
     inject_and_collect_xaml_tree(root, hwnd, pid, L"", initDll, "winui3",
-                               L"WinUIVisualDiagConnection");
+                               L"WinUIVisualDiagConnection", fastProperties);
 }
 
 } // namespace lvt

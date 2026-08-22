@@ -121,7 +121,12 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     std::vector<InstanceHandle> m_orderedHandles;
     std::vector<InstanceHandle> m_roots;
     std::wstring m_pipeName;
-    bool m_collectProps = false;
+    // Parsed from the pipe-name suffix ("pipe_name|FAST") passed down from
+    // xaml_diag_common.cpp — see CollectBoundsForNode / CollectPositionsAndText
+    // for what this actually gates. Defaults to false (today's full,
+    // GetPropertyValuesChain-based collection) so existing callers that never
+    // set the suffix see no behavior change.
+    bool m_fastMode = false;
 
 public:
     wil::com_ptr<IVisualTreeService> m_vts;
@@ -197,16 +202,16 @@ public:
         wil::unique_bstr initData(rawInitData);
         if (initData) {
             std::wstring data(initData.get());
-            // Format: "pipe_name" or "pipe_name|PROPS"
+            // Format: "pipe_name" or "pipe_name|FAST"
             auto sep = data.find(L'|');
             if (sep != std::wstring::npos) {
                 m_pipeName = data.substr(0, sep);
                 std::wstring flags = data.substr(sep + 1);
-                m_collectProps = (flags.find(L"PROPS") != std::wstring::npos);
+                m_fastMode = (flags.find(L"FAST") != std::wstring::npos);
             } else {
                 m_pipeName = data;
             }
-            LogMsg("Pipe name: %ls, collectProps: %d", m_pipeName.c_str(), m_collectProps);
+            LogMsg("Pipe name: %ls, fastMode: %d", m_pipeName.c_str(), m_fastMode);
         }
 
         hr = diag->QueryInterface(IID_PPV_ARGS(m_vts.put()));
@@ -513,6 +518,19 @@ private:
     // combined cost of this walk, chunked or not, and fails the whole tick
     // cleanly (no partial data) rather than partially collecting.
     void CollectBounds(IVisualTreeService* vts, size_t start, size_t count) {
+        // Fast mode skips GetPropertyValuesChain entirely — the dominant
+        // per-node cost (~4.5ms/element, measured live against Microsoft
+        // Store and Calculator) of walking an element's *entire* property
+        // inheritance chain just to read ActualWidth/ActualHeight out of it.
+        // CollectPositionsAndText gets bounds a cheaper way instead (direct
+        // FrameworkElement.ActualWidth/ActualHeight via the same IInspectable
+        // it already fetches for position/text), so there is nothing for
+        // this function to do in fast mode.
+        if (m_fastMode) {
+            LogMsg("CollectBounds: skipped in fast mode, batch [%zu,%zu)", start,
+                   std::min(start + count, m_orderedHandles.size()));
+            return;
+        }
         size_t end = std::min(start + count, m_orderedHandles.size());
         int collected = 0;
         for (size_t i = start; i < end; i++) {
@@ -537,6 +555,24 @@ private:
     // Also reads Text property from TextBlock elements.
     // Tries both WinUI3 (Microsoft.UI.Xaml) and system XAML (Windows.UI.Xaml) interfaces.
     // Chunked the same way, and for the same reason, as CollectBounds above.
+    // Unboxes a Content/Header-style IInspectable to a string only when it is
+    // actually one — most ContentControls hold a nested UIElement subtree
+    // there instead (a StackPanel with an Image+TextBlock, say), and that has
+    // no meaningful flat string to show. IPropertyValue is how WinRT
+    // represents a boxed primitive regardless of which XAML projection
+    // produced it, so this one helper covers both WUX and Microsoft.UI.Xaml
+    // without a separate branch for each.
+    static bool TryUnboxString(const winrt::Windows::Foundation::IInspectable& value,
+                               winrt::hstring& out) {
+        if (auto propValue = value.try_as<winrt::Windows::Foundation::IPropertyValue>()) {
+            if (propValue.Type() == winrt::Windows::Foundation::PropertyType::String) {
+                out = propValue.GetString();
+                return !out.empty();
+            }
+        }
+        return false;
+    }
+
     void CollectPositionsAndText(size_t start, size_t count) {
         namespace WUX = winrt::Windows::UI::Xaml;
         namespace WUXC = winrt::Windows::UI::Xaml::Controls;
@@ -544,13 +580,12 @@ private:
         if (!m_diag) return;
 
         size_t end = std::min(start + count, m_orderedHandles.size());
-        int positioned = 0, textsRead = 0;
+        int positioned = 0, textsRead = 0, boundsFromFastPath = 0;
         for (size_t i = start; i < end; i++) {
             InstanceHandle handle = m_orderedHandles[i];
             auto it = m_nodes.find(handle);
             if (it == m_nodes.end()) continue;
             TreeNode& node = it->second;
-            if (!node.hasBounds) continue;
 
             // Keep raw to preserve XAML diagnostics' existing ABI lifetime behavior.
             ::IInspectable* raw = nullptr;
@@ -561,6 +596,41 @@ private:
                 winrt::Windows::Foundation::IInspectable inspectable;
                 winrt::copy_from_abi(inspectable, raw);
                 raw = nullptr; // ownership transferred
+
+                // Fast mode never ran GetPropertyValuesChain (see
+                // CollectBounds), so ActualWidth/ActualHeight have not been
+                // read yet — get them the same cheap way position/text
+                // already come from: a direct WinRT property read on the
+                // IInspectable this loop obtained anyway, no COM property-
+                // chain walk. Non-fast mode already has hasBounds from
+                // CollectBounds and skips this — it is not wrong to redo it,
+                // just pointless cost this path exists specifically to avoid.
+                if (m_fastMode && !node.hasBounds) {
+                    bool gotBounds = false;
+#if LVT_HAS_WINUI3_PROJECTION
+                    if (auto fe = inspectable.try_as<winrt::Microsoft::UI::Xaml::FrameworkElement>()) {
+                        double w = fe.ActualWidth(), h = fe.ActualHeight();
+                        if (std::isfinite(w) && std::isfinite(h)) {
+                            node.width = w;
+                            node.height = h;
+                            gotBounds = true;
+                        }
+                    }
+#endif
+                    if (!gotBounds) {
+                        if (auto fe = inspectable.try_as<WUX::FrameworkElement>()) {
+                            double w = fe.ActualWidth(), h = fe.ActualHeight();
+                            if (std::isfinite(w) && std::isfinite(h)) {
+                                node.width = w;
+                                node.height = h;
+                                gotBounds = true;
+                            }
+                        }
+                    }
+                    node.hasBounds = gotBounds;
+                    if (gotBounds) boundsFromFastPath++;
+                }
+                if (!node.hasBounds) continue;
 
                 // Position via TransformToVisual — try WinUI3 first, then system XAML
                 bool gotPosition = false;
@@ -600,14 +670,35 @@ private:
                     node.properties.emplace_back(L"Text", std::wstring(text));
                     textsRead++;
                 }
+
+                // Content from ContentControl (Button, ListViewItem, ...) —
+                // only when it unboxes to a plain string (see TryUnboxString):
+                // most controls' Content is a nested element subtree, which
+                // has nothing flat to show here. This runs in both modes —
+                // GetPropertyValuesChain's own filter (xaml_property_filter.h)
+                // treats a reference-typed Content as a handle and drops it,
+                // so today this is new data even in the default/full path,
+                // not a duplicate of what GetPropertyValuesChain already
+                // reports.
+                winrt::hstring content;
+#if LVT_HAS_WINUI3_PROJECTION
+                if (auto cc = inspectable.try_as<winrt::Microsoft::UI::Xaml::Controls::ContentControl>())
+                    TryUnboxString(cc.Content(), content);
+#endif
+                if (content.empty()) {
+                    if (auto cc = inspectable.try_as<WUXC::ContentControl>())
+                        TryUnboxString(cc.Content(), content);
+                }
+                if (!content.empty())
+                    node.properties.emplace_back(L"Content", std::wstring(content));
             } catch (...) {
                 // Swallow WinRT exceptions — element may be in an invalid state
             }
 
             if (raw) raw->Release();
         }
-        LogMsg("CollectPositionsAndText: %d positioned, %d texts in batch [%zu,%zu)",
-               positioned, textsRead, start, end);
+        LogMsg("CollectPositionsAndText: %d positioned, %d texts, %d bounds-from-fast-path in batch [%zu,%zu)",
+               positioned, textsRead, boundsFromFastPath, start, end);
     }
 #endif
 
