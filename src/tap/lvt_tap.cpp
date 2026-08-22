@@ -12,6 +12,7 @@
 #include <string>
 #include <map>
 #include <vector>
+#include <algorithm>
 #include <cstdio>
 #include <cmath>
 #include <unknwn.h>
@@ -94,6 +95,16 @@ struct TreeNode {
 
 class LvtTap;
 
+// Describes one chunk of nodes to collect, passed via SendMessage's LPARAM.
+// The struct lives on AdviseThreadProcImpl's stack: SendMessage is
+// synchronous, so it stays valid for exactly as long as the receiving
+// thread's WndProc needs it, with no lifetime management required.
+struct BatchRequest {
+    LvtTap* self;
+    size_t start;
+    size_t count;
+};
+
 // Forward declaration for WndProc
 static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -103,6 +114,11 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     wil::com_ptr<IXamlDiagnostics> m_diag;
     wil::unique_hwnd m_msgWnd; // Message-only window for UI thread dispatch
     std::map<InstanceHandle, TreeNode> m_nodes;
+    // Stable, flattened order over m_nodes' handles, built once per pass so
+    // both collection functions can be dispatched to the UI thread in small
+    // chunks (see AdviseThreadProcImpl) instead of one giant blocking call —
+    // a std::map has no efficient random-access range, hence flattening.
+    std::vector<InstanceHandle> m_orderedHandles;
     std::vector<InstanceHandle> m_roots;
     std::wstring m_pipeName;
     bool m_collectProps = false;
@@ -253,19 +269,45 @@ public:
                     Sleep(500);
                     LogMsg("After sleep: nodes=%zu", m_nodes.size());
                 }
-                // Dispatch GetPropertyValuesChain to UI thread via message window.
-                // SendMessage blocks until the UI thread processes the message.
+
+                m_orderedHandles.clear();
+                m_orderedHandles.reserve(m_nodes.size());
+                for (auto& [handle, node] : m_nodes) m_orderedHandles.push_back(handle);
+
+                // Dispatch GetPropertyValuesChain (and, below, TransformToVisual)
+                // to the UI thread in small chunks rather than one call
+                // covering every node. A single unbroken SendMessage call
+                // occupies the target's UI thread start to finish (several
+                // seconds for a rich tree) with no chance to service its own
+                // pending messages in between — including the modal loop
+                // DefWindowProc runs while the user is dragging the window,
+                // observed live as the target app feeling laggy/stuttery to
+                // move while `watch` was attached. Chunking with a short
+                // sleep between SendMessage calls lets that message queue
+                // drain between chunks; every node still gets collected, in
+                // the same order, every tick, so this does not reopen the
+                // flapping the earlier (now-removed) time budget caused.
+                constexpr size_t kBatchSize = 20;
                 if (m_msgWnd) {
-                    LogMsg("Dispatching CollectBounds to UI thread via SendMessage");
-                    SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS, 0,
-                                 reinterpret_cast<LPARAM>(this));
+                    LogMsg("Dispatching CollectBounds to UI thread via SendMessage, %zu nodes in batches of %zu",
+                           m_orderedHandles.size(), kBatchSize);
+                    for (size_t start = 0; start < m_orderedHandles.size(); start += kBatchSize) {
+                        BatchRequest req{this, start, kBatchSize};
+                        SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS, 0,
+                                     reinterpret_cast<LPARAM>(&req));
+                        Sleep(1);
+                    }
                 }
                 // Get element positions via TransformToVisual (works around broken
                 // ActualOffset serialization in WinUI3). Must run on the UI thread.
 #if LVT_HAS_XAML_PROJECTION
                 if (m_msgWnd) {
-                    SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS + 1, 0,
-                                 reinterpret_cast<LPARAM>(this));
+                    for (size_t start = 0; start < m_orderedHandles.size(); start += kBatchSize) {
+                        BatchRequest req{this, start, kBatchSize};
+                        SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS + 1, 0,
+                                     reinterpret_cast<LPARAM>(&req));
+                        Sleep(1);
+                    }
                 }
 #endif
                 SerializeAndSend();
@@ -443,25 +485,38 @@ private:
     // to a client (the lvt Viewer) exactly like a connection that was
     // stuck, not one that was overcorrecting on interpreting real data.
     //
-    // The actual protection against a pathologically slow collection was
-    // already in place one layer up: xaml_diag_common.cpp's TAP DLL only
-    // calls CreateFileW to connect to lvt.exe's pipe *after*
+    // What still needed fixing after removing that budget: even at full,
+    // uninterrupted speed, a single SendMessage-dispatched pass over a rich
+    // tree (several seconds for 1000+ nodes) occupies the target's UI thread
+    // start to finish with no chance to service its own pending messages in
+    // between — which is exactly what a modal window-move loop (DefWindowProc
+    // handling WM_NCLBUTTONDOWN/SC_MOVE) *also* needs that same thread for,
+    // observed live as the target app feeling laggy/stuttery to drag while
+    // `watch` was attached. AdviseThreadProcImpl now dispatches this in small
+    // chunks (kBatchSize nodes per SendMessage call) with a short Sleep
+    // between chunks, so the target's UI thread gets to drain its own
+    // message queue between chunks instead of being monopolized for the
+    // whole pass — full correctness is unaffected (every node still gets
+    // collected, in the same order, every tick; only the dispatch is
+    // chunked), so this does not reintroduce the flapping the time budget
+    // caused.
+    //
+    // The protection against a pathologically slow *overall* collection is
+    // still one layer up: xaml_diag_common.cpp's TAP DLL only calls
+    // CreateFileW to connect to lvt.exe's pipe *after*
     // CollectBounds/CollectPositionsAndText/SerializeAndSend all finish (see
     // SerializeAndSend below), so lvt.exe's own 15-second "TAP DLL did not
     // connect" timeout on the other end of that pipe already bounds the
-    // combined cost of this walk — and it fails the *whole* tick cleanly
-    // (no partial data, no flapping) rather than partially collecting, which
-    // is exactly the property a per-node budget could not give without an
-    // architecture change (e.g. caching results across ticks by lvt's
-    // durable key, which nothing here does — every tick starts from an
-    // empty map). So: no cap here: run to completion, and let the existing,
-    // coarser, whole-tick timeout be the actual backstop for a target that
-    // is genuinely too large or too slow to finish in time.
-    void CollectBounds(IVisualTreeService* vts) {
-        LogMsg("CollectBounds: collecting layout for %zu nodes on thread %lu",
-               m_nodes.size(), GetCurrentThreadId());
+    // combined cost of this walk, chunked or not, and fails the whole tick
+    // cleanly (no partial data) rather than partially collecting.
+    void CollectBounds(IVisualTreeService* vts, size_t start, size_t count) {
+        size_t end = std::min(start + count, m_orderedHandles.size());
         int collected = 0;
-        for (auto& [handle, node] : m_nodes) {
+        for (size_t i = start; i < end; i++) {
+            InstanceHandle handle = m_orderedHandles[i];
+            auto it = m_nodes.find(handle);
+            if (it == m_nodes.end()) continue;
+            TreeNode& node = it->second;
             bool logDetail = false;
             int code = CollectBoundsForNodeSEH(vts, node, handle, logDetail);
             if (code != 0) {
@@ -470,26 +525,28 @@ private:
             }
             if (node.hasBounds) collected++;
         }
-        LogMsg("CollectBounds: collected bounds for %d/%zu nodes", collected, m_nodes.size());
+        LogMsg("CollectBounds: collected bounds for %d/%zu nodes in batch [%zu,%zu)",
+               collected, end - start, start, end);
     }
 
 #if LVT_HAS_XAML_PROJECTION
     // Use TransformToVisual to get each element's position relative to the XAML island root.
     // Also reads Text property from TextBlock elements.
     // Tries both WinUI3 (Microsoft.UI.Xaml) and system XAML (Windows.UI.Xaml) interfaces.
-    // No per-node time budget here either — see CollectBounds's comment for
-    // why: a wall-clock cutoff produces non-deterministic partial coverage
-    // across ticks (flapping "changed" events for unchanged elements), and
-    // the whole-tick 15-second pipe-connect timeout in xaml_diag_common.cpp
-    // already bounds pathologically slow collection without that downside.
-    void CollectPositionsAndText() {
+    // Chunked the same way, and for the same reason, as CollectBounds above.
+    void CollectPositionsAndText(size_t start, size_t count) {
         namespace WUX = winrt::Windows::UI::Xaml;
         namespace WUXC = winrt::Windows::UI::Xaml::Controls;
 
         if (!m_diag) return;
 
+        size_t end = std::min(start + count, m_orderedHandles.size());
         int positioned = 0, textsRead = 0;
-        for (auto& [handle, node] : m_nodes) {
+        for (size_t i = start; i < end; i++) {
+            InstanceHandle handle = m_orderedHandles[i];
+            auto it = m_nodes.find(handle);
+            if (it == m_nodes.end()) continue;
+            TreeNode& node = it->second;
             if (!node.hasBounds) continue;
 
             // Keep raw to preserve XAML diagnostics' existing ABI lifetime behavior.
@@ -546,18 +603,19 @@ private:
 
             if (raw) raw->Release();
         }
-        LogMsg("CollectPositionsAndText: %d positioned, %d texts", positioned, textsRead);
+        LogMsg("CollectPositionsAndText: %d positioned, %d texts in batch [%zu,%zu)",
+               positioned, textsRead, start, end);
     }
 #endif
 
     // Called on the UI thread via SendMessage from the worker thread
 public:
-    void CollectBoundsOnUIThread() {
-        CollectBounds(m_vts.get());
+    void CollectBoundsOnUIThread(size_t start, size_t count) {
+        CollectBounds(m_vts.get(), start, count);
     }
 #if LVT_HAS_XAML_PROJECTION
-    void CollectPositionsOnUIThread() {
-        CollectPositionsAndText();
+    void CollectPositionsOnUIThread(size_t start, size_t count) {
+        CollectPositionsAndText(start, count);
     }
 #endif
 private:
@@ -661,17 +719,17 @@ private:
 // Window procedure for dispatching GetPropertyValuesChain to UI thread
 static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == LvtTap::WM_COLLECT_BOUNDS) {
-        auto* self = reinterpret_cast<LvtTap*>(lParam);
-        if (self) {
-            self->CollectBoundsOnUIThread();
+        auto* req = reinterpret_cast<BatchRequest*>(lParam);
+        if (req && req->self) {
+            req->self->CollectBoundsOnUIThread(req->start, req->count);
         }
         return 0;
     }
     if (msg == LvtTap::WM_COLLECT_BOUNDS + 1) {
 #if LVT_HAS_XAML_PROJECTION
-        auto* self = reinterpret_cast<LvtTap*>(lParam);
-        if (self) {
-            self->CollectPositionsOnUIThread();
+        auto* req = reinterpret_cast<BatchRequest*>(lParam);
+        if (req && req->self) {
+            req->self->CollectPositionsOnUIThread(req->start, req->count);
         }
 #endif
         return 0;
