@@ -32,6 +32,9 @@ public sealed class CrosshairPicker
         _handle.MouseMove += OnMouseMove;
         _handle.MouseLeftButtonUp += OnMouseUp;
         _handle.LostMouseCapture += OnLostCapture;
+        // Mouse capture does not affect keyboard focus, so Escape has to be
+        // caught at the window level rather than on _handle itself.
+        _ownerWindow.PreviewKeyDown += OnPreviewKeyDown;
     }
 
     private void OnMouseDown(object sender, MouseButtonEventArgs e)
@@ -39,7 +42,7 @@ public sealed class CrosshairPicker
         _dragging = true;
         _handle.CaptureMouse();
         _handle.Cursor = Cursors.Cross;
-        HintChanged?.Invoke("Release over a window to inspect it…");
+        HintChanged?.Invoke("Release over a window to inspect it… (Esc to cancel)");
         e.Handled = true;
     }
 
@@ -71,6 +74,18 @@ public sealed class CrosshairPicker
         HideHighlight();
     }
 
+    private void OnPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (!_dragging || e.Key != Key.Escape)
+            return;
+        e.Handled = true;
+        HintChanged?.Invoke("Cancelled. Drag the crosshair onto a window to inspect it.");
+        // Releasing capture routes through OnLostCapture, which already
+        // does the rest of the cancel (clear _dragging, hide the highlight,
+        // restore the cursor) — no need to duplicate that here.
+        _handle.ReleaseMouseCapture();
+    }
+
     private void UpdateHighlight()
     {
         var hwnd = ResolveWindowUnderCursor();
@@ -97,25 +112,51 @@ public sealed class CrosshairPicker
             _overlay.Hide();
     }
 
+    /// <summary>
+    /// Finds the topmost window actually visible at the cursor — not just
+    /// "whatever WindowFromPoint returns", which only reports Z-order among
+    /// windows WindowFromPoint itself considers, and does not know about
+    /// DWM cloaking (a UWP app on another virtual desktop, or one DWM is
+    /// mid-transition on, is still cloaked-but-"there" and can report a
+    /// completely stale rect — this was the direct cause of a highlight
+    /// landing nowhere near any real window).
+    ///
+    /// EnumWindows visits top-level windows in top-to-bottom Z-order, so
+    /// the first one that (a) is not our own toolbar/overlay, (b) is
+    /// visible, not minimized, and not cloaked, and (c) actually contains
+    /// the point is exactly the topmost visible window there — anything
+    /// occluded by it, however large, is correctly never reached, and a
+    /// minimized window (parked off-screen or not) is never a candidate at
+    /// all rather than incidentally excluded by its rect missing the point.
+    /// </summary>
     private IntPtr ResolveWindowUnderCursor()
     {
         if (!NativeMethods.GetCursorPos(out var pt))
             return IntPtr.Zero;
 
-        var hwnd = NativeMethods.WindowFromPoint(pt);
-        if (hwnd == IntPtr.Zero)
-            return IntPtr.Zero;
-
-        var root = NativeMethods.GetAncestor(hwnd, NativeMethods.GA_ROOT);
-        if (root == IntPtr.Zero)
-            return IntPtr.Zero;
-
-        // Never resolve to our own toolbar/overlay windows.
         var ownHwnd = new WindowInteropHelper(_ownerWindow).Handle;
         var overlayHwnd = new WindowInteropHelper(_overlay).Handle;
-        if (root == ownHwnd || root == overlayHwnd)
-            return IntPtr.Zero;
 
-        return root;
+        var found = IntPtr.Zero;
+        NativeMethods.EnumWindows((hwnd, _) =>
+        {
+            if (hwnd == ownHwnd || hwnd == overlayHwnd)
+                return true; // keep looking
+
+            if (!NativeMethods.IsWindowVisible(hwnd) || NativeMethods.IsIconic(hwnd) ||
+                NativeMethods.IsCloaked(hwnd))
+                return true;
+
+            var rect = NativeMethods.GetVisibleFrame(hwnd);
+            if (rect.Width <= 0 || rect.Height <= 0)
+                return true;
+            if (pt.X < rect.Left || pt.X >= rect.Right || pt.Y < rect.Top || pt.Y >= rect.Bottom)
+                return true;
+
+            found = hwnd;
+            return false; // stop — found the topmost visible window at this point
+        }, IntPtr.Zero);
+
+        return found;
     }
 }

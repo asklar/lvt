@@ -70,7 +70,7 @@ public partial class MainWindow : Window
             _picker.TargetPicked += hwnd => _viewModel.ConnectTo(hwnd);
             _picker.HintChanged += hint => _viewModel.StatusText = hint;
 
-            _elementPicker = new ElementPicker(ElementPickHandle);
+            _elementPicker = new ElementPicker(ElementPickHandle, this);
             _elementPicker.HintChanged += hint => _viewModel.StatusText = hint;
             _elementPicker.Dragging += pt => PreviewElementAt(pt);
             _elementPicker.Picked += pt =>

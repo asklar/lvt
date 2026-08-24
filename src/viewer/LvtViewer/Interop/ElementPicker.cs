@@ -29,13 +29,16 @@ public sealed class ElementPicker
     /// <summary>Fires with a short hint whenever dragging starts/stops, for a status-bar cue.</summary>
     public event Action<string>? HintChanged;
 
-    public ElementPicker(FrameworkElement handle)
+    public ElementPicker(FrameworkElement handle, Window ownerWindow)
     {
         _handle = handle;
         _handle.MouseLeftButtonDown += OnMouseDown;
         _handle.MouseMove += OnMouseMove;
         _handle.MouseLeftButtonUp += OnMouseUp;
         _handle.LostMouseCapture += OnLostCapture;
+        // Mouse capture does not affect keyboard focus, so Escape has to be
+        // caught at the window level rather than on _handle itself.
+        ownerWindow.PreviewKeyDown += OnPreviewKeyDown;
     }
 
     private void OnMouseDown(object sender, MouseButtonEventArgs e)
@@ -43,7 +46,7 @@ public sealed class ElementPicker
         _dragging = true;
         _handle.CaptureMouse();
         _handle.Cursor = Cursors.Cross;
-        HintChanged?.Invoke("Release over the target's UI to select that element in the tree…");
+        HintChanged?.Invoke("Release over the target's UI to select that element in the tree… (Esc to cancel)");
         e.Handled = true;
     }
 
@@ -69,5 +72,16 @@ public sealed class ElementPicker
     {
         _dragging = false;
         _handle.Cursor = null;
+    }
+
+    private void OnPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (!_dragging || e.Key != Key.Escape)
+            return;
+        e.Handled = true;
+        HintChanged?.Invoke("Cancelled.");
+        // Releasing capture routes through OnLostCapture, which already
+        // clears _dragging and restores the cursor — nothing else to do.
+        _handle.ReleaseMouseCapture();
     }
 }

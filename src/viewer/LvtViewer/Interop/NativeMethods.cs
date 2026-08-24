@@ -24,9 +24,11 @@ public struct RECT
 
 /// <summary>
 /// P/Invoke declarations backing the crosshair-drag window picker
-/// (Interop/CrosshairPicker.cs), which resolves a screen point to a
-/// top-level window the same way Inspect.exe does: WindowFromPoint +
-/// GetAncestor(GA_ROOT) + GetWindowThreadProcessId.
+/// (Interop/CrosshairPicker.cs), which resolves a screen point to the
+/// topmost actually-visible top-level window there via EnumWindows (Z-order)
+/// filtered by IsWindowVisible/IsIconic/IsCloaked and a rect hit test — see
+/// CrosshairPicker.ResolveWindowUnderCursor for why WindowFromPoint alone
+/// is not enough.
 /// </summary>
 public static class NativeMethods
 {
@@ -38,6 +40,14 @@ public static class NativeMethods
     // GetWindowRect alone would draw the highlight noticeably outside the
     // window's visible edge.
     public const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+
+    // A cloaked window (DWM hides it — a UWP app on another virtual desktop,
+    // or one DWM is mid-transition on) is still a perfectly valid HWND that
+    // WindowFromPoint/EnumWindows will happily return, but it is not what
+    // the user can actually see on screen, and its rect can be stale
+    // garbage from whenever it was last actually shown. Skipping cloaked
+    // windows is what keeps the crosshair from ever picking one.
+    public const int DWMWA_CLOAKED = 14;
 
     [DllImport("user32.dll")]
     public static extern bool GetCursorPos(out POINT point);
@@ -63,8 +73,24 @@ public static class NativeMethods
     [DllImport("user32.dll")]
     public static extern bool IsIconic(IntPtr hwnd);
 
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hwnd);
+
+    public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+
+    // Enumerates top-level windows in top-to-bottom Z-order — exactly the
+    // order a hit test needs to try them in, so the first one whose rect
+    // contains the point (after skipping minimized/invisible/cloaked ones)
+    // is correctly the topmost *visible* window at that point, not merely
+    // the topmost window of any kind.
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
     [DllImport("dwmapi.dll")]
     public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RECT value, int size);
+
+    [DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")]
+    public static extern int DwmGetWindowAttributeInt(IntPtr hwnd, int attribute, out int value, int size);
 
     [DllImport("user32.dll")]
     public static extern uint GetDpiForSystem();
@@ -109,4 +135,8 @@ public static class NativeMethods
         GetWindowText(hwnd, sb, sb.Capacity);
         return sb.ToString();
     }
+
+    /// <summary>Whether DWM is currently hiding this window — see DWMWA_CLOAKED's comment.</summary>
+    public static bool IsCloaked(IntPtr hwnd) =>
+        DwmGetWindowAttributeInt(hwnd, DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0 && cloaked != 0;
 }
