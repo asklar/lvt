@@ -8,6 +8,45 @@ namespace lvt {
 
 using json = nlohmann::json;
 
+namespace {
+
+// Flattens an already-keyed tree (see index_tree below) into depth-first,
+// path-ordered records for diffing. Deliberately does NOT compute identity
+// itself — `element->key` is trusted to already be correct, because
+// index_tree always calls assign_element_keys first. Keeping this file from
+// ever inventing its own, second key algorithm is the whole point: it is
+// exactly what went wrong before (see element_key.h's assign_element_keys
+// doc comment).
+struct IndexedElement {
+    const Element* element = nullptr;
+    std::string path;
+};
+
+void collect_index(const Element& el, const std::string& path, std::vector<IndexedElement>& out) {
+    out.push_back({&el, path});
+    for (size_t i = 0; i < el.children.size(); ++i) {
+        auto childPath = path.empty() ? std::to_string(i) : path + "." + std::to_string(i);
+        collect_index(el.children[i], childPath, out);
+    }
+}
+
+// Assigns stable keys (assign_element_keys — the same, single algorithm
+// dump/query/UIA output use) and flattens the now-keyed tree into
+// path-ordered records. `root` is mutated (its elements' `.key` fields are
+// (re)computed) — safe and idempotent even if a caller already assigned
+// keys upstream (build_tree/build_uia_tree both do, for instance): calling
+// it again here is what makes this file self-sufficient rather than
+// depending on every caller remembering to key their tree beforehand,
+// which is exactly the assumption that silently broke last time.
+std::vector<IndexedElement> index_tree(Element& root) {
+    assign_element_keys(root);
+    std::vector<IndexedElement> elements;
+    collect_index(root, "0", elements);
+    return elements;
+}
+
+} // namespace
+
 static std::string bounds_to_string(const Bounds& b) {
     return std::to_string(b.x) + "," + std::to_string(b.y) + "," +
            std::to_string(b.width) + "," + std::to_string(b.height);
@@ -133,12 +172,12 @@ static Element element_without_children(const Element& el) {
     return flat;
 }
 
-std::vector<ChangeEvent> snapshot_added_events(const Element& root) {
+std::vector<ChangeEvent> snapshot_added_events(Element& root) {
     std::vector<ChangeEvent> events;
     for (const auto& indexed : index_tree(root)) {
         ChangeEvent event;
         event.type = ChangeEvent::Type::Added;
-        event.key = indexed.key;
+        event.key = indexed.element->key;
         event.path = indexed.path;
         event.element = element_without_children(*indexed.element);
         events.push_back(std::move(event));
@@ -146,17 +185,21 @@ std::vector<ChangeEvent> snapshot_added_events(const Element& root) {
     return events;
 }
 
-std::vector<ChangeEvent> diff_trees(const Element& before, const Element& after) {
-    std::vector<IndexedElement> beforeElements;
-    std::vector<IndexedElement> afterElements;
-    index_tree_pair(before, after, beforeElements, afterElements);
+std::vector<ChangeEvent> diff_trees(Element& before, Element& after) {
+    // Each side is keyed independently — assign_element_keys' local, per-
+    // parent scoping needs nothing from the other tree to produce a stable
+    // key, unlike the old global-count algorithm this replaced, which had
+    // to look at both sides together specifically to decide consistently
+    // whether a disambiguating suffix was needed at all.
+    std::vector<IndexedElement> beforeElements = index_tree(before);
+    std::vector<IndexedElement> afterElements = index_tree(after);
 
     std::map<std::string, IndexedElement> beforeByKey;
     std::map<std::string, IndexedElement> afterByKey;
     for (const auto& indexed : beforeElements)
-        beforeByKey[indexed.key] = indexed;
+        beforeByKey[indexed.element->key] = indexed;
     for (const auto& indexed : afterElements)
-        afterByKey[indexed.key] = indexed;
+        afterByKey[indexed.element->key] = indexed;
 
     std::vector<ChangeEvent> events;
 

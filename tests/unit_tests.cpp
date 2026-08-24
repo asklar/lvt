@@ -695,10 +695,73 @@ TEST(WatchDiff, MovedElement) {
 
     auto events = diff_trees(before, after);
 
-    ASSERT_EQ(events.size(), 1);
-    EXPECT_EQ(events[0].type, ChangeEvent::Type::Changed);
-    EXPECT_EQ(events[0].fields["path"].oldValue, "0.1");
-    EXPECT_EQ(events[0].fields["path"].newValue, "0.0.0");
+    // Reparenting shows up as Removed (old key) + Added (new key), not a
+    // single Changed/path event, and that is a deliberate trade-off, not a
+    // gap: assign_element_keys (the one, single key algorithm this and
+    // dump/query/UIA output all share — see its doc comment in
+    // element_key.h) always threads the full parent chain into every
+    // element's key, precisely because that per-parent locality is what
+    // keeps an unrelated change elsewhere in the tree from ever touching
+    // this element's key at all (see the
+    // DuplicateIdentityElsewhereDoesNotDestabilizeUnrelatedSubtree test
+    // right below). Reparenting inherently changes that chain, so the key
+    // changes with it — for any element, named or not. The information
+    // itself is still fully accurate (Button really did stop existing at
+    // its old position and start existing at its new one); it is just
+    // conveyed as two events instead of a single, more elegant one.
+    //
+    // Checked by type+path rather than by vector index/order: diff_trees
+    // emits all Added events before all Removed events (see its own
+    // implementation), which is an implementation detail this test should
+    // not need to know about.
+    ASSERT_EQ(events.size(), 2);
+    for (const auto& event : events)
+        EXPECT_EQ(event.element.text, "OK");
+    auto hasEvent = [&](ChangeEvent::Type type, const std::string& path) {
+        return std::any_of(events.begin(), events.end(), [&](const ChangeEvent& e) {
+            return e.type == type && e.path == path;
+        });
+    };
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Removed, "0.1"));
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Added, "0.0.0"));
+}
+
+TEST(WatchDiff, DuplicateIdentityElsewhereDoesNotDestabilizeUnrelatedSubtree) {
+    // Regression test for the actual reported bug ("the tree rebuilds while
+    // navigating", reproduced live against Microsoft Store's tree): watch's
+    // diffing used to compute its key discriminator from a GLOBAL,
+    // whole-tree count of each identity (framework/className) plus the full
+    // root-to-node path as the fallback — meaning a change ANYWHERE that
+    // shared an identity with an element elsewhere in the tree could change
+    // that unrelated element's key too. A real XAML tree is thick with
+    // duplicate-identity elements (Grid/Border/TextBlock/ContentPresenter/
+    // Rectangle/...), so this showed up live as large, unrelated portions
+    // of the tree looking removed-and-re-added on every tick.
+    // assign_element_keys' per-parent scoping (the same algorithm dump/
+    // query/UIA output already used) means only an element's OWN siblings
+    // can ever affect its key — nothing outside its own parent can.
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "GroupA"));
+    before.children[0].children.push_back(diff_el("Text", "TextBlock", "A1"));
+    before.children.push_back(diff_el("Pane", "GroupB"));
+    before.children[1].children.push_back(diff_el("Text", "TextBlock", "B1"));
+
+    // GroupB (entirely unrelated to GroupA) gains a same-identity sibling —
+    // the exact shape of change that used to cascade globally.
+    auto after = before;
+    after.children[1].children.insert(after.children[1].children.begin(),
+                                      diff_el("Text", "TextBlock", "B0"));
+
+    auto events = diff_trees(before, after);
+
+    // Whatever this does to GroupB's own children (a real, bounded, locally
+    // -scoped side effect of inserting a sibling ahead of an existing one —
+    // see WatchDiff.MovedElement for the same trade-off applied to
+    // reparenting) must never touch GroupA's "A1", which nothing here
+    // changed at all.
+    for (const auto& event : events)
+        EXPECT_NE(event.element.text, "A1")
+            << "an unrelated GroupB change destabilized GroupA's element";
 }
 
 TEST(WatchDiff, SerializeChangedEvent) {
