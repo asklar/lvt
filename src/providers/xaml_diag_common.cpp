@@ -208,7 +208,10 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
 
 }
 
-bool inject_and_collect_xaml_tree(
+// Single attempt at injection + collection — see inject_and_collect_xaml_tree
+// (the public entry point, defined below) for why this is wrapped in a
+// retry rather than being the public API directly.
+static bool try_inject_and_collect_xaml_tree_once(
     Element& root,
     HWND /*hwnd*/,
     DWORD pid,
@@ -536,6 +539,53 @@ bool inject_and_collect_xaml_tree(
     }
 
     return true;
+}
+
+// Injects and collects the XAML tree, retrying a bounded number of times on
+// a transient failure before giving up.
+//
+// Every one of this function's failure paths (TAP DLL did not connect in
+// time, no data received, a malformed/partial JSON payload) is a real,
+// previously-observed *transient* condition — see the retry already added
+// to run_watch_loop's very first tick in main.cpp for the same root cause
+// described there. That fix only covered the first tick; every *later*
+// `watch` tick called this exactly once with no retry at all, so the exact
+// same transient hiccup — momentary system load, the TAP DLL taking a
+// moment longer than usual to connect back — showed up live as the whole
+// XAML/WinUI3 subtree disappearing from the reported tree for one tick and
+// reappearing the next, which is indistinguishable, from the viewer's
+// side, from a real structural change. Reported live as "on refresh, the
+// CoreWindow node has no children."
+//
+// Retrying here, rather than in each caller, fixes it for every caller
+// (dump, watch's first tick via main.cpp's own retry, and every later
+// watch tick) with one change. Attempts are few and the backoff is short
+// specifically because this runs inside `watch`'s own tick loop, which
+// already ticks only every --interval (500ms default) — a handful of
+// short retries costs a fraction of one interval on the rare failing tick,
+// not a user-visible stall, and does not turn one failing tick into
+// several ticks' worth of delay.
+bool inject_and_collect_xaml_tree(
+    Element& root,
+    HWND hwnd,
+    DWORD pid,
+    const std::wstring& xamlDiagDll,
+    const std::wstring& initDllPath,
+    const std::string& frameworkLabel,
+    const std::wstring& connPrefix,
+    bool fastProperties)
+{
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt > 0) {
+            if (g_debug)
+                fprintf(stderr, "lvt: retrying XAML injection (attempt %d)\n", attempt + 1);
+            Sleep(static_cast<DWORD>(100 * attempt));
+        }
+        if (try_inject_and_collect_xaml_tree_once(root, hwnd, pid, xamlDiagDll, initDllPath,
+                                                  frameworkLabel, connPrefix, fastProperties))
+            return true;
+    }
+    return false;
 }
 
 } // namespace lvt
