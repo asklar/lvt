@@ -764,6 +764,70 @@ TEST(WatchDiff, DuplicateIdentityElsewhereDoesNotDestabilizeUnrelatedSubtree) {
             << "an unrelated GroupB change destabilized GroupA's element";
 }
 
+TEST(WatchDiff, AncestorSiblingChurnDoesNotDestabilizeStableDescendants) {
+    // Regression test for the deeper version of the reported bug ("the
+    // tree rebuilds while navigating"): the fix above (per-parent-scoped
+    // disambiguation) stops an unrelated *subtree* from destabilizing
+    // another, but a purely structural key — recomputed fresh from a
+    // tree's shape every tick, with no memory of previous ticks — still
+    // threads every ancestor's own disambiguating segment into each of its
+    // descendants' keys. So if an ancestor's *own* position among its own
+    // same-identity siblings shifts (extremely common in a live, animated
+    // UI: a virtualized/recycled list item, a carousel auto-rotating),
+    // every element beneath it gets a brand-new key on that tick even
+    // though nothing about it individually changed. Verified live: a
+    // passively watched, completely untouched Microsoft Store home page
+    // (whose carousel auto-rotates) showed nearly its *entire* tree
+    // repeatedly flip-flopping between removed and re-added, purely from
+    // time passing, not from anything a user did.
+    //
+    // Cross-tick reconciliation (diff_trees now matches each tick's tree
+    // against the previous one and lets a matched node INHERIT its
+    // predecessor's key, rather than ever recomputing it from scratch) is
+    // what actually fixes this: a stable descendant survives even when its
+    // own ancestor's local position moves, as long as reconciliation still
+    // recognizes that ancestor as "the same slot, just moved" — which the
+    // one-level-deep shape fingerprint (see reconcile_children) is what
+    // lets it do here, since the tracked card is distinguishable from the
+    // newly inserted, differently-shaped one.
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Card", "Card"));          // slot 0
+    before.children.push_back(diff_el("Card", "Card"));          // slot 1 -- tracked
+    before.children[1].children.push_back(diff_el("Text", "TextBlock", "Stable"));
+
+    // A new, differently-shaped same-identity sibling is inserted *before*
+    // the tracked card, shifting its own local index from 1 to 2 -- the
+    // exact shape of change a recycled/virtualized list item produces.
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Card", "Card"));
+    after.children.push_back(diff_el("Card", "Card"));            // newly inserted, empty
+    after.children.push_back(diff_el("Card", "Card"));            // the tracked card, now at index 2
+    after.children[2].children.push_back(diff_el("Text", "TextBlock", "Stable"));
+
+    auto events = diff_trees(before, after);
+
+    // The tracked card's own child must never show up as Added or Removed
+    // (its parent moving is expected to still surface as a legitimate
+    // Changed/path event for the child too, since the child's own reported
+    // position shifted from "0.1.0" to "0.2.0" — that is correct,
+    // informative structural news, not the bug); it must never be treated
+    // as a brand-new/disappeared element.
+    for (const auto& event : events) {
+        if (event.element.text != "Stable")
+            continue;
+        EXPECT_NE(event.type, ChangeEvent::Type::Added)
+            << "an ancestor's own index shift destabilized a stable descendant (reported as Added)";
+        EXPECT_NE(event.type, ChangeEvent::Type::Removed)
+            << "an ancestor's own index shift destabilized a stable descendant (reported as Removed)";
+    }
+    bool sawTrackedCardMove = std::any_of(events.begin(), events.end(), [](const ChangeEvent& e) {
+        return e.type == ChangeEvent::Type::Changed &&
+               e.fields.count("path") &&
+               e.fields.at("path").oldValue == "0.1" && e.fields.at("path").newValue == "0.2";
+    });
+    EXPECT_TRUE(sawTrackedCardMove) << "expected the tracked card to be recognized as moved, not replaced";
+}
+
 TEST(WatchDiff, SerializeChangedEvent) {
     ChangeEvent event;
     event.type = ChangeEvent::Type::Changed;

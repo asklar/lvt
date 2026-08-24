@@ -46,7 +46,7 @@ static std::string hwnd_key(uintptr_t handle) {
     return out.str();
 }
 
-static std::string stable_name_key(const Element& el) {
+std::string stable_name_key(const Element& el) {
     for (const char* name : {"AutomationId", "x:Name", "Name", "automationId", "name"}) {
         auto it = el.properties.find(name);
         if (it != el.properties.end() && !it->second.empty())
