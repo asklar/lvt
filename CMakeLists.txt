@@ -382,13 +382,39 @@ if(LVT_ENABLE_WINUI3)
     # There is no vcpkg port for the Windows App SDK, so this always comes from
     # a NuGet package: the vcpkg port downloads it and passes the directory in,
     # otherwise fall back to the NuGet cache or a local packages/ dir.
+    #
+    # Two different NuGet layouts exist and both need checking: the older,
+    # unified "Microsoft.WindowsAppSDK" package (winmds under lib/uap10.0),
+    # and the newer split packaging (Microsoft.WindowsAppSDK.WinUI,
+    # .Foundation, .Base, ...) where each capability is its own package and
+    # the winmds live under metadata/ instead - only the latter was found
+    # installed on this machine (confirmed via the NuGet cache directly),
+    # so a build here would otherwise silently fall back to no WinUI3
+    # projection at all: CollectPositionsAndText's WinUI3-specific casts
+    # compile out, meaning every genuine WinUI3 element's bounds/position/
+    # text collection could only ever fail (this is what turned out to be
+    # the entire root cause of the "bounds/text not captured for WinUI3
+    # elements in File Explorer" bug - not a code defect).
     if(NOT LVT_WASDK_WINMD_DIR)
         file(GLOB _wasdk_candidates
             "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk/*/lib/uap10.0"
             "$ENV{NUGET_PACKAGES}/microsoft.windowsappsdk/*/lib/uap10.0"
             "${CMAKE_SOURCE_DIR}/packages/Microsoft.WindowsAppSDK.*/lib/uap10.0"
+            "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk.winui/*/metadata"
+            "$ENV{NUGET_PACKAGES}/microsoft.windowsappsdk.winui/*/metadata"
         )
-        foreach(_candidate ${_wasdk_candidates})
+        # Prefer the newest STABLE version when several are cached: plain
+        # descending string sort would put "2.0.250930000-experimental"
+        # ahead of "1.8.251222000" (lexicographically "2" > "1"), and an
+        # experimental/preview SDK's winmd can reference types (seen live:
+        # Microsoft.Web.WebView2.Core.CoreWebView2) that don't resolve
+        # against the stable siblings selected below, failing the whole
+        # projection generation. Only fall back to a pre-release version if
+        # truly nothing stable is cached.
+        list(SORT _wasdk_candidates ORDER DESCENDING)
+        set(_wasdk_stable_candidates "${_wasdk_candidates}")
+        list(FILTER _wasdk_stable_candidates EXCLUDE REGEX "-(experimental|preview|alpha|beta)[0-9.]*[/\\\\]")
+        foreach(_candidate ${_wasdk_stable_candidates} ${_wasdk_candidates})
             if(EXISTS "${_candidate}/Microsoft.UI.Xaml.winmd")
                 set(LVT_WASDK_WINMD_DIR "${_candidate}" CACHE PATH "" FORCE)
                 break()
@@ -436,10 +462,72 @@ if(LVT_ENABLE_WINUI3)
             message(STATUS "  using ${LVT_CPPWINRT_EXE}")
 
             file(GLOB WASDK_ALL_WINMDS "${LVT_WASDK_WINMD_DIR}/*.winmd")
-            # Also include other winmd directories in the package
-            get_filename_component(_wasdk_root "${LVT_WASDK_WINMD_DIR}/../.." ABSOLUTE)
-            file(GLOB_RECURSE _extra_winmds "${_wasdk_root}/*.winmd")
-            list(APPEND WASDK_ALL_WINMDS ${_extra_winmds})
+            # Also include other winmd directories that belong with this
+            # one - which ones depends on which of the two NuGet layouts
+            # LVT_WASDK_WINMD_DIR matched above.
+            if(LVT_WASDK_WINMD_DIR MATCHES "/metadata$")
+                # Split-package layout (Microsoft.WindowsAppSDK.WinUI,
+                # .Foundation, .Base, ...): LVT_WASDK_WINMD_DIR is
+                # .../microsoft.windowsappsdk.winui/<version>/metadata.
+                # Sibling packages define types Microsoft.UI.Xaml.winmd can
+                # reference, so pull in the latest STABLE version of every
+                # other microsoft.windowsappsdk.* package cached alongside
+                # this one - explicitly not a second, different version of
+                # THIS SAME package: mixing versions of one package (e.g.
+                # both a cached 2.0-experimental and 1.8 stable .winui) fed
+                # cppwinrt conflicting type definitions and broke the whole
+                # projection ("Type ... could not be found" from a database
+                # mismatch) - this is exactly the failure being guarded
+                # against here.
+                get_filename_component(_wasdk_version_dir "${LVT_WASDK_WINMD_DIR}/.." ABSOLUTE)
+                get_filename_component(_wasdk_this_pkg_dir "${_wasdk_version_dir}/.." ABSOLUTE)
+                get_filename_component(_wasdk_packages_dir "${_wasdk_this_pkg_dir}/.." ABSOLUTE)
+                file(GLOB _sibling_wasdk_pkg_dirs "${_wasdk_packages_dir}/microsoft.windowsappsdk.*")
+                foreach(_sibling_pkg ${_sibling_wasdk_pkg_dirs})
+                    if(NOT _sibling_pkg STREQUAL _wasdk_this_pkg_dir AND IS_DIRECTORY "${_sibling_pkg}")
+                        file(GLOB _sibling_versions "${_sibling_pkg}/*")
+                        list(SORT _sibling_versions ORDER DESCENDING)
+                        set(_sibling_stable_versions "${_sibling_versions}")
+                        list(FILTER _sibling_stable_versions EXCLUDE REGEX "-(experimental|preview|alpha|beta)[0-9.]*$")
+                        foreach(_sibling_version ${_sibling_stable_versions} ${_sibling_versions})
+                            file(GLOB_RECURSE _sibling_winmds "${_sibling_version}/*.winmd")
+                            if(_sibling_winmds)
+                                list(APPEND WASDK_ALL_WINMDS ${_sibling_winmds})
+                                break() # only the one (best) version of this sibling
+                            endif()
+                        endforeach()
+                    endif()
+                endforeach()
+            else()
+                # Unified layout (Microsoft.WindowsAppSDK): LVT_WASDK_WINMD_DIR
+                # is .../microsoft.windowsappsdk/<version>/lib/uap10.0 -
+                # other TFM directories under that same version's lib/ can
+                # hold winmds too.
+                get_filename_component(_wasdk_root "${LVT_WASDK_WINMD_DIR}/../.." ABSOLUTE)
+                file(GLOB_RECURSE _extra_winmds "${_wasdk_root}/*.winmd")
+                list(APPEND WASDK_ALL_WINMDS ${_extra_winmds})
+            endif()
+
+            # Microsoft.UI.Xaml.winmd references WebView2 types (WinUI3's
+            # WebView2 control), which live in an entirely separate NuGet
+            # package (Microsoft.Web.WebView2, not part of WindowsAppSDK at
+            # all) - missing this reference is what actually broke
+            # generation here ("Type 'Microsoft.Web.WebView2.Core.CoreWebView2'
+            # could not be found") once the WindowsAppSDK winmds themselves
+            # were correctly found above.
+            file(GLOB _webview2_version_dirs
+                "$ENV{USERPROFILE}/.nuget/packages/microsoft.web.webview2/*"
+                "$ENV{NUGET_PACKAGES}/microsoft.web.webview2/*")
+            list(SORT _webview2_version_dirs ORDER DESCENDING)
+            set(_webview2_stable_dirs "${_webview2_version_dirs}")
+            list(FILTER _webview2_stable_dirs EXCLUDE REGEX "-(experimental|preview|prerelease|alpha|beta)[0-9.]*$")
+            foreach(_webview2_dir ${_webview2_stable_dirs} ${_webview2_version_dirs})
+                if(EXISTS "${_webview2_dir}/lib/Microsoft.Web.WebView2.Core.winmd")
+                    list(APPEND WASDK_ALL_WINMDS "${_webview2_dir}/lib/Microsoft.Web.WebView2.Core.winmd")
+                    break()
+                endif()
+            endforeach()
+
             list(REMOVE_DUPLICATES WASDK_ALL_WINMDS)
 
             # A stale projection must not be left behind on failure.
