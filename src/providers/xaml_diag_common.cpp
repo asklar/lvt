@@ -26,6 +26,11 @@ using json = nlohmann::json;
 
 namespace lvt {
 
+// How long to wait for the TAP DLL to finish walking the target's tree and
+// connect back with the result — see its use below for the measured,
+// evidence-based reason this is 60s, not the 15s it used to be.
+static constexpr DWORD kXamlCollectionTimeoutMs = 60000;
+
 static std::wstring make_pipe_name() {
     GUID guid;
     CoCreateGuid(&guid);
@@ -328,9 +333,34 @@ static bool try_inject_and_collect_xaml_tree_once(
     if (g_debug)
         fprintf(stderr, "lvt: injection succeeded, waiting for XAML tree data...\n");
 
-    // Wait for the TAP DLL to connect
+    // Wait for the TAP DLL to connect. This is not "waiting for a handshake" —
+    // the TAP DLL only calls CreateFileW to connect to this pipe *after* it
+    // finishes the entire tree walk (CollectBounds/CollectPositionsAndText/
+    // SerializeAndSend — see lvt_tap.cpp's AdviseThreadProcImpl), so this
+    // wait covers the whole collection, not just a connection round-trip.
+    //
+    // kXamlCollectionTimeoutMs used to be 15000 (15s) here, which is what
+    // actually caused live, reproducible tree data loss: traced through the
+    // TAP DLL's own timestamped log for a real, busy WinUI3 tree (Microsoft
+    // Store's animated home page, ~1936 elements) and measured a single
+    // *successful* collection (every COM call returned success; the data
+    // was built correctly) taking 40.8 seconds end to end — because
+    // CollectBounds/CollectPositionsAndText dispatch to the target's UI
+    // thread in small chunks specifically so a busy/animating target's own
+    // UI thread gets to interleave its own work between chunks (see that
+    // dispatch's own comment) rather than being monopolized; an actively
+    // animating tree can need many such interleavings, each costing real
+    // wall-clock time. At 15 seconds, lvt.exe was routinely giving up and
+    // closing this pipe *while the TAP DLL was still legitimately working*,
+    // so a bit over half the time it later tried to connect back it found
+    // nothing there — "Failed to open pipe: 2" (ERROR_FILE_NOT_FOUND) in the
+    // TAP DLL's own log, once its walk finally did finish. From `watch`'s
+    // side that showed up as the entire XAML/WinUI3 subtree looking removed
+    // for anywhere up to tens of seconds before reappearing once a later
+    // tick's collection finished inside the new timeout — reported live as
+    // "the tree refreshes/resets" and "the CoreWindow node has no children".
     if (connectErr == ERROR_IO_PENDING) {
-        DWORD waitResult = WaitForSingleObject(ov.hEvent, 15000);
+        DWORD waitResult = WaitForSingleObject(ov.hEvent, kXamlCollectionTimeoutMs);
         if (waitResult != WAIT_OBJECT_0) {
             fprintf(stderr, "lvt: TAP DLL did not connect (timeout)\n");
             CancelIo(pipe.get());
@@ -354,7 +384,7 @@ static bool try_inject_and_collect_xaml_tree_once(
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                if (WaitForSingleObject(readOv.hEvent, 15000) != WAIT_OBJECT_0) {
+                if (WaitForSingleObject(readOv.hEvent, kXamlCollectionTimeoutMs) != WAIT_OBJECT_0) {
                     CancelIo(pipe.get());
                     break;
                 }
@@ -541,30 +571,26 @@ static bool try_inject_and_collect_xaml_tree_once(
     return true;
 }
 
-// Injects and collects the XAML tree, retrying a bounded number of times on
-// a transient failure before giving up.
+// Injects and collects the XAML tree, retrying a small, bounded number of
+// times if the single attempt genuinely fails (a hard error, not merely
+// "this is taking a while" — kXamlCollectionTimeoutMs above already gives a
+// slow-but-progressing collection the room it needs, based on measured
+// real-world timing, so a failure that gets here is a rarer case: the
+// target closing mid-walk, a one-off COM error, and similar).
 //
-// Every one of this function's failure paths (TAP DLL did not connect in
-// time, no data received, a malformed/partial JSON payload) is a real,
-// previously-observed *transient* condition — see the retry already added
-// to run_watch_loop's very first tick in main.cpp for the same root cause
-// described there. That fix only covered the first tick; every *later*
-// `watch` tick called this exactly once with no retry at all, so the exact
-// same transient hiccup — momentary system load, the TAP DLL taking a
-// moment longer than usual to connect back — showed up live as the whole
-// XAML/WinUI3 subtree disappearing from the reported tree for one tick and
-// reappearing the next, which is indistinguishable, from the viewer's
-// side, from a real structural change. Reported live as "on refresh, the
-// CoreWindow node has no children."
-//
-// Retrying here, rather than in each caller, fixes it for every caller
-// (dump, watch's first tick via main.cpp's own retry, and every later
-// watch tick) with one change. Attempts are few and the backoff is short
-// specifically because this runs inside `watch`'s own tick loop, which
-// already ticks only every --interval (500ms default) — a handful of
-// short retries costs a fraction of one interval on the rare failing tick,
-// not a user-visible stall, and does not turn one failing tick into
-// several ticks' worth of delay.
+// Deliberately few attempts, with a real gap between them, rather than
+// many with a short one: if a previous attempt failed after actually
+// starting a walk inside the target (as opposed to failing before that,
+// e.g. at InitializeXamlDiagnosticsEx itself), the TAP DLL's own worker
+// thread for that attempt keeps running in the target to completion
+// regardless of what lvt.exe decides to do — there is no way to cancel it
+// from here. Retrying too eagerly would start a *second*, fully
+// independent walk competing with that still-running one for the same
+// target UI thread via SendMessage, which can only make a target that is
+// already struggling to keep up slower still, not faster — the opposite
+// of what a retry is supposed to achieve. A short pause before the one
+// retry this makes gives a stray straggler more of a chance to finish
+// first.
 bool inject_and_collect_xaml_tree(
     Element& root,
     HWND hwnd,
@@ -575,11 +601,11 @@ bool inject_and_collect_xaml_tree(
     const std::wstring& connPrefix,
     bool fastProperties)
 {
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
         if (attempt > 0) {
             if (g_debug)
                 fprintf(stderr, "lvt: retrying XAML injection (attempt %d)\n", attempt + 1);
-            Sleep(static_cast<DWORD>(100 * attempt));
+            Sleep(1000);
         }
         if (try_inject_and_collect_xaml_tree_once(root, hwnd, pid, xamlDiagDll, initDllPath,
                                                   frameworkLabel, connPrefix, fastProperties))

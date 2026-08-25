@@ -513,10 +513,24 @@ private:
     // still one layer up: xaml_diag_common.cpp's TAP DLL only calls
     // CreateFileW to connect to lvt.exe's pipe *after*
     // CollectBounds/CollectPositionsAndText/SerializeAndSend all finish (see
-    // SerializeAndSend below), so lvt.exe's own 15-second "TAP DLL did not
-    // connect" timeout on the other end of that pipe already bounds the
-    // combined cost of this walk, chunked or not, and fails the whole tick
-    // cleanly (no partial data) rather than partially collecting.
+    // SerializeAndSend below), so lvt.exe's own "TAP DLL did not connect"
+    // timeout on the other end of that pipe already bounds the combined
+    // cost of this walk, chunked or not, and fails the whole tick cleanly
+    // (no partial data) rather than partially collecting.
+    //
+    // That timeout used to be 15 seconds, which was not a safety margin —
+    // it was the actual cause of real, reproducible tree data loss. Traced
+    // live against Microsoft Store's animated home page (~1936 elements):
+    // a single *successful* collection (every call below returned success)
+    // measured 40.8 seconds end to end, because chunking here specifically
+    // lets a busy/animating target's UI thread interleave its own work
+    // between chunks rather than being monopolized — exactly what an
+    // actively animating tree needs a lot of. At 15 seconds, lvt.exe
+    // routinely gave up and closed the pipe while this was still
+    // legitimately working, so the "fails cleanly" path above was firing
+    // for collections that would have succeeded if just given more time.
+    // See xaml_diag_common.cpp's kXamlCollectionTimeoutMs (now 60s) for
+    // where this is actually bounded today.
     void CollectBounds(IVisualTreeService* vts, size_t start, size_t count) {
         // Fast mode skips GetPropertyValuesChain entirely — the dominant
         // per-node cost (~4.5ms/element, measured live against Microsoft

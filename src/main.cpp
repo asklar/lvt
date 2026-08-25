@@ -610,16 +610,18 @@ static void collect_frameworks_present(const lvt::Element& el, std::set<std::str
 }
 
 // True if `previous` had real content in an *injected* framework (xaml or
-// winui3 — the ones that require InitializeXamlDiagnosticsEx and can fail
-// transiently; win32/comctl never inject and are not what this guards
-// against) that `current` has none of at all. The target window itself
-// being confirmed still open (see run_watch_loop's IsWindow check, which
-// always runs before this) makes "the whole XAML tree just vanished" a
-// symptom of a failed injection, not real news — see
-// inject_and_collect_xaml_tree's own retry and doc comment for the
-// underlying transient conditions this guards against, and why a few
-// retries at that layer are not always enough to bridge a longer stall.
-// Observed live taking as long as ~25 seconds to recover on its own.
+// winui3 — the ones that require InitializeXamlDiagnosticsEx and can fail;
+// win32/comctl never inject and are not what this guards against) that
+// `current` has none of at all. The target window itself being confirmed
+// still open (see run_watch_loop's IsWindow check, which always runs
+// before this) makes "the whole XAML tree just vanished" a symptom, not
+// real news, in the rare case it still happens: the actual root cause this
+// guarded against — xaml_diag_common.cpp's TAP DLL connect-back timeout
+// being far shorter (15s) than a busy, actively animating tree can
+// legitimately need (measured live at 40.8s for a real, successful
+// collection) — is now fixed at its source (that timeout is 60s). This is
+// kept as a secondary safety net for whatever is left over that: a
+// genuinely hung target, or a walk slower even than the new timeout.
 static bool lost_injected_framework_content(const lvt::Element& previous, const lvt::Element& current) {
     std::set<std::string> prevFrameworks, currFrameworks;
     collect_frameworks_present(previous, prevFrameworks);
@@ -690,18 +692,21 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             continue;
         }
 
-        // See lost_injected_framework_content's doc comment: a tick whose
-        // XAML/WinUI3 content vanished entirely, when the previous tick had
-        // real content there, is a suspected transient injection failure,
-        // not real news. Retry the whole tree build a bounded number of
-        // extra times, right here, before accepting the loss — bounded so a
-        // *genuine* loss (the app really did close its XAML view) still
-        // gets reported, just not on the very first affected tick.
+        // See lost_injected_framework_content's doc comment: this is now a
+        // secondary safety net (the actual root cause is fixed at its
+        // source, in xaml_diag_common.cpp's connect-back timeout), so a
+        // small, conservative retry here is enough — and, per
+        // inject_and_collect_xaml_tree's own comment, retrying *too*
+        // eagerly risks starting another walk that competes with a
+        // still-running straggler from the attempt that is timing out,
+        // rather than helping it finish. Bounded so a *genuine* loss (the
+        // app really did close its XAML view) still gets reported, just
+        // not on the very first affected tick.
         if (lost_injected_framework_content(previous, current)) {
-            for (int extra = 0; extra < 6 && lost_injected_framework_content(previous, current); extra++) {
+            for (int extra = 0; extra < 2 && lost_injected_framework_content(previous, current); extra++) {
                 if (lvt::g_debug)
                     fprintf(stderr, "lvt: XAML/WinUI3 content vanished this tick; retrying (attempt %d)\n", extra + 1);
-                Sleep(500);
+                Sleep(1000);
                 lvt::Element retryTree;
                 if (build_output_tree(target, args, retryTree))
                     current = std::move(retryTree);
