@@ -5,7 +5,6 @@
         AllowsTransparency="True"
         Background="Transparent"
         ShowInTaskbar="False"
-        Topmost="True"
         ResizeMode="NoResize"
         Focusable="False"
         ShowActivated="False"

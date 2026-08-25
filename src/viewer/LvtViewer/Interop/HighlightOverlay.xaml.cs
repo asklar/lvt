@@ -7,19 +7,34 @@ using System.Windows.Media;
 namespace LvtViewer.Interop;
 
 /// <summary>
-/// A borderless, click-through, always-on-top window that draws a highlight
-/// rectangle around whatever top-level window the crosshair drag is
-/// currently hovering — the same visual feedback Inspect.exe gives while its
+/// A borderless, click-through window that draws a highlight rectangle
+/// around whatever top-level window the crosshair drag is currently
+/// hovering — the same visual feedback Inspect.exe gives while its
 /// viewfinder is being dragged.
+///
+/// Deliberately NOT WS_EX_TOPMOST/Topmost="True": an earlier version used
+/// that, which kept the highlight visible on top of *everything* even when
+/// the window it was supposedly highlighting was itself minimized or
+/// covered by some unrelated window — Topmost places a window in its own
+/// always-on-top band, entirely independent of whatever it is meant to be
+/// annotating. Instead, SetOwner makes this window a native Win32-owned
+/// window of whichever HWND it is currently highlighting: Windows enforces
+/// that an owned window always stays directly above its owner in z-order
+/// (and only there), so if some other window covers the target, the
+/// highlight is covered right along with it — exactly the behavior wanted,
+/// with no separate occlusion-detection logic required.
 /// </summary>
 public partial class HighlightOverlay : Window
 {
     private const int GWL_EXSTYLE = -20;
+    private const int GWLP_HWNDPARENT = -8;
     private const int WS_EX_TRANSPARENT = 0x00000020;
     private const int WS_EX_LAYERED = 0x00080000;
     private const int WS_EX_TOOLWINDOW = 0x00000080;
     private const int WS_EX_NOACTIVATE = 0x08000000;
 
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
     private const uint SWP_NOACTIVATE = 0x0010;
     private const uint SWP_NOZORDER = 0x0004;
 
@@ -29,9 +44,20 @@ public partial class HighlightOverlay : Window
     [DllImport("user32.dll")]
     private static extern int SetWindowLong(IntPtr hwnd, int index, int value);
 
+    // GWLP_HWNDPARENT stores a window handle, which is pointer-sized (64-bit
+    // on x64 — this whole project is x64-only, but the distinction still
+    // matters here specifically): the plain 32-bit SetWindowLong/GetWindowLong
+    // pair above is fine for GWL_EXSTYLE (a genuinely 32-bit style bitmask)
+    // but would silently truncate an HWND passed through it, so the owner
+    // relationship needs its own, pointer-width pair.
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")]
+    private static extern IntPtr SetWindowLongPtr(IntPtr hwnd, int index, IntPtr value);
+
     [DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
         int x, int y, int cx, int cy, uint uFlags);
+
+    private IntPtr _owner = IntPtr.Zero;
 
     public HighlightOverlay()
     {
@@ -45,6 +71,36 @@ public partial class HighlightOverlay : Window
         var style = GetWindowLong(hwnd, GWL_EXSTYLE);
         SetWindowLong(hwnd, GWL_EXSTYLE,
             style | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+    }
+
+    /// <summary>
+    /// Makes this window a native owned window of <paramref name="targetHwnd"/>
+    /// — see the class comment for why this replaces Topmost. Both callers
+    /// (CrosshairPicker, which retargets on every dragged-over window, and
+    /// MainWindow, which retargets whenever the connected target or the
+    /// selected element's host changes) are expected to call this before
+    /// every Show()/MoveTo(), not just once, since the window being
+    /// highlighted can change across the highlight's lifetime.
+    /// </summary>
+    public void SetOwner(IntPtr targetHwnd)
+    {
+        if (targetHwnd == IntPtr.Zero || targetHwnd == _owner)
+            return;
+        _owner = targetHwnd;
+
+        var hwnd = new WindowInteropHelper(this).EnsureHandle();
+        SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, targetHwnd);
+
+        // Changing GWLP_HWNDPARENT only updates which window this one is now
+        // considered owned by; the OS re-enforces "an owned window stays
+        // directly above its owner" the next time the *owner's* own
+        // z-position changes, not necessarily the instant ownership itself
+        // is reassigned. Without this explicit repositioning, retargeting
+        // the highlight onto a new window could leave it showing at
+        // whatever z-position it last held — e.g. still on top of some
+        // unrelated window that happens to cover the new target — until
+        // something else nudges the target's z-order.
+        SetWindowPos(hwnd, targetHwnd, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
     /// <summary>

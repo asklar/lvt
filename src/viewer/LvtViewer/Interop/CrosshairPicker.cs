@@ -99,6 +99,11 @@ public sealed class CrosshairPicker
             return;
         }
 
+        // Owns the overlay to whichever window is now under the cursor, so
+        // its z-order tracks that window (see HighlightOverlay's class
+        // comment) rather than staying independently on top of everything
+        // as dragging moves from one candidate window to another.
+        _overlay.SetOwner(hwnd);
         var rect = NativeMethods.GetVisibleFrame(hwnd);
         _overlay.MoveTo(rect);
         if (_overlay.Visibility != Visibility.Visible)

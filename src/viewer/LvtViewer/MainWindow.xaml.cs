@@ -22,12 +22,13 @@ public partial class MainWindow : Window
     private CrosshairPicker? _picker;
     private ElementPicker? _elementPicker;
 
-    // Reuses the same borderless/click-through/topmost overlay the
-    // crosshair-drag gesture uses (Interop/HighlightOverlay.xaml) to show
-    // SelectedElement's bounds on the *target* app (item 1). The two never
-    // show at once: the crosshair overlay only appears while dragging,
-    // before a target is connected; this one only appears once an element
-    // is selected in an already-connected tree.
+    // Reuses the same borderless/click-through HighlightOverlay class the
+    // crosshair-drag gesture uses (its own separate instance — see
+    // CrosshairPicker's own _overlay field) to show SelectedElement's
+    // bounds on the *target* app (item 1). The two never show at once: the
+    // crosshair overlay only appears while dragging, before a target is
+    // connected; this one only appears once an element is selected in an
+    // already-connected tree.
     private readonly HighlightOverlay _selectionHighlight = new();
     private ElementNodeViewModel? _highlightedNode;
 
@@ -59,13 +60,6 @@ public partial class MainWindow : Window
 
         Loaded += (_, _) =>
         {
-            // WPF requires a window to have been shown before it can be
-            // assigned as another window's Owner, so this can only happen
-            // once MainWindow itself is loaded — setting it in the
-            // constructor throws InvalidOperationException immediately on
-            // every launch.
-            _selectionHighlight.Owner = this;
-
             _picker = new CrosshairPicker(CrosshairHandle, this);
             _picker.TargetPicked += hwnd => _viewModel.ConnectTo(hwnd);
             _picker.HintChanged += hint => _viewModel.StatusText = hint;
@@ -115,6 +109,11 @@ public partial class MainWindow : Window
             _selectionHighlight.Hide();
             return;
         }
+        // Element-picking only ever operates within the already-connected
+        // target, so the owner is always CurrentHwnd here — see
+        // ShowHighlightForCurrentNode's identical call for why this needs
+        // to happen on every show, not just once.
+        _selectionHighlight.SetOwner(_viewModel.CurrentHwnd);
         _selectionHighlight.MoveTo(rect);
         if (_selectionHighlight.Visibility != Visibility.Visible)
             _selectionHighlight.Show();
@@ -309,6 +308,12 @@ public partial class MainWindow : Window
             return;
         }
 
+        // Owns the overlay to the connected target's own top-level window,
+        // not this (the viewer's) window — see HighlightOverlay's class
+        // comment. Called on every show (cheap no-op if unchanged, see
+        // SetOwner) rather than once at connect time so the overlay keeps
+        // tracking the right window's z-order even across a reconnect.
+        _selectionHighlight.SetOwner(_viewModel.CurrentHwnd);
         _selectionHighlight.MoveTo(rect);
         if (_selectionHighlight.Visibility != Visibility.Visible)
             _selectionHighlight.Show();
