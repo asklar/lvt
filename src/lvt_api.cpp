@@ -147,11 +147,10 @@ bool find_session(const std::string& id, Session& out) {
 // g_sessionsMutex for that whole time), so a persistent IFrameworkConnection
 // - move-only by design, see connection_registry.h's ConnectionHandle -
 // cannot live as a Session member; it is kept here instead, keyed by session
-// id, and reused across every get_visual_tree/find_elements/click/... call
-// that session makes against an XAML/WinUI3 target, the same way watch's
-// loop reuses one across ticks (see main.cpp's acquire_watch_connections).
-// Erased (dropping the ConnectionHandles, which disconnect cleanly) in
-// method_disconnect.
+// id, and reused across every get_visual_tree/get_uia_tree/find_elements/
+// click/... call that session makes, the same way watch's loop reuses one
+// across ticks (see main.cpp's acquire_watch_connections). Erased (dropping
+// the ConnectionHandles, which disconnect cleanly) in method_disconnect.
 std::mutex g_connectionsMutex;
 std::map<std::string, std::vector<std::pair<std::string, lvt::ConnectionHandle>>> g_sessionConnections;
 
@@ -172,16 +171,29 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
     auto& entry = g_sessionConnections[session.id];
-    if (entry.empty()) {
+
+    const auto has_label = [&entry](const char* label) {
+        for (const auto& [existingLabel, handle] : entry) {
+            if (existingLabel == label && handle)
+                return true;
+        }
+        return false;
+    };
+
+    const bool needXaml = hasXaml && !has_label("xaml");
+    const bool needWinUI3 = hasWinUI3 && !has_label("winui3");
+    if (needXaml || needWinUI3) {
         // A full, untrimmed probe tree, needed only to resolve which
         // process/DLL a connection should target (XamlProvider needs to
-        // locate the CoreWindow) - discarded once that resolution is done.
-        // If this first attempt fails to acquire anything, `entry` stays
-        // empty and the next call simply tries again rather than caching
-        // a permanent failure.
+        // locate the CoreWindow) - discarded once that resolution is done. A
+        // session may already hold some other connection here (e.g. UIA, or
+        // only one of xaml/winui3 from an earlier partial success), so retry
+        // only whichever framework labels are still missing instead of treating
+        // "entry is non-empty" as "everything this session could ever need is
+        // already connected".
         lvt::Element probeTree = lvt::build_tree(session.hwnd, session.pid, frameworks);
 #if LVT_ENABLE_XAML
-        if (hasXaml) {
+        if (needXaml) {
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "xaml",
                 [&probeTree](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -193,7 +205,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         }
 #endif
 #if LVT_ENABLE_WINUI3
-        if (hasWinUI3) {
+        if (needWinUI3) {
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "winui3",
                 [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -220,6 +232,40 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         return nullptr;
     };
 }
+
+#ifdef LVT_ENABLE_UIA
+// UIA mode does not go through build_tree/ConnectionLookup, because the whole
+// UIA tree replaces the visual tree rather than enriching it. It still benefits
+// from the same "connect once, reuse many times" shape, though: a session can
+// keep one client-side IUIAutomation object alive and re-walk through it on
+// every request instead of CoCreateInstance + timeout setup on every call.
+lvt::UiaConnection* uia_connection_for_session(const Session& session) {
+    std::lock_guard<std::mutex> lock(g_connectionsMutex);
+    auto& entry = g_sessionConnections[session.id];
+
+    for (auto it = entry.begin(); it != entry.end(); ++it) {
+        if (it->first != "uia")
+            continue;
+        if (it->second && it->second->is_alive())
+            return dynamic_cast<lvt::UiaConnection*>(it->second.get());
+
+        it->second.reset();
+        entry.erase(it);
+        break;
+    }
+
+    auto handle = lvt::ConnectionRegistry::instance().acquire(
+        session.pid, session.hwnd, "uia",
+        [](HWND hwnd, DWORD) -> std::shared_ptr<lvt::IFrameworkConnection> {
+            return lvt::UiaConnection::connect(hwnd);
+        });
+    if (!handle)
+        return nullptr;
+
+    entry.emplace_back("uia", std::move(handle));
+    return dynamic_cast<lvt::UiaConnection*>(entry.back().second.get());
+}
+#endif
 
 // --- per-target serialization -------------------------------------------
 //
@@ -522,7 +568,13 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         lvt::UiaProvider provider;
         const auto options = uia_options_from(params);
 
-        // Retry a failed walk rather than reporting the target unreadable.
+        // Prefer the session's persistent UIA client when one is available, so
+        // repeated MCP reads reuse one IUIAutomation object instead of
+        // CoCreateInstance + timeout setup on every call. Still retry a failed
+        // walk rather than reporting the target unreadable: external readers
+        // (screen readers, Inspect.exe, another lvt) can still collide with
+        // this process, and a failed/acquisition-reused path should degrade to
+        // the exact one-shot walk this code used before the connection work.
         //
         // A UIA walk is answered by the target's UI thread, which serves one
         // caller at a time, so a walk that overlaps another fails its
@@ -537,7 +589,19 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         for (int attempt = 0; attempt < 3 && !result; ++attempt) {
             if (attempt > 0)
                 Sleep(static_cast<DWORD>(120 * attempt));
-            result = provider.build(session.hwnd, options, &wasTruncated);
+
+            bool attemptTruncated = false;
+            lvt::Element connectedTree;
+            if (auto* connection = uia_connection_for_session(session)) {
+                if (connection->get_tree_with_options(connectedTree, options, &attemptTruncated)) {
+                    result = std::move(connectedTree);
+                    wasTruncated = attemptTruncated;
+                    break;
+                }
+            }
+
+            result = provider.build(session.hwnd, options, &attemptTruncated);
+            wasTruncated = attemptTruncated;
         }
         if (!result) {
             error = "could not read the UI Automation tree for this window; it may be busy "
@@ -1651,7 +1715,8 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
         options.timeoutMs = 10000;
     }
 
-    const auto result = lvt::perform_action(session.hwnd, options, request);
+    const auto result = lvt::perform_action(session.hwnd, options, request,
+                                            uia_connection_for_session(session));
     auto out = action_result_to_json(result, actionName, get_string(params, "element"));
     if (!result.ok)
         throw std::runtime_error(out.dump());

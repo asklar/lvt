@@ -69,15 +69,18 @@ struct ActionResult {
     bool hasElement = false;
 };
 
-// Resolve the reference against a fresh UIA walk of the target and perform the
-// action. Everything happens on the provider's MTA thread.
+// Resolve the reference against a UIA walk of the target and perform the
+// action. When `connection` is supplied, the resolve/readback/wait walks reuse
+// that persistent client; the live-element action itself still runs on the
+// action path's own automation object. Everything happens on an MTA thread.
 //
 // Pattern-based paths are preferred throughout: they do not steal focus, do not
 // move the cursor, and work when the window is not on top. SendInput is the
 // fallback for elements that expose no suitable pattern, and it requires
 // bringing the window forward.
 ActionResult perform_action(HWND hwnd, const UiaOptions& options,
-                            const ActionRequest& request);
+                            const ActionRequest& request,
+                            UiaConnection* connection = nullptr);
 
 // Parse an action name as accepted on the command line.
 bool parse_action_kind(const std::string& name, ActionKind& out);

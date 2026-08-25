@@ -555,6 +555,37 @@ static bool build_uia_tree(const lvt::TargetInfo& target, const Args& args,
     return true;
 }
 
+static bool build_uia_tree_with_connection(const lvt::TargetInfo& target, const Args& args,
+                                           const lvt::ConnectionLookup& connectionLookup,
+                                           lvt::Element& tree) {
+    if (!connectionLookup)
+        return build_uia_tree(target, args, tree);
+
+    lvt::UiaOptions options;
+    if (!lvt::parse_uia_view(args.uiaViewName, options.view)) {
+        fprintf(stderr, "lvt: --uia-view must be raw, control, or content\n");
+        return false;
+    }
+    options.extraProperties = args.uiaProps;
+    options.timeoutMs = args.uiaTimeoutMs;
+
+    // build_root_tree only knows about the generic IFrameworkConnection
+    // interface. UIA is the one caller that also needs per-call view/property/
+    // timeout control, so when we know we are in --uia mode we intentionally
+    // recover the richer concrete type here.
+    if (auto* base = connectionLookup("uia")) {
+        if (auto* connection = dynamic_cast<lvt::UiaConnection*>(base)) {
+            if (connection->is_alive() && connection->get_tree_with_options(tree, options)) {
+                lvt::assign_element_ids(tree);
+                lvt::assign_element_keys(tree);
+                return true;
+            }
+        }
+    }
+
+    return build_uia_tree(target, args, tree);
+}
+
 static std::string uia_framework_label(const Args& args) {
     lvt::UiaView view = lvt::UiaView::control;
     lvt::parse_uia_view(args.uiaViewName, view);
@@ -567,6 +598,11 @@ static bool build_uia_tree(const lvt::TargetInfo&, const Args&, lvt::Element&) {
     return false;
 }
 
+static bool build_uia_tree_with_connection(const lvt::TargetInfo& target, const Args& args,
+                                           const lvt::ConnectionLookup&, lvt::Element& tree) {
+    return build_uia_tree(target, args, tree);
+}
+
 static std::string uia_framework_label(const Args&) { return "uia"; }
 #endif
 
@@ -575,13 +611,13 @@ static std::string uia_framework_label(const Args&) { return "uia"; }
 // produced without injecting anything into the target.
 //
 // `connectionLookup` is forwarded to build_tree unchanged - see its own doc
-// comment in tree_builder.h. Only run_watch_loop supplies one today, so
-// every other caller (dump/query/screenshot) sees no behavior change.
+// comment in tree_builder.h. watch supplies one for both visual-tree and UIA
+// sessions; every other caller (dump/query/screenshot) sees no behavior change.
 static bool build_root_tree(const lvt::TargetInfo& target, const Args& args,
                             lvt::Element& tree,
                             const lvt::ConnectionLookup& connectionLookup = {}) {
     if (args.uia) {
-        if (!build_uia_tree(target, args, tree))
+        if (!build_uia_tree_with_connection(target, args, connectionLookup, tree))
             return false;
         return true;
     }
@@ -646,22 +682,34 @@ static bool lost_injected_framework_content(const lvt::Element& previous, const 
     return false;
 }
 
-// Acquires a persistent connection (see connection_registry.h) for every
-// injectable framework (xaml/winui3) detected on `target`, so the tick loop
-// below can reuse them via build_tree's ConnectionLookup instead of
-// re-injecting from scratch every tick - the confirmed root cause of the
-// leaked-window/"tree refreshes" bug this redesign replaces. Held for the
-// whole watch session; released (each ConnectionHandle's destructor sends a
-// clean DISCONNECT) when run_watch_loop returns.
+// Acquires the persistent connections a watch session can reuse across ticks.
+// For visual-tree sessions that means one connection per injectable framework
+// (xaml/winui3); for --uia it means one reusable UI Automation client. Held
+// for the whole watch session; released automatically when run_watch_loop
+// returns.
 //
-// Needs a fresh, UNTRIMMED tree walk of its own rather than reusing
-// whatever the tick loop's `previous`/`current` holds: those may have been
-// scoped by --element/--depth and could be missing the very node (e.g. a
-// CoreWindow) XamlProvider::open_connection needs to resolve which process
-// to inject into. This probe tree is discarded once that resolution is done.
+// The visual-tree path needs a fresh, UNTRIMMED probe walk of its own rather
+// than reusing whatever the tick loop's `previous`/`current` holds: those may
+// have been scoped by --element/--depth and could be missing the very node
+// (e.g. a CoreWindow) XamlProvider::open_connection needs to resolve which
+// process to inject into. UIA needs no such probe because it does not resolve
+// a framework island before connecting.
 static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_connections(
-    const lvt::TargetInfo& target) {
+    const lvt::TargetInfo& target, const Args& args) {
     std::vector<std::pair<std::string, lvt::ConnectionHandle>> connections;
+
+#ifdef LVT_ENABLE_UIA
+    if (args.uia) {
+        auto handle = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, "uia",
+            [](HWND hwnd, DWORD) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                return lvt::UiaConnection::connect(hwnd);
+            });
+        if (handle)
+            connections.emplace_back("uia", std::move(handle));
+        return connections;
+    }
+#endif
 
     auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
     bool hasXaml = false, hasWinUI3 = false;
@@ -720,11 +768,9 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
 
     // Acquired ONCE for the whole watch session (not per tick - see
     // acquire_watch_connections's doc comment) and released automatically
-    // when this function returns, however it returns. UIA-only sessions
-    // never inject anything, so skip this entirely for --uia.
+    // when this function returns, however it returns.
     std::vector<std::pair<std::string, lvt::ConnectionHandle>> connections;
-    if (!args.uia)
-        connections = acquire_watch_connections(target);
+    connections = acquire_watch_connections(target, args);
     lvt::ConnectionLookup lookup = make_lookup(connections);
 
     // The very first tree build did not get the same tolerance the tick loop
