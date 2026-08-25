@@ -4,29 +4,30 @@
 
 The TAP DLL (`lvt_tap.dll`) is a COM in-process server that gets injected into the target process to walk XAML visual trees. It uses the same diagnostic infrastructure that Visual Studio's Live Visual Tree uses. ("TAP" comes from the `wszTAPDllName` parameter of `InitializeXamlDiagnosticsEx`.)
 
-## Injection flow
+`InitializeXamlDiagnosticsEx` and `AdviseVisualTreeChange` are a subscribe-and-react API: they are meant to be called **once** per debugging session, with `OnVisualTreeChange` then incrementally reporting Add/Remove mutations for as long as the subscription stays alive. The TAP DLL is built around that model — connect once, serve many tree refreshes over a persistent pipe, disconnect once when the session ends — not around reconnecting from scratch on every refresh. An earlier version of this file did the latter (calling `InitializeXamlDiagnosticsEx` fresh every `watch` tick); that caused a confirmed, unbounded resource leak (one message-only window created and never destroyed per tick) and was the root cause of a "tree refreshes/resets" bug reported against Microsoft Store. See `src/providers/framework_connection.h` and `connection_registry.h` for the caller-side half of this design.
+
+## Connection lifecycle
 
 ```mermaid
 sequenceDiagram
-    participant lvt as lvt.exe
-    participant target as Target Process
+    participant lvt as lvt.exe (XamlDiagConnection)
+    participant target as Target Process (LvtTap)
 
-    lvt->>lvt: LoadLibrary(initDllPath)
-    lvt->>lvt: GetProcAddress(InitializeXamlDiagnosticsEx)
+    lvt->>lvt: CreateNamedPipe(pipeName, PIPE_ACCESS_DUPLEX)
     lvt->>target: InitializeXamlDiagnosticsEx(connectionName, pid, pipe, tapDll, CLSID)
-    target->>target: LoadLibrary("lvt_tap.dll")
-    target->>target: DllGetClassObject(CLSID_LvtTap)
-    target->>target: IClassFactory::CreateInstance()
-    target->>target: SetSite(IXamlDiagnostics)
-    target->>target: QI → IVisualTreeService
-    target->>target: AdviseVisualTreeChange(callback)
-    loop Tree replay
-        target->>target: OnVisualTreeChange(node)
+    target->>target: LoadLibrary("lvt_tap.dll"), SetSite(IXamlDiagnostics)
+    target->>target: AdviseVisualTreeChange(callback) — ONCE
+    target->>lvt: connects to pipe, writes "READY"
+    lvt->>lvt: connect() returns a live connection
+
+    loop Every tree refresh (a watch tick, an MCP tool call, ...)
+        lvt->>target: "GET_TREE" or "GET_TREE FAST"
+        target->>target: dispatch CollectBounds/CollectPositionsAndText to UI thread
+        target->>lvt: one JSON line (the current tree)
     end
-    target->>target: CollectBounds (UI thread dispatch)
-    lvt->>lvt: CreateNamedPipe(pipeName)
-    target->>lvt: SerializeAndSend() → JSON over pipe
-    lvt->>lvt: Parse JSON, graft into element tree
+
+    lvt->>target: "DISCONNECT" (when the caller releases the connection)
+    target->>target: UnadviseVisualTreeChange, DestroyWindow, UnregisterClass, COM release
 ```
 
 ### Connection names
@@ -56,18 +57,21 @@ flowchart TB
     Launch["Launch worker thread (AdviseThreadProc)"]
 
     OnVTC["OnVisualTreeChange(relation, element, mutation)"]
-    BuildMap["Build TreeNode map (m_nodes, m_roots)"]
+    BuildMap["Add/Remove into TreeNode map (m_nodes, m_roots)"]
 
-    WorkerThread["Worker thread"]
-    Advise["AdviseVisualTreeChange — replays existing tree"]
-    SendMsg["SendMessage(WM_COLLECT_BOUNDS) — dispatch to UI thread"]
-    Serialize["SerializeAndSend() — JSON → named pipe"]
-    Unadvise["UnadviseVisualTreeChange()"]
+    WorkerThread["Worker thread: AdviseThreadProcImpl"]
+    Advise["AdviseVisualTreeChange — ONCE, replays existing tree"]
+    Serve["ServeConnection: connect pipe, write READY"]
+    Loop["RunCommandLoop: read GET_TREE/DISCONNECT requests"]
+    HandleGetTree["HandleGetTree: SendMessage(WM_COLLECT_BOUNDS) dispatch, SerializeAndSend"]
+    Cleanup["CleanupUIResources: Unadvise, DestroyWindow, UnregisterClass, COM release"]
 
     LvtTap --> SetSite & OnVTC & WorkerThread
     SetSite --> QI & MsgWnd & Launch
     OnVTC --> BuildMap
-    WorkerThread --> Advise --> SendMsg --> Serialize --> Unadvise
+    WorkerThread --> Advise --> Serve --> Loop
+    Loop -->|GET_TREE, repeated| HandleGetTree
+    Loop -->|DISCONNECT or broken pipe| Cleanup
 ```
 
 ## Threading model
@@ -95,29 +99,35 @@ sequenceDiagram
     UI->>Worker: Launch worker thread
     UI->>UI: Return S_OK (UI thread is now free)
 
-    Worker->>Worker: AdviseVisualTreeChange(callback)
+    Worker->>Worker: AdviseVisualTreeChange(callback) — ONCE
     loop Tree replay
         Worker->>Worker: OnVisualTreeChange(node) → builds m_nodes map
     end
+    Worker->>Pipe: connect, write "READY"
 
-    Worker->>UI: SendMessage(WM_COLLECT_BOUNDS)
-    Note over Worker: blocks until UI thread responds
-
-    UI->>UI: WndProc: WM_COLLECT_BOUNDS
-    loop For each node
-        UI->>UI: GetPropertyValuesChain() → ActualWidth, ActualHeight, ActualOffset
+    loop Every GET_TREE request
+        Worker->>UI: SendMessage(WM_COLLECT_BOUNDS)
+        Note over Worker: blocks until UI thread responds
+        UI->>UI: WndProc: WM_COLLECT_BOUNDS
+        loop For each node
+            UI->>UI: GetPropertyValuesChain() → ActualWidth, ActualHeight, ActualOffset
+        end
+        UI->>Worker: Return (unblocks SendMessage)
+        Worker->>Pipe: SerializeAndSend() → one JSON line
     end
-    UI->>Worker: Return (unblocks SendMessage)
 
-    Worker->>Pipe: SerializeAndSend() → JSON
-    Worker->>Worker: UnadviseVisualTreeChange()
+    Worker->>UI: SendMessageTimeout(WM_TAP_DESTROY) — on DISCONNECT/broken pipe
+    UI->>UI: DestroyWindow(hwnd) — runs on the owning thread
+    Worker->>Worker: UnadviseVisualTreeChange(), UnregisterClass, COM release
 ```
 
 Key details:
-- The message-only window is created on the UI thread in `SetSite()` via `CreateWindowExW(... HWND_MESSAGE ...)`
+- The message-only window is created **once**, on the UI thread in `SetSite()`, via `CreateWindowExW(... HWND_MESSAGE ...)` — and destroyed exactly once, when the connection ends, not per request.
 - `SendMessage` from the worker thread blocks until the UI thread processes `WM_COLLECT_BOUNDS`
 - The UI thread is free at this point (SetSite has returned), so there's no deadlock
+- `DestroyWindow` must run on the thread that created the window; the worker thread cannot call it directly, so cleanup dispatches `WM_TAP_DESTROY` to the UI thread via `SendMessageTimeoutW` (bounded, so a hung/gone UI thread cannot block cleanup forever)
 - SEH wrappers (`CollectBoundsForNodeSEH`) protect against crashes in individual node queries
+- `m_nodes`/`m_roots`/`m_orderedHandles` are guarded by `m_nodesMutex`: once a connection stays open across many requests, `OnVisualTreeChange` can fire (adding or removing nodes) between — or even during — a `GET_TREE` request's own collection pass, which the old one-shot-per-tick design never had to account for
 
 ### Why COM marshaling doesn't work
 
@@ -138,6 +148,8 @@ Each `TreeNode` stores:
 | `offsetX`, `offsetY` | `GetPropertyValuesChain` | `ActualOffset` (if available) |
 | `hasBounds` | Computed | `true` if both width and height were collected |
 
+`OnVisualTreeChange` handles both `Add` (inserts into `m_nodes`/the parent's `childHandles`, or `m_roots` for a top-level element) and `Remove` (erases from all three) — Remove handling only matters once a connection's tree state persists across many requests instead of being torn down and rebuilt from scratch every time.
+
 ### Bounds collection results
 
 Not all nodes return bounds:
@@ -145,9 +157,9 @@ Not all nodes return bounds:
 - `ActualOffset` is often not available via `GetPropertyValuesChain` (it's a non-dependency-property in WinUI 3)
 - When offsets are missing, all XAML elements within a bridge share the bridge window's screen position
 
-## JSON output format
+## Wire protocol
 
-The TAP DLL serializes the tree as a JSON array of root nodes:
+Every message on the pipe is one line (UTF-8, `\n`-terminated). lvt.exe → TAP DLL commands are plain text; TAP DLL → lvt.exe responses are either a literal `READY`/`BYE`, or the tree itself as a JSON array of root nodes:
 
 ```json
 [
@@ -164,7 +176,14 @@ The TAP DLL serializes the tree as a JSON array of root nodes:
 ]
 ```
 
-This is sent as UTF-8 over the named pipe and parsed by `graft_json_node()` in `xaml_diag_common.cpp`.
+| Direction | Message | Meaning |
+|-----------|---------|---------|
+| TAP → lvt | `READY` | Sent once, right after `AdviseVisualTreeChange` succeeds — before any bounds/property collection |
+| lvt → TAP | `GET_TREE` / `GET_TREE FAST` | Request a refresh; `FAST` overrides the connection's default fast-mode setting for this one response |
+| TAP → lvt | `[...]` | One JSON array of root nodes, in response to `GET_TREE` |
+| lvt → TAP | `DISCONNECT` | End the connection; TAP DLL replies `BYE`, then runs its cleanup |
+
+Parsed and grafted by `graft_xaml_tree_json()` in `xaml_diag_common.cpp`.
 
 ## Static CRT
 
@@ -175,6 +194,7 @@ The TAP DLL is built with `/MT` (static CRT). This is essential because:
 
 ## Debugging
 
-- **Log file:** `%TEMP%\lvt_tap.log` — all TAP DLL operations are logged with thread IDs
+- **Log file:** `%TEMP%\lvt_tap.log` for unpackaged targets, but `%LOCALAPPDATA%\Packages\<PackageFamilyName>\AC\Temp\lvt_tap.log` for AppContainer (UWP/MSIX-packaged) targets — the two are easy to confuse when debugging a packaged app. All TAP DLL operations are logged with millisecond timestamps and thread IDs. Because the TAP DLL never unloads (`DllCanUnloadNow` returns `S_FALSE`, see below), this file accumulates across every run against that target for as long as the target process lives, not just the most recent one.
 - **Debugger:** Use `C:\Debuggers\cdb.exe` to attach to the target process and debug injection issues
-- **File lock:** `lvt_tap.dll` is locked by the target process after injection. Kill the target before rebuilding.
+- **File lock:** `lvt_tap.dll` is locked by the target process after injection. Kill the target before rebuilding. For AppContainer targets, the staged copy at `%TEMP%\lvt_tap\` can also be held open by an unrelated, long-lived AppContainer host process from an earlier test run — if a rebuilt DLL isn't taking effect, check for and kill stale processes still holding that staged file before assuming the build itself is broken.
+
