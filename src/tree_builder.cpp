@@ -199,9 +199,24 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
             auto connection = connectionLookup ? connectionLookup("xaml") : nullptr;
             if (connection && connection->is_alive()) {
                 xaml.enrich_with_connection(root, *connection, fastProperties);
-            } else {
+            } else if (!connectionLookup) {
+                // No ConnectionLookup at all means this is a one-shot CLI
+                // call (dump/query/screenshot) that never acquired a
+                // persistent connection by design - a single inject-collect-
+                // disconnect is the correct, minimal-footprint behavior here.
                 xaml.enrich(root, hwnd, pid, fastProperties);
             }
+            // else: a ConnectionLookup was supplied (watch/MCP) but has no
+            // alive connection for "xaml" right now. Skip enrichment for
+            // this call rather than silently falling back to the one-shot
+            // path above - that fallback is what silently reintroduced
+            // permanent per-tick reinjection once a connection died, since
+            // it looks identical to a slow-but-working tick from the
+            // caller's side. The connection owner (refresh_dead_watch_
+            // connections for watch, the MCP session's reconnect logic)
+            // is responsible for re-acquiring a fresh persistent connection
+            // before the next tick/call; this one just comes back with
+            // whatever the tree already had for this framework.
 #endif
             break;
         }
@@ -211,9 +226,15 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
             auto connection = connectionLookup ? connectionLookup("winui3") : nullptr;
             if (connection && connection->is_alive()) {
                 winui3.enrich_with_connection(root, *connection, fastProperties);
-            } else {
+            } else if (!connectionLookup) {
+                // See the matching comment in the Xaml case above: no
+                // lookup at all means a one-shot CLI call, where a single
+                // inject-collect-disconnect is correct by design.
                 winui3.enrich(root, hwnd, pid, fastProperties);
             }
+            // else: lookup was supplied (watch/MCP) but returned no alive
+            // connection - skip rather than silently reinject; see the
+            // Xaml case above for the full rationale.
 #endif
             break;
         }
