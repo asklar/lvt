@@ -172,6 +172,24 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
     auto& entry = g_sessionConnections[session.id];
 
+    // A connection can die mid-session (a transient timeout against an
+    // unusually large/busy tree, or the target recycling something XAML
+    // diagnostics-related - see main.cpp's refresh_dead_watch_connections
+    // for the live evidence and full reasoning, which applies identically
+    // here). Drop any dead entries first so the "what does this session
+    // still need" check below is based on current reality, not just
+    // whether a label was ever successfully connected once - otherwise a
+    // single transient failure would silently and permanently fall back to
+    // one-shot-per-call reinjection for the rest of the session.
+    for (auto it = entry.begin(); it != entry.end();) {
+        if (it->second && !it->second->is_alive()) {
+            it->second.reset();
+            it = entry.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     const auto has_label = [&entry](const char* label) {
         for (const auto& [existingLabel, handle] : entry) {
             if (existingLabel == label && handle)

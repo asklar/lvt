@@ -763,12 +763,76 @@ static lvt::ConnectionLookup make_lookup(
     };
 }
 
+// Called once per tick, before building the tree: if a held connection has
+// died (a transient timeout against an unusually large/busy tree - observed
+// live against Microsoft Store's home page, whose own collection can take
+// several seconds even in --fast mode - or the target recycling something
+// XAML-diagnostics-related), is_alive() goes false and build_tree correctly
+// falls back to a one-shot re-inject for that one tick. Without this
+// function, that fallback would be *permanent* for the rest of the watch
+// session: nothing ever tried to re-establish a fresh persistent connection
+// afterward, so every subsequent tick would keep re-injecting from scratch
+// for as long as `watch` kept running - silently regressing to exactly the
+// per-tick reinjection behavior (and its refresh/reset symptom) this whole
+// mechanism exists to replace. Observed live: once Microsoft Store's XAML
+// connection timed out once, every following tick logged
+// "InitializeXamlDiagnosticsEx failed" - the connection endpoints were still
+// consumed/settling from the connection that had just died, so immediately
+// retrying via the one-shot path on every single tick kept losing that race
+// too, compounding rather than recovering.
+//
+// Releasing a dead ConnectionHandle before calling acquire() again for the
+// same key is required, not just tidy: ConnectionRegistry::release() only
+// looks up its map by (pid, label), not by matching the specific connection
+// instance a caller's handle refers to. Reacquiring first (while still
+// holding the old, dead handle) would create a new entry in the map under
+// that same key; the old handle's *later* release would then decrement the
+// brand new entry's refcount instead of the dead one's, since release() has
+// no way to tell them apart - risking the fresh connection being torn down
+// prematurely. Resetting first ensures the dead entry is fully erased
+// before any new one for the same key can exist.
+static void refresh_dead_watch_connections(
+    const lvt::TargetInfo& target, const Args& args,
+    std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
+    bool anyDead = false;
+    for (auto& [label, handle] : connections) {
+        if (handle && !handle->is_alive()) {
+            if (lvt::g_debug)
+                fprintf(stderr, "lvt: %s connection died; will attempt to reconnect\n", label.c_str());
+            handle.reset();
+            anyDead = true;
+        }
+    }
+    if (!anyDead)
+        return;
+
+    // Re-derive fresh connections via the same logic used at startup rather
+    // than duplicating it, then take only the ones this call actually
+    // needed (still-alive entries above were left alone and must not be
+    // touched here - see this function's own comment on why acquiring twice
+    // for the same live key, even transiently, is safe: it is just a
+    // temporary extra refcount that `fresh` going out of scope drops again,
+    // never releasing anything this function did not itself acquire).
+    auto fresh = acquire_watch_connections(target, args);
+    for (auto& [label, handle] : connections) {
+        if (handle)
+            continue;
+        for (auto& [freshLabel, freshHandle] : fresh) {
+            if (freshLabel == label && freshHandle) {
+                handle = std::move(freshHandle);
+                break;
+            }
+        }
+    }
+}
+
 static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
-    // Acquired ONCE for the whole watch session (not per tick - see
-    // acquire_watch_connections's doc comment) and released automatically
-    // when this function returns, however it returns.
+    // Acquired at the start of the session and refreshed whenever a held
+    // connection dies (see refresh_dead_watch_connections) - not
+    // re-acquired from scratch every tick, which is the entire point of
+    // this mechanism.
     std::vector<std::pair<std::string, lvt::ConnectionHandle>> connections;
     connections = acquire_watch_connections(target, args);
     lvt::ConnectionLookup lookup = make_lookup(connections);
@@ -817,6 +881,8 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             fprintf(stderr, "lvt: target window closed\n");
             break;
         }
+
+        refresh_dead_watch_connections(target, args, connections);
 
         lvt::Element current;
         if (!build_output_tree(target, args, current, lookup)) {
