@@ -12,6 +12,13 @@
 #include "providers/uia_provider.h"
 #include "providers/uia_actions.h"
 #endif
+#include "providers/connection_registry.h"
+#if LVT_ENABLE_XAML
+#include "providers/xaml_provider.h"
+#endif
+#if LVT_ENABLE_WINUI3
+#include "providers/winui3_provider.h"
+#endif
 
 #include "element_key.h"
 #include <cstdio>
@@ -566,8 +573,13 @@ static std::string uia_framework_label(const Args&) { return "uia"; }
 // Build the root tree for the requested mode. --uia replaces the visual tree
 // outright rather than enriching it: it is a different view of the same window,
 // produced without injecting anything into the target.
+//
+// `connectionLookup` is forwarded to build_tree unchanged - see its own doc
+// comment in tree_builder.h. Only run_watch_loop supplies one today, so
+// every other caller (dump/query/screenshot) sees no behavior change.
 static bool build_root_tree(const lvt::TargetInfo& target, const Args& args,
-                            lvt::Element& tree) {
+                            lvt::Element& tree,
+                            const lvt::ConnectionLookup& connectionLookup = {}) {
     if (args.uia) {
         if (!build_uia_tree(target, args, tree))
             return false;
@@ -576,14 +588,15 @@ static bool build_root_tree(const lvt::TargetInfo& target, const Args& args,
 
     auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
     tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption,
-                          args.fastProperties);
+                          args.fastProperties, connectionLookup);
     return true;
 }
 
 static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
-                              lvt::Element& outputTree) {
+                              lvt::Element& outputTree,
+                              const lvt::ConnectionLookup& connectionLookup = {}) {
     lvt::Element tree;
-    if (!build_root_tree(target, args, tree))
+    if (!build_root_tree(target, args, tree, connectionLookup))
         return false;
 
     lvt::Element* outputRoot = &tree;
@@ -633,8 +646,86 @@ static bool lost_injected_framework_content(const lvt::Element& previous, const 
     return false;
 }
 
+// Acquires a persistent connection (see connection_registry.h) for every
+// injectable framework (xaml/winui3) detected on `target`, so the tick loop
+// below can reuse them via build_tree's ConnectionLookup instead of
+// re-injecting from scratch every tick - the confirmed root cause of the
+// leaked-window/"tree refreshes" bug this redesign replaces. Held for the
+// whole watch session; released (each ConnectionHandle's destructor sends a
+// clean DISCONNECT) when run_watch_loop returns.
+//
+// Needs a fresh, UNTRIMMED tree walk of its own rather than reusing
+// whatever the tick loop's `previous`/`current` holds: those may have been
+// scoped by --element/--depth and could be missing the very node (e.g. a
+// CoreWindow) XamlProvider::open_connection needs to resolve which process
+// to inject into. This probe tree is discarded once that resolution is done.
+static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_connections(
+    const lvt::TargetInfo& target) {
+    std::vector<std::pair<std::string, lvt::ConnectionHandle>> connections;
+
+    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+    bool hasXaml = false, hasWinUI3 = false;
+    for (auto& fi : frameworks) {
+        if (fi.type == lvt::Framework::Xaml) hasXaml = true;
+        if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
+    }
+    if (!hasXaml && !hasWinUI3)
+        return connections;
+
+    lvt::Element probeTree = lvt::build_tree(target.hwnd, target.pid, frameworks);
+
+#if LVT_ENABLE_XAML
+    if (hasXaml) {
+        auto handle = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, "xaml",
+            [&probeTree](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                lvt::XamlProvider xaml;
+                return xaml.open_connection(probeTree, hwnd, pid);
+            });
+        if (handle)
+            connections.emplace_back("xaml", std::move(handle));
+    }
+#endif
+#if LVT_ENABLE_WINUI3
+    if (hasWinUI3) {
+        auto handle = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, "winui3",
+            [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                lvt::WinUI3Provider winui3;
+                return winui3.open_connection(hwnd, pid);
+            });
+        if (handle)
+            connections.emplace_back("winui3", std::move(handle));
+    }
+#endif
+    return connections;
+}
+
+// Builds a ConnectionLookup (see tree_builder.h) closing over `connections`
+// so build_tree can find the right one by framework label without knowing
+// anything about the registry or how it was acquired.
+static lvt::ConnectionLookup make_lookup(
+    std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
+    return [&connections](const std::string& label) -> lvt::IFrameworkConnection* {
+        for (auto& [lbl, handle] : connections) {
+            if (lbl == label)
+                return handle.get();
+        }
+        return nullptr;
+    };
+}
+
 static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+
+    // Acquired ONCE for the whole watch session (not per tick - see
+    // acquire_watch_connections's doc comment) and released automatically
+    // when this function returns, however it returns. UIA-only sessions
+    // never inject anything, so skip this entirely for --uia.
+    std::vector<std::pair<std::string, lvt::ConnectionHandle>> connections;
+    if (!args.uia)
+        connections = acquire_watch_connections(target);
+    lvt::ConnectionLookup lookup = make_lookup(connections);
 
     // The very first tree build did not get the same tolerance the tick loop
     // below already has for a transient failure — it would fail outright
@@ -658,7 +749,7 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
                 fprintf(stderr, "lvt: retrying initial watch connection (attempt %d)\n", attempt + 1);
             Sleep(static_cast<DWORD>(300 * attempt));
         }
-        built = build_output_tree(target, args, previous);
+        built = build_output_tree(target, args, previous, lookup);
     }
     if (!built)
         return 1;
@@ -682,7 +773,7 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
         }
 
         lvt::Element current;
-        if (!build_output_tree(target, args, current)) {
+        if (!build_output_tree(target, args, current, lookup)) {
             // A tick can fail transiently — most easily in UIA mode, where a
             // momentarily busy target trips the transaction timeout. That is
             // precisely the condition --watch exists to observe, so skip the
@@ -708,7 +799,7 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
                     fprintf(stderr, "lvt: XAML/WinUI3 content vanished this tick; retrying (attempt %d)\n", extra + 1);
                 Sleep(1000);
                 lvt::Element retryTree;
-                if (build_output_tree(target, args, retryTree))
+                if (build_output_tree(target, args, retryTree, lookup))
                     current = std::move(retryTree);
             }
         }

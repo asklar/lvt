@@ -10,11 +10,18 @@
 #include "screenshot.h"
 #include "target.h"
 #include "tree_builder.h"
+#include "providers/connection_registry.h"
 
 #ifdef LVT_ENABLE_UIA
 #include "providers/uia_actions.h"
 #include "providers/uia_props.h"
 #include "providers/uia_provider.h"
+#endif
+#if LVT_ENABLE_XAML
+#include "providers/xaml_provider.h"
+#endif
+#if LVT_ENABLE_WINUI3
+#include "providers/winui3_provider.h"
 #endif
 
 #include <wil/resource.h>
@@ -131,6 +138,87 @@ bool find_session(const std::string& id, Session& out) {
         return false;
     out = it->second;
     return true;
+}
+
+// --- per-session persistent connections ----------------------------------
+//
+// Session is copied out of g_sessions by find_session/require_session (a
+// deliberate choice: methods do their real work without holding
+// g_sessionsMutex for that whole time), so a persistent IFrameworkConnection
+// - move-only by design, see connection_registry.h's ConnectionHandle -
+// cannot live as a Session member; it is kept here instead, keyed by session
+// id, and reused across every get_visual_tree/find_elements/click/... call
+// that session makes against an XAML/WinUI3 target, the same way watch's
+// loop reuses one across ticks (see main.cpp's acquire_watch_connections).
+// Erased (dropping the ConnectionHandles, which disconnect cleanly) in
+// method_disconnect.
+std::mutex g_connectionsMutex;
+std::map<std::string, std::vector<std::pair<std::string, lvt::ConnectionHandle>>> g_sessionConnections;
+
+// Builds a ConnectionLookup for build_tree, lazily acquiring (once per
+// session, on whichever call first needs it) a persistent connection for
+// each xaml/winui3 framework this session's target actually has. Returns an
+// empty (falsy) ConnectionLookup when the target has neither, so build_tree
+// falls back to its normal one-shot-per-call path with no behavior change.
+lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
+                                                    const std::vector<lvt::FrameworkInfo>& frameworks) {
+    bool hasXaml = false, hasWinUI3 = false;
+    for (auto& fi : frameworks) {
+        if (fi.type == lvt::Framework::Xaml) hasXaml = true;
+        if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
+    }
+    if (!hasXaml && !hasWinUI3)
+        return {};
+
+    std::lock_guard<std::mutex> lock(g_connectionsMutex);
+    auto& entry = g_sessionConnections[session.id];
+    if (entry.empty()) {
+        // A full, untrimmed probe tree, needed only to resolve which
+        // process/DLL a connection should target (XamlProvider needs to
+        // locate the CoreWindow) - discarded once that resolution is done.
+        // If this first attempt fails to acquire anything, `entry` stays
+        // empty and the next call simply tries again rather than caching
+        // a permanent failure.
+        lvt::Element probeTree = lvt::build_tree(session.hwnd, session.pid, frameworks);
+#if LVT_ENABLE_XAML
+        if (hasXaml) {
+            auto handle = lvt::ConnectionRegistry::instance().acquire(
+                session.pid, session.hwnd, "xaml",
+                [&probeTree](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                    lvt::XamlProvider xaml;
+                    return xaml.open_connection(probeTree, hwnd, pid);
+                });
+            if (handle)
+                entry.emplace_back("xaml", std::move(handle));
+        }
+#endif
+#if LVT_ENABLE_WINUI3
+        if (hasWinUI3) {
+            auto handle = lvt::ConnectionRegistry::instance().acquire(
+                session.pid, session.hwnd, "winui3",
+                [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                    lvt::WinUI3Provider winui3;
+                    return winui3.open_connection(hwnd, pid);
+                });
+            if (handle)
+                entry.emplace_back("winui3", std::move(handle));
+        }
+#endif
+    }
+
+    // `entry` lives in g_sessionConnections for as long as this session
+    // does (std::map never invalidates other elements' addresses on
+    // insert/erase), so capturing its address is safe for the lookup's
+    // short lifetime - used once, synchronously, within this same
+    // build_tree_for call.
+    auto* connections = &entry;
+    return [connections](const std::string& label) -> lvt::IFrameworkConnection* {
+        for (auto& [lbl, handle] : *connections) {
+            if (lbl == label)
+                return handle.get();
+        }
+        return nullptr;
+    };
 }
 
 // --- per-target serialization -------------------------------------------
@@ -481,7 +569,8 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
 
     auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
     const bool fastProperties = get_bool(params, "fast", false);
-    tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {}, fastProperties);
+    auto connectionLookup = connection_lookup_for_session(session, frameworks);
+    tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {}, fastProperties, connectionLookup);
     return true;
 }
 
@@ -628,6 +717,15 @@ json method_disconnect(const json& params) {
     }
     if (!stillReferenced)
         forget_target_lock(released);
+    {
+        // Dropping this session's ConnectionHandles here releases the
+        // registry's references (see connection_registry.h); if this was
+        // the last reference to a given (pid, framework) connection, its
+        // destructor sends a clean DISCONNECT rather than leaving it open
+        // until the whole MCP server process eventually exits.
+        std::lock_guard<std::mutex> lock(g_connectionsMutex);
+        g_sessionConnections.erase(id);
+    }
     return json{{"disconnected", id}};
 }
 

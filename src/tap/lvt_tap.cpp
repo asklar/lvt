@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <mutex>
+#include <optional>
 #include <unknwn.h>
 
 #include "xaml_property_filter.h"
@@ -79,6 +81,39 @@ static HMODULE GetCurrentModuleHandle() {
     return hm;
 }
 
+// Buffered line reader over the persistent duplex pipe. Reading one byte per
+// ReadFile call (fine for a single one-shot handshake) is far too slow once
+// this pipe stays open for the whole connection and carries a full tree's
+// JSON (potentially several MB) as one line per GET_TREE response — this
+// reads in 8KB chunks and splits on '\n', keeping any partial trailing line
+// buffered for the next call.
+class PipeLineReader {
+public:
+    explicit PipeLineReader(HANDLE pipe) : m_pipe(pipe) {}
+
+    // Returns std::nullopt on EOF or a read error (the pipe is gone).
+    std::optional<std::string> ReadLine() {
+        for (;;) {
+            auto nl = m_buffer.find('\n');
+            if (nl != std::string::npos) {
+                std::string line = m_buffer.substr(0, nl);
+                m_buffer.erase(0, nl + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                return line;
+            }
+            char chunk[8192];
+            DWORD read = 0;
+            BOOL ok = ReadFile(m_pipe, chunk, sizeof(chunk), &read, nullptr);
+            if (!ok || read == 0) return std::nullopt;
+            m_buffer.append(chunk, read);
+        }
+    }
+
+private:
+    HANDLE m_pipe;
+    std::string m_buffer;
+};
+
 struct TreeNode {
     InstanceHandle handle = 0;
     std::wstring type;
@@ -120,17 +155,46 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     // a std::map has no efficient random-access range, hence flattening.
     std::vector<InstanceHandle> m_orderedHandles;
     std::vector<InstanceHandle> m_roots;
+    // Guards all direct access to m_nodes/m_roots/m_orderedHandles. XAML's
+    // OnVisualTreeChange can fire on whichever UI thread owns the affected
+    // element(s) - which, for an app with more than one XAML "core"/window,
+    // need not be the same thread m_msgWnd (and therefore CollectBounds/
+    // CollectPositionsAndText, dispatched there via SendMessage) is pinned
+    // to. This mattered far less under the old one-shot-per-tick design,
+    // which read this data exactly once, immediately after a single
+    // synchronous initial replay. A persistent connection reads it
+    // repeatedly across many GET_TREE requests over its whole life, so a
+    // concurrent Add/Remove from another thread needs an actual lock, not
+    // just favorable timing.
+    std::mutex m_nodesMutex;
     std::wstring m_pipeName;
     // Parsed from the pipe-name suffix ("pipe_name|FAST") passed down from
-    // xaml_diag_common.cpp — see CollectBoundsForNode / CollectPositionsAndText
-    // for what this actually gates. Defaults to false (today's full,
-    // GetPropertyValuesChain-based collection) so existing callers that never
-    // set the suffix see no behavior change.
+    // xaml_diag_common.cpp — this is only the connection-wide *default*;
+    // each GET_TREE request can override it for that one response (see
+    // HandleGetTree), so a single persistent connection can still mix fast
+    // live-tree polls with an occasional full-property request the way the
+    // old per-call model did.
     bool m_fastMode = false;
+    // The persistent, duplex connection back to lvt.exe. Opened exactly
+    // once per connection lifetime (see ConnectPipeOnce) and kept open for
+    // as long as the command loop runs - this is the whole point of this
+    // redesign: one connect, many requests, instead of the old one-shot
+    // "collect once, write once, close" pipe.
+    wil::unique_hfile m_pipe;
+    // Guards every write to m_pipe. A GET_TREE response (written from the
+    // worker/command-loop thread) and a pushed CHANGE event (written from
+    // whichever thread XAML's OnVisualTreeChange happens to call back on)
+    // must never interleave their bytes on the wire.
+    std::mutex m_pipeWriteMutex;
 
 public:
     wil::com_ptr<IVisualTreeService> m_vts;
     static constexpr UINT WM_COLLECT_BOUNDS = WM_USER + 100;
+    // WM_COLLECT_BOUNDS + 1 is used for CollectPositionsAndText dispatch
+    // (see LvtTapMsgWndProc). This one asks the UI thread (the only thread
+    // allowed to destroy a window it owns) to destroy m_msgWnd during final
+    // cleanup - see CleanupUIResources.
+    static constexpr UINT WM_TAP_DESTROY = WM_USER + 102;
 
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -257,6 +321,39 @@ public:
         return self->AdviseThreadProcImpl();
     }
 
+    // Connects the persistent duplex pipe back to lvt.exe. Unlike the old
+    // one-shot model (open, write once, close), this handle is kept open
+    // for the connection's whole life - see m_pipe's comment.
+    bool ConnectPipeOnce() {
+        if (m_pipeName.empty()) {
+            LogMsg("ConnectPipeOnce: pipe name is empty");
+            return false;
+        }
+        m_pipe.reset(CreateFileW(m_pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                                  nullptr, OPEN_EXISTING, 0, nullptr));
+        if (!m_pipe) {
+            LogMsg("ConnectPipeOnce: failed to open pipe, error=%lu", GetLastError());
+            return false;
+        }
+        LogMsg("ConnectPipeOnce: connected");
+        return true;
+    }
+
+    // Writes one line (message + '\n') to the pipe. Safe to call from any
+    // thread - guarded (see m_pipeWriteMutex) so a pushed CHANGE event can
+    // never interleave its bytes with a GET_TREE response.
+    bool WriteLine(const std::string& utf8Line) {
+        std::lock_guard<std::mutex> lock(m_pipeWriteMutex);
+        if (!m_pipe) return false;
+        std::string withNewline = utf8Line;
+        withNewline += '\n';
+        DWORD written = 0;
+        BOOL ok = WriteFile(m_pipe.get(), withNewline.data(),
+                             static_cast<DWORD>(withNewline.size()), &written, nullptr);
+        if (ok) FlushFileBuffers(m_pipe.get());
+        return ok != FALSE;
+    }
+
     DWORD AdviseThreadProcImpl() {
         LogMsg("AdviseThread starting");
 
@@ -265,6 +362,16 @@ public:
                 static_cast<IVisualTreeServiceCallback*>(
                     static_cast<IVisualTreeServiceCallback2*>(this));
 
+            // AdviseVisualTreeChange is called exactly ONCE per connection
+            // lifetime, here, and stays registered for as long as the
+            // command loop below runs - it is a subscribe-and-react API
+            // (OnVisualTreeChange keeps incrementally maintaining m_nodes/
+            // m_roots for the whole connection), not something meant to be
+            // re-established on every tree refresh. Re-subscribing from
+            // scratch every poll (the old design) is what caused a
+            // confirmed, unbounded per-tick resource leak - see
+            // CleanupUIResources's comment for how this now cleans up
+            // exactly once, when the connection actually ends, instead.
             LogMsg("Calling AdviseVisualTreeChange");
             HRESULT hr = m_vts->AdviseVisualTreeChange(cb);
             LogMsg("AdviseVisualTreeChange returned 0x%08X, nodes=%zu, roots=%zu",
@@ -276,56 +383,151 @@ public:
                     LogMsg("After sleep: nodes=%zu", m_nodes.size());
                 }
 
-                m_orderedHandles.clear();
-                m_orderedHandles.reserve(m_nodes.size());
-                for (auto& [handle, node] : m_nodes) m_orderedHandles.push_back(handle);
+                ServeConnection();
 
-                // Dispatch GetPropertyValuesChain (and, below, TransformToVisual)
-                // to the UI thread in small chunks rather than one call
-                // covering every node. A single unbroken SendMessage call
-                // occupies the target's UI thread start to finish (several
-                // seconds for a rich tree) with no chance to service its own
-                // pending messages in between — including the modal loop
-                // DefWindowProc runs while the user is dragging the window,
-                // observed live as the target app feeling laggy/stuttery to
-                // move while `watch` was attached. Chunking with a short
-                // sleep between SendMessage calls lets that message queue
-                // drain between chunks; every node still gets collected, in
-                // the same order, every tick, so this does not reopen the
-                // flapping the earlier (now-removed) time budget caused.
-                constexpr size_t kBatchSize = 20;
-                if (m_msgWnd) {
-                    LogMsg("Dispatching CollectBounds to UI thread via SendMessage, %zu nodes in batches of %zu",
-                           m_orderedHandles.size(), kBatchSize);
-                    for (size_t start = 0; start < m_orderedHandles.size(); start += kBatchSize) {
-                        BatchRequest req{this, start, kBatchSize};
-                        SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS, 0,
-                                     reinterpret_cast<LPARAM>(&req));
-                        Sleep(1);
-                    }
-                    LogMsg("Finished CollectBounds dispatch");
-                }
-                // Get element positions via TransformToVisual (works around broken
-                // ActualOffset serialization in WinUI3). Must run on the UI thread.
-#if LVT_HAS_XAML_PROJECTION
-                if (m_msgWnd) {
-                    for (size_t start = 0; start < m_orderedHandles.size(); start += kBatchSize) {
-                        BatchRequest req{this, start, kBatchSize};
-                        SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS + 1, 0,
-                                     reinterpret_cast<LPARAM>(&req));
-                        Sleep(1);
-                    }
-                    LogMsg("Finished CollectPositionsAndText dispatch");
-                }
-#endif
-                SerializeAndSend();
                 m_vts->UnadviseVisualTreeChange(cb);
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {
             LogMsg("AdviseThread crashed: 0x%08X", GetExceptionCode());
         }
 
+        CleanupUIResources();
+        LogMsg("AdviseThread exiting");
         return 0;
+    }
+
+    // Connects the persistent pipe and, if that succeeds, serves requests
+    // until the connection ends. Split out of AdviseThreadProcImpl (rather
+    // than inlined into its __try block) because MSVC's SEH rejects any
+    // C++ temporary requiring unwind cleanup - such as the std::string
+    // WriteLine("READY") would otherwise construct - directly inside a
+    // function that also contains __try (error C2712); a plain function
+    // call like this one has no such temporary at the __try call site.
+    void ServeConnection() {
+        if (ConnectPipeOnce()) {
+            WriteLine("READY");
+            LogMsg("Sent READY, entering command loop");
+            RunCommandLoop();
+        } else {
+            LogMsg("Failed to connect pipe; cannot serve requests this connection");
+        }
+    }
+
+    // Persistent request/response loop, run for as long as lvt.exe keeps
+    // this connection open. Each request re-walks bounds/properties over
+    // the ALREADY-subscribed tree (no re-injection, no new AdviseVisualTreeChange,
+    // no new message window) - this is the entire point of this redesign.
+    void RunCommandLoop() {
+        PipeLineReader reader(m_pipe.get());
+        for (;;) {
+            auto line = reader.ReadLine();
+            if (!line) {
+                LogMsg("RunCommandLoop: pipe closed/error, exiting loop");
+                break;
+            }
+            LogMsg("RunCommandLoop: received command '%s'", line->c_str());
+            if (*line == "DISCONNECT") {
+                WriteLine("BYE");
+                break;
+            } else if (line->rfind("GET_TREE", 0) == 0) {
+                bool fast = line->find("FAST") != std::string::npos;
+                HandleGetTree(fast);
+            } else {
+                LogMsg("RunCommandLoop: unknown command, ignoring");
+            }
+        }
+    }
+
+    // Re-collects bounds/properties for the tree already tracked in m_nodes
+    // (kept current by OnVisualTreeChange for the whole connection) and
+    // writes exactly one response line - every GET_TREE must get a
+    // response, even an empty "[]", since lvt.exe blocks waiting for one.
+    void HandleGetTree(bool fast) {
+        m_fastMode = fast;
+
+        {
+            std::lock_guard<std::mutex> lock(m_nodesMutex);
+            m_orderedHandles.clear();
+            m_orderedHandles.reserve(m_nodes.size());
+            for (auto& [handle, node] : m_nodes) m_orderedHandles.push_back(handle);
+        }
+
+        // Dispatch GetPropertyValuesChain (and, below, TransformToVisual) to
+        // the UI thread in small chunks rather than one call covering every
+        // node. A single unbroken SendMessage call occupies the target's UI
+        // thread start to finish (several seconds for a rich tree) with no
+        // chance to service its own pending messages in between — including
+        // the modal loop DefWindowProc runs while the user is dragging the
+        // window, observed live as the target app feeling laggy/stuttery to
+        // move while `watch` was attached. Chunking with a short sleep
+        // between SendMessage calls lets that message queue drain between
+        // chunks; every node still gets collected, in the same order, every
+        // request.
+        constexpr size_t kBatchSize = 20;
+        if (m_msgWnd) {
+            LogMsg("Dispatching CollectBounds to UI thread via SendMessage, %zu nodes in batches of %zu",
+                   m_orderedHandles.size(), kBatchSize);
+            for (size_t start = 0; start < m_orderedHandles.size(); start += kBatchSize) {
+                BatchRequest req{this, start, kBatchSize};
+                SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS, 0,
+                             reinterpret_cast<LPARAM>(&req));
+                Sleep(1);
+            }
+            LogMsg("Finished CollectBounds dispatch");
+        }
+        // Get element positions via TransformToVisual (works around broken
+        // ActualOffset serialization in WinUI3). Must run on the UI thread.
+#if LVT_HAS_XAML_PROJECTION
+        if (m_msgWnd) {
+            for (size_t start = 0; start < m_orderedHandles.size(); start += kBatchSize) {
+                BatchRequest req{this, start, kBatchSize};
+                SendMessageW(m_msgWnd.get(), WM_COLLECT_BOUNDS + 1, 0,
+                             reinterpret_cast<LPARAM>(&req));
+                Sleep(1);
+            }
+            LogMsg("Finished CollectPositionsAndText dispatch");
+        }
+#endif
+        SerializeAndSend();
+    }
+
+    // Tears down everything SetSiteImpl/AdviseThreadProcImpl set up, exactly
+    // once, when the connection actually ends (DISCONNECT or a broken
+    // pipe) - not once per tree refresh. This is the direct fix for the
+    // confirmed leak: every earlier version of this file created a new
+    // message-only window per collection and never destroyed it.
+    void CleanupUIResources() {
+        if (m_msgWnd) {
+            HWND hwnd = m_msgWnd.get();
+            LogMsg("Cleanup: requesting destroy of message window %p", hwnd);
+            // DestroyWindow must run on the thread that created the window
+            // (the UI thread SetSiteImpl ran on), not this worker thread -
+            // dispatch it there via the same SendMessage mechanism already
+            // used for bounds collection. A bounded timeout (rather than a
+            // bare blocking SendMessage) means a hung/gone UI thread cannot
+            // keep this worker thread - and therefore this whole cleanup -
+            // from ever completing.
+            DWORD_PTR result = 0;
+            LRESULT dispatched = SendMessageTimeoutW(hwnd, WM_TAP_DESTROY, 0, 0,
+                                                      SMTO_ABORTIFHUNG, 2000, &result);
+            if (dispatched == 0) {
+                LogMsg("Cleanup: SendMessageTimeout for destroy failed/timed out, error=%lu",
+                       GetLastError());
+            } else if (IsWindow(hwnd)) {
+                LogMsg("Cleanup: message window still alive after destroy request");
+            } else {
+                LogMsg("Cleanup: message window destroyed");
+                // Already destroyed on the correct thread above; release
+                // ownership so wil::unique_hwnd's destructor does not also
+                // attempt DestroyWindow (which would run on THIS thread,
+                // the wrong one, and on an already-invalid handle).
+                (void)m_msgWnd.release();
+            }
+        }
+        UnregisterClassW(L"LvtTapMsg", GetCurrentModuleHandle());
+        m_vts.reset();
+        m_diag.reset();
+        m_pipe.reset();
     }
 
     HRESULT STDMETHODCALLTYPE GetSite(REFIID riid, void** ppvSite) override {
@@ -339,6 +541,7 @@ public:
         VisualElement element,
         VisualMutationType mutationType) override
     {
+        std::lock_guard<std::mutex> lock(m_nodesMutex);
         if (mutationType == VisualMutationType::Add) {
             TreeNode node;
             node.handle = element.Handle;
@@ -356,6 +559,28 @@ public:
                 }
             } else {
                 m_roots.push_back(element.Handle);
+            }
+        } else if (mutationType == VisualMutationType::Remove) {
+            // Essential for a persistent connection, not optional: the old
+            // one-shot-per-tick design never needed this branch at all - a
+            // removed element simply would not appear in the *next fresh*
+            // replay, since m_nodes was rebuilt from scratch every time. A
+            // long-lived connection's m_nodes is never rebuilt, so without
+            // this, every element the target ever destroys would stay in
+            // the reported tree forever.
+            auto it = m_nodes.find(element.Handle);
+            if (it != m_nodes.end()) {
+                InstanceHandle parent = it->second.parent;
+                m_nodes.erase(it);
+                if (parent != 0) {
+                    auto pit = m_nodes.find(parent);
+                    if (pit != m_nodes.end()) {
+                        auto& kids = pit->second.childHandles;
+                        kids.erase(std::remove(kids.begin(), kids.end(), element.Handle), kids.end());
+                    }
+                } else {
+                    m_roots.erase(std::remove(m_roots.begin(), m_roots.end(), element.Handle), m_roots.end());
+                }
             }
         }
         return S_OK;
@@ -549,6 +774,7 @@ private:
         int collected = 0;
         for (size_t i = start; i < end; i++) {
             InstanceHandle handle = m_orderedHandles[i];
+            std::lock_guard<std::mutex> lock(m_nodesMutex);
             auto it = m_nodes.find(handle);
             if (it == m_nodes.end()) continue;
             TreeNode& node = it->second;
@@ -597,6 +823,7 @@ private:
         int positioned = 0, textsRead = 0, boundsFromFastPath = 0;
         for (size_t i = start; i < end; i++) {
             InstanceHandle handle = m_orderedHandles[i];
+            std::lock_guard<std::mutex> lock(m_nodesMutex);
             auto it = m_nodes.find(handle);
             if (it == m_nodes.end()) continue;
             TreeNode& node = it->second;
@@ -793,17 +1020,31 @@ private:
     }
 
     void SerializeAndSend() {
-        LogMsg("SerializeAndSend: nodes=%zu, roots=%zu, pipe=%ls",
-               m_nodes.size(), m_roots.size(), m_pipeName.c_str());
+        // One lock for the whole recursive walk (SerializeNode is
+        // non-reentrant with respect to m_nodesMutex - it is only ever
+        // called from here) so the tree serialized is a single consistent
+        // snapshot, not a mix of before/after some concurrent Add/Remove
+        // that happened to land mid-walk. Released before the pipe write
+        // below, which can block on a slow/busy reader and has nothing to
+        // do with m_nodes.
+        std::wstring json;
+        {
+            std::lock_guard<std::mutex> lock(m_nodesMutex);
+            LogMsg("SerializeAndSend: nodes=%zu, roots=%zu", m_nodes.size(), m_roots.size());
 
-        if (m_pipeName.empty() || m_nodes.empty()) return;
-
-        std::wstring json = L"[";
-        for (size_t i = 0; i < m_roots.size(); i++) {
-            if (i) json += L",";
-            json += SerializeNode(m_roots[i]);
+            // Every GET_TREE request gets exactly one response line, even
+            // an empty "[]" - lvt.exe's connection object is blocked
+            // waiting for a reply (see xaml_diag_common.cpp's get_tree()),
+            // and silently returning here without writing anything would
+            // hang it until its own read timeout instead of completing
+            // quickly with "no data".
+            json = L"[";
+            for (size_t i = 0; i < m_roots.size(); i++) {
+                if (i) json += L",";
+                json += SerializeNode(m_roots[i]);
+            }
+            json += L"]";
         }
-        json += L"]";
         LogMsg("SerializeAndSend: built JSON, %zu wchars", json.size());
 
         int len = WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
@@ -811,17 +1052,11 @@ private:
         std::string utf8(len, '\0');
         WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
                             utf8.data(), len, nullptr, nullptr);
-        LogMsg("SerializeAndSend: converted to UTF-8, %d bytes; opening pipe", len);
 
-        wil::unique_hfile pipe(CreateFileW(m_pipeName.c_str(), GENERIC_WRITE, 0,
-                                  nullptr, OPEN_EXISTING, 0, nullptr));
-        if (pipe) {
-            DWORD written = 0;
-            WriteFile(pipe.get(), utf8.data(), (DWORD)utf8.size(), &written, nullptr);
-            FlushFileBuffers(pipe.get());
-            LogMsg("Wrote %lu bytes to pipe", written);
+        if (WriteLine(utf8)) {
+            LogMsg("SerializeAndSend: wrote %d bytes to the persistent pipe", len);
         } else {
-            LogMsg("Failed to open pipe: %lu", GetLastError());
+            LogMsg("SerializeAndSend: failed to write to pipe, error=%lu", GetLastError());
         }
     }
 };
@@ -842,6 +1077,13 @@ static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             req->self->CollectPositionsOnUIThread(req->start, req->count);
         }
 #endif
+        return 0;
+    }
+    if (msg == LvtTap::WM_TAP_DESTROY) {
+        // Runs on the thread that created hwnd (this window's owning UI
+        // thread) - see CleanupUIResources for why DestroyWindow cannot be
+        // called directly from the worker thread instead.
+        DestroyWindow(hwnd);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);

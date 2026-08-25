@@ -2418,6 +2418,96 @@ TEST_F(WinUI3SampleFixture, UiaWatchEmitsAddedEvents) {
     EXPECT_GT(events, 0) << "no complete watch events parsed";
 }
 
+// Regression test for the persistent-connection redesign (see
+// connection_registry.h / xaml_diag_common.cpp's XamlDiagConnection): watch
+// must inject and subscribe (InitializeXamlDiagnosticsEx + AdviseVisualTreeChange)
+// exactly ONCE for the life of a session, not once per tick. That per-tick
+// re-injection was the confirmed root cause of an unbounded resource leak
+// (a message-only window created and never destroyed every tick) and the
+// "tree refreshes/resets" bug diagnosed live against Microsoft Store.
+TEST_F(WinUI3SampleFixture, WatchReusesOnePersistentConnectionAcrossManyTicks) {
+    SkipIfNotReady();
+
+    // The sample app here is unpackaged (plain CreateProcessA, no AppContainer),
+    // so its TAP DLL logs to the simple, global %TEMP%\lvt_tap.log - counting
+    // "SetSite called" lines before and after running several ticks is a
+    // direct, unambiguous measure of how many times the TAP DLL was actually
+    // (re)injected, which nothing observable from outside the process
+    // (stdout, the CLI's own exit code) can distinguish otherwise.
+    wchar_t tempPath[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempPath);
+    std::wstring logPath = std::wstring(tempPath) + L"lvt_tap.log";
+
+    auto count_set_site_calls = [&]() -> int {
+        std::ifstream log(logPath, std::ios::binary);
+        if (!log)
+            return 0;
+        int count = 0;
+        std::string line;
+        while (std::getline(log, line)) {
+            if (line.find("SetSite called") != std::string::npos)
+                count++;
+        }
+        return count;
+    };
+
+    const int before = count_set_site_calls();
+
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    wil::unique_handle readEnd, writeEnd;
+    ASSERT_TRUE(CreatePipe(readEnd.put(), writeEnd.put(), &sa, 0));
+    ASSERT_TRUE(SetHandleInformation(readEnd.get(), HANDLE_FLAG_INHERIT, 0));
+
+    STARTUPINFOA si{sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = writeEnd.get();
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION pi{};
+
+    auto lvt = get_lvt_path();
+    std::string cmd = make_cmd(lvt, get_pid_arg() + " watch --interval 300");
+    ASSERT_TRUE(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                               CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi));
+    wil::unique_handle process(pi.hProcess);
+    wil::unique_handle thread(pi.hThread);
+    writeEnd.reset();  // so ReadFile sees EOF if the child ever exits
+
+    // Drain output for several seconds so multiple ticks genuinely happen -
+    // event content/correctness is already covered elsewhere; only that
+    // real time passes while the connection stays open and keeps serving
+    // requests matters for this test.
+    std::string output;
+    const auto deadline = GetTickCount64() + 6000;
+    while (GetTickCount64() < deadline) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(readEnd.get(), nullptr, 0, nullptr, &available, nullptr))
+            break;
+        if (available == 0) {
+            Sleep(50);
+            continue;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!ReadFile(readEnd.get(), chunk.data(), available, &read, nullptr) || read == 0)
+            break;
+        output.append(chunk, 0, read);
+    }
+
+    TerminateProcess(process.get(), 0);
+    WaitForSingleObject(process.get(), 5000);
+
+    ASSERT_FALSE(output.empty()) << "watch emitted nothing";
+
+    const int after = count_set_site_calls();
+    // Exactly one new connection is expected for this whole session. Allow
+    // a small margin (e.g. one resync retry if the target was briefly busy)
+    // but this must be nowhere near "one per tick" - at a 300ms interval
+    // over 6 seconds that would be roughly 20.
+    EXPECT_LE(after - before, 2)
+        << "watch re-injected far more than once (SetSite called " << before << " times before, "
+        << after << " times after) - the persistent connection was not reused across ticks";
+}
+
 // --- Cross-architecture behaviour ---
 // --uia injects nothing, so it is exempt from the architecture-match check that
 // the visual-tree providers need. Both halves of that claim are asserted here,

@@ -179,7 +179,8 @@ void trim_to_depth(Element& root, int maxDepth) {
 }
 
 Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frameworks,
-                   int maxDepth, const std::string& pluginOption, bool fastProperties) {
+                   int maxDepth, const std::string& pluginOption, bool fastProperties,
+                   const ConnectionLookup& connectionLookup) {
     // Start with the Win32 provider as the base — it always applies
     Win32Provider win32;
     Element root = win32.build(hwnd, maxDepth);
@@ -195,14 +196,24 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         case Framework::Xaml: {
 #if LVT_ENABLE_XAML
             XamlProvider xaml;
-            xaml.enrich(root, hwnd, pid, fastProperties);
+            auto connection = connectionLookup ? connectionLookup("xaml") : nullptr;
+            if (connection && connection->is_alive()) {
+                xaml.enrich_with_connection(root, *connection, fastProperties);
+            } else {
+                xaml.enrich(root, hwnd, pid, fastProperties);
+            }
 #endif
             break;
         }
         case Framework::WinUI3: {
 #if LVT_ENABLE_WINUI3
             WinUI3Provider winui3;
-            winui3.enrich(root, hwnd, pid, fastProperties);
+            auto connection = connectionLookup ? connectionLookup("winui3") : nullptr;
+            if (connection && connection->is_alive()) {
+                winui3.enrich_with_connection(root, *connection, fastProperties);
+            } else {
+                winui3.enrich(root, hwnd, pid, fastProperties);
+            }
 #endif
             break;
         }

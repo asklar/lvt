@@ -69,4 +69,15 @@ void WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProper
                                L"WinUIVisualDiagConnection", fastProperties);
 }
 
+std::shared_ptr<IFrameworkConnection> WinUI3Provider::open_connection(HWND hwnd, DWORD pid) {
+    std::wstring frameworkUdk = find_framework_udk(pid);
+    std::wstring initDll = !frameworkUdk.empty() ? frameworkUdk : L"Windows.UI.Xaml.dll";
+    return make_xaml_diag_connection(hwnd, pid, L"", initDll, "winui3", L"WinUIVisualDiagConnection");
+}
+
+void WinUI3Provider::enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties) {
+    label_winui3_windows(root);
+    connection.get_tree(root, fastProperties);
+}
+
 } // namespace lvt

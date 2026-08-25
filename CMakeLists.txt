@@ -129,6 +129,7 @@ set(LVT_CORE_SOURCES
     src/wil_diagnostics.cpp
     src/providers/win32_provider.cpp
     src/providers/comctl_provider.cpp
+    src/providers/connection_registry.cpp
 )
 
 # xaml_diag_common backs both the XAML and WinUI 3 providers.
