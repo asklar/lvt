@@ -239,7 +239,17 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
                     pf.name = fi.name;
                     pf.version = fi.version;
                     pf.plugin = &p;
-                    enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
+                    // A plugin's persistent connection (see plugin.h's
+                    // optional v2 functions) is looked up under its own
+                    // detected name, same as "xaml"/"winui3" - a caller
+                    // that acquired one via open_plugin_connection supplies
+                    // it through the same ConnectionLookup mechanism.
+                    auto connection = connectionLookup ? connectionLookup(fi.name) : nullptr;
+                    if (connection && connection->is_alive()) {
+                        connection->get_tree(root, fastProperties);
+                    } else {
+                        enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
+                    }
                     break;
                 }
             }

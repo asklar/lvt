@@ -84,8 +84,14 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
         }
 
         LvtPluginInfo* info = infoFn();
+        // Accept any version from 1 up to what this core supports, not
+        // just an exact match: a plugin reporting api_version=1 (built
+        // before the optional v2 connection functions existed - see
+        // plugin.h) must keep loading and working via lvt_enrich_tree,
+        // exactly as it always did. Only reject something newer than this
+        // core understands, or malformed metadata.
         if (!info || info->struct_size < sizeof(LvtPluginInfo) ||
-            info->api_version != LVT_PLUGIN_API_VERSION) {
+            info->api_version < 1 || info->api_version > LVT_PLUGIN_API_VERSION) {
             if (g_debug)
                 fprintf(stderr, "lvt: %ls has incompatible plugin API version\n",
                         fd.cFileName);
@@ -101,11 +107,29 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
             GetProcAddress(lp.module.get(), LVT_PLUGIN_ENRICH_FUNC));
         lp.free_fn = reinterpret_cast<LvtPluginFreeFn>(
             GetProcAddress(lp.module.get(), LVT_PLUGIN_FREE_FUNC));
+        // Every one of these is independently optional - see plugin.h's
+        // "Persistent connections". A plugin still on v1 simply doesn't
+        // export them, GetProcAddress returns nullptr, and every consumer
+        // of LoadedPlugin already treats a null function pointer as "this
+        // plugin doesn't support that" (open_plugin_connection below
+        // requires connection_open specifically to be non-null before
+        // trying to use any of the rest).
+        lp.connection_open = reinterpret_cast<LvtConnectionOpenFn>(
+            GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_OPEN_FUNC));
+        lp.connection_get_tree = reinterpret_cast<LvtConnectionGetTreeFn>(
+            GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_GET_TREE_FUNC));
+        lp.connection_poll_events = reinterpret_cast<LvtConnectionPollEventsFn>(
+            GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_POLL_EVENTS_FUNC));
+        lp.connection_events_free = reinterpret_cast<LvtConnectionEventsFreeFn>(
+            GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_EVENTS_FREE_FUNC));
+        lp.connection_close = reinterpret_cast<LvtConnectionCloseFn>(
+            GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_CLOSE_FUNC));
 
         if (g_debug)
-            fprintf(stderr, "lvt: loaded plugin '%s' (%s)\n",
+            fprintf(stderr, "lvt: loaded plugin '%s' (%s)%s\n",
                     info->name ? info->name : "?",
-                    info->description ? info->description : "");
+                    info->description ? info->description : "",
+                    lp.connection_open ? ", supports persistent connections" : "");
 
         s_plugins.push_back(std::move(lp));
     } while (FindNextFileW(hFind.get(), &fd));
@@ -207,32 +231,12 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     parent.children.push_back(std::move(el));
 }
 
-bool enrich_with_plugin(Element& root, HWND hwnd, DWORD pid,
-                        const PluginFrameworkInfo& pluginFw,
-                        const std::string& pluginOption) {
-    if (!pluginFw.plugin || !pluginFw.plugin->enrich) return false;
-
-    char* jsonOut = nullptr;
-    int ok = pluginFw.plugin->enrich(hwnd, pid,
-                                     pluginOption.empty() ? nullptr : pluginOption.c_str(),
-                                     &jsonOut);
-    if (!ok || !jsonOut) return false;
-
-    json treeJson;
-    try {
-        treeJson = json::parse(jsonOut);
-    } catch (const json::parse_error& e) {
-        fprintf(stderr, "lvt: failed to parse plugin JSON: %s\n", e.what());
-        if (pluginFw.plugin->free_fn) pluginFw.plugin->free_fn(jsonOut);
-        return false;
-    }
-
-    if (g_debug)
-        fprintf(stderr, "lvt: plugin '%s' returned %zu bytes of tree data\n",
-                pluginFw.name.c_str(), strlen(jsonOut));
-
-    if (pluginFw.plugin->free_fn) pluginFw.plugin->free_fn(jsonOut);
-
+// Grafts an already-parsed plugin tree JSON payload into `root` - shared by
+// the one-shot path (enrich_with_plugin) and a reused PluginConnection's
+// repeated get_tree() calls, so both share exactly one implementation of
+// this logic (mirrors xaml_diag_common.cpp's graft_xaml_tree_json split for
+// the same reason).
+static void graft_plugin_tree_json(const json& treeJson, Element& root, const std::string& frameworkName) {
     // The plugin JSON is an array of tree roots. Each root has a "target_hwnd"
     // field (hex HWND string) indicating which existing element to graft under.
     // We walk the tree fresh for each root to find the matching host element by
@@ -262,22 +266,144 @@ bool enrich_with_plugin(Element& root, HWND hwnd, DWORD pid,
                 double baseY = host->bounds.y;
                 if (node.contains("children") && node["children"].is_array()) {
                     for (auto& child : node["children"]) {
-                        graft_json_node(child, *host, pluginFw.name, baseX, baseY);
+                        graft_json_node(child, *host, frameworkName, baseX, baseY);
                     }
                 } else {
-                    graft_json_node(node, *host, pluginFw.name, baseX, baseY);
+                    graft_json_node(node, *host, frameworkName, baseX, baseY);
                 }
             } else {
                 // No matching host — graft under root
-                graft_json_node(node, root, pluginFw.name,
+                graft_json_node(node, root, frameworkName,
                                 root.bounds.x, root.bounds.y);
             }
         }
     } else if (treeJson.is_object()) {
-        graft_json_node(treeJson, root, pluginFw.name);
+        graft_json_node(treeJson, root, frameworkName);
+    }
+}
+
+bool enrich_with_plugin(Element& root, HWND hwnd, DWORD pid,
+                        const PluginFrameworkInfo& pluginFw,
+                        const std::string& pluginOption) {
+    if (!pluginFw.plugin || !pluginFw.plugin->enrich) return false;
+
+    char* jsonOut = nullptr;
+    int ok = pluginFw.plugin->enrich(hwnd, pid,
+                                     pluginOption.empty() ? nullptr : pluginOption.c_str(),
+                                     &jsonOut);
+    if (!ok || !jsonOut) return false;
+
+    json treeJson;
+    try {
+        treeJson = json::parse(jsonOut);
+    } catch (const json::parse_error& e) {
+        fprintf(stderr, "lvt: failed to parse plugin JSON: %s\n", e.what());
+        if (pluginFw.plugin->free_fn) pluginFw.plugin->free_fn(jsonOut);
+        return false;
     }
 
+    if (g_debug)
+        fprintf(stderr, "lvt: plugin '%s' returned %zu bytes of tree data\n",
+                pluginFw.name.c_str(), strlen(jsonOut));
+
+    if (pluginFw.plugin->free_fn) pluginFw.plugin->free_fn(jsonOut);
+
+    graft_plugin_tree_json(treeJson, root, pluginFw.name);
     return true;
+}
+
+// IFrameworkConnection adapter over a plugin's optional v2 connection
+// functions (see plugin.h). Lets connection_registry.h's ConnectionRegistry
+// treat a plugin-provided connection identically to XamlDiagConnection -
+// callers (watch's loop, an MCP session) don't need to know or care which
+// one they got.
+class PluginConnection : public IFrameworkConnection {
+public:
+    PluginConnection(const LoadedPlugin* plugin, void* handle, std::string frameworkName)
+        : m_plugin(plugin), m_handle(handle), m_frameworkName(std::move(frameworkName)) {
+    }
+
+    ~PluginConnection() override {
+        if (m_handle && m_plugin->connection_close)
+            m_plugin->connection_close(m_handle);
+    }
+
+    bool get_tree(Element& root, bool /*fastProperties*/) override {
+        // Plugins have no fast/full distinction today - see plugin.h's
+        // LvtConnectionGetTreeFn. Accepting and ignoring the parameter here
+        // (rather than omitting it) keeps this a drop-in IFrameworkConnection,
+        // consistent with XamlDiagConnection's signature.
+        if (!m_handle || !m_plugin->connection_get_tree)
+            return false;
+
+        char* jsonOut = nullptr;
+        int ok = m_plugin->connection_get_tree(m_handle, nullptr, &jsonOut);
+        if (!ok || !jsonOut) {
+            m_alive = false;
+            return false;
+        }
+
+        json treeJson;
+        try {
+            treeJson = json::parse(jsonOut);
+        } catch (const json::parse_error& e) {
+            fprintf(stderr, "lvt: failed to parse plugin connection JSON: %s\n", e.what());
+            if (m_plugin->free_fn) m_plugin->free_fn(jsonOut);
+            return false;
+        }
+        if (m_plugin->free_fn) m_plugin->free_fn(jsonOut);
+
+        graft_plugin_tree_json(treeJson, root, m_frameworkName);
+        return true;
+    }
+
+    std::vector<ConnectionEvent> poll_events() override {
+        std::vector<ConnectionEvent> result;
+        if (!m_handle || !m_plugin->connection_poll_events)
+            return result;
+
+        LvtConnectionEvent* events = nullptr;
+        uint32_t count = 0;
+        if (!m_plugin->connection_poll_events(m_handle, &events, &count) || !events)
+            return result;
+
+        result.reserve(count);
+        for (uint32_t i = 0; i < count; i++) {
+            ConnectionEvent ev;
+            ev.mutation = (events[i].mutation && std::string(events[i].mutation) == "remove")
+                              ? ConnectionEvent::Mutation::removed
+                              : ConnectionEvent::Mutation::added;
+            ev.handle = events[i].handle;
+            ev.parentHandle = events[i].parent_handle;
+            ev.childIndex = events[i].child_index;
+            ev.elementType = events[i].element_type ? events[i].element_type : "";
+            ev.name = events[i].name ? events[i].name : "";
+            result.push_back(std::move(ev));
+        }
+        if (m_plugin->connection_events_free)
+            m_plugin->connection_events_free(events, count);
+        return result;
+    }
+
+    bool is_alive() const override { return m_alive && m_handle != nullptr; }
+
+private:
+    const LoadedPlugin* m_plugin;
+    void* m_handle;
+    std::string m_frameworkName;
+    bool m_alive = true;
+};
+
+std::shared_ptr<IFrameworkConnection> open_plugin_connection(
+    const PluginFrameworkInfo& pluginFw, HWND hwnd, DWORD pid) {
+    if (!pluginFw.plugin || !pluginFw.plugin->connection_open || !pluginFw.plugin->connection_get_tree)
+        return nullptr;
+
+    void* handle = pluginFw.plugin->connection_open(hwnd, pid);
+    if (!handle)
+        return nullptr;
+
+    return std::make_shared<PluginConnection>(pluginFw.plugin, handle, pluginFw.name);
 }
 
 } // namespace lvt
