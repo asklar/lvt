@@ -783,6 +783,29 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             continue;
         }
 
+        // Drain whatever incremental Add/Remove notifications a connection
+        // pushed since the last tick (see PushChangeEvent in lvt_tap.cpp
+        // and IFrameworkConnection::poll_events). watch's own change events
+        // (emitted below via diff_trees) already come from comparing two
+        // full GET_TREE snapshots, so these are not fed into that today -
+        // this just bounds each connection's internal event queue (see
+        // XamlDiagConnection::queue_change_event's cap) and surfaces them
+        // for debugging. A future phase could drive watch's ticks from
+        // these directly instead of polling on a fixed interval.
+        if (lvt::g_debug) {
+            for (auto& [label, handle] : connections) {
+                if (!handle) continue;
+                auto events = handle->poll_events();
+                if (!events.empty())
+                    fprintf(stderr, "lvt: %s connection reported %zu pushed change event(s) this tick\n",
+                            label.c_str(), events.size());
+            }
+        } else {
+            for (auto& [label, handle] : connections) {
+                if (handle) (void)handle->poll_events();
+            }
+        }
+
         // See lost_injected_framework_content's doc comment: this is now a
         // secondary safety net (the actual root cause is fixed at its
         // source, in xaml_diag_common.cpp's connect-back timeout), so a

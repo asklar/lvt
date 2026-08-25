@@ -19,6 +19,7 @@
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -496,29 +497,38 @@ public:
             m_alive = false;
             return false;
         }
-        std::string line;
-        if (!m_io->read_line(kXamlCollectionTimeoutMs, line)) {
-            fprintf(stderr, "lvt: %s: no response from TAP DLL (timeout or broken connection)\n",
-                    m_frameworkLabel.c_str());
-            m_alive = false;
-            return false;
+        // A pushed CHANGE event (see lvt_tap.cpp's OnVisualTreeChange/
+        // PushChangeEvent) can arrive on this same stream at any time,
+        // interleaved with the response to this specific request - drain
+        // and queue any of those (they start with '{') before the actual
+        // tree response (a JSON array, starts with '[') turns up.
+        for (;;) {
+            std::string line;
+            if (!m_io->read_line(kXamlCollectionTimeoutMs, line)) {
+                fprintf(stderr, "lvt: %s: no response from TAP DLL (timeout or broken connection)\n",
+                        m_frameworkLabel.c_str());
+                m_alive = false;
+                return false;
+            }
+            if (!line.empty() && line[0] == '{') {
+                queue_change_event(line);
+                continue;
+            }
+            json treeJson;
+            try {
+                treeJson = json::parse(line);
+            } catch (const json::parse_error& e) {
+                fprintf(stderr, "lvt: failed to parse XAML tree JSON: %s\n", e.what());
+                return false;
+            }
+            graft_xaml_tree_json(treeJson, root, m_frameworkLabel);
+            return true;
         }
-        json treeJson;
-        try {
-            treeJson = json::parse(line);
-        } catch (const json::parse_error& e) {
-            fprintf(stderr, "lvt: failed to parse XAML tree JSON: %s\n", e.what());
-            return false;
-        }
-        graft_xaml_tree_json(treeJson, root, m_frameworkLabel);
-        return true;
     }
 
     std::vector<ConnectionEvent> poll_events() override {
-        // The TAP DLL does not push CHANGE notifications yet - see the
-        // "incremental push" phase. Safe to return empty either way:
-        // callers always have get_tree() as a full-refresh fallback.
-        return {};
+        std::lock_guard<std::mutex> lock(m_eventsMutex);
+        return std::move(m_pendingEvents);
     }
 
     bool is_alive() const override { return m_alive; }
@@ -530,10 +540,51 @@ private:
         m_alive = true;
     }
 
+    // Parses one {"type":"CHANGE",...} line (see lvt_tap.cpp's
+    // PushChangeEvent for the exact shape) and queues it for poll_events().
+    // Malformed/unrecognized lines are dropped rather than treated as an
+    // error - a push event is best-effort by design (see PushChangeEvent's
+    // comment), and get_tree()'s own response is never affected by this.
+    void queue_change_event(const std::string& line) {
+        json ev;
+        try {
+            ev = json::parse(line);
+        } catch (const json::parse_error&) {
+            return;
+        }
+        if (ev.value("type", "") != "CHANGE")
+            return;
+
+        ConnectionEvent ce;
+        ce.mutation = (ev.value("mutation", "") == "remove")
+                          ? ConnectionEvent::Mutation::removed
+                          : ConnectionEvent::Mutation::added;
+        ce.handle = static_cast<uintptr_t>(ev.value("handle", 0ULL));
+        ce.parentHandle = static_cast<uintptr_t>(ev.value("parent", 0ULL));
+        ce.childIndex = ev.value("childIndex", 0);
+        ce.elementType = ev.value("elementType", "");
+        ce.name = ev.value("name", "");
+
+        std::lock_guard<std::mutex> lock(m_eventsMutex);
+        // A caller that never calls poll_events() at all (e.g. a one-shot
+        // CLI command that happened to acquire a connection but never asked
+        // for events) must not turn this into an unbounded leak of its own.
+        // Capping and dropping the oldest is safe: nothing currently
+        // depends on poll_events() for correctness (get_tree() is always a
+        // complete, independent refresh), only as an optional efficiency
+        // gain for a caller that does drain regularly.
+        constexpr size_t kMaxPendingEvents = 10000;
+        if (m_pendingEvents.size() >= kMaxPendingEvents)
+            m_pendingEvents.erase(m_pendingEvents.begin());
+        m_pendingEvents.push_back(std::move(ce));
+    }
+
     wil::unique_hfile m_pipe;
     std::unique_ptr<DuplexPipeLineIO> m_io;
     std::string m_frameworkLabel;
     bool m_alive = false;
+    std::mutex m_eventsMutex;
+    std::vector<ConnectionEvent> m_pendingEvents;
 };
 
 std::shared_ptr<XamlDiagConnection> XamlDiagConnection::connect(

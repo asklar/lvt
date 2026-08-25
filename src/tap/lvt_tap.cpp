@@ -354,6 +354,39 @@ public:
         return ok != FALSE;
     }
 
+    // Writes one unsolicited {"type":"CHANGE",...} line - see
+    // OnVisualTreeChange, which calls this after releasing m_nodesMutex
+    // (never while holding it, to keep lock ordering simple: WriteLine only
+    // ever needs m_pipeWriteMutex). Safe to call before ServeConnection has
+    // run (no pipe yet - SetSiteImpl's synchronous initial replay happens
+    // first) or after the connection has ended: WriteLine just fails
+    // quietly in both cases, same as for any other caller, and a
+    // subsequent GET_TREE response always reflects current reality
+    // regardless of whether this push made it out.
+    void PushChangeEvent(bool added, InstanceHandle handle, InstanceHandle parent,
+                         unsigned int childIndex, const std::wstring& type, const std::wstring& name) {
+        std::wstring json = L"{\"type\":\"CHANGE\",\"mutation\":\"";
+        json += added ? L"add" : L"remove";
+        json += L"\",\"handle\":" + std::to_wstring(handle);
+        json += L",\"parent\":" + std::to_wstring(parent);
+        if (added) {
+            json += L",\"childIndex\":" + std::to_wstring(childIndex);
+            json += L",\"elementType\":\"" + Escape(type) + L"\"";
+            if (!name.empty())
+                json += L",\"name\":\"" + Escape(name) + L"\"";
+        }
+        json += L"}";
+
+        int len = WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
+                                      nullptr, 0, nullptr, nullptr);
+        std::string utf8(len, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
+                            utf8.data(), len, nullptr, nullptr);
+        bool sent = WriteLine(utf8);
+        LogMsg("PushChangeEvent: %s handle=%llu parent=%llu sent=%d",
+               added ? "add" : "remove", (unsigned long long)handle, (unsigned long long)parent, sent);
+    }
+
     DWORD AdviseThreadProcImpl() {
         LogMsg("AdviseThread starting");
 
@@ -541,48 +574,62 @@ public:
         VisualElement element,
         VisualMutationType mutationType) override
     {
-        std::lock_guard<std::mutex> lock(m_nodesMutex);
-        if (mutationType == VisualMutationType::Add) {
-            TreeNode node;
-            node.handle = element.Handle;
-            node.type = element.Type ? element.Type : L"";
-            node.name = element.Name ? element.Name : L"";
-            node.numChildren = element.NumChildren;
-            node.parent = relation.Parent;
-            node.childIndex = relation.ChildIndex;
-            m_nodes[element.Handle] = std::move(node);
+        const bool isAdd = (mutationType == VisualMutationType::Add);
+        const bool isRemove = (mutationType == VisualMutationType::Remove);
+        std::wstring type, name;
+        {
+            std::lock_guard<std::mutex> lock(m_nodesMutex);
+            if (isAdd) {
+                TreeNode node;
+                node.handle = element.Handle;
+                node.type = element.Type ? element.Type : L"";
+                node.name = element.Name ? element.Name : L"";
+                node.numChildren = element.NumChildren;
+                node.parent = relation.Parent;
+                node.childIndex = relation.ChildIndex;
+                type = node.type;
+                name = node.name;
+                m_nodes[element.Handle] = std::move(node);
 
-            if (relation.Parent != 0) {
-                auto it = m_nodes.find(relation.Parent);
-                if (it != m_nodes.end()) {
-                    it->second.childHandles.push_back(element.Handle);
-                }
-            } else {
-                m_roots.push_back(element.Handle);
-            }
-        } else if (mutationType == VisualMutationType::Remove) {
-            // Essential for a persistent connection, not optional: the old
-            // one-shot-per-tick design never needed this branch at all - a
-            // removed element simply would not appear in the *next fresh*
-            // replay, since m_nodes was rebuilt from scratch every time. A
-            // long-lived connection's m_nodes is never rebuilt, so without
-            // this, every element the target ever destroys would stay in
-            // the reported tree forever.
-            auto it = m_nodes.find(element.Handle);
-            if (it != m_nodes.end()) {
-                InstanceHandle parent = it->second.parent;
-                m_nodes.erase(it);
-                if (parent != 0) {
-                    auto pit = m_nodes.find(parent);
-                    if (pit != m_nodes.end()) {
-                        auto& kids = pit->second.childHandles;
-                        kids.erase(std::remove(kids.begin(), kids.end(), element.Handle), kids.end());
+                if (relation.Parent != 0) {
+                    auto it = m_nodes.find(relation.Parent);
+                    if (it != m_nodes.end()) {
+                        it->second.childHandles.push_back(element.Handle);
                     }
                 } else {
-                    m_roots.erase(std::remove(m_roots.begin(), m_roots.end(), element.Handle), m_roots.end());
+                    m_roots.push_back(element.Handle);
+                }
+            } else if (isRemove) {
+                // Essential for a persistent connection, not optional: the
+                // old one-shot-per-tick design never needed this branch at
+                // all - a removed element simply would not appear in the
+                // *next fresh* replay, since m_nodes was rebuilt from
+                // scratch every time. A long-lived connection's m_nodes is
+                // never rebuilt, so without this, every element the target
+                // ever destroys would stay in the reported tree forever.
+                auto it = m_nodes.find(element.Handle);
+                if (it != m_nodes.end()) {
+                    InstanceHandle parent = it->second.parent;
+                    m_nodes.erase(it);
+                    if (parent != 0) {
+                        auto pit = m_nodes.find(parent);
+                        if (pit != m_nodes.end()) {
+                            auto& kids = pit->second.childHandles;
+                            kids.erase(std::remove(kids.begin(), kids.end(), element.Handle), kids.end());
+                        }
+                    } else {
+                        m_roots.erase(std::remove(m_roots.begin(), m_roots.end(), element.Handle), m_roots.end());
+                    }
                 }
             }
         }
+
+        // Pushed outside m_nodesMutex (see PushChangeEvent's comment on
+        // lock ordering). Lets a connected lvt.exe eventually react to real
+        // events instead of only ever polling via GET_TREE - see
+        // IFrameworkConnection::poll_events.
+        if (isAdd || isRemove)
+            PushChangeEvent(isAdd, element.Handle, relation.Parent, relation.ChildIndex, type, name);
         return S_OK;
     }
 

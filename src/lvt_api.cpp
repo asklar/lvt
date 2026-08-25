@@ -571,6 +571,21 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
     const bool fastProperties = get_bool(params, "fast", false);
     auto connectionLookup = connection_lookup_for_session(session, frameworks);
     tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {}, fastProperties, connectionLookup);
+
+    // Bounds each reused connection's internal pushed-event queue (see
+    // XamlDiagConnection::queue_change_event's cap - this drain just keeps
+    // it small in the common case rather than relying on the cap alone).
+    // Nothing consumes the events themselves yet; a future tool (e.g. a
+    // "wait for tree change" call) could.
+    {
+        std::lock_guard<std::mutex> lock(g_connectionsMutex);
+        auto it = g_sessionConnections.find(session.id);
+        if (it != g_sessionConnections.end()) {
+            for (auto& [label, handle] : it->second) {
+                if (handle) (void)handle->poll_events();
+            }
+        }
+    }
     return true;
 }
 
