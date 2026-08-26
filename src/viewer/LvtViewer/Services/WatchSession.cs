@@ -65,6 +65,28 @@ public sealed class WatchSession : IDisposable
 
         process.Exited += (_, _) =>
         {
+            // Process.Exited fires asynchronously, on a threadpool thread,
+            // sometime after the OS actually tears the process down — not
+            // necessarily before this method's own caller (Start(), via its
+            // own Stop() call below) has already moved on. Reconnecting
+            // (switching target, toggling UseUia, ...) calls Stop() then
+            // Start() back-to-back: Stop() kills the *old* process, but its
+            // Exited callback can still arrive *after* Start() has already
+            // assigned _process to the *new* one. Without this check, that
+            // stale notification for the old, already-replaced process
+            // still unconditionally fires Exited — which MainViewModel
+            // treats as "the watch session died", wiping IsConnected and
+            // the brand new tree even though the new process is alive and
+            // well underneath. Observed live: ExitCode=-1 (an entirely
+            // ordinary Process.Kill() exit code, not a crash) reported for
+            // a target that never actually closed - this is exactly why.
+            if (!ReferenceEquals(process, _process))
+            {
+                Logger.Log("watch",
+                    $"Process exited, ExitCode={SafeExitCode(process)} (stale — already replaced by a newer session, ignoring)");
+                return;
+            }
+
             // This is the #1 suspect for "the crosshair sometimes goes
             // disabled for no reason" (ElementPickHandle.IsEnabled is bound
             // to IsConnected, which MainViewModel clears on this event) — an
