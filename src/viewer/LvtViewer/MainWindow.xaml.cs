@@ -110,13 +110,10 @@ public partial class MainWindow : Window
             return;
         }
         // Element-picking only ever operates within the already-connected
-        // target, so the owner is always CurrentHwnd here — see
-        // ShowHighlightForCurrentNode's identical call for why this needs
-        // to happen on every show, not just once.
-        _selectionHighlight.SetOwner(_viewModel.CurrentHwnd);
-        _selectionHighlight.MoveTo(rect);
-        if (_selectionHighlight.Visibility != Visibility.Visible)
-            _selectionHighlight.Show();
+        // target, so the owner is always CurrentHwnd here. Track() owns +
+        // positions + starts occlusion/minimize polling (see
+        // HighlightOverlay's class comment).
+        _selectionHighlight.Track(_viewModel.CurrentHwnd, rect);
     }
 
     /// <summary>
@@ -308,15 +305,12 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Owns the overlay to the connected target's own top-level window,
-        // not this (the viewer's) window — see HighlightOverlay's class
-        // comment. Called on every show (cheap no-op if unchanged, see
-        // SetOwner) rather than once at connect time so the overlay keeps
-        // tracking the right window's z-order even across a reconnect.
-        _selectionHighlight.SetOwner(_viewModel.CurrentHwnd);
-        _selectionHighlight.MoveTo(rect);
-        if (_selectionHighlight.Visibility != Visibility.Visible)
-            _selectionHighlight.Show();
+        // Tracks the connected target's own top-level window, not this
+        // (the viewer's) window — see HighlightOverlay's class comment.
+        // Called on every show (cheap no-op if unchanged) rather than once
+        // at connect time so the overlay keeps tracking the right window
+        // even across a reconnect.
+        _selectionHighlight.Track(_viewModel.CurrentHwnd, rect);
     }
 
     /// <summary>

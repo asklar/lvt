@@ -99,15 +99,12 @@ public sealed class CrosshairPicker
             return;
         }
 
-        // Owns the overlay to whichever window is now under the cursor, so
-        // its z-order tracks that window (see HighlightOverlay's class
-        // comment) rather than staying independently on top of everything
-        // as dragging moves from one candidate window to another.
-        _overlay.SetOwner(hwnd);
+        // Tracks whichever window is now under the cursor — Track() owns
+        // it, positions it, and starts polling for occlusion/minimize so
+        // the preview correctly disappears if something covers the
+        // candidate window mid-drag (see HighlightOverlay's class comment).
         var rect = NativeMethods.GetVisibleFrame(hwnd);
-        _overlay.MoveTo(rect);
-        if (_overlay.Visibility != Visibility.Visible)
-            _overlay.Show();
+        _overlay.Track(hwnd, rect);
     }
 
     private void HideHighlight()

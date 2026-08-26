@@ -76,6 +76,9 @@ public static class NativeMethods
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hwnd);
 
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentProcessId();
+
     public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
     // Enumerates top-level windows in top-to-bottom Z-order — exactly the
@@ -139,4 +142,63 @@ public static class NativeMethods
     /// <summary>Whether DWM is currently hiding this window — see DWMWA_CLOAKED's comment.</summary>
     public static bool IsCloaked(IntPtr hwnd) =>
         DwmGetWindowAttributeInt(hwnd, DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0 && cloaked != 0;
+
+    /// <summary>
+    /// True if some other, actually-visible top-level window — not
+    /// belonging to this process, and not <paramref name="targetHwnd"/>
+    /// itself — is stacked above <paramref name="targetHwnd"/> at
+    /// <paramref name="point"/>, i.e. targetHwnd is not what the user would
+    /// actually see there right now.
+    ///
+    /// This exists because Win32's owned-window z-order rule ("an owned
+    /// window always stays above its owner") only guarantees that one
+    /// direction: it does not guarantee staying *below* whatever unrelated
+    /// window already happens to be above the owner. Any subsequent z-order
+    /// recalculation re-snaps an owned window directly above its owner
+    /// regardless of what unrelated window was on top a moment
+    /// before — so HighlightOverlay cannot rely on ownership/SetWindowPos
+    /// alone to stay hidden behind a covering app; it must actually check.
+    /// Mirrors CrosshairPicker.ResolveWindowUnderCursor's top-to-bottom
+    /// EnumWindows technique so both share one source of truth for "is my
+    /// target actually visible here".
+    /// </summary>
+    public static bool IsOccludedAt(IntPtr targetHwnd, POINT point)
+    {
+        uint ownPid = GetCurrentProcessId();
+        bool occluded = false;
+        bool reachedTarget = false;
+
+        EnumWindows((hwnd, _) =>
+        {
+            if (hwnd == targetHwnd)
+            {
+                reachedTarget = true;
+                return false; // stop — nothing above targetHwnd covered the point
+            }
+
+            // Never let our own viewer/overlay windows count as "occluding"
+            // the target, even if one is visually positioned over it.
+            GetWindowThreadProcessId(hwnd, out var pid);
+            if (pid == ownPid)
+                return true;
+
+            if (!IsWindowVisible(hwnd) || IsIconic(hwnd) || IsCloaked(hwnd))
+                return true;
+
+            var rect = GetVisibleFrame(hwnd);
+            if (rect.Width <= 0 || rect.Height <= 0)
+                return true;
+            if (point.X < rect.Left || point.X >= rect.Right ||
+                point.Y < rect.Top || point.Y >= rect.Bottom)
+                return true;
+
+            occluded = true;
+            return false;
+        }, IntPtr.Zero);
+
+        // If targetHwnd was never reached (e.g. it has since been
+        // destroyed, or is no longer a top-level window), treat it as
+        // occluded/not-visible rather than assuming it is fine to show.
+        return occluded || !reachedTarget;
+    }
 }
