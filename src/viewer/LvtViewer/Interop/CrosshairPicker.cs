@@ -143,7 +143,29 @@ public sealed class CrosshairPicker
         NativeMethods.EnumWindows((hwnd, _) =>
         {
             if (hwnd == ownHwnd || hwnd == overlayHwnd)
-                return true; // keep looking
+            {
+                // Our own UI can genuinely be the topmost thing at this
+                // exact point — most commonly the cursor is still over the
+                // crosshair handle itself right at drag-start. If so, the
+                // search must stop here rather than skip past us and keep
+                // looking further down the Z-order: continuing could
+                // otherwise "find" some unrelated, far-lower window whose
+                // rect merely happens to also span this same screen point
+                // (e.g. some other large/maximized app elsewhere in the
+                // Z-order) even though it is not actually visible here at
+                // all — it is covered by our own window, which the
+                // unconditional skip below used to ignore entirely.
+                // Observed live: dragging the crosshair from directly over
+                // the viewer's own button picked a large, fully unrelated,
+                // and actually-hidden-behind-the-viewer window instead of
+                // correctly finding nothing (or whatever genuinely was
+                // topmost) at that point.
+                var ownRect = NativeMethods.GetVisibleFrame(hwnd);
+                if (pt.X >= ownRect.Left && pt.X < ownRect.Right &&
+                    pt.Y >= ownRect.Top && pt.Y < ownRect.Bottom)
+                    return false; // stop — our own UI occupies this point
+                return true; // not at this point; keep looking
+            }
 
             if (!NativeMethods.IsWindowVisible(hwnd) || NativeMethods.IsIconic(hwnd) ||
                 NativeMethods.IsCloaked(hwnd))
