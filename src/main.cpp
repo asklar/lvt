@@ -730,8 +730,21 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
                 lvt::XamlProvider xaml;
                 return xaml.open_connection(probeTree, hwnd, pid);
             });
-        if (handle)
-            connections.emplace_back("xaml", std::move(handle));
+        // Always record a "xaml" entry once the framework is detected, even
+        // if this particular acquire attempt failed (handle is then empty/
+        // falsy) - InitializeXamlDiagnosticsEx is known to fail transiently
+        // on a first try against a slow/busy target (observed live against
+        // Microsoft Store) even though a retry moments later succeeds.
+        // Without an entry here at all, refresh_dead_watch_connections has
+        // nothing to notice and retry: it can only detect and fix an
+        // existing (label, handle) pair going dead, not a framework whose
+        // very first acquisition never even produced one - which silently
+        // and permanently starved that framework of enrichment for the
+        // rest of the session once tree_builder.cpp stopped falling back
+        // to one-shot reinjection for a lookup-returns-nothing case (see
+        // that commit's own reasoning for why one-shot must not be the
+        // silent fallback there).
+        connections.emplace_back("xaml", std::move(handle));
     }
 #endif
 #if LVT_ENABLE_WINUI3
@@ -742,8 +755,8 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
                 lvt::WinUI3Provider winui3;
                 return winui3.open_connection(hwnd, pid);
             });
-        if (handle)
-            connections.emplace_back("winui3", std::move(handle));
+        // See the matching comment in the Xaml case above.
+        connections.emplace_back("winui3", std::move(handle));
     }
 #endif
     return connections;
@@ -767,14 +780,17 @@ static lvt::ConnectionLookup make_lookup(
 // died (a transient timeout against an unusually large/busy tree - observed
 // live against Microsoft Store's home page, whose own collection can take
 // several seconds even in --fast mode - or the target recycling something
-// XAML-diagnostics-related), is_alive() goes false and build_tree correctly
-// falls back to a one-shot re-inject for that one tick. Without this
-// function, that fallback would be *permanent* for the rest of the watch
-// session: nothing ever tried to re-establish a fresh persistent connection
-// afterward, so every subsequent tick would keep re-injecting from scratch
-// for as long as `watch` kept running - silently regressing to exactly the
-// per-tick reinjection behavior (and its refresh/reset symptom) this whole
-// mechanism exists to replace. Observed live: once Microsoft Store's XAML
+// XAML-diagnostics-related), is_alive() goes false; and, separately, a
+// framework can have been detected but never successfully acquired a
+// connection in the first place (its very first InitializeXamlDiagnosticsEx
+// attempt failed - also observed live against Microsoft Store, transient
+// but common against a slow/busy target). Since tree_builder.cpp no longer
+// silently falls back to one-shot reinjection when a supplied
+// ConnectionLookup returns nothing for a framework (see the commit that
+// tightened that), *both* cases need this function to actively retry them -
+// otherwise either one would silently and permanently skip that
+// framework's enrichment for the rest of the watch session, with nothing
+// left to notice or recover. Observed live: once Microsoft Store's XAML
 // connection timed out once, every following tick logged
 // "InitializeXamlDiagnosticsEx failed" - the connection endpoints were still
 // consumed/settling from the connection that had just died, so immediately
@@ -796,9 +812,16 @@ static void refresh_dead_watch_connections(
     std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
     bool anyDead = false;
     for (auto& [label, handle] : connections) {
-        if (handle && !handle->is_alive()) {
+        // A missing/never-acquired handle (acquire_watch_connections still
+        // records an entry even when its own acquire() attempt failed - see
+        // that function's comment) is treated exactly like a dead one here:
+        // both mean "this framework has no working connection right now",
+        // and both are worth retrying rather than leaving as a permanent
+        // gap for the rest of the session.
+        if (!handle || !handle->is_alive()) {
             if (lvt::g_debug)
-                fprintf(stderr, "lvt: %s connection died; will attempt to reconnect\n", label.c_str());
+                fprintf(stderr, "lvt: %s connection %s; will attempt to (re)connect\n",
+                        label.c_str(), handle ? "died" : "was never established");
             handle.reset();
             anyDead = true;
         }
