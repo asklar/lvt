@@ -462,6 +462,8 @@ ParsedRef parse_ref(const std::string& ref) {
     // not.
     if (ref.rfind("uia|", 0) == 0)
         return {RefTree::uia, ref};
+    if (ref.rfind("xaml:0x", 0) == 0 || ref.rfind("winui3:0x", 0) == 0)
+        return {RefTree::visual, ref};
     if (ref.find('|') != std::string::npos)
         return {RefTree::visual, ref};
 
@@ -1339,6 +1341,11 @@ json method_hit_test(const json& params) {
 bool looks_like_visual_key(const std::string& ref) {
     if (ref.rfind("uia:", 0) == 0 || ref.rfind("uia|", 0) == 0)
         return false;
+    // XAML/WinUI3 use compact diagnostics-handle keys rather than structural
+    // paths. They are still visual-tree references and must be rejected by a
+    // UIA-mode session before attempting to resolve or act on them.
+    if (ref.rfind("xaml:0x", 0) == 0 || ref.rfind("winui3:0x", 0) == 0)
+        return true;
     // A durable key always has a framework prefix followed by '|'.
     const auto bar = ref.find('|');
     return bar != std::string::npos && bar > 0;

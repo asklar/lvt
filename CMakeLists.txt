@@ -112,6 +112,12 @@ set(LVT_PUBLIC_HEADERS
     src/wil_diagnostics.h
     "${CMAKE_CURRENT_BINARY_DIR}/include/lvt/lvt_config.h"
 )
+# tree_builder.h exposes ConnectionLookup in its public API and includes this
+# header using its source-tree-relative providers/ path. Preserve that layout
+# in the install tree rather than flattening the provider header beside it.
+set(LVT_PUBLIC_PROVIDER_HEADERS
+    src/providers/framework_connection.h
+)
 
 # --- lvt_core: the reusable library behind the CLI ---
 set(LVT_CORE_SOURCES
@@ -1024,6 +1030,8 @@ install(TARGETS lvt_core
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
 )
 install(FILES ${LVT_PUBLIC_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/lvt")
+install(FILES ${LVT_PUBLIC_PROVIDER_HEADERS}
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/lvt/providers")
 
 if(LVT_BUILD_TOOL)
     install(TARGETS lvt RUNTIME DESTINATION "${LVT_INSTALL_TOOLSDIR}")
