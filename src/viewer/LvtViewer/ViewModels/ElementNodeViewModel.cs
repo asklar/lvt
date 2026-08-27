@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Text;
 using LvtViewer.Models;
 
 namespace LvtViewer.ViewModels;
@@ -118,20 +119,37 @@ public sealed class ElementNodeViewModel : ObservableObject
         "name", // x:Name, captured as a plain property by the XAML TAP (see xaml_diag_common.cpp)
     };
 
-    /// <summary>What the TreeView shows for this node.</summary>
-    public string DisplayName
+    private string DisplayValue
     {
         get
         {
             if (!string.IsNullOrEmpty(Text))
-                return $"{Type} \"{Text}\"";
+                return Text;
             foreach (var propName in IdentifyingPropertyPriority)
             {
                 var row = FindProperty(propName);
                 if (row != null && !string.IsNullOrEmpty(row.Value))
-                    return $"{Type} \"{row.Value}\"";
+                    return row.Value;
             }
-            return Type;
+            return "";
+        }
+    }
+
+    /// <summary>
+    /// Human-readable label used throughout the viewer. XAML icon controls
+    /// commonly expose private-use Unicode characters whose meaning depends
+    /// on an app-bundled font the viewer does not have. Show their code point
+    /// (for example U+EEF4) instead of a misleading missing-glyph rectangle.
+    /// </summary>
+    public string DisplayName
+    {
+        get
+        {
+            var value = DisplayValue;
+            if (value.Length == 0)
+                return Type;
+            value = DescribePrivateUseCharacters(value);
+            return $"{Type} \"{value}\"";
         }
     }
 
@@ -190,7 +208,10 @@ public sealed class ElementNodeViewModel : ObservableObject
         // Drop rows for properties that no longer appear at all (rare on a
         // full snapshot, but keeps a re-added node from carrying stale rows).
         foreach (var stale in PropertyRows.Where(r => !seen.Contains(r.Name) && !r.IsEditable).ToList())
+        {
             PropertyRows.Remove(stale);
+            NotifyIfIdentifyingProperty(stale.Name);
+        }
     }
 
     /// <summary>Applies one changed-field update by name ("type", "framework", "className", "text").</summary>
@@ -250,6 +271,24 @@ public sealed class ElementNodeViewModel : ObservableObject
     {
         if (Array.IndexOf(IdentifyingPropertyPriority, name) >= 0)
             OnPropertyChanged(nameof(DisplayName));
+    }
+
+    private static string DescribePrivateUseCharacters(string value)
+    {
+        var result = new StringBuilder(value.Length);
+        for (int i = 0; i < value.Length; i++)
+        {
+            int codePoint = char.ConvertToUtf32(value, i);
+            if (char.IsHighSurrogate(value[i]))
+                i++;
+            if (codePoint is >= 0xE000 and <= 0xF8FF or
+                >= 0xF0000 and <= 0xFFFFD or
+                >= 0x100000 and <= 0x10FFFD)
+                result.Append($"U+{codePoint:X4}");
+            else
+                result.Append(char.ConvertFromUtf32(codePoint));
+        }
+        return result.ToString();
     }
 
     public PropertyRowViewModel? FindProperty(string name) =>
