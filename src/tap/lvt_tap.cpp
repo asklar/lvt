@@ -482,7 +482,23 @@ public:
             std::lock_guard<std::mutex> lock(m_nodesMutex);
             m_orderedHandles.clear();
             m_orderedHandles.reserve(m_nodes.size());
-            for (auto& [handle, node] : m_nodes) m_orderedHandles.push_back(handle);
+            for (auto& [handle, node] : m_nodes) {
+                m_orderedHandles.push_back(handle);
+
+                // Properties and geometry are a per-request snapshot, not
+                // persistent tree identity. Leaving them in m_nodes made
+                // Text/Content entries append again on every watch tick,
+                // growing the serialized payload without bound. It also
+                // left hasBounds true forever, so fast mode stopped reading
+                // ActualWidth/ActualHeight after the first request and
+                // returned stale sizes after a resize.
+                node.properties.clear();
+                node.width = 0;
+                node.height = 0;
+                node.offsetX = 0;
+                node.offsetY = 0;
+                node.hasBounds = false;
+            }
         }
 
         // Dispatch GetPropertyValuesChain (and, below, TransformToVisual) to
@@ -866,6 +882,19 @@ private:
         return false;
     }
 
+    static void SetCollectedProperty(TreeNode& node, const wchar_t* name,
+                                     const winrt::hstring& value) {
+        if (value.empty())
+            return;
+        auto existing = std::find_if(
+            node.properties.begin(), node.properties.end(),
+            [name](const auto& property) { return property.first == name; });
+        if (existing != node.properties.end())
+            existing->second = std::wstring(value);
+        else
+            node.properties.emplace_back(name, std::wstring(value));
+    }
+
     void CollectPositionsAndText(size_t start, size_t count) {
         namespace WUX = winrt::Windows::UI::Xaml;
         namespace WUXC = winrt::Windows::UI::Xaml::Controls;
@@ -961,7 +990,7 @@ private:
                         text = tb.Text();
                 }
                 if (!text.empty()) {
-                    node.properties.emplace_back(L"Text", std::wstring(text));
+                    SetCollectedProperty(node, L"Text", text);
                     textsRead++;
                 }
 
@@ -984,14 +1013,15 @@ private:
                         TryUnboxString(cc.Content(), content);
                 }
                 if (!content.empty())
-                    node.properties.emplace_back(L"Content", std::wstring(content));
+                    SetCollectedProperty(node, L"Content", content);
             } catch (...) {
                 // Swallow WinRT exceptions — element may be in an invalid state
             }
 
             if (raw) raw->Release();
         }
-        LogMsg("CollectPositionsAndText: %d positioned, %d texts, %d bounds-from-fast-path in batch [%zu,%zu)",
+        LogMsg("CollectPositionsAndText: %d positioned, %d texts, "
+               "%d bounds-from-fast-path in batch [%zu,%zu)",
                positioned, textsRead, boundsFromFastPath, start, end);
     }
 #endif
