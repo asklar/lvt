@@ -9,6 +9,8 @@
     </Window.CommandBindings>
     <Window.InputBindings>
         <KeyBinding Key="F" Modifiers="Control" Command="ApplicationCommands.Find"/>
+        <KeyBinding Key="F3" Command="{Binding FindNextCommand}"/>
+        <KeyBinding Key="F3" Modifiers="Shift" Command="{Binding FindPreviousCommand}"/>
     </Window.InputBindings>
 
     <Window.Resources>
@@ -100,8 +102,10 @@
                          Text="{Binding SearchQuery, UpdateSourceTrigger=PropertyChanged}"
                          ToolTip="Find by text, class, type, or property (Ctrl+F)"
                          KeyDown="SearchBox_KeyDown"/>
-                <Button Content="Find Next" Command="{Binding FindNextCommand}" Padding="10,3" Margin="0,0,6,0"/>
-                <Button Content="Find Previous" Command="{Binding FindPreviousCommand}" Padding="10,3"/>
+                <Button Content="Find Next" Command="{Binding FindNextCommand}" Padding="10,3" Margin="0,0,6,0"
+                        ToolTip="Find the next match (F3)"/>
+                <Button Content="Find Previous" Command="{Binding FindPreviousCommand}" Padding="10,3"
+                        ToolTip="Find the previous match (Shift+F3)"/>
             </StackPanel>
         </Border>
 
