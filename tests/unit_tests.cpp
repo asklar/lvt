@@ -12,6 +12,7 @@
 #include "providers/winforms_inject.h"
 #include "providers/wpf_inject.h"
 #include "providers/uia_provider.h"
+#include "providers/connection_registry.h"
 #include "providers/uia_props.h"
 #include "input.h"
 #include "providers/uia_actions.h"
@@ -370,6 +371,41 @@ TEST(Element, DefaultValues) {
     EXPECT_EQ(el.nativeHandle, 0u);
 }
 
+namespace {
+
+class SnapshotLifetimeConnection final : public IFrameworkConnection {
+public:
+    explicit SnapshotLifetimeConnection(std::shared_ptr<int> destroyed)
+        : destroyed_(std::move(destroyed)) {}
+    ~SnapshotLifetimeConnection() override { ++*destroyed_; }
+
+    bool get_tree(Element&, bool, const std::string& = {}) override { return true; }
+    std::vector<ConnectionEvent> poll_events() override { return {}; }
+    bool is_alive() const override { return true; }
+
+private:
+    std::shared_ptr<int> destroyed_;
+};
+
+} // namespace
+
+TEST(ConnectionHandle, SharedSnapshotOutlivesRegistryHandle) {
+    auto destroyed = std::make_shared<int>(0);
+    auto handle = ConnectionRegistry::instance().acquire(
+        GetCurrentProcessId(), nullptr, "unit-snapshot-lifetime",
+        [destroyed](HWND, DWORD) {
+            return std::make_shared<SnapshotLifetimeConnection>(destroyed);
+        });
+    ASSERT_TRUE(handle);
+
+    auto snapshot = handle.shared();
+    handle.reset();
+    EXPECT_EQ(*destroyed, 0);
+
+    snapshot.reset();
+    EXPECT_EQ(*destroyed, 1);
+}
+
 // ---- Durable element keys and lookup ----
 
 static Element key_el(const std::string& type, const std::string& name = "",
@@ -441,6 +477,31 @@ TEST(ElementKeys, NativeHandlesStayTiedAfterSwap) {
     EXPECT_EQ(root.children[0].key, secondKey);
     EXPECT_EQ(root.children[1].nativeHandle, 0x1111u);
     EXPECT_EQ(root.children[1].key, firstKey);
+}
+
+TEST(ElementKeys, XamlInstanceHandlesUseCompactProcessWideKeys) {
+    Element root = key_el("Window");
+
+    Element panel;
+    panel.type = "Grid";
+    panel.className = "Microsoft.UI.Xaml.Controls.Grid";
+    panel.framework = "winui3";
+    panel.nativeHandle = 0x123456789ABC;
+
+    Element button;
+    button.type = "Button";
+    button.className = "Microsoft.UI.Xaml.Controls.Button";
+    button.framework = "winui3";
+    button.nativeHandle = 0xFEDCBA987654;
+    panel.children.push_back(std::move(button));
+    root.children.push_back(std::move(panel));
+
+    assign_element_keys(root);
+
+    EXPECT_EQ(root.children[0].key, "winui3:0x123456789ABC");
+    EXPECT_EQ(root.children[0].children[0].key, "winui3:0xFEDCBA987654");
+    EXPECT_EQ(root.children[0].children[0].key.find(root.children[0].key),
+              std::string::npos);
 }
 
 TEST(ElementLookup, ResolvesByIdAndDurableKey) {
@@ -695,10 +756,137 @@ TEST(WatchDiff, MovedElement) {
 
     auto events = diff_trees(before, after);
 
-    ASSERT_EQ(events.size(), 1);
-    EXPECT_EQ(events[0].type, ChangeEvent::Type::Changed);
-    EXPECT_EQ(events[0].fields["path"].oldValue, "0.1");
-    EXPECT_EQ(events[0].fields["path"].newValue, "0.0.0");
+    // Reparenting shows up as Removed (old key) + Added (new key), not a
+    // single Changed/path event, and that is a deliberate trade-off, not a
+    // gap: assign_element_keys (the one, single key algorithm this and
+    // dump/query/UIA output all share — see its doc comment in
+    // element_key.h) always threads the full parent chain into every
+    // element's key, precisely because that per-parent locality is what
+    // keeps an unrelated change elsewhere in the tree from ever touching
+    // this element's key at all (see the
+    // DuplicateIdentityElsewhereDoesNotDestabilizeUnrelatedSubtree test
+    // right below). Reparenting inherently changes that chain, so the key
+    // changes with it — for any element, named or not. The information
+    // itself is still fully accurate (Button really did stop existing at
+    // its old position and start existing at its new one); it is just
+    // conveyed as two events instead of a single, more elegant one.
+    //
+    // Checked by type+path rather than by vector index/order: diff_trees
+    // emits all Added events before all Removed events (see its own
+    // implementation), which is an implementation detail this test should
+    // not need to know about.
+    ASSERT_EQ(events.size(), 2);
+    for (const auto& event : events)
+        EXPECT_EQ(event.element.text, "OK");
+    auto hasEvent = [&](ChangeEvent::Type type, const std::string& path) {
+        return std::any_of(events.begin(), events.end(), [&](const ChangeEvent& e) {
+            return e.type == type && e.path == path;
+        });
+    };
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Removed, "0.1"));
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Added, "0.0.0"));
+}
+
+TEST(WatchDiff, DuplicateIdentityElsewhereDoesNotDestabilizeUnrelatedSubtree) {
+    // Regression test for the actual reported bug ("the tree rebuilds while
+    // navigating", reproduced live against Microsoft Store's tree): watch's
+    // diffing used to compute its key discriminator from a GLOBAL,
+    // whole-tree count of each identity (framework/className) plus the full
+    // root-to-node path as the fallback — meaning a change ANYWHERE that
+    // shared an identity with an element elsewhere in the tree could change
+    // that unrelated element's key too. A real XAML tree is thick with
+    // duplicate-identity elements (Grid/Border/TextBlock/ContentPresenter/
+    // Rectangle/...), so this showed up live as large, unrelated portions
+    // of the tree looking removed-and-re-added on every tick.
+    // assign_element_keys' per-parent scoping (the same algorithm dump/
+    // query/UIA output already used) means only an element's OWN siblings
+    // can ever affect its key — nothing outside its own parent can.
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "GroupA"));
+    before.children[0].children.push_back(diff_el("Text", "TextBlock", "A1"));
+    before.children.push_back(diff_el("Pane", "GroupB"));
+    before.children[1].children.push_back(diff_el("Text", "TextBlock", "B1"));
+
+    // GroupB (entirely unrelated to GroupA) gains a same-identity sibling —
+    // the exact shape of change that used to cascade globally.
+    auto after = before;
+    after.children[1].children.insert(after.children[1].children.begin(),
+                                      diff_el("Text", "TextBlock", "B0"));
+
+    auto events = diff_trees(before, after);
+
+    // Whatever this does to GroupB's own children (a real, bounded, locally
+    // -scoped side effect of inserting a sibling ahead of an existing one —
+    // see WatchDiff.MovedElement for the same trade-off applied to
+    // reparenting) must never touch GroupA's "A1", which nothing here
+    // changed at all.
+    for (const auto& event : events)
+        EXPECT_NE(event.element.text, "A1")
+            << "an unrelated GroupB change destabilized GroupA's element";
+}
+
+TEST(WatchDiff, AncestorSiblingChurnDoesNotDestabilizeStableDescendants) {
+    // Regression test for the deeper version of the reported bug ("the
+    // tree rebuilds while navigating"): the fix above (per-parent-scoped
+    // disambiguation) stops an unrelated *subtree* from destabilizing
+    // another, but a purely structural key — recomputed fresh from a
+    // tree's shape every tick, with no memory of previous ticks — still
+    // threads every ancestor's own disambiguating segment into each of its
+    // descendants' keys. So if an ancestor's *own* position among its own
+    // same-identity siblings shifts (extremely common in a live, animated
+    // UI: a virtualized/recycled list item, a carousel auto-rotating),
+    // every element beneath it gets a brand-new key on that tick even
+    // though nothing about it individually changed. Verified live: a
+    // passively watched, completely untouched Microsoft Store home page
+    // (whose carousel auto-rotates) showed nearly its *entire* tree
+    // repeatedly flip-flopping between removed and re-added, purely from
+    // time passing, not from anything a user did.
+    //
+    // Cross-tick reconciliation (diff_trees now matches each tick's tree
+    // against the previous one and lets a matched node INHERIT its
+    // predecessor's key, rather than ever recomputing it from scratch) is
+    // what actually fixes this: a stable descendant survives even when its
+    // own ancestor's local position moves, as long as reconciliation still
+    // recognizes that ancestor as "the same slot, just moved" — which the
+    // one-level-deep shape fingerprint (see reconcile_children) is what
+    // lets it do here, since the tracked card is distinguishable from the
+    // newly inserted, differently-shaped one.
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Card", "Card"));          // slot 0
+    before.children.push_back(diff_el("Card", "Card"));          // slot 1 -- tracked
+    before.children[1].children.push_back(diff_el("Text", "TextBlock", "Stable"));
+
+    // A new, differently-shaped same-identity sibling is inserted *before*
+    // the tracked card, shifting its own local index from 1 to 2 -- the
+    // exact shape of change a recycled/virtualized list item produces.
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Card", "Card"));
+    after.children.push_back(diff_el("Card", "Card"));            // newly inserted, empty
+    after.children.push_back(diff_el("Card", "Card"));            // the tracked card, now at index 2
+    after.children[2].children.push_back(diff_el("Text", "TextBlock", "Stable"));
+
+    auto events = diff_trees(before, after);
+
+    // The tracked card's own child must never show up as Added or Removed
+    // (its parent moving is expected to still surface as a legitimate
+    // Changed/path event for the child too, since the child's own reported
+    // position shifted from "0.1.0" to "0.2.0" — that is correct,
+    // informative structural news, not the bug); it must never be treated
+    // as a brand-new/disappeared element.
+    for (const auto& event : events) {
+        if (event.element.text != "Stable")
+            continue;
+        EXPECT_NE(event.type, ChangeEvent::Type::Added)
+            << "an ancestor's own index shift destabilized a stable descendant (reported as Added)";
+        EXPECT_NE(event.type, ChangeEvent::Type::Removed)
+            << "an ancestor's own index shift destabilized a stable descendant (reported as Removed)";
+    }
+    bool sawTrackedCardMove = std::any_of(events.begin(), events.end(), [](const ChangeEvent& e) {
+        return e.type == ChangeEvent::Type::Changed &&
+               e.fields.count("path") &&
+               e.fields.at("path").oldValue == "0.1" && e.fields.at("path").newValue == "0.2";
+    });
+    EXPECT_TRUE(sawTrackedCardMove) << "expected the tracked card to be recognized as moved, not replaced";
 }
 
 TEST(WatchDiff, SerializeChangedEvent) {
@@ -1522,8 +1710,24 @@ TEST(XamlPropertyFilter, EmptyValueIsNeverCaptured) {
     EXPECT_FALSE(lvt::xaml_should_capture_property(L"Text", L"", L"String"));
 }
 
-TEST(XamlPropertyFilter, NonTextNonStatePropertiesAreIgnored) {
-    EXPECT_FALSE(lvt::xaml_should_capture_property(L"SomeRandomProperty", L"42", L"Int32"));
+TEST(XamlPropertyFilter, ArbitraryPropertiesAreCapturedWithRecognizedValueTypes) {
+    // Broadened capture: any named property is captured (not just a curated
+    // text/state allowlist) as long as its ValueType is a recognized
+    // primitive shape — this is what makes the property panel show a
+    // control's full property set (FontSize, Opacity, a custom DP, ...)
+    // rather than a handful of hand-picked names.
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"FontSize", L"14", L"Double"));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"Opacity", L"0.5", L"Double"));
+    EXPECT_TRUE(lvt::xaml_should_capture_property(L"SomeRandomProperty", L"42", L"Int32"));
+}
+
+TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {
+    // A reference-typed property (a Brush, a Transform, another control) has
+    // no meaningful flat string value to show, and its serialized value is
+    // an opaque handle — excluded because its ValueType names an actual
+    // class rather than one of the recognized primitive shapes.
+    EXPECT_FALSE(lvt::xaml_should_capture_property(L"Foreground", L"123456789012", L"Brush"));
+    EXPECT_FALSE(lvt::xaml_should_capture_property(L"RenderTransform", L"987654321098", L"TransformGroup"));
 }
 
 TEST(XamlPropertyFilter, LongDigitTextIsKeptWhenValueTypeIsConfirmedString) {

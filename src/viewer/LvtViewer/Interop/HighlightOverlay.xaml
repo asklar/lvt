@@ -1,0 +1,13 @@
+<Window x:Class="LvtViewer.Interop.HighlightOverlay"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        ResizeMode="NoResize"
+        Focusable="False"
+        ShowActivated="False"
+        Visibility="Hidden">
+    <Border BorderBrush="#FF2AA1F0" BorderThickness="4" />
+</Window>

@@ -1280,6 +1280,51 @@ TEST_F(WinUI3SampleFixture, DurableKeysDeterministicAndQueryable) {
     EXPECT_EQ(byKey, "PrimaryButton");
 }
 
+// --fast skips IVisualTreeService::GetPropertyValuesChain (the dominant
+// per-element cost of a rich WinUI3 tree, ~4.5ms/element measured live
+// against Microsoft Store/Calculator) and collects bounds/Text/Content the
+// cheaper way instead — see lvt_tap.cpp's CollectBounds/CollectPositionsAndText.
+// This only checks the one thing that actually matters for a caller: the
+// same named controls, with the same identity, still show up — not that
+// every property matches (--fast is documented to report fewer of them).
+TEST_F(WinUI3SampleFixture, FastModeStillFindsNamedControlsAndBounds) {
+    SkipIfNotReady();
+
+    auto lvt = get_lvt_path();
+    auto winui3Ready = [](const json& j) {
+        return frameworks_contain_winui3(j) &&
+               has_winui3_stitched_under_bridge(j["root"]) &&
+               json_tree_has_named_control(j["root"], "PrimaryButton");
+    };
+    auto j = dump_ready_tree(lvt, get_pid_arg() + " --fast", winui3Ready);
+    ASSERT_TRUE(winui3Ready(j)) << "WinUI3 tree never became ready in --fast mode";
+
+    auto* button = find_named_control(j["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr);
+    EXPECT_EQ(button->value("framework", ""), "winui3");
+    EXPECT_EQ(button->value("type", ""), "Button");
+    ASSERT_FALSE(button->value("key", "").empty());
+
+    // Bounds still need to come from somewhere in fast mode — from the
+    // direct FrameworkElement.ActualWidth/ActualHeight read in
+    // CollectPositionsAndText, since CollectBounds (GetPropertyValuesChain)
+    // is skipped entirely. At least some elements in a real, rendered
+    // window must report non-zero size, or fast mode would be useless for
+    // the highlight/hit-test use cases it exists to serve.
+    std::vector<const json*> elements;
+    collect_json_elements(j["root"], elements);
+    bool anyNonZeroBounds = false;
+    for (auto* el : elements) {
+        if (!el->contains("bounds")) continue;
+        auto& b = (*el)["bounds"];
+        if (b.value("width", 0) > 0 && b.value("height", 0) > 0) {
+            anyNonZeroBounds = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(anyNonZeroBounds) << "no element reported non-zero bounds in --fast mode";
+}
+
 TEST_F(NotepadFixture, Win32BoundsReasonable) {
     // Every element in the Win32 tree should have reasonable (non-extreme) bounds
     auto lvt = get_lvt_path();
@@ -2371,6 +2416,98 @@ TEST_F(WinUI3SampleFixture, UiaWatchEmitsAddedEvents) {
         ++events;
     }
     EXPECT_GT(events, 0) << "no complete watch events parsed";
+}
+
+// Regression test for the persistent-connection redesign (see
+// connection_registry.h / xaml_diag_common.cpp's XamlDiagConnection): watch
+// must inject and subscribe (InitializeXamlDiagnosticsEx + AdviseVisualTreeChange)
+// exactly ONCE for the life of a session, not once per tick. That per-tick
+// re-injection was the confirmed root cause of an unbounded resource leak
+// (a message-only window created and never destroyed every tick) and the
+// "tree refreshes/resets" bug diagnosed live against Microsoft Store.
+TEST_F(WinUI3SampleFixture, WatchReusesOnePersistentConnectionAcrossManyTicks) {
+    SkipIfNotReady();
+
+    // The sample app here is unpackaged (plain CreateProcessA, no AppContainer),
+    // so its TAP DLL logs to the simple, global %TEMP%\lvt_tap.log - counting
+    // "SetSite called" lines before and after running several ticks is a
+    // direct, unambiguous measure of how many times the TAP DLL was actually
+    // (re)injected, which nothing observable from outside the process
+    // (stdout, the CLI's own exit code) can distinguish otherwise.
+    wchar_t tempPath[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempPath);
+    std::wstring logPath = std::wstring(tempPath) + L"lvt_tap.log";
+
+    auto count_set_site_calls = [&]() -> int {
+        std::ifstream log(logPath, std::ios::binary);
+        if (!log)
+            return 0;
+        int count = 0;
+        std::string line;
+        while (std::getline(log, line)) {
+            if (line.find("SetSite called") != std::string::npos)
+                count++;
+        }
+        return count;
+    };
+
+    const int before = count_set_site_calls();
+
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    wil::unique_handle readEnd, writeEnd;
+    ASSERT_TRUE(CreatePipe(readEnd.put(), writeEnd.put(), &sa, 0));
+    ASSERT_TRUE(SetHandleInformation(readEnd.get(), HANDLE_FLAG_INHERIT, 0));
+
+    STARTUPINFOA si{sizeof(si)};
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = writeEnd.get();
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION pi{};
+
+    auto lvt = get_lvt_path();
+    std::string cmd = make_cmd(lvt, get_pid_arg() + " watch --fast --interval 300");
+    ASSERT_TRUE(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                               CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi));
+    wil::unique_handle process(pi.hProcess);
+    wil::unique_handle thread(pi.hThread);
+    writeEnd.reset();  // so ReadFile sees EOF if the child ever exits
+
+    // Drain output for several seconds so multiple ticks genuinely happen -
+    // event content/correctness is already covered elsewhere; only that
+    // real time passes while the connection stays open and keeps serving
+    // requests matters for this test.
+    std::string output;
+    const auto deadline = GetTickCount64() + 6000;
+    while (GetTickCount64() < deadline) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(readEnd.get(), nullptr, 0, nullptr, &available, nullptr))
+            break;
+        if (available == 0) {
+            Sleep(50);
+            continue;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!ReadFile(readEnd.get(), chunk.data(), available, &read, nullptr) || read == 0)
+            break;
+        output.append(chunk, 0, read);
+    }
+
+    TerminateProcess(process.get(), 0);
+    WaitForSingleObject(process.get(), 5000);
+
+    ASSERT_FALSE(output.empty()) << "watch emitted nothing";
+
+    const int after = count_set_site_calls();
+    // Exactly one new connection is expected for this whole session. This
+    // used to allow two as a retry margin, which let a real startup bug
+    // escape: acquire_watch_connections built its CoreWindow probe using
+    // the full detected framework list, causing one complete throwaway
+    // injection before opening the persistent connection. The probe is now
+    // deliberately Win32-only; any second SetSite here is a regression.
+    EXPECT_EQ(after - before, 1)
+        << "watch must inject exactly once (SetSite called " << before << " times before, "
+        << after << " times after)";
 }
 
 // --- Cross-architecture behaviour ---

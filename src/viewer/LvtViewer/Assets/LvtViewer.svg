@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>lvt Viewer application icon</title>
+  <g fill="none" stroke="#2B78B9" stroke-width="18" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M77 32H52C41 32 32 41 32 52V77"/>
+    <path d="M179 32H204C215 32 224 41 224 52V77"/>
+    <path d="M32 179V204C32 215 41 224 52 224H77"/>
+    <path d="M224 179V204C224 215 215 224 204 224H179"/>
+  </g>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M128 134V157H86V180M128 157H170V180"
+          stroke="#F7FAFC" stroke-width="24"/>
+    <path d="M128 134V157H86V180M128 157H170V180"
+          stroke="#273A50" stroke-width="13"/>
+  </g>
+
+  <g fill="none" stroke-linecap="round">
+    <path d="M128 64V78M78 112H92M164 112H178" stroke="#2B78B9" stroke-width="13"/>
+    <circle cx="128" cy="112" r="29" stroke="#F7FAFC" stroke-width="22"/>
+    <circle cx="128" cy="112" r="29" stroke="#159BC7" stroke-width="13"/>
+  </g>
+  <circle cx="128" cy="112" r="9" fill="#159BC7"/>
+
+  <g stroke="#F7FAFC" stroke-width="7">
+    <circle cx="86" cy="190" r="17" fill="#E6693E"/>
+    <circle cx="170" cy="190" r="17" fill="#42A66F"/>
+  </g>
+</svg>

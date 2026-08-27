@@ -49,24 +49,34 @@ static std::wstring find_framework_udk(DWORD pid) {
     return {};
 }
 
-void WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid) {
+void WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties) {
     label_winui3_windows(root);
 
     // Try XAML diagnostics injection for the full visual tree
     // WinUI3 registers "WinUIVisualDiagConnection" endpoints
-    // InitializeXamlDiagnosticsEx can be loaded from FrameworkUdk.dll (WinAppSDK)
-    // or from Windows.UI.Xaml.dll (System32)
+    // InitializeXamlDiagnosticsEx for WinUI 3 is exported by the Windows App
+    // SDK's FrameworkUdk. Microsoft.UI.Xaml.dll can also be the WinUI 2
+    // controls library hosted by system XAML, so falling back to
+    // Windows.UI.Xaml.dll here would use the wrong endpoint flavor.
     std::wstring frameworkUdk = find_framework_udk(pid);
-    std::wstring initDll;
-    if (!frameworkUdk.empty()) {
-        initDll = frameworkUdk;
-    } else {
-        // Fall back to system XAML
-        initDll = L"Windows.UI.Xaml.dll";
-    }
+    if (frameworkUdk.empty())
+        return;
 
-    inject_and_collect_xaml_tree(root, hwnd, pid, L"", initDll, "winui3",
-                               L"WinUIVisualDiagConnection");
+    inject_and_collect_xaml_tree(root, hwnd, pid, L"", frameworkUdk, "winui3",
+                               L"WinUIVisualDiagConnection", fastProperties);
+}
+
+std::shared_ptr<IFrameworkConnection> WinUI3Provider::open_connection(HWND hwnd, DWORD pid) {
+    std::wstring frameworkUdk = find_framework_udk(pid);
+    if (frameworkUdk.empty())
+        return nullptr;
+    return make_xaml_diag_connection(hwnd, pid, L"", frameworkUdk, "winui3",
+                                     L"WinUIVisualDiagConnection");
+}
+
+void WinUI3Provider::enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties) {
+    label_winui3_windows(root);
+    connection.get_tree(root, fastProperties);
 }
 
 } // namespace lvt

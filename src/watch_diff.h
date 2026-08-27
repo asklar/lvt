@@ -25,8 +25,13 @@ struct ChangeEvent {
     std::map<std::string, FieldChange> fields;
 };
 
-std::vector<ChangeEvent> diff_trees(const Element& before, const Element& after);
-std::vector<ChangeEvent> snapshot_added_events(const Element& root);
+// Both take a mutable Element& (not const): they call assign_element_keys
+// on it internally — see that function's doc comment in element_key.h for
+// why watch's diffing computing its OWN, different key algorithm used to be
+// a real, live bug, and why this file now always goes through the one
+// shared implementation instead.
+std::vector<ChangeEvent> diff_trees(Element& before, Element& after);
+std::vector<ChangeEvent> snapshot_added_events(Element& root);
 std::string serialize_change_event(const ChangeEvent& event);
 
 } // namespace lvt

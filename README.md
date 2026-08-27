@@ -21,7 +21,10 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 
 ### Download
 
-Grab the latest release from **[GitHub Releases](https://github.com/asklar/lvt/releases/latest)** — extract the zip and run `lvt.exe` from any terminal.
+Grab the latest release from **[GitHub Releases](https://github.com/asklar/lvt/releases/latest)**.
+The `lvt-vX.Y.Z-<arch>.zip` assets are the lean command-line packages; extract
+one and run `lvt.exe` from any terminal. The graphical viewer is published
+separately as `lvt-viewer-vX.Y.Z-x64.zip`.
 
 ### Install the Copilot skill
 
@@ -186,7 +189,7 @@ lvt frameworks --hwnd 0x1A0B3C
 lvt dump --name myapp --element e5 --depth 3
 
 # Query an element by durable key or eN id
-lvt query "win32|Window|MyWindow/win32|Button|Button|Name:OK" text --name myapp
+lvt query "win32|MyWindow/win32|Button|Name:OK" text --name myapp
 
 # Watch for live tree changes as JSON diff events
 lvt watch --name notepad --interval 250
@@ -222,6 +225,7 @@ lvt wait-for e9 --wait-prop IsEnabled=true --name myapp
 | `--output <file>` | Write to a file instead of stdout, or the PNG path for `screenshot` |
 | `--format <fmt>` | `json` (default) or `xml` |
 | `--interval <ms>` | Polling interval for `watch` (default: 500) |
+| `--fast` | Skip the XAML/WinUI3 property-chain walk (`GetPropertyValuesChain`) in favor of cheap direct property reads. Much faster on a rich tree — still reports bounds, `Text`, `Content`, and basic state, but not arbitrary custom properties. Default is off (today's exhaustive collection) |
 | `--element <ref>` | Scope to a specific element subtree by positional `eN` id, durable key, or `uia:<RuntimeId>` |
 | `--uia` | Use the UI Automation tree instead of the visual tree |
 | `--uia-view <view>` | UIA tree view: `control` (default), `raw`, or `content` |
@@ -400,6 +404,33 @@ for the full tool reference and the security model.
 Building it from source needs a Rust toolchain and is opt-in
 (`-DLVT_ENABLE_MCP=ON`); released binaries have it built in.
 
+## lvt Viewer
+
+A graphical, live element-tree browser for Windows — think Visual Studio's
+Live Visual Tree or the Windows SDK's Inspect.exe. Drag a crosshair onto a
+window to target it; a tree on one side and a property panel on the other
+both update live as the target's UI changes.
+
+Download `lvt-viewer-vX.Y.Z-x64.zip` from the matching
+[GitHub release](https://github.com/asklar/lvt/releases/latest), extract the
+whole archive, and run `LvtViewer.exe`. The archive contains the matching x64
+CLI, TAP DLLs, managed walkers, and plugins; it requires the
+[.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0).
+
+To build it from source instead:
+
+```powershell
+cmake --preset default -DLVT_BUILD_VIEWER=ON
+cmake --build build
+.\build\viewer\LvtViewer.exe
+```
+
+It's a separate WPF (.NET) app that drives `lvt.exe` as a subprocess (`watch`
+for live updates, `toggle`/`set-value` for editing) rather than linking
+`lvt_core`. See **[src/viewer/README.md](src/viewer/README.md)** for the
+architecture, why `watch` was chosen over MCP for live updates, and how to
+build/run it.
+
 ## Output format
 
 ### Watch mode
@@ -410,6 +441,11 @@ ticks emit `added`, `removed`, and `changed` events with old/new field values.
 Element matching uses stable framework/type/class/path-derived keys instead of
 the positional `e0`, `e1`, ... ids, so unique moved elements are reported as
 `changed` events with a `path` field change.
+
+`--fast` applies to `watch` too: every tick collects the cheaper property set
+instead of the full XAML/WinUI3 property chain, so `changed` events on an
+arbitrary custom property outside bounds/Text/Content/basic state won't be
+reported — only those properties are tracked and diffed in fast mode.
 
 ### JSON
 

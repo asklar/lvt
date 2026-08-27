@@ -2,6 +2,7 @@
 // Used by both XamlProvider and WinUI3Provider.
 
 #include "xaml_diag_common.h"
+#include "framework_connection.h"
 #include "../tap/tap_clsid.h"
 #include "../debug.h"
 #include "../bounds_util.h"
@@ -17,6 +18,9 @@
 #include <xamlOM.h>
 #include <nlohmann/json.hpp>
 #include <cstdio>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -25,6 +29,11 @@
 using json = nlohmann::json;
 
 namespace lvt {
+
+// How long to wait for the TAP DLL to finish walking the target's tree and
+// connect back with the result — see its use below for the measured,
+// evidence-based reason this is 60s, not the 15s it used to be.
+static constexpr DWORD kXamlCollectionTimeoutMs = 60000;
 
 static std::wstring make_pipe_name() {
     GUID guid;
@@ -118,7 +127,8 @@ static std::string sanitize(const std::string& s) {
 
 // Collect all DesktopChildSiteBridge elements in tree order
 static void collect_bridges(Element& el, std::vector<Element*>& bridges) {
-    if (el.className == "Microsoft.UI.Content.DesktopChildSiteBridge") {
+    if (el.className == "Microsoft.UI.Content.DesktopChildSiteBridge" ||
+        el.className == "Windows.UI.Composition.DesktopWindowContentBridge") {
         bridges.push_back(&el);
     }
     for (auto& child : el.children) {
@@ -140,6 +150,13 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     parent.children.emplace_back();
     Element& el = parent.children.back();
     el.framework = framework;
+    // IXamlDiagnostics supplies an InstanceHandle for every live XAML
+    // object. Preserve it as the provider-native identity: watch_diff can
+    // reconcile directly by handle, compact element keys can avoid
+    // repeating a multi-kilobyte ancestor path, and future property-edit
+    // commands can address the exact object expected by
+    // IVisualTreeService::SetProperty.
+    el.nativeHandle = static_cast<uintptr_t>(j.value("handle", 0ULL));
     el.className = sanitize(j.value("type", ""));
 
     // x:Name is a developer identifier, not user-visible text — store as property
@@ -208,174 +225,14 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
 
 }
 
-bool inject_and_collect_xaml_tree(
-    Element& root,
-    HWND /*hwnd*/,
-    DWORD pid,
-    const std::wstring& xamlDiagDll,
-    const std::wstring& initDllPath,
-    const std::string& frameworkLabel,
-    const std::wstring& connPrefix)
-{
-    std::wstring tapDll = tap_dll_path(L"lvt_tap");
-
-    if (GetFileAttributesW(tapDll.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        fprintf(stderr, "lvt: TAP DLL not found: %ls\n", tapDll.c_str());
-        return false;
-    }
-
-    // AppContainer (UWP) processes can't load DLLs from arbitrary paths.
-    // Stage the TAP DLL in a temp directory with appropriate ACLs.
-    std::wstring stagedDll;
-    if (is_appcontainer_process(pid)) {
-        stagedDll = stage_tap_dll_for_appcontainer(tapDll);
-        if (!stagedDll.empty())
-            tapDll = stagedDll;
-    }
-
-    std::wstring pipeName = make_pipe_name();
-
-    // Build a security descriptor that allows AppContainer (UWP) processes to connect.
-    // S-1-15-2-1 = ALL_APPLICATION_PACKAGES
-    SECURITY_ATTRIBUTES sa = {};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = FALSE;
-    PSECURITY_DESCRIPTOR rawPipeSd = nullptr;
-    ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &rawPipeSd, nullptr);
-    wil::unique_hlocal pipeSecurityDescriptor(rawPipeSd);
-    sa.lpSecurityDescriptor = pipeSecurityDescriptor.get();
-
-    wil::unique_hfile pipe(CreateNamedPipeW(
-        pipeName.c_str(),
-        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1, 0, 1024 * 1024, 10000, &sa));
-
-    if (!pipe) {
-        fprintf(stderr, "lvt: failed to create named pipe (error %lu)\n", GetLastError());
-        return false;
-    }
-
-    // Load InitializeXamlDiagnosticsEx from the specified DLL.
-    // This function runs in OUR process but injects into the target.
-    wil::unique_hmodule hXaml(LoadLibraryExW(initDllPath.c_str(), nullptr,
-        LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS));
-    if (!hXaml) {
-        hXaml.reset(LoadLibraryW(initDllPath.c_str()));
-    }
-    if (!hXaml) {
-        fprintf(stderr, "lvt: failed to load %ls (error %lu)\n", initDllPath.c_str(), GetLastError());
-        return false;
-    }
-
-    using FnInit = HRESULT(WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, CLSID, LPCWSTR);
-    auto pInit = reinterpret_cast<FnInit>(
-        GetProcAddress(hXaml.get(), "InitializeXamlDiagnosticsEx"));
-    if (!pInit) {
-        fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx not found in %ls\n", initDllPath.c_str());
-        return false;
-    }
-
-    // Try connection endpoint names: prefix + "1", prefix + "2", ...
-    // Start the overlapped pipe connect BEFORE injection. When the TAP DLL
-    // is already loaded in the target (repeated runs), pInit triggers SetSite
-    // synchronously and the TAP DLL can connect+write+close before we'd
-    // otherwise reach ConnectNamedPipe, causing a missed connection.
-    OVERLAPPED ov = {};
-    wil::unique_event connectEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    ov.hEvent = connectEvent.get();
-    ConnectNamedPipe(pipe.get(), &ov);
-    DWORD connectErr = GetLastError();
-
-    HRESULT hr = E_FAIL;
-    for (int i = 0; i < 10; i++) {
-        wchar_t endPoint[64];
-        swprintf_s(endPoint, L"%s%d", connPrefix.c_str(), i + 1);
-
-        hr = pInit(
-            endPoint,
-            pid,
-            xamlDiagDll.c_str(),
-            tapDll.c_str(),
-            CLSID_LvtTap,
-            pipeName.c_str());
-
-        if (g_debug)
-            fprintf(stderr, "lvt: %ls pid=%lu -> 0x%08lX\n", endPoint, pid, hr);
-
-        if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
-            break;
-    }
-
-    hXaml.reset();
-
-    if (FAILED(hr)) {
-        fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx failed (0x%08lX)\n", hr);
-        CancelIo(pipe.get());
-        return false;
-    }
-
-    if (g_debug)
-        fprintf(stderr, "lvt: injection succeeded, waiting for XAML tree data...\n");
-
-    // Wait for the TAP DLL to connect
-    if (connectErr == ERROR_IO_PENDING) {
-        DWORD waitResult = WaitForSingleObject(ov.hEvent, 15000);
-        if (waitResult != WAIT_OBJECT_0) {
-            fprintf(stderr, "lvt: TAP DLL did not connect (timeout)\n");
-            CancelIo(pipe.get());
-            return false;
-        }
-    } else if (connectErr != ERROR_PIPE_CONNECTED) {
-        fprintf(stderr, "lvt: ConnectNamedPipe failed (error %lu)\n", connectErr);
-        return false;
-    }
-
-    // Read all data from pipe (overlapped with timeout)
-    std::string data;
-    char buf[4096];
-    DWORD bytesRead = 0;
-    OVERLAPPED readOv = {};
-    wil::unique_event readEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    readOv.hEvent = readEvent.get();
-    for (;;) {
-        ResetEvent(readOv.hEvent);
-        BOOL ok = ReadFile(pipe.get(), buf, sizeof(buf), &bytesRead, &readOv);
-        if (!ok) {
-            DWORD err = GetLastError();
-            if (err == ERROR_IO_PENDING) {
-                if (WaitForSingleObject(readOv.hEvent, 15000) != WAIT_OBJECT_0) {
-                    CancelIo(pipe.get());
-                    break;
-                }
-                if (!GetOverlappedResult(pipe.get(), &readOv, &bytesRead, FALSE) || bytesRead == 0)
-                    break;
-            } else {
-                break;
-            }
-        } else if (bytesRead == 0) {
-            break;
-        }
-        data.append(buf, bytesRead);
-    }
-
-    if (g_debug)
-        fprintf(stderr, "lvt: received %zu bytes of XAML tree data\n", data.size());
-
-    if (data.empty()) {
-        fprintf(stderr, "lvt: no XAML tree data received from target process\n");
-        return false;
-    }
-
-    json treeJson;
-    try {
-        treeJson = json::parse(data);
-    } catch (const json::parse_error& e) {
-        fprintf(stderr, "lvt: failed to parse XAML tree JSON: %s\n", e.what());
-        return false;
-    }
-
+// Grafts an already-parsed XAML tree JSON payload (as produced by the TAP
+// DLL's SerializeAndSend, or a duplex connection's GET_TREE response - same
+// shape either way) into `root`. Split out from the connect+collect flow so
+// both the one-shot path (inject_and_collect_xaml_tree) and a reused,
+// persistent connection's repeated get_tree() calls (see XamlDiagConnection
+// below) share exactly one implementation of this logic instead of two
+// copies that could drift apart.
+static void graft_xaml_tree_json(const json& treeJson, Element& root, const std::string& frameworkLabel) {
     // Graft XAML elements into corresponding bridge windows.
     // Each DesktopWindowXamlSource root maps 1:1 to a DesktopChildSiteBridge HWND.
     // We match by best-fit size: the XAML root's first child dimensions are compared
@@ -384,6 +241,25 @@ bool inject_and_collect_xaml_tree(
     // may differ from XAML tree root enumeration order.
     if (treeJson.is_array()) {
         std::set<std::string> usedBridges;
+
+        // InitializeXamlDiagnosticsEx targets a whole process, not a single
+        // HWND: when several top-level windows of the same app share one
+        // process (multiple Notepad or File Explorer windows are common —
+        // and were exactly how this was found), every window's XAML content
+        // comes back in one combined stream, and more than one
+        // DesktopWindowXamlSource root here means there is real ambiguity
+        // about which root belongs to *this* window's bridges. Only then is
+        // it worth rejecting a low-confidence match (see the tolerance
+        // check below): with a single root there is nothing else it could
+        // be, no matter how poorly its content size happens to match, so
+        // the legacy graft-under-root fallback stays exactly as
+        // conservative as before for the overwhelmingly common case.
+        size_t xamlSourceRootCount = 0;
+        for (auto& node : treeJson) {
+            if (sanitize(node.value("type", "")).find("DesktopWindowXamlSource") != std::string::npos)
+                xamlSourceRootCount++;
+        }
+        const bool multipleRootsAmbiguous = xamlSourceRootCount > 1;
 
         for (auto& node : treeJson) {
             std::string typeName = sanitize(node.value("type", ""));
@@ -412,9 +288,18 @@ bool inject_and_collect_xaml_tree(
                 }
             }
 
-            // Skip bridge matching for roots with no measurable content
+            // Skip strict bridge matching for roots with no measurable
+            // content when there is no ambiguity to resolve: fall back to
+            // the legacy graft-under-root behavior, same as before this
+            // window's-worth-of-contamination fix existed, since with a
+            // single root there is no sibling window's content it could be
+            // confused with — dropping it here would only lose real
+            // structure (e.g. a not-yet-laid-out tab strip) for no safety
+            // benefit. Only drop outright when multiple roots are actually
+            // competing for the same bridges.
             if (contentW <= 0 && contentH <= 0) {
-                graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
+                if (!multipleRootsAmbiguous)
+                    graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
                 continue;
             }
 
@@ -443,6 +328,38 @@ bool inject_and_collect_xaml_tree(
                 }
             }
 
+            // Reject a "best" match that still isn't actually close — but
+            // only when multiple roots are genuinely competing (see
+            // multipleRootsAmbiguous above). Without a tolerance, the loop
+            // above always finds *some* bridge — including bridges
+            // belonging to *this* window that just happen to be the
+            // least-bad leftover for a completely different window's root —
+            // silently grafting one window's content (and its Text/bounds)
+            // onto a sibling window's tree. Requiring the winning candidate
+            // to be within a size-relative tolerance of its own bridge is
+            // what tells "this genuinely is that bridge's content" apart
+            // from "this is a foreign root that merely didn't lose by
+            // much"; anything else is dropped instead of misattached. When
+            // there is only one root, skip this check entirely and keep the
+            // legacy behavior of accepting whatever the single bridge is,
+            // however poor the size match — there is no other candidate it
+            // could rightfully belong to.
+            if (multipleRootsAmbiguous && bestIdx >= 0) {
+                double bw = bridges[bestIdx]->bounds.width;
+                double bh = bridges[bestIdx]->bounds.height;
+                constexpr double kMinAbsoluteToleragePx = 40.0;
+                constexpr double kRelativeTolerance = 0.25;
+                double tolerance = std::max(kMinAbsoluteToleragePx, (bw + bh) * kRelativeTolerance);
+                if (bestScore > tolerance) {
+                    if (g_debug) {
+                        fprintf(stderr, "lvt: rejecting XAML root match (score=%.0f > tolerance=%.0f); "
+                                        "likely belongs to a different window sharing this process\n",
+                                bestScore, tolerance);
+                    }
+                    bestIdx = -1;
+                }
+            }
+
             if (bestIdx >= 0) {
                 auto* bridge = bridges[bestIdx];
                 auto identity = bridge_identity(*bridge);
@@ -451,15 +368,459 @@ bool inject_and_collect_xaml_tree(
                 double baseX = bridge->bounds.x;
                 double baseY = bridge->bounds.y;
                 graft_json_node(node, *bridge, frameworkLabel, baseX, baseY);
-            } else {
+            } else if (!multipleRootsAmbiguous) {
+                // No DesktopChildSiteBridge matched at all — including the
+                // case where this window has none to begin with (classic
+                // system XAML doesn't use the WinUI3 Islands bridge model,
+                // so `bridges` is always empty there). With only one root in
+                // play there is no sibling window's content to confuse this
+                // with, so fall back to the legacy graft-under-root
+                // behavior exactly as before this fix.
                 graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
             }
+            // Otherwise: multiple roots were genuinely competing and none
+            // matched confidently enough — drop this root rather than
+            // misattach it to the wrong window.
         }
     } else if (treeJson.is_object()) {
         graft_json_node(treeJson, root, frameworkLabel);
     }
+}
 
-    return true;
+// Buffered line I/O over the persistent duplex pipe lvt.exe creates and the
+// TAP DLL connects back to. Every read/write must pass an OVERLAPPED
+// structure - the pipe handle is created with FILE_FLAG_OVERLAPPED (needed
+// so the initial "wait for the TAP DLL to connect" step can be bounded by a
+// timeout) and mixing overlapped and non-overlapped calls on the same
+// handle is unsupported.
+class DuplexPipeLineIO {
+public:
+    explicit DuplexPipeLineIO(HANDLE pipe) : m_pipe(pipe) {
+        m_readEvent.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        m_writeEvent.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    }
+
+    // Reads one '\n'-terminated line (returned without the newline).
+    // Returns false on timeout, a broken pipe, or EOF - all of which mean
+    // this connection is no longer usable.
+    bool read_line(DWORD timeoutMs, std::string& outLine) {
+        for (;;) {
+            auto nl = m_buffer.find('\n');
+            if (nl != std::string::npos) {
+                outLine = m_buffer.substr(0, nl);
+                m_buffer.erase(0, nl + 1);
+                if (!outLine.empty() && outLine.back() == '\r') outLine.pop_back();
+                return true;
+            }
+            char chunk[8192];
+            DWORD bytesRead = 0;
+            OVERLAPPED ov = {};
+            ResetEvent(m_readEvent.get());
+            ov.hEvent = m_readEvent.get();
+            BOOL ok = ReadFile(m_pipe, chunk, sizeof(chunk), &bytesRead, &ov);
+            if (!ok) {
+                DWORD err = GetLastError();
+                if (err == ERROR_IO_PENDING) {
+                    if (WaitForSingleObject(m_readEvent.get(), timeoutMs) != WAIT_OBJECT_0) {
+                        CancelIo(m_pipe);
+                        return false;
+                    }
+                    if (!GetOverlappedResult(m_pipe, &ov, &bytesRead, FALSE) || bytesRead == 0)
+                        return false;
+                } else {
+                    return false;
+                }
+            } else if (bytesRead == 0) {
+                return false;
+            }
+            m_buffer.append(chunk, bytesRead);
+        }
+    }
+
+    // Writes one line (message + '\n'). lvt.exe only ever sends short text
+    // commands, so a generous fixed default timeout is plenty.
+    bool write_line(const std::string& line, DWORD timeoutMs = 5000) {
+        std::string withNewline = line + "\n";
+        OVERLAPPED ov = {};
+        ResetEvent(m_writeEvent.get());
+        ov.hEvent = m_writeEvent.get();
+        DWORD written = 0;
+        BOOL ok = WriteFile(m_pipe, withNewline.data(),
+                             static_cast<DWORD>(withNewline.size()), &written, &ov);
+        if (!ok) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) return false;
+            if (WaitForSingleObject(m_writeEvent.get(), timeoutMs) != WAIT_OBJECT_0) {
+                CancelIo(m_pipe);
+                return false;
+            }
+            if (!GetOverlappedResult(m_pipe, &ov, &written, FALSE)) return false;
+        }
+        return true;
+    }
+
+private:
+    HANDLE m_pipe;
+    wil::unique_event m_readEvent;
+    wil::unique_event m_writeEvent;
+    std::string m_buffer;
+};
+
+// A live, persistent connection to one XAML/WinUI3 diagnostics session in a
+// target process - the concrete IFrameworkConnection this file provides.
+// See framework_connection.h for why this exists: InitializeXamlDiagnosticsEx
+// and AdviseVisualTreeChange are meant to be called ONCE per session, not
+// re-run from scratch on every tree refresh (the old design, and the
+// confirmed source of an unbounded per-tick resource leak in the TAP DLL -
+// one message-only window created and never destroyed per refresh).
+//
+// connect() performs the injection exactly once; get_tree() then reuses the
+// same pipe for as many refreshes as the caller needs, and the destructor
+// sends a clean DISCONNECT so the TAP DLL's own teardown
+// (UnadviseVisualTreeChange, DestroyWindow, COM release - see lvt_tap.cpp's
+// CleanupUIResources) runs exactly once, when this connection actually ends,
+// instead of never running at all.
+class XamlDiagConnection : public IFrameworkConnection {
+public:
+    static std::shared_ptr<XamlDiagConnection> connect(
+        HWND hwnd, DWORD pid,
+        const std::wstring& xamlDiagDll,
+        const std::wstring& initDllPath,
+        std::string frameworkLabel,
+        const std::wstring& connPrefix);
+
+    ~XamlDiagConnection() override {
+        if (m_alive && m_io) {
+            // Best-effort: tell the TAP DLL we're done so it runs its clean
+            // teardown instead of just noticing a broken pipe later. A
+            // short timeout is fine - we are tearing down either way.
+            m_io->write_line("DISCONNECT", 2000);
+        }
+    }
+
+    bool get_tree(Element& root, bool fastProperties,
+                  const std::string& /*providerOption*/ = {}) override {
+        if (!m_alive) return false;
+        std::string cmd = fastProperties ? "GET_TREE FAST" : "GET_TREE";
+        if (!m_io->write_line(cmd)) {
+            m_alive = false;
+            return false;
+        }
+        // A pushed CHANGE event (see lvt_tap.cpp's OnVisualTreeChange/
+        // PushChangeEvent) can arrive on this same stream at any time,
+        // interleaved with the response to this specific request - drain
+        // and queue any of those (they start with '{') before the actual
+        // tree response (a JSON array, starts with '[') turns up.
+        for (;;) {
+            std::string line;
+            if (!m_io->read_line(kXamlCollectionTimeoutMs, line)) {
+                fprintf(stderr, "lvt: %s: no response from TAP DLL (timeout or broken connection)\n",
+                        m_frameworkLabel.c_str());
+                m_alive = false;
+                return false;
+            }
+            if (!line.empty() && line[0] == '{') {
+                queue_change_event(line);
+                continue;
+            }
+            json treeJson;
+            try {
+                treeJson = json::parse(line);
+            } catch (const json::parse_error& e) {
+                fprintf(stderr, "lvt: failed to parse XAML tree JSON: %s\n", e.what());
+                return false;
+            }
+            graft_xaml_tree_json(treeJson, root, m_frameworkLabel);
+            return true;
+        }
+    }
+
+    std::vector<ConnectionEvent> poll_events() override {
+        std::lock_guard<std::mutex> lock(m_eventsMutex);
+        return std::move(m_pendingEvents);
+    }
+
+    bool is_alive() const override { return m_alive; }
+
+private:
+    XamlDiagConnection(wil::unique_hfile pipe, std::unique_ptr<DuplexPipeLineIO> io,
+                       std::string frameworkLabel)
+        : m_pipe(std::move(pipe)), m_io(std::move(io)), m_frameworkLabel(std::move(frameworkLabel)) {
+        m_alive = true;
+    }
+
+    // Parses one {"type":"CHANGE",...} line (see lvt_tap.cpp's
+    // PushChangeEvent for the exact shape) and queues it for poll_events().
+    // Malformed/unrecognized lines are dropped rather than treated as an
+    // error - a push event is best-effort by design (see PushChangeEvent's
+    // comment), and get_tree()'s own response is never affected by this.
+    void queue_change_event(const std::string& line) {
+        json ev;
+        try {
+            ev = json::parse(line);
+        } catch (const json::parse_error&) {
+            return;
+        }
+        if (ev.value("type", "") != "CHANGE")
+            return;
+
+        ConnectionEvent ce;
+        ce.mutation = (ev.value("mutation", "") == "remove")
+                          ? ConnectionEvent::Mutation::removed
+                          : ConnectionEvent::Mutation::added;
+        ce.handle = static_cast<uintptr_t>(ev.value("handle", 0ULL));
+        ce.parentHandle = static_cast<uintptr_t>(ev.value("parent", 0ULL));
+        ce.childIndex = ev.value("childIndex", 0);
+        ce.elementType = ev.value("elementType", "");
+        ce.name = ev.value("name", "");
+
+        std::lock_guard<std::mutex> lock(m_eventsMutex);
+        // A caller that never calls poll_events() at all (e.g. a one-shot
+        // CLI command that happened to acquire a connection but never asked
+        // for events) must not turn this into an unbounded leak of its own.
+        // Capping and dropping the oldest is safe: nothing currently
+        // depends on poll_events() for correctness (get_tree() is always a
+        // complete, independent refresh), only as an optional efficiency
+        // gain for a caller that does drain regularly.
+        constexpr size_t kMaxPendingEvents = 10000;
+        if (m_pendingEvents.size() >= kMaxPendingEvents)
+            m_pendingEvents.erase(m_pendingEvents.begin());
+        m_pendingEvents.push_back(std::move(ce));
+    }
+
+    wil::unique_hfile m_pipe;
+    std::unique_ptr<DuplexPipeLineIO> m_io;
+    std::string m_frameworkLabel;
+    bool m_alive = false;
+    std::mutex m_eventsMutex;
+    std::vector<ConnectionEvent> m_pendingEvents;
+};
+
+std::shared_ptr<XamlDiagConnection> XamlDiagConnection::connect(
+    HWND /*hwnd*/, DWORD pid,
+    const std::wstring& xamlDiagDll,
+    const std::wstring& initDllPath,
+    std::string frameworkLabel,
+    const std::wstring& connPrefix)
+{
+    std::wstring tapDll = tap_dll_path(L"lvt_tap");
+
+    if (GetFileAttributesW(tapDll.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        fprintf(stderr, "lvt: TAP DLL not found: %ls\n", tapDll.c_str());
+        return nullptr;
+    }
+
+    // AppContainer (UWP) processes can't load DLLs from arbitrary paths.
+    // Stage the TAP DLL in a temp directory with appropriate ACLs.
+    std::wstring stagedDll;
+    if (is_appcontainer_process(pid)) {
+        stagedDll = stage_tap_dll_for_appcontainer(tapDll);
+        if (!stagedDll.empty())
+            tapDll = stagedDll;
+    }
+
+    std::wstring pipeName = make_pipe_name();
+
+    // Build a security descriptor that allows AppContainer (UWP) processes to connect.
+    // S-1-15-2-1 = ALL_APPLICATION_PACKAGES
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+    PSECURITY_DESCRIPTOR rawPipeSd = nullptr;
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1, &rawPipeSd, nullptr);
+    wil::unique_hlocal pipeSecurityDescriptor(rawPipeSd);
+    sa.lpSecurityDescriptor = pipeSecurityDescriptor.get();
+
+    // PIPE_ACCESS_DUPLEX (not PIPE_ACCESS_INBOUND): lvt.exe now sends
+    // GET_TREE/DISCONNECT requests over this same pipe for as long as the
+    // connection lives, not just receiving one write-once blob.
+    wil::unique_hfile pipe(CreateNamedPipeW(
+        pipeName.c_str(),
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 1024 * 1024, 1024 * 1024, 10000, &sa));
+
+    if (!pipe) {
+        fprintf(stderr, "lvt: failed to create named pipe (error %lu)\n", GetLastError());
+        return nullptr;
+    }
+
+    // Load InitializeXamlDiagnosticsEx from the specified DLL.
+    // This function runs in OUR process but injects into the target.
+    wil::unique_hmodule hXaml(LoadLibraryExW(initDllPath.c_str(), nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS));
+    if (!hXaml) {
+        hXaml.reset(LoadLibraryW(initDllPath.c_str()));
+    }
+    if (!hXaml) {
+        fprintf(stderr, "lvt: failed to load %ls (error %lu)\n", initDllPath.c_str(), GetLastError());
+        return nullptr;
+    }
+
+    using FnInit = HRESULT(WINAPI*)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, CLSID, LPCWSTR);
+    auto pInit = reinterpret_cast<FnInit>(
+        GetProcAddress(hXaml.get(), "InitializeXamlDiagnosticsEx"));
+    if (!pInit) {
+        fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx not found in %ls\n", initDllPath.c_str());
+        return nullptr;
+    }
+
+    // Try connection endpoint names: prefix + "1", prefix + "2", ...
+    // Start the overlapped pipe connect BEFORE injection. When the TAP DLL
+    // is already loaded in the target (repeated runs), pInit triggers SetSite
+    // synchronously and the TAP DLL can connect+write+close before we'd
+    // otherwise reach ConnectNamedPipe, causing a missed connection.
+    OVERLAPPED ov = {};
+    wil::unique_event connectEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ov.hEvent = connectEvent.get();
+    ConnectNamedPipe(pipe.get(), &ov);
+    DWORD connectErr = GetLastError();
+
+    HRESULT hr = E_FAIL;
+    // The TAP DLL parses its GetInitializationData() BSTR as "pipe_name" or
+    // "pipe_name|FAST" (see lvt_tap.cpp's SetSiteImpl) — this only sets the
+    // connection-wide *default* fast mode now; get_tree() overrides it per
+    // request (see HandleGetTree in lvt_tap.cpp), so a single persistent
+    // connection can still mix fast live-tree polls with an occasional full
+    // request the way the old per-call model did.
+    std::wstring initData = pipeName;
+    // Connection identifiers are monotonically allocated by each XAML core
+    // and can grow well beyond 10 in a long-lived, multi-window process.
+    // Windows Terminal was observed with no endpoint in slots 1..10 despite
+    // an active WinUI tree. UWPSpy uses the same 10,000-attempt ceiling,
+    // citing DXamlCore's own allocation behavior; keep a high finite bound so
+    // a framework-detection false positive cannot loop forever.
+    constexpr int kMaxConnectionIdentifiers = 10000;
+    for (int i = 0; i < kMaxConnectionIdentifiers; i++) {
+        wchar_t endPoint[64];
+        swprintf_s(endPoint, L"%s%d", connPrefix.c_str(), i + 1);
+
+        hr = pInit(
+            endPoint,
+            pid,
+            xamlDiagDll.c_str(),
+            tapDll.c_str(),
+            CLSID_LvtTap,
+            initData.c_str());
+
+        if (g_debug)
+            fprintf(stderr, "lvt: %ls pid=%lu -> 0x%08lX\n", endPoint, pid, hr);
+
+        if (hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND))
+            break;
+    }
+
+    hXaml.reset();
+
+    if (FAILED(hr)) {
+        fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx failed (0x%08lX)\n", hr);
+        CancelIo(pipe.get());
+        return nullptr;
+    }
+
+    if (g_debug)
+        fprintf(stderr, "lvt: injection succeeded, waiting for TAP DLL to connect...\n");
+
+    // Wait for the TAP DLL to connect and subscribe. Unlike the old
+    // one-shot model, this is now a real handshake wait, not a "wait for
+    // the whole collection" wait: the TAP DLL sends READY as soon as it has
+    // subscribed (AdviseVisualTreeChange), *before* doing any bounds/
+    // property collection (see lvt_tap.cpp's ServeConnection) - the actual
+    // per-request collection cost (measured live at up to 40+ seconds for a
+    // large, actively animating tree - see kXamlCollectionTimeoutMs's own
+    // comment for that measurement) is now bounded by get_tree()'s own
+    // read_line() timeout instead of this connect step.
+    if (connectErr == ERROR_IO_PENDING) {
+        DWORD waitResult = WaitForSingleObject(ov.hEvent, kXamlCollectionTimeoutMs);
+        if (waitResult != WAIT_OBJECT_0) {
+            fprintf(stderr, "lvt: TAP DLL did not connect (timeout)\n");
+            CancelIo(pipe.get());
+            return nullptr;
+        }
+    } else if (connectErr != ERROR_PIPE_CONNECTED) {
+        fprintf(stderr, "lvt: ConnectNamedPipe failed (error %lu)\n", connectErr);
+        return nullptr;
+    }
+
+    auto io = std::make_unique<DuplexPipeLineIO>(pipe.get());
+    std::string readyLine;
+    if (!io->read_line(kXamlCollectionTimeoutMs, readyLine) || readyLine != "READY") {
+        fprintf(stderr, "lvt: TAP DLL did not send READY (got '%s')\n", readyLine.c_str());
+        return nullptr;
+    }
+
+    if (g_debug)
+        fprintf(stderr, "lvt: TAP DLL connected and ready\n");
+
+    // std::shared_ptr with a private constructor: std::make_shared can't
+    // call it directly, so construct with new and wrap.
+    return std::shared_ptr<XamlDiagConnection>(
+        new XamlDiagConnection(std::move(pipe), std::move(io), std::move(frameworkLabel)));
+}
+
+// Establishes a persistent XAML/WinUI3 diagnostics connection for reuse
+// across many tree refreshes - see framework_connection.h and
+// connection_registry.h for how a caller (watch's loop, an MCP session)
+// acquires/reuses/releases one instead of re-injecting per refresh.
+std::shared_ptr<IFrameworkConnection> make_xaml_diag_connection(
+    HWND hwnd, DWORD pid,
+    const std::wstring& xamlDiagDll,
+    const std::wstring& initDllPath,
+    const std::string& frameworkLabel,
+    const std::wstring& connPrefix)
+{
+    return XamlDiagConnection::connect(hwnd, pid, xamlDiagDll, initDllPath, frameworkLabel, connPrefix);
+}
+
+// Injects and collects the XAML tree, retrying a small, bounded number of
+// times if the single attempt genuinely fails (a hard error, not merely
+// "this is taking a while" — kXamlCollectionTimeoutMs above already gives a
+// slow-but-progressing collection the room it needs, based on measured
+// real-world timing, so a failure that gets here is a rarer case: the
+// target closing mid-walk, a one-off COM error, and similar).
+//
+// Deliberately few attempts, with a real gap between them, rather than
+// many with a short one: if a previous attempt failed after actually
+// starting a walk inside the target (as opposed to failing before that,
+// e.g. at InitializeXamlDiagnosticsEx itself), the TAP DLL's own worker
+// thread for that attempt keeps running in the target to completion
+// regardless of what lvt.exe decides to do — there is no way to cancel it
+// from here. Retrying too eagerly would start a *second*, fully
+// independent walk competing with that still-running one for the same
+// target UI thread via SendMessage, which can only make a target that is
+// already struggling to keep up slower still, not faster — the opposite
+// of what a retry is supposed to achieve. A short pause before the one
+// retry this makes gives a stray straggler more of a chance to finish
+// first.
+bool inject_and_collect_xaml_tree(
+    Element& root,
+    HWND hwnd,
+    DWORD pid,
+    const std::wstring& xamlDiagDll,
+    const std::wstring& initDllPath,
+    const std::string& frameworkLabel,
+    const std::wstring& connPrefix,
+    bool fastProperties)
+{
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (attempt > 0) {
+            if (g_debug)
+                fprintf(stderr, "lvt: retrying XAML injection (attempt %d)\n", attempt + 1);
+            Sleep(1000);
+        }
+        // A one-shot caller (dump/query/screenshot) has no reason to keep
+        // this connection open once it has its tree - unlike watch's loop
+        // or an MCP session (see connection_registry.h), which acquire one
+        // and reuse it across many refreshes instead of reconnecting every
+        // time. `connection` going out of scope at the end of this
+        // iteration sends a clean DISCONNECT (see ~XamlDiagConnection).
+        auto connection = XamlDiagConnection::connect(hwnd, pid, xamlDiagDll, initDllPath,
+                                                       frameworkLabel, connPrefix);
+        if (connection && connection->get_tree(root, fastProperties))
+            return true;
+    }
+    return false;
 }
 
 } // namespace lvt

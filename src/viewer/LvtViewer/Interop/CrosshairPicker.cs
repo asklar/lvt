@@ -1,0 +1,195 @@
+using System;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Interop;
+
+namespace LvtViewer.Interop;
+
+/// <summary>
+/// Implements Inspect.exe-style "viewfinder" targeting: press-and-drag a
+/// crosshair handle; while dragging, whatever top-level window is under the
+/// cursor is highlighted; on release, that window is resolved to a PID/HWND
+/// and reported via <see cref="TargetPicked"/>.
+/// </summary>
+public sealed class CrosshairPicker
+{
+    private readonly FrameworkElement _handle;
+    private readonly Window _ownerWindow;
+    private readonly HighlightOverlay _overlay = new();
+    private bool _dragging;
+    private IntPtr _lastHighlighted = IntPtr.Zero;
+
+    public event Action<IntPtr>? TargetPicked;
+
+    /// <summary>Fires with a short hint whenever dragging starts/stops, for a status-bar cue.</summary>
+    public event Action<string>? HintChanged;
+
+    public CrosshairPicker(FrameworkElement handle, Window ownerWindow)
+    {
+        _handle = handle;
+        _ownerWindow = ownerWindow;
+        _handle.MouseLeftButtonDown += OnMouseDown;
+        _handle.MouseMove += OnMouseMove;
+        _handle.MouseLeftButtonUp += OnMouseUp;
+        _handle.LostMouseCapture += OnLostCapture;
+        // Mouse capture does not affect keyboard focus, so Escape has to be
+        // caught at the window level rather than on _handle itself.
+        _ownerWindow.PreviewKeyDown += OnPreviewKeyDown;
+    }
+
+    private void OnMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        _dragging = true;
+        _handle.CaptureMouse();
+        _handle.Cursor = Cursors.Cross;
+        HintChanged?.Invoke("Release over a window to inspect it… (Esc to cancel)");
+        e.Handled = true;
+    }
+
+    private void OnMouseMove(object sender, MouseEventArgs e)
+    {
+        if (!_dragging)
+            return;
+        UpdateHighlight();
+    }
+
+    private void OnMouseUp(object sender, MouseButtonEventArgs e)
+    {
+        if (!_dragging)
+            return;
+        _dragging = false;
+        _handle.ReleaseMouseCapture();
+        var hwnd = ResolveWindowUnderCursor();
+        HideHighlight();
+        if (hwnd != IntPtr.Zero)
+            TargetPicked?.Invoke(hwnd);
+        else
+            HintChanged?.Invoke("No window was under the cursor on release. Drag the crosshair onto a window to inspect it.");
+    }
+
+    private void OnLostCapture(object sender, MouseEventArgs e)
+    {
+        _dragging = false;
+        _handle.Cursor = null;
+        HideHighlight();
+    }
+
+    private void OnPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (!_dragging || e.Key != Key.Escape)
+            return;
+        e.Handled = true;
+        HintChanged?.Invoke("Cancelled. Drag the crosshair onto a window to inspect it.");
+        // Releasing capture routes through OnLostCapture, which already
+        // does the rest of the cancel (clear _dragging, hide the highlight,
+        // restore the cursor) — no need to duplicate that here.
+        _handle.ReleaseMouseCapture();
+    }
+
+    private void UpdateHighlight()
+    {
+        var hwnd = ResolveWindowUnderCursor();
+        if (hwnd == _lastHighlighted)
+            return;
+        _lastHighlighted = hwnd;
+
+        if (hwnd == IntPtr.Zero)
+        {
+            HideHighlight();
+            return;
+        }
+
+        // Tracks whichever window is now under the cursor — Track() owns
+        // it, positions it, and starts polling for occlusion/minimize so
+        // the preview correctly disappears if something covers the
+        // candidate window mid-drag (see HighlightOverlay's class comment).
+        var rect = NativeMethods.GetVisibleFrame(hwnd);
+        _overlay.Track(hwnd, rect);
+    }
+
+    private void HideHighlight()
+    {
+        _lastHighlighted = IntPtr.Zero;
+        if (_overlay.IsVisible)
+            _overlay.Hide();
+    }
+
+    /// <summary>
+    /// Finds the topmost window actually visible at the cursor — not just
+    /// "whatever WindowFromPoint returns", which only reports Z-order among
+    /// windows WindowFromPoint itself considers, and does not know about
+    /// DWM cloaking (a UWP app on another virtual desktop, or one DWM is
+    /// mid-transition on, is still cloaked-but-"there" and can report a
+    /// completely stale rect — this was the direct cause of a highlight
+    /// landing nowhere near any real window).
+    ///
+    /// EnumWindows visits top-level windows in top-to-bottom Z-order, so
+    /// the first one that (a) is not our own toolbar/overlay, (b) is
+    /// visible, not minimized, and not cloaked, and (c) actually contains
+    /// the point is exactly the topmost visible window there — anything
+    /// occluded by it, however large, is correctly never reached, and a
+    /// minimized window (parked off-screen or not) is never a candidate at
+    /// all rather than incidentally excluded by its rect missing the point.
+    /// </summary>
+    private IntPtr ResolveWindowUnderCursor()
+    {
+        if (!NativeMethods.GetCursorPos(out var pt))
+            return IntPtr.Zero;
+
+        var ownHwnd = new WindowInteropHelper(_ownerWindow).Handle;
+        var overlayHwnd = new WindowInteropHelper(_overlay).Handle;
+
+        var found = IntPtr.Zero;
+        NativeMethods.EnumWindows((hwnd, _) =>
+        {
+            // The overlay is deliberately click-through and only visual
+            // feedback for the candidate beneath it. Once it is shown it
+            // covers the cursor by definition, so treating it as an
+            // occluder makes the next mouse move (and mouse-up) resolve to
+            // no target: the rectangle flashes once, then disappears and
+            // nothing can be selected. Always skip it.
+            if (hwnd == overlayHwnd)
+                return true;
+
+            if (hwnd == ownHwnd)
+            {
+                // Our own UI can genuinely be the topmost thing at this
+                // exact point — most commonly the cursor is still over the
+                // crosshair handle itself right at drag-start. If so, the
+                // search must stop here rather than skip past us and keep
+                // looking further down the Z-order: continuing could
+                // otherwise "find" some unrelated, far-lower window whose
+                // rect merely happens to also span this same screen point
+                // (e.g. some other large/maximized app elsewhere in the
+                // Z-order) even though it is not actually visible here at
+                // all — it is covered by our own window, which the
+                // unconditional skip below used to ignore entirely.
+                // Observed live: dragging the crosshair from directly over
+                // the viewer's own button picked a large, fully unrelated,
+                // and actually-hidden-behind-the-viewer window instead of
+                // correctly finding nothing (or whatever genuinely was
+                // topmost) at that point.
+                var ownRect = NativeMethods.GetVisibleFrame(hwnd);
+                if (pt.X >= ownRect.Left && pt.X < ownRect.Right &&
+                    pt.Y >= ownRect.Top && pt.Y < ownRect.Bottom)
+                    return false; // stop — our own UI occupies this point
+                return true; // not at this point; keep looking
+            }
+
+            if (!NativeMethods.IsWindowVisible(hwnd) || NativeMethods.IsIconic(hwnd) ||
+                NativeMethods.IsCloaked(hwnd))
+                return true;
+
+            var rect = NativeMethods.GetVisibleFrame(hwnd);
+            if (rect.Width <= 0 || rect.Height <= 0)
+                return true;
+            if (pt.X < rect.Left || pt.X >= rect.Right || pt.Y < rect.Top || pt.Y >= rect.Bottom)
+                return true;
+
+            found = hwnd;
+            return false; // stop — found the topmost visible window at this point
+        }, IntPtr.Zero);
+
+        return found;
+    }
+}

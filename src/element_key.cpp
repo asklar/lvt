@@ -18,59 +18,26 @@ std::string escape_key_part(const std::string& value) {
 }
 
 std::string base_identity_key(const Element& el) {
-    return escape_key_part(el.framework) + "|" +
-           escape_key_part(el.type) + "|" +
-           escape_key_part(el.className);
-}
-
-void collect_index(const Element& el, const std::string& path,
-                   std::vector<IndexedElement>& out,
-                   std::unordered_map<std::string, int>& counts) {
-    IndexedElement indexed;
-    indexed.element = &el;
-    indexed.path = path;
-    indexed.baseKey = base_identity_key(el);
-    out.push_back(indexed);
-    counts[indexed.baseKey]++;
-
-    for (size_t i = 0; i < el.children.size(); ++i) {
-        auto childPath = path.empty() ? std::to_string(i) : path + "." + std::to_string(i);
-        collect_index(el.children[i], childPath, out, counts);
-    }
-}
-
-void assign_keys(std::vector<IndexedElement>& elements,
-                 const std::unordered_map<std::string, int>& counts) {
-    for (auto& indexed : elements) {
-        indexed.key = indexed.baseKey;
-        auto count = counts.find(indexed.baseKey);
-        if (count != counts.end() && count->second > 1)
-            indexed.key += "|@" + indexed.path;
-    }
-}
-
-std::vector<IndexedElement> index_tree(const Element& root) {
-    std::vector<IndexedElement> elements;
-    std::unordered_map<std::string, int> counts;
-    collect_index(root, "0", elements, counts);
-    assign_keys(elements, counts);
-    return elements;
-}
-
-void index_tree_pair(const Element& before, const Element& after,
-                     std::vector<IndexedElement>& beforeElements,
-                     std::vector<IndexedElement>& afterElements) {
-    std::unordered_map<std::string, int> beforeCounts;
-    std::unordered_map<std::string, int> afterCounts;
-    collect_index(before, "0", beforeElements, beforeCounts);
-    collect_index(after, "0", afterElements, afterCounts);
-
-    std::unordered_map<std::string, int> combinedCounts = beforeCounts;
-    for (const auto& [key, count] : afterCounts)
-        combinedCounts[key] = std::max(combinedCounts[key], count);
-
-    assign_keys(beforeElements, combinedCounts);
-    assign_keys(afterElements, combinedCounts);
+    // Only one of type/className, not both: for every provider that sets
+    // both (xaml_diag_common.cpp, wpf_inject.cpp), `type` is derived as the
+    // substring of `className` after its last '.', so it never carries
+    // information className does not already have — including both here
+    // duplicated it for nothing. className is the more specific of the two
+    // when both exist (a raw win32/native class name, or a fully-qualified
+    // XAML type), so it wins; type is the fallback for providers where
+    // className can be legitimately empty (UIA elements often report no
+    // ClassName at all, see uia_provider.cpp), so the key never gets an
+    // empty identity segment.
+    //
+    // This matters far more than it looks: a key is built once per element
+    // but then repeated as a "/"-joined prefix in *every one* of that
+    // element's descendants (see assign_child_keys below), so halving one
+    // segment here roughly halves the key payload of an entire subtree, not
+    // just one element. Measured on a real ~1900-element WinUI3 tree
+    // (Microsoft Store), the full ancestor-chain "key" made up 40% of the
+    // dump's total JSON size before this change.
+    const std::string& identity = el.className.empty() ? el.type : el.className;
+    return escape_key_part(el.framework) + "|" + escape_key_part(identity);
 }
 
 static std::string hwnd_key(uintptr_t handle) {
@@ -79,7 +46,25 @@ static std::string hwnd_key(uintptr_t handle) {
     return out.str();
 }
 
-static std::string stable_name_key(const Element& el) {
+// XAML diagnostics InstanceHandles are already process-wide object
+// identities. Unlike a sibling index/name path, they do not change when an
+// element is reparented and do not need every ancestor repeated in every
+// descendant's key. They have also been observed stable across independent
+// diagnostics connections to the same live target, which the WinUI
+// integration test guards by dumping twice and querying in a third process.
+// Keep the structural algorithm as the fallback for providers/elements that
+// do not expose such an identity.
+static std::string compact_instance_key(const Element& el) {
+    if (el.nativeHandle == 0 ||
+        (el.framework != "xaml" && el.framework != "winui3"))
+        return {};
+
+    std::ostringstream out;
+    out << el.framework << ":0x" << std::hex << std::uppercase << el.nativeHandle;
+    return out.str();
+}
+
+std::string stable_name_key(const Element& el) {
     for (const char* name : {"AutomationId", "x:Name", "Name", "automationId", "name"}) {
         auto it = el.properties.find(name);
         if (it != el.properties.end() && !it->second.empty())
@@ -88,6 +73,14 @@ static std::string stable_name_key(const Element& el) {
     return {};
 }
 
+// baseCounts/hwndCounts/nameCounts are all scoped to just `parent`'s own
+// direct children (see assign_child_keys, which builds them fresh for each
+// parent) — never counted across the whole tree. This locality is the
+// entire point: a node's key can only ever be disturbed by a change among
+// its OWN siblings, never by something elsewhere in an unrelated subtree.
+// See assign_element_keys' doc comment for what used to go wrong when a
+// different, GLOBALLY-scoped algorithm was used instead (in watch's
+// diffing, before this).
 static std::string discriminator_for_child(const Element& child, size_t childIndex,
                                            const std::map<std::string, int>& baseCounts,
                                            const std::map<std::string, int>& hwndCounts,
@@ -133,14 +126,21 @@ static void assign_child_keys(Element& parent, const std::string& parentKey) {
 
     for (size_t i = 0; i < parent.children.size(); ++i) {
         auto& child = parent.children[i];
-        auto segment = discriminator_for_child(child, i, baseCounts, hwndCounts, nameCounts);
-        child.key = parentKey.empty() ? segment : parentKey + "/" + segment;
+        auto compact = compact_instance_key(child);
+        if (!compact.empty()) {
+            child.key = std::move(compact);
+        } else {
+            auto segment = discriminator_for_child(child, i, baseCounts, hwndCounts, nameCounts);
+            child.key = parentKey.empty() ? segment : parentKey + "/" + segment;
+        }
         assign_child_keys(child, child.key);
     }
 }
 
 void assign_element_keys(Element& root) {
-    root.key = base_identity_key(root);
+    root.key = compact_instance_key(root);
+    if (root.key.empty())
+        root.key = base_identity_key(root);
     assign_child_keys(root, root.key);
 }
 

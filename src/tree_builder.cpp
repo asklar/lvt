@@ -179,7 +179,8 @@ void trim_to_depth(Element& root, int maxDepth) {
 }
 
 Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frameworks,
-                   int maxDepth, const std::string& pluginOption) {
+                   int maxDepth, const std::string& pluginOption, bool fastProperties,
+                   const ConnectionLookup& connectionLookup) {
     // Start with the Win32 provider as the base — it always applies
     Win32Provider win32;
     Element root = win32.build(hwnd, maxDepth);
@@ -195,14 +196,45 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         case Framework::Xaml: {
 #if LVT_ENABLE_XAML
             XamlProvider xaml;
-            xaml.enrich(root, hwnd, pid);
+            auto connection = connectionLookup ? connectionLookup("xaml") : nullptr;
+            if (connection && connection->is_alive()) {
+                xaml.enrich_with_connection(root, *connection, fastProperties);
+            } else if (!connectionLookup) {
+                // No ConnectionLookup at all means this is a one-shot CLI
+                // call (dump/query/screenshot) that never acquired a
+                // persistent connection by design - a single inject-collect-
+                // disconnect is the correct, minimal-footprint behavior here.
+                xaml.enrich(root, hwnd, pid, fastProperties);
+            }
+            // else: a ConnectionLookup was supplied (watch/MCP) but has no
+            // alive connection for "xaml" right now. Skip enrichment for
+            // this call rather than silently falling back to the one-shot
+            // path above - that fallback is what silently reintroduced
+            // permanent per-tick reinjection once a connection died, since
+            // it looks identical to a slow-but-working tick from the
+            // caller's side. The connection owner (refresh_dead_watch_
+            // connections for watch, the MCP session's reconnect logic)
+            // is responsible for re-acquiring a fresh persistent connection
+            // before the next tick/call; this one just comes back with
+            // whatever the tree already had for this framework.
 #endif
             break;
         }
         case Framework::WinUI3: {
 #if LVT_ENABLE_WINUI3
             WinUI3Provider winui3;
-            winui3.enrich(root, hwnd, pid);
+            auto connection = connectionLookup ? connectionLookup("winui3") : nullptr;
+            if (connection && connection->is_alive()) {
+                winui3.enrich_with_connection(root, *connection, fastProperties);
+            } else if (!connectionLookup) {
+                // See the matching comment in the Xaml case above: no
+                // lookup at all means a one-shot CLI call, where a single
+                // inject-collect-disconnect is correct by design.
+                winui3.enrich(root, hwnd, pid, fastProperties);
+            }
+            // else: lookup was supplied (watch/MCP) but returned no alive
+            // connection - skip rather than silently reinject; see the
+            // Xaml case above for the full rationale.
 #endif
             break;
         }
@@ -228,7 +260,17 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
                     pf.name = fi.name;
                     pf.version = fi.version;
                     pf.plugin = &p;
-                    enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
+                    // A plugin's persistent connection (see plugin.h's
+                    // optional v2 functions) is looked up under its own
+                    // detected name, same as "xaml"/"winui3" - a caller
+                    // that acquired one via open_plugin_connection supplies
+                    // it through the same ConnectionLookup mechanism.
+                    auto connection = connectionLookup ? connectionLookup(fi.name) : nullptr;
+                    if (connection && connection->is_alive()) {
+                        connection->get_tree(root, fastProperties, pluginOption);
+                    } else {
+                        enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
+                    }
                     break;
                 }
             }

@@ -1,0 +1,247 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using LvtViewer.Models;
+using LvtViewer.ViewModels;
+
+namespace LvtViewer.Services;
+
+/// <summary>
+/// Maintains the live element tree from a stream of lvt watch events
+/// (see watch_diff.h / watch_diff.cpp). This is the sole data source for the
+/// viewer's tree and property panel — see README.md for why watch (rather
+/// than polling dump, or MCP) was chosen as the live-update mechanism.
+///
+/// Design principle, non-negotiable: an event that only concerns already-
+/// enumerated elements must only ever touch those elements. "added" inserts
+/// one node into its parent's Children at the right position; "removed"
+/// removes one node from wherever it currently sits; a "changed" reorder
+/// moves one node from its old parent to its new one. Nothing here ever
+/// recomputes the whole hierarchy from scratch — an earlier version of this
+/// class did exactly that (a full walk of every known node, every time
+/// anything anywhere added/removed/reordered), and even though it reused
+/// ElementNodeViewModel instances by identity, doing that walk at all again
+/// and again is what "the tree refreshes as I navigate" turned out to be:
+/// each one is real, visible WPF layout work across the *entire* TreeView,
+/// not just near whatever actually changed.
+///
+/// lvt's "path" is a dot-separated, depth-first child-index string
+/// (element_key.cpp): the root is "0", its children are "0.0", "0.1", ...
+/// Because collect_index() visits a node before its children, the very
+/// first burst of "added" events a fresh `lvt watch` process emits
+/// (run_watch_loop -> snapshot_added_events) already arrives in
+/// parent-before-child order — but later ticks diff by sorting on *key*
+/// (diff_trees uses std::map&lt;key,...&gt;), so a brand new subtree's
+/// "added" events are not guaranteed to arrive parent-first. AttachToParent
+/// tolerates arbitrary arrival order by queuing a child whose parent has not
+/// been seen yet in _pendingChildren, keyed by the parent path it is
+/// waiting for, and resolving it the moment that parent itself attaches.
+/// </summary>
+public sealed class LiveTree
+{
+    private readonly Dictionary<string, ElementNodeViewModel> _byKey = new();
+
+    /// <summary>Currently-attached nodes only, keyed by their current Path — the lookup AttachToParent uses to find a node's parent.</summary>
+    private readonly Dictionary<string, ElementNodeViewModel> _byPath = new();
+
+    /// <summary>Which keys are actually attached (in Roots or some parent's Children) right now, as opposed to merely known — see DetachFromParent.</summary>
+    private readonly HashSet<string> _attachedKeys = new();
+
+    /// <summary>Children waiting on a parent path that has not attached yet, keyed by that parent path.</summary>
+    private readonly Dictionary<string, List<ElementNodeViewModel>> _pendingChildren = new();
+
+    /// <summary>0 or 1 items: the root element of the watched window.</summary>
+    public ObservableCollection<ElementNodeViewModel> Roots { get; } = new();
+
+    public void Reset()
+    {
+        Logger.Log("tree", $"Reset() — clearing {_byKey.Count} known nodes");
+        _byKey.Clear();
+        _byPath.Clear();
+        _attachedKeys.Clear();
+        _pendingChildren.Clear();
+        Roots.Clear();
+    }
+
+    public void Apply(WatchEventDto evt)
+    {
+        switch (evt.Event)
+        {
+            case "added":
+                ApplyAdded(evt);
+                break;
+            case "changed":
+                ApplyChanged(evt);
+                break;
+            case "removed":
+                ApplyRemoved(evt);
+                break;
+        }
+    }
+
+    private ElementNodeViewModel GetOrCreate(string key)
+    {
+        if (!_byKey.TryGetValue(key, out var node))
+        {
+            node = new ElementNodeViewModel { Key = key };
+            _byKey[key] = node;
+        }
+        return node;
+    }
+
+    private void ApplyAdded(WatchEventDto evt)
+    {
+        if (evt.Element == null)
+            return;
+        var alreadyKnown = _byKey.ContainsKey(evt.Key);
+        var node = GetOrCreate(evt.Key);
+        if (alreadyKnown)
+        {
+            // Should not happen per the protocol ("added" only ever names a
+            // genuinely new key) — defensive only, so a violation of that
+            // does not leave a duplicate/dangling entry rather than crashing.
+            DetachFromParent(node);
+        }
+        node.UpdateFrom(evt.Element, evt.Key, evt.Path);
+        Logger.Log("tree", $"added key={evt.Key} path={evt.Path}");
+        AttachToParent(node);
+    }
+
+    private void ApplyChanged(WatchEventDto evt)
+    {
+        if (!_byKey.TryGetValue(evt.Key, out var node) || evt.Fields == null)
+            return;
+
+        foreach (var (fieldName, change) in evt.Fields)
+        {
+            if (fieldName == "path")
+            {
+                // A reorder/reparent: move exactly this one node from
+                // wherever it currently sits to wherever it belongs now —
+                // never a reason to touch any other node.
+                Logger.Log("tree", $"changed key={evt.Key} path {node.Path} -> {change.New}");
+                DetachFromParent(node);
+                node.Path = change.New;
+                AttachToParent(node);
+            }
+            else if (fieldName == "bounds")
+            {
+                node.SetBoundsFromString(change.New);
+            }
+            else if (fieldName.StartsWith("properties.", StringComparison.Ordinal))
+            {
+                node.SetProperty(fieldName["properties.".Length..], change.New);
+            }
+            else
+            {
+                node.SetScalarField(fieldName, change.New);
+            }
+        }
+    }
+
+    private void ApplyRemoved(WatchEventDto evt)
+    {
+        if (_byKey.TryGetValue(evt.Key, out var node))
+        {
+            DetachFromParent(node);
+            _byKey.Remove(evt.Key);
+            Logger.Log("tree", $"removed key={evt.Key}");
+        }
+    }
+
+    /// <summary>
+    /// Inserts <paramref name="node"/> into the hierarchy at the position
+    /// its own Path says it belongs — Roots if it is the root, its parent's
+    /// Children (found via _byPath, sorted-inserted by child index) if the
+    /// parent is already attached, or _pendingChildren if it is not (yet).
+    /// </summary>
+    private void AttachToParent(ElementNodeViewModel node)
+    {
+        _byPath[node.Path] = node;
+        _attachedKeys.Add(node.Key);
+
+        // Any children that were waiting specifically on this path can
+        // resolve now — including transitively: attaching one of them below
+        // registers *its* path, which the next AttachToParent call (for a
+        // grandchild already queued on that path) will find.
+        if (_pendingChildren.Remove(node.Path, out var waiting))
+        {
+            foreach (var child in waiting)
+                AttachAsChild(node, child);
+        }
+
+        if (node.Path == "0")
+        {
+            node.Parent = null;
+            node.IsExpanded = true; // start expanded — only happens once, when the root first attaches
+            if (!Roots.Contains(node))
+                Roots.Add(node);
+            return;
+        }
+
+        var parentPath = ParentPathOf(node.Path);
+        if (_byPath.TryGetValue(parentPath, out var parent))
+        {
+            AttachAsChild(parent, node);
+        }
+        else
+        {
+            if (!_pendingChildren.TryGetValue(parentPath, out var list))
+                _pendingChildren[parentPath] = list = new List<ElementNodeViewModel>();
+            list.Add(node);
+        }
+    }
+
+    /// <summary>
+    /// Removes <paramref name="node"/> from wherever it currently sits —
+    /// Roots, its parent's Children, or (if its own parent never attached)
+    /// the pending-children queue it was waiting in — without touching
+    /// anything else. A no-op site (Roots.Remove / Children.Remove /
+    /// list.Remove on an item not present) is intentionally tolerated
+    /// rather than pre-checked, since which one applies depends on state
+    /// this method itself does not need to branch on separately.
+    /// </summary>
+    private void DetachFromParent(ElementNodeViewModel node)
+    {
+        if (_attachedKeys.Remove(node.Key))
+        {
+            _byPath.Remove(node.Path);
+            if (node.Parent != null)
+            {
+                node.Parent.Children.Remove(node);
+                node.Parent = null;
+            }
+            else
+            {
+                Roots.Remove(node);
+            }
+        }
+        else if (_pendingChildren.TryGetValue(ParentPathOf(node.Path), out var list))
+        {
+            list.Remove(node);
+        }
+    }
+
+    private static void AttachAsChild(ElementNodeViewModel parent, ElementNodeViewModel child)
+    {
+        child.Parent = parent;
+        var index = ChildIndex(child.Path);
+        var insertAt = 0;
+        while (insertAt < parent.Children.Count && ChildIndex(parent.Children[insertAt].Path) < index)
+            insertAt++;
+        parent.Children.Insert(insertAt, child);
+    }
+
+    private static string ParentPathOf(string path)
+    {
+        var lastDot = path.LastIndexOf('.');
+        return lastDot < 0 ? "" : path[..lastDot];
+    }
+
+    private static int ChildIndex(string path)
+    {
+        var lastDot = path.LastIndexOf('.');
+        var segment = lastDot < 0 ? path : path[(lastDot + 1)..];
+        return int.TryParse(segment, out var value) ? value : 0;
+    }
+}

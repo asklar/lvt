@@ -59,6 +59,22 @@ HRESULT create_automation(const UiaOptions& options, IUIAutomation** out) {
     return S_OK;
 }
 
+std::optional<Element> build_tree_for_action(HWND hwnd, const UiaOptions& options,
+                                             UiaConnection* connection) {
+    // The live Invoke/Value/SendInput path below still uses its own automation
+    // object because that code is not modelled as an IFrameworkConnection. The
+    // surrounding tree reads, however, are ordinary UIA walks and can reuse a
+    // session/watch connection when one exists.
+    if (connection && connection->is_alive()) {
+        Element tree;
+        if (connection->get_tree_with_options(tree, options))
+            return tree;
+    }
+
+    UiaProvider provider;
+    return provider.build(hwnd, options);
+}
+
 // Compare a RuntimeId SAFEARRAY against the components we are looking for.
 bool runtime_id_matches(SAFEARRAY* array, const std::vector<int>& runtimeId) {
     if (!array)
@@ -581,7 +597,8 @@ const char* action_kind_name(ActionKind kind) {
 }
 
 ActionResult perform_action(HWND hwnd, const UiaOptions& options,
-                            const ActionRequest& request) {
+                            const ActionRequest& request,
+                            UiaConnection* connection) {
     ActionResult result;
 
     // Waiting is not an action on a live element: it re-walks until the tree
@@ -613,8 +630,7 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
                 return result;
             }
 
-            UiaProvider provider;
-            if (auto tree = provider.build(hwnd, options)) {
+            if (auto tree = build_tree_for_action(hwnd, options, connection)) {
                 assign_element_ids(*tree);
                 assign_element_keys(*tree);
                 const Element* found = find_element_by_ref(*tree, request.elementRef);
@@ -666,8 +682,7 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
     Element target;
     std::vector<int> runtimeId;
     if (needsElement) {
-        UiaProvider provider;
-        auto tree = provider.build(hwnd, options);
+        auto tree = build_tree_for_action(hwnd, options, connection);
         if (!tree) {
             result.message = "could not read the UI Automation tree for this window";
             return result;
@@ -935,8 +950,7 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
     // effect without a second walk. Re-found by RuntimeId because ids shift
     // whenever the tree changes, which an action may well have caused.
     if (needsElement) {
-        UiaProvider provider;
-        if (auto after = provider.build(hwnd, options)) {
+        if (auto after = build_tree_for_action(hwnd, options, connection)) {
             lvt::assign_element_ids(*after);
             lvt::assign_element_keys(*after);
             const auto it = target.properties.find("RuntimeId");

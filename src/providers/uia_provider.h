@@ -1,7 +1,9 @@
 #pragma once
+#include "framework_connection.h"
 #include "provider.h"
 #include "uia_props.h"
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -48,6 +50,31 @@ public:
     // returned root carries a "Truncated" property, so a consumer reading only
     // the document can still tell the tree is incomplete.
     std::optional<Element> build(HWND hwnd, const UiaOptions& options, bool* truncated = nullptr);
+};
+
+// Reusable UIA client for callers that read the same target repeatedly (watch,
+// MCP sessions). Unlike the visual-tree connections this never injects into the
+// target; it simply amortizes CoCreateInstance(CUIAutomation[8]) across many
+// walks while keeping each walk's own view/property/timeout options.
+class UiaConnection : public IFrameworkConnection {
+public:
+    static std::shared_ptr<UiaConnection> connect(HWND hwnd);
+    ~UiaConnection() override;
+
+    bool get_tree(Element& root, bool fastProperties,
+                  const std::string& providerOption = {}) override;
+    bool get_tree_with_options(Element& root, const UiaOptions& options,
+                               bool* truncated = nullptr);
+    std::vector<ConnectionEvent> poll_events() override;
+    bool is_alive() const override;
+
+private:
+    explicit UiaConnection(HWND hwnd);
+
+    struct State;
+
+    HWND m_hwnd = nullptr;
+    std::unique_ptr<State> m_state;
 };
 
 // Format a UIA RuntimeId as the dotted string lvt emits, e.g. "42.1234.0".

@@ -61,7 +61,13 @@ flowchart BT
 
 2. **ComCtlProvider** walks the existing tree and enriches known ComCtl controls. For example, a `SysListView32` element gets child elements for its items, columns, and headers via control-specific messages (`LVM_GETITEMCOUNT`, `LVM_GETITEMTEXT`, etc.).
 
-3. **XamlProvider / WinUI3Provider** inject the TAP DLL into the target process, receive the XAML visual tree as JSON via named pipe, and graft XAML subtrees into matching `DesktopChildSiteBridge` elements in the Win32 tree.
+3. **XamlProvider / WinUI3Provider** inject the TAP DLL into the target process, receive the XAML visual tree as JSON over a persistent named pipe, and graft XAML subtrees into matching `DesktopChildSiteBridge` elements in the Win32 tree.
+
+### Reusable connections (`providers/framework_connection.h`, `connection_registry.h`)
+
+Injecting the TAP DLL and calling `AdviseVisualTreeChange` is meant to happen **once** per debugging session, not on every tree refresh — see `docs/tap-dll-design.md`'s connection lifecycle section. `IFrameworkConnection` is the generic interface a provider can implement to expose that as "connect once, `get_tree()` many times"; `ConnectionRegistry` is a per-process, refcounted registry (keyed by `pid` + framework label) that lets a long-running consumer — `watch`'s tick loop, an MCP session — acquire one via a move-only `ConnectionHandle` and reuse it for its own lifetime, instead of each tree refresh re-injecting from scratch. `tree_builder.h`'s `build_tree` takes an optional `ConnectionLookup` callback for this; a caller that doesn't supply one (a one-shot `dump`/`query`/`screenshot`) sees no behavior change — providers fall back to their original one-shot `enrich()`.
+
+Only XamlProvider and WinUI3Provider implement this today (they are the only frameworks with a real `AdviseVisualTreeChange`-equivalent API); other providers/plugins can adopt the same interface later without changing how callers acquire or use it.
 
 ### Element ID assignment
 

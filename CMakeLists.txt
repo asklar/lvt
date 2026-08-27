@@ -48,6 +48,11 @@ option(LVT_ENABLE_MCP      "MCP server mode (lvt mcp); requires a Rust toolchain
 
 option(LVT_BUILD_TOOL    "Build the lvt command-line tool"                     ON)
 option(LVT_BUILD_MANAGED "Build managed .NET assemblies (requires .NET SDK)"   ON)
+# Off by default: it's a separate WPF app built by its own `dotnet build`, not
+# something most contributors touching lvt_core need. See src/viewer/README.md
+# for the architecture (it drives lvt.exe as a subprocess; it never links
+# lvt_core) and why it is not part of the default build.
+option(LVT_BUILD_VIEWER  "Build the lvt Viewer WPF app (requires .NET SDK)"    OFF)
 # LVT_BUILD_TESTS is declared above project(), before the vcpkg toolchain runs.
 
 if(LVT_BUILD_MANAGED AND NOT (LVT_ENABLE_WPF OR LVT_ENABLE_WINFORMS OR LVT_ENABLE_AVALONIA))
@@ -107,6 +112,12 @@ set(LVT_PUBLIC_HEADERS
     src/wil_diagnostics.h
     "${CMAKE_CURRENT_BINARY_DIR}/include/lvt/lvt_config.h"
 )
+# tree_builder.h exposes ConnectionLookup in its public API and includes this
+# header using its source-tree-relative providers/ path. Preserve that layout
+# in the install tree rather than flattening the provider header beside it.
+set(LVT_PUBLIC_PROVIDER_HEADERS
+    src/providers/framework_connection.h
+)
 
 # --- lvt_core: the reusable library behind the CLI ---
 set(LVT_CORE_SOURCES
@@ -124,6 +135,7 @@ set(LVT_CORE_SOURCES
     src/wil_diagnostics.cpp
     src/providers/win32_provider.cpp
     src/providers/comctl_provider.cpp
+    src/providers/connection_registry.cpp
 )
 
 # xaml_diag_common backs both the XAML and WinUI 3 providers.
@@ -194,6 +206,50 @@ if(LVT_BUILD_TOOL)
     target_link_libraries(lvt PRIVATE lvt_core WIL::WIL nlohmann_json::nlohmann_json)
     lvt_add_version_resource(lvt
         "lvt - Live Visual Tree CLI" "lvt" "lvt.exe" VFT_APP)
+endif()
+
+# --- lvt Viewer (WPF, .NET) --------------------------------------------------
+# A separate desktop GUI, built by its own `dotnet build` rather than CMake
+# compiling anything: it drives lvt.exe as a subprocess (dump/watch/action
+# verbs) instead of linking lvt_core, so nothing here needs a C++/.NET
+# interop seam. See src/viewer/README.md for the architecture.
+if(LVT_BUILD_VIEWER)
+    find_program(LVT_DOTNET_EXE NAMES dotnet)
+    if(NOT LVT_DOTNET_EXE)
+        message(FATAL_ERROR
+            "LVT_BUILD_VIEWER is ON but dotnet was not found. Install the .NET SDK, "
+            "or configure with -DLVT_BUILD_VIEWER=OFF to build without the viewer.")
+    endif()
+
+    set(LVT_VIEWER_PROJECT "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer/LvtViewer.csproj")
+    set(LVT_VIEWER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/viewer")
+    add_custom_target(lvt_viewer ALL
+        COMMAND "${LVT_DOTNET_EXE}" build "${LVT_VIEWER_PROJECT}" -c Release -o "${LVT_VIEWER_OUTPUT_DIR}"
+        BYPRODUCTS "${LVT_VIEWER_OUTPUT_DIR}/LvtViewer.exe"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Building lvt Viewer (WPF)"
+    )
+    if(LVT_BUILD_TOOL)
+        # A copy of lvt.exe with none of its TAP DLLs/plugins next to it is
+        # actively worse than no copy: it resolves (get_tap_directory() finds
+        # this directory first) but every framework-specific enrichment it
+        # would have provided silently stops working, indistinguishable from
+        # the target simply not using that framework - exactly the failure
+        # mode a user hit the first time this copied everything but the TAP
+        # DLLs. The rest of that copying (mirroring the release packaging
+        # step in .github/workflows/release.yml and the install() rules
+        # below) lives further down this file, after the TAP DLL and plugin
+        # targets it references are actually defined - if(TARGET ...) can
+        # only see targets CMake has already processed by that point in the
+        # file, so doing it here (before those add_library() calls) would
+        # silently no-op every one of those checks.
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:lvt>" "${LVT_VIEWER_OUTPUT_DIR}/lvt.exe"
+            COMMENT "Copying lvt.exe next to the viewer"
+        )
+        add_dependencies(lvt_viewer lvt)
+    endif()
 endif()
 
 # --- MCP server (Rust) -----------------------------------------------------
@@ -332,13 +388,39 @@ if(LVT_ENABLE_WINUI3)
     # There is no vcpkg port for the Windows App SDK, so this always comes from
     # a NuGet package: the vcpkg port downloads it and passes the directory in,
     # otherwise fall back to the NuGet cache or a local packages/ dir.
+    #
+    # Two different NuGet layouts exist and both need checking: the older,
+    # unified "Microsoft.WindowsAppSDK" package (winmds under lib/uap10.0),
+    # and the newer split packaging (Microsoft.WindowsAppSDK.WinUI,
+    # .Foundation, .Base, ...) where each capability is its own package and
+    # the winmds live under metadata/ instead - only the latter was found
+    # installed on this machine (confirmed via the NuGet cache directly),
+    # so a build here would otherwise silently fall back to no WinUI3
+    # projection at all: CollectPositionsAndText's WinUI3-specific casts
+    # compile out, meaning every genuine WinUI3 element's bounds/position/
+    # text collection could only ever fail (this is what turned out to be
+    # the entire root cause of the "bounds/text not captured for WinUI3
+    # elements in File Explorer" bug - not a code defect).
     if(NOT LVT_WASDK_WINMD_DIR)
         file(GLOB _wasdk_candidates
             "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk/*/lib/uap10.0"
             "$ENV{NUGET_PACKAGES}/microsoft.windowsappsdk/*/lib/uap10.0"
             "${CMAKE_SOURCE_DIR}/packages/Microsoft.WindowsAppSDK.*/lib/uap10.0"
+            "$ENV{USERPROFILE}/.nuget/packages/microsoft.windowsappsdk.winui/*/metadata"
+            "$ENV{NUGET_PACKAGES}/microsoft.windowsappsdk.winui/*/metadata"
         )
-        foreach(_candidate ${_wasdk_candidates})
+        # Prefer the newest STABLE version when several are cached: plain
+        # descending string sort would put "2.0.250930000-experimental"
+        # ahead of "1.8.251222000" (lexicographically "2" > "1"), and an
+        # experimental/preview SDK's winmd can reference types (seen live:
+        # Microsoft.Web.WebView2.Core.CoreWebView2) that don't resolve
+        # against the stable siblings selected below, failing the whole
+        # projection generation. Only fall back to a pre-release version if
+        # truly nothing stable is cached.
+        list(SORT _wasdk_candidates ORDER DESCENDING)
+        set(_wasdk_stable_candidates "${_wasdk_candidates}")
+        list(FILTER _wasdk_stable_candidates EXCLUDE REGEX "-(experimental|preview|alpha|beta)[0-9.]*[/\\\\]")
+        foreach(_candidate ${_wasdk_stable_candidates} ${_wasdk_candidates})
             if(EXISTS "${_candidate}/Microsoft.UI.Xaml.winmd")
                 set(LVT_WASDK_WINMD_DIR "${_candidate}" CACHE PATH "" FORCE)
                 break()
@@ -386,10 +468,72 @@ if(LVT_ENABLE_WINUI3)
             message(STATUS "  using ${LVT_CPPWINRT_EXE}")
 
             file(GLOB WASDK_ALL_WINMDS "${LVT_WASDK_WINMD_DIR}/*.winmd")
-            # Also include other winmd directories in the package
-            get_filename_component(_wasdk_root "${LVT_WASDK_WINMD_DIR}/../.." ABSOLUTE)
-            file(GLOB_RECURSE _extra_winmds "${_wasdk_root}/*.winmd")
-            list(APPEND WASDK_ALL_WINMDS ${_extra_winmds})
+            # Also include other winmd directories that belong with this
+            # one - which ones depends on which of the two NuGet layouts
+            # LVT_WASDK_WINMD_DIR matched above.
+            if(LVT_WASDK_WINMD_DIR MATCHES "/metadata$")
+                # Split-package layout (Microsoft.WindowsAppSDK.WinUI,
+                # .Foundation, .Base, ...): LVT_WASDK_WINMD_DIR is
+                # .../microsoft.windowsappsdk.winui/<version>/metadata.
+                # Sibling packages define types Microsoft.UI.Xaml.winmd can
+                # reference, so pull in the latest STABLE version of every
+                # other microsoft.windowsappsdk.* package cached alongside
+                # this one - explicitly not a second, different version of
+                # THIS SAME package: mixing versions of one package (e.g.
+                # both a cached 2.0-experimental and 1.8 stable .winui) fed
+                # cppwinrt conflicting type definitions and broke the whole
+                # projection ("Type ... could not be found" from a database
+                # mismatch) - this is exactly the failure being guarded
+                # against here.
+                get_filename_component(_wasdk_version_dir "${LVT_WASDK_WINMD_DIR}/.." ABSOLUTE)
+                get_filename_component(_wasdk_this_pkg_dir "${_wasdk_version_dir}/.." ABSOLUTE)
+                get_filename_component(_wasdk_packages_dir "${_wasdk_this_pkg_dir}/.." ABSOLUTE)
+                file(GLOB _sibling_wasdk_pkg_dirs "${_wasdk_packages_dir}/microsoft.windowsappsdk.*")
+                foreach(_sibling_pkg ${_sibling_wasdk_pkg_dirs})
+                    if(NOT _sibling_pkg STREQUAL _wasdk_this_pkg_dir AND IS_DIRECTORY "${_sibling_pkg}")
+                        file(GLOB _sibling_versions "${_sibling_pkg}/*")
+                        list(SORT _sibling_versions ORDER DESCENDING)
+                        set(_sibling_stable_versions "${_sibling_versions}")
+                        list(FILTER _sibling_stable_versions EXCLUDE REGEX "-(experimental|preview|alpha|beta)[0-9.]*$")
+                        foreach(_sibling_version ${_sibling_stable_versions} ${_sibling_versions})
+                            file(GLOB_RECURSE _sibling_winmds "${_sibling_version}/*.winmd")
+                            if(_sibling_winmds)
+                                list(APPEND WASDK_ALL_WINMDS ${_sibling_winmds})
+                                break() # only the one (best) version of this sibling
+                            endif()
+                        endforeach()
+                    endif()
+                endforeach()
+            else()
+                # Unified layout (Microsoft.WindowsAppSDK): LVT_WASDK_WINMD_DIR
+                # is .../microsoft.windowsappsdk/<version>/lib/uap10.0 -
+                # other TFM directories under that same version's lib/ can
+                # hold winmds too.
+                get_filename_component(_wasdk_root "${LVT_WASDK_WINMD_DIR}/../.." ABSOLUTE)
+                file(GLOB_RECURSE _extra_winmds "${_wasdk_root}/*.winmd")
+                list(APPEND WASDK_ALL_WINMDS ${_extra_winmds})
+            endif()
+
+            # Microsoft.UI.Xaml.winmd references WebView2 types (WinUI3's
+            # WebView2 control), which live in an entirely separate NuGet
+            # package (Microsoft.Web.WebView2, not part of WindowsAppSDK at
+            # all) - missing this reference is what actually broke
+            # generation here ("Type 'Microsoft.Web.WebView2.Core.CoreWebView2'
+            # could not be found") once the WindowsAppSDK winmds themselves
+            # were correctly found above.
+            file(GLOB _webview2_version_dirs
+                "$ENV{USERPROFILE}/.nuget/packages/microsoft.web.webview2/*"
+                "$ENV{NUGET_PACKAGES}/microsoft.web.webview2/*")
+            list(SORT _webview2_version_dirs ORDER DESCENDING)
+            set(_webview2_stable_dirs "${_webview2_version_dirs}")
+            list(FILTER _webview2_stable_dirs EXCLUDE REGEX "-(experimental|preview|prerelease|alpha|beta)[0-9.]*$")
+            foreach(_webview2_dir ${_webview2_stable_dirs} ${_webview2_version_dirs})
+                if(EXISTS "${_webview2_dir}/lib/Microsoft.Web.WebView2.Core.winmd")
+                    list(APPEND WASDK_ALL_WINMDS "${_webview2_dir}/lib/Microsoft.Web.WebView2.Core.winmd")
+                    break()
+                endif()
+            endforeach()
+
             list(REMOVE_DUPLICATES WASDK_ALL_WINMDS)
 
             # A stale projection must not be left behind on failure.
@@ -618,6 +762,89 @@ add_custom_command(TARGET lvt_chromium_plugin POST_BUILD
 )
 endif()
 
+# lvt Viewer: copy the TAP DLLs and plugins lvt.exe needs, alongside it.
+# Deliberately placed here rather than in the LVT_BUILD_VIEWER block above:
+# if(TARGET lvt_tap) and friends can only see targets CMake has already
+# processed by this point in the file, so this has to come after every
+# add_library()/add_executable() call it references.
+if(LVT_BUILD_VIEWER AND LVT_BUILD_TOOL)
+    foreach(_tap lvt_tap lvt_wpf_tap lvt_winforms_tap)
+        if(TARGET ${_tap})
+            add_custom_command(TARGET lvt_viewer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:${_tap}>" "${LVT_VIEWER_OUTPUT_DIR}/"
+                COMMENT "Copying ${_tap} next to the viewer"
+            )
+            add_dependencies(lvt_viewer ${_tap})
+        endif()
+    endforeach()
+    unset(_tap)
+
+    if(TARGET lvt_wpf_tap AND LVT_BUILD_MANAGED)
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.dll" "${LVT_VIEWER_OUTPUT_DIR}/LvtWpfTap.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.runtimeconfig.json"
+                "${LVT_VIEWER_OUTPUT_DIR}/LvtWpfTap.runtimeconfig.json"
+            COMMENT "Copying the managed WPF tree walker assembly next to the viewer"
+        )
+    endif()
+
+    if(TARGET lvt_winforms_tap AND LVT_BUILD_MANAGED)
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.dll" "${LVT_VIEWER_OUTPUT_DIR}/LvtWinFormsTap.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.runtimeconfig.json"
+                "${LVT_VIEWER_OUTPUT_DIR}/LvtWinFormsTap.runtimeconfig.json"
+            COMMENT "Copying the managed WinForms tree walker assembly next to the viewer"
+        )
+    endif()
+
+    foreach(_plugin lvt_avalonia_plugin lvt_chromium_plugin)
+        if(TARGET ${_plugin})
+            add_custom_command(TARGET lvt_viewer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${LVT_VIEWER_OUTPUT_DIR}/plugins"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:${_plugin}>" "${LVT_VIEWER_OUTPUT_DIR}/plugins/"
+                COMMENT "Copying ${_plugin} next to the viewer"
+            )
+            add_dependencies(lvt_viewer ${_plugin})
+        endif()
+    endforeach()
+    unset(_plugin)
+
+    if(TARGET lvt_avalonia_tap)
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:lvt_avalonia_tap>" "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/"
+            COMMENT "Copying the Avalonia TAP DLL next to the viewer"
+        )
+        add_dependencies(lvt_viewer lvt_avalonia_tap)
+        if(LVT_BUILD_MANAGED)
+            add_custom_command(TARGET lvt_viewer POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
+                    "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+                    "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+                COMMENT "Copying the managed Avalonia tree walker assembly next to the viewer"
+            )
+        endif()
+    endif()
+
+    if(TARGET lvt_chromium_plugin)
+        add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium" "${LVT_VIEWER_OUTPUT_DIR}/plugins/chromium"
+            COMMENT "Copying the Chromium native host + extension next to the viewer"
+        )
+    endif()
+endif()
+
 # --- Tests ---
 if(LVT_BUILD_TESTS)
 enable_testing()
@@ -803,6 +1030,8 @@ install(TARGETS lvt_core
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
 )
 install(FILES ${LVT_PUBLIC_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/lvt")
+install(FILES ${LVT_PUBLIC_PROVIDER_HEADERS}
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/lvt/providers")
 
 if(LVT_BUILD_TOOL)
     install(TARGETS lvt RUNTIME DESTINATION "${LVT_INSTALL_TOOLSDIR}")

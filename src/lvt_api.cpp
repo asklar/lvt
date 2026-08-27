@@ -10,11 +10,18 @@
 #include "screenshot.h"
 #include "target.h"
 #include "tree_builder.h"
+#include "providers/connection_registry.h"
 
 #ifdef LVT_ENABLE_UIA
 #include "providers/uia_actions.h"
 #include "providers/uia_props.h"
 #include "providers/uia_provider.h"
+#endif
+#if LVT_ENABLE_XAML
+#include "providers/xaml_provider.h"
+#endif
+#if LVT_ENABLE_WINUI3
+#include "providers/winui3_provider.h"
 #endif
 
 #include <wil/resource.h>
@@ -132,6 +139,167 @@ bool find_session(const std::string& id, Session& out) {
     out = it->second;
     return true;
 }
+
+bool session_is_active(const std::string& id) {
+    std::lock_guard<std::mutex> lock(g_sessionsMutex);
+    return g_sessions.contains(id);
+}
+
+// --- per-session persistent connections ----------------------------------
+//
+// Session is copied out of g_sessions by find_session/require_session (a
+// deliberate choice: methods do their real work without holding
+// g_sessionsMutex for that whole time), so a persistent IFrameworkConnection
+// - move-only by design, see connection_registry.h's ConnectionHandle -
+// cannot live as a Session member; it is kept here instead, keyed by session
+// id, and reused across every get_visual_tree/get_uia_tree/find_elements/
+// click/... call that session makes, the same way watch's loop reuses one
+// across ticks (see main.cpp's acquire_watch_connections). Erased (dropping
+// the ConnectionHandles, which disconnect cleanly) in method_disconnect.
+std::mutex g_connectionsMutex;
+std::map<std::string, std::vector<std::pair<std::string, lvt::ConnectionHandle>>> g_sessionConnections;
+
+// Builds a ConnectionLookup for build_tree, lazily acquiring (once per
+// session, on whichever call first needs it) a persistent connection for
+// each xaml/winui3 framework this session's target actually has. Returns an
+// empty (falsy) ConnectionLookup when the target has neither, so build_tree
+// falls back to its normal one-shot-per-call path with no behavior change.
+lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
+                                                    const std::vector<lvt::FrameworkInfo>& frameworks) {
+    bool hasXaml = false, hasWinUI3 = false;
+    for (auto& fi : frameworks) {
+        if (fi.type == lvt::Framework::Xaml) hasXaml = true;
+        if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
+    }
+    if (!hasXaml && !hasWinUI3)
+        return {};
+
+    std::lock_guard<std::mutex> lock(g_connectionsMutex);
+    auto& entry = g_sessionConnections[session.id];
+
+    // A connection can die mid-session (a transient timeout against an
+    // unusually large/busy tree, or the target recycling something XAML
+    // diagnostics-related - see main.cpp's refresh_dead_watch_connections
+    // for the live evidence and full reasoning, which applies identically
+    // here). Drop any dead entries first so the "what does this session
+    // still need" check below is based on current reality, not just
+    // whether a label was ever successfully connected once - otherwise a
+    // single transient failure would silently and permanently fall back to
+    // one-shot-per-call reinjection for the rest of the session.
+    for (auto it = entry.begin(); it != entry.end();) {
+        if (it->second && !it->second->is_alive()) {
+            it->second.reset();
+            it = entry.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    const auto has_label = [&entry](const char* label) {
+        for (const auto& [existingLabel, handle] : entry) {
+            if (existingLabel == label && handle)
+                return true;
+        }
+        return false;
+    };
+
+    const bool needXaml = hasXaml && !has_label("xaml");
+    const bool needWinUI3 = hasWinUI3 && !has_label("winui3");
+    if (needXaml || needWinUI3) {
+        // A full, untrimmed probe tree, needed only to resolve which
+        // process/DLL a connection should target (XamlProvider needs to
+        // locate the CoreWindow) - discarded once that resolution is done. A
+        // session may already hold some other connection here (e.g. UIA, or
+        // only one of xaml/winui3 from an earlier partial success), so retry
+        // only whichever framework labels are still missing instead of treating
+        // "entry is non-empty" as "everything this session could ever need is
+        // already connected".
+        // Only the native CoreWindow HWND is needed to resolve the process
+        // for XAML injection. Do not run the detected framework providers
+        // here: that would perform a complete one-shot XAML collection
+        // immediately before opening the persistent connection.
+        lvt::Element probeTree = lvt::build_tree(session.hwnd, session.pid, {});
+#if LVT_ENABLE_XAML
+        if (needXaml) {
+            auto handle = lvt::ConnectionRegistry::instance().acquire(
+                session.pid, session.hwnd, "xaml",
+                [&probeTree](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                    lvt::XamlProvider xaml;
+                    return xaml.open_connection(probeTree, hwnd, pid);
+                });
+            if (handle)
+                entry.emplace_back("xaml", std::move(handle));
+        }
+#endif
+#if LVT_ENABLE_WINUI3
+        if (needWinUI3) {
+            auto handle = lvt::ConnectionRegistry::instance().acquire(
+                session.pid, session.hwnd, "winui3",
+                [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                    lvt::WinUI3Provider winui3;
+                    return winui3.open_connection(hwnd, pid);
+                });
+            if (handle)
+                entry.emplace_back("winui3", std::move(handle));
+        }
+#endif
+    }
+
+    // Do not return raw pointers into g_sessionConnections. `disconnect`
+    // can run concurrently on another MCP worker and erase this entry while
+    // build_tree is still using its lookup. A shared snapshot keeps every
+    // in-flight connection alive until this synchronous build finishes,
+    // independently of the session/registry handle being removed.
+    std::vector<std::pair<std::string, std::shared_ptr<lvt::IFrameworkConnection>>> connections;
+    connections.reserve(entry.size());
+    for (const auto& [label, handle] : entry) {
+        if (handle)
+            connections.emplace_back(label, handle.shared());
+    }
+    return [connections = std::move(connections)](
+               const std::string& label) -> lvt::IFrameworkConnection* {
+        for (const auto& [lbl, connection] : connections) {
+            if (lbl == label)
+                return connection.get();
+        }
+        return nullptr;
+    };
+}
+
+#ifdef LVT_ENABLE_UIA
+// UIA mode does not go through build_tree/ConnectionLookup, because the whole
+// UIA tree replaces the visual tree rather than enriching it. It still benefits
+// from the same "connect once, reuse many times" shape, though: a session can
+// keep one client-side IUIAutomation object alive and re-walk through it on
+// every request instead of CoCreateInstance + timeout setup on every call.
+std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& session) {
+    std::lock_guard<std::mutex> lock(g_connectionsMutex);
+    auto& entry = g_sessionConnections[session.id];
+
+    for (auto it = entry.begin(); it != entry.end(); ++it) {
+        if (it->first != "uia")
+            continue;
+        if (it->second && it->second->is_alive())
+            return std::dynamic_pointer_cast<lvt::UiaConnection>(it->second.shared());
+
+        it->second.reset();
+        entry.erase(it);
+        break;
+    }
+
+    auto handle = lvt::ConnectionRegistry::instance().acquire(
+        session.pid, session.hwnd, "uia",
+        [](HWND hwnd, DWORD) -> std::shared_ptr<lvt::IFrameworkConnection> {
+            return lvt::UiaConnection::connect(hwnd);
+        });
+    if (!handle)
+        return nullptr;
+
+    auto connection = std::dynamic_pointer_cast<lvt::UiaConnection>(handle.shared());
+    entry.emplace_back("uia", std::move(handle));
+    return connection;
+}
+#endif
 
 // --- per-target serialization -------------------------------------------
 //
@@ -306,6 +474,8 @@ ParsedRef parse_ref(const std::string& ref) {
     // not.
     if (ref.rfind("uia|", 0) == 0)
         return {RefTree::uia, ref};
+    if (ref.rfind("xaml:0x", 0) == 0 || ref.rfind("winui3:0x", 0) == 0)
+        return {RefTree::visual, ref};
     if (ref.find('|') != std::string::npos)
         return {RefTree::visual, ref};
 
@@ -429,12 +599,26 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         *truncated = false;
     // One walk of a given window at a time; see the note on g_targetLocks.
     TargetGuard guard(session.hwnd);
+    // A request can copy its Session just before a concurrent disconnect
+    // removes it, then wait behind disconnect on this target lock. Refuse
+    // once it reaches the critical section rather than recreating a
+    // connection entry for a session that no longer exists.
+    if (!session_is_active(session.id)) {
+        error = "this session was disconnected while the request was waiting";
+        return false;
+    }
     if (uia) {
 #ifdef LVT_ENABLE_UIA
         lvt::UiaProvider provider;
         const auto options = uia_options_from(params);
 
-        // Retry a failed walk rather than reporting the target unreadable.
+        // Prefer the session's persistent UIA client when one is available, so
+        // repeated MCP reads reuse one IUIAutomation object instead of
+        // CoCreateInstance + timeout setup on every call. Still retry a failed
+        // walk rather than reporting the target unreadable: external readers
+        // (screen readers, Inspect.exe, another lvt) can still collide with
+        // this process, and a failed/acquisition-reused path should degrade to
+        // the exact one-shot walk this code used before the connection work.
         //
         // A UIA walk is answered by the target's UI thread, which serves one
         // caller at a time, so a walk that overlaps another fails its
@@ -449,7 +633,19 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         for (int attempt = 0; attempt < 3 && !result; ++attempt) {
             if (attempt > 0)
                 Sleep(static_cast<DWORD>(120 * attempt));
-            result = provider.build(session.hwnd, options, &wasTruncated);
+
+            bool attemptTruncated = false;
+            lvt::Element connectedTree;
+            if (auto connection = uia_connection_for_session(session)) {
+                if (connection->get_tree_with_options(connectedTree, options, &attemptTruncated)) {
+                    result = std::move(connectedTree);
+                    wasTruncated = attemptTruncated;
+                    break;
+                }
+            }
+
+            result = provider.build(session.hwnd, options, &attemptTruncated);
+            wasTruncated = attemptTruncated;
         }
         if (!result) {
             error = "could not read the UI Automation tree for this window; it may be busy "
@@ -480,7 +676,24 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
     }
 
     auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
-    tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {});
+    const bool fastProperties = get_bool(params, "fast", false);
+    auto connectionLookup = connection_lookup_for_session(session, frameworks);
+    tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {}, fastProperties, connectionLookup);
+
+    // Bounds each reused connection's internal pushed-event queue (see
+    // XamlDiagConnection::queue_change_event's cap - this drain just keeps
+    // it small in the common case rather than relying on the cap alone).
+    // Nothing consumes the events themselves yet; a future tool (e.g. a
+    // "wait for tree change" call) could.
+    {
+        std::lock_guard<std::mutex> lock(g_connectionsMutex);
+        auto it = g_sessionConnections.find(session.id);
+        if (it != g_sessionConnections.end()) {
+            for (auto& [label, handle] : it->second) {
+                if (handle) (void)handle->poll_events();
+            }
+        }
+    }
     return true;
 }
 
@@ -624,6 +837,21 @@ json method_disconnect(const json& params) {
         // go once nothing else needs it.
         for (const auto& [_, session] : g_sessions)
             stillReferenced = stillReferenced || session.hwnd == released;
+    }
+    {
+        // Match the lock order used by tree/action reads: target first,
+        // connection map second. This waits for any operation that already
+        // entered the target critical section, while those operations hold
+        // their own shared connection snapshot so teardown cannot invalidate
+        // a raw pointer in flight.
+        TargetGuard guard(released);
+        // Dropping this session's ConnectionHandles here releases the
+        // registry's references (see connection_registry.h); if this was
+        // the last reference to a given (pid, framework) connection, its
+        // destructor sends a clean DISCONNECT rather than leaving it open
+        // until the whole MCP server process eventually exits.
+        std::lock_guard<std::mutex> lock(g_connectionsMutex);
+        g_sessionConnections.erase(id);
     }
     if (!stillReferenced)
         forget_target_lock(released);
@@ -1139,6 +1367,11 @@ json method_hit_test(const json& params) {
 bool looks_like_visual_key(const std::string& ref) {
     if (ref.rfind("uia:", 0) == 0 || ref.rfind("uia|", 0) == 0)
         return false;
+    // XAML/WinUI3 use compact diagnostics-handle keys rather than structural
+    // paths. They are still visual-tree references and must be rejected by a
+    // UIA-mode session before attempting to resolve or act on them.
+    if (ref.rfind("xaml:0x", 0) == 0 || ref.rfind("winui3:0x", 0) == 0)
+        return true;
     // A durable key always has a framework prefix followed by '|'.
     const auto bar = ref.find('|');
     return bar != std::string::npos && bar > 0;
@@ -1524,6 +1757,8 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     std::optional<TargetGuard> guard;
     if (!isWait)
         guard.emplace(session.hwnd);
+    if (!session_is_active(session.id))
+        throw std::runtime_error("this session was disconnected while the request was waiting");
 
     auto options = uia_options_from(params);
     if (isWait) {
@@ -1537,7 +1772,8 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
         options.timeoutMs = 10000;
     }
 
-    const auto result = lvt::perform_action(session.hwnd, options, request);
+    auto connection = uia_connection_for_session(session);
+    const auto result = lvt::perform_action(session.hwnd, options, request, connection.get());
     auto out = action_result_to_json(result, actionName, get_string(params, "element"));
     if (!result.ok)
         throw std::runtime_error(out.dump());

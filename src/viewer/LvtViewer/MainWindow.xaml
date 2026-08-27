@@ -1,0 +1,236 @@
+﻿<Window x:Class="LvtViewer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:LvtViewer.ViewModels"
+        xmlns:conv="clr-namespace:LvtViewer.Converters"
+        Title="lvt Viewer" Icon="Assets/LvtViewer.ico"
+        Height="760" Width="1150" WindowStartupLocation="CenterScreen">
+    <Window.CommandBindings>
+        <CommandBinding Command="ApplicationCommands.Find" Executed="Find_Executed"/>
+    </Window.CommandBindings>
+    <Window.InputBindings>
+        <KeyBinding Key="F" Modifiers="Control" Command="ApplicationCommands.Find"/>
+        <KeyBinding Key="F3" Command="{Binding FindNextCommand}"/>
+        <KeyBinding Key="F3" Modifiers="Shift" Command="{Binding FindPreviousCommand}"/>
+    </Window.InputBindings>
+
+    <Window.Resources>
+        <conv:FrameworkToBrushConverter x:Key="FrameworkToBrush"/>
+        <conv:EditKindToVisibilityConverter x:Key="EditKindToVisibility"/>
+        <conv:InverseBooleanToVisibilityConverter x:Key="InverseBoolToVisibility"/>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility"/>
+
+        <HierarchicalDataTemplate DataType="{x:Type vm:ElementNodeViewModel}" ItemsSource="{Binding Children}">
+            <StackPanel Orientation="Horizontal">
+                <Ellipse Width="8" Height="8" Margin="0,0,6,0" VerticalAlignment="Center"
+                         Fill="{Binding Framework, Converter={StaticResource FrameworkToBrush}}"/>
+                <TextBlock Text="{Binding DisplayName}"/>
+            </StackPanel>
+        </HierarchicalDataTemplate>
+    </Window.Resources>
+
+    <DockPanel>
+        <!-- Toolbar: crosshair target picker, tree mode, reconnect, current target -->
+        <Border DockPanel.Dock="Top" Background="#FFF3F3F3" BorderBrush="#FFD5D5D5" BorderThickness="0,0,0,1" Padding="8">
+            <StackPanel Orientation="Horizontal">
+                <Border x:Name="CrosshairHandle" Width="30" Height="30" Background="White"
+                        BorderBrush="#FF808080" BorderThickness="1" Cursor="Hand" Margin="0,0,12,0"
+                        ToolTip="Press and drag onto a window to inspect it">
+                    <Canvas Width="20" Height="20">
+                        <Line X1="10" Y1="0" X2="10" Y2="20" Stroke="Black" StrokeThickness="2"/>
+                        <Line X1="0" Y1="10" X2="20" Y2="10" Stroke="Black" StrokeThickness="2"/>
+                        <Ellipse Canvas.Left="5" Canvas.Top="5" Width="10" Height="10" Stroke="Red" StrokeThickness="2"/>
+                    </Canvas>
+                </Border>
+
+                <!-- Point-to-select an element within the already-connected target (item 2).
+                     Border has no built-in disabled visual the way Button does, so IsEnabled=false
+                     (nothing connected yet) needs an explicit Opacity trigger — otherwise a disabled
+                     crosshair that simply does not respond to clicks looks identical to a broken one. -->
+                <Border x:Name="ElementPickHandle" Width="30" Height="30" Background="White"
+                        BorderBrush="#FF808080" BorderThickness="1" Cursor="Hand" Margin="0,0,12,0"
+                        IsEnabled="{Binding IsConnected}"
+                        ToolTip="Press and drag onto the target's UI to select that element in the tree (connect to a target first)">
+                    <Border.Style>
+                        <Style TargetType="Border">
+                            <Setter Property="Opacity" Value="1"/>
+                            <Style.Triggers>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.35"/>
+                                </Trigger>
+                            </Style.Triggers>
+                        </Style>
+                    </Border.Style>
+                    <Canvas Width="20" Height="20">
+                        <Line X1="10" Y1="0" X2="10" Y2="20" Stroke="Black" StrokeThickness="2"/>
+                        <Line X1="0" Y1="10" X2="20" Y2="10" Stroke="Black" StrokeThickness="2"/>
+                        <Ellipse Canvas.Left="5" Canvas.Top="5" Width="10" Height="10" Stroke="#FF2AA1F0" StrokeThickness="2"/>
+                    </Canvas>
+                </Border>
+
+                <CheckBox Content="UI Automation tree" IsChecked="{Binding UseUia}"
+                          VerticalAlignment="Center" Margin="0,0,16,0"/>
+                <CheckBox Content="Highlight selection" IsChecked="{Binding HighlightSelected}"
+                          VerticalAlignment="Center" Margin="0,0,16,0"/>
+
+                <!-- Framework/content-type filter: visual-tree mode only (item 7) -->
+                <ToggleButton x:Name="FrameworkFilterToggle" Content="Filter by type ▾" Padding="10,3" Margin="0,0,16,0"
+                              Visibility="{Binding IsFrameworkFilterActive, Converter={StaticResource BoolToVisibility}}"/>
+                <Popup PlacementTarget="{Binding ElementName=FrameworkFilterToggle}" Placement="Bottom"
+                       IsOpen="{Binding IsChecked, ElementName=FrameworkFilterToggle, Mode=TwoWay}"
+                       StaysOpen="False">
+                    <Border Background="White" BorderBrush="#FF808080" BorderThickness="1" Padding="8">
+                        <ItemsControl ItemsSource="{Binding FrameworkFilters}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <CheckBox Content="{Binding Name}" IsChecked="{Binding IsChecked}" Margin="0,2,0,2"/>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Border>
+                </Popup>
+
+                <Button Content="Reconnect" Command="{Binding ReconnectCommand}" Padding="10,3" Margin="0,0,16,0"/>
+                <TextBlock Text="{Binding TargetText}" VerticalAlignment="Center" FontWeight="SemiBold"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Search bar: find an element by text, class name, type, or any property value/name -->
+        <Border DockPanel.Dock="Top" Background="#FFFAFAFA" BorderBrush="#FFD5D5D5" BorderThickness="0,0,0,1" Padding="8,4">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="Find:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <TextBox x:Name="SearchBox" Width="260" Margin="0,0,6,0"
+                         Text="{Binding SearchQuery, UpdateSourceTrigger=PropertyChanged}"
+                         ToolTip="Find by text, class, type, or property (Ctrl+F)"
+                         KeyDown="SearchBox_KeyDown"/>
+                <Button Content="Find Next" Command="{Binding FindNextCommand}" Padding="10,3" Margin="0,0,6,0"
+                        ToolTip="Find the next match (F3)"/>
+                <Button Content="Find Previous" Command="{Binding FindPreviousCommand}" Padding="10,3"
+                        ToolTip="Find the previous match (Shift+F3)"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Status bar -->
+        <Border DockPanel.Dock="Bottom" Background="#FFEFEFEF" BorderBrush="#FFD5D5D5" BorderThickness="0,1,0,0" Padding="6,3">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="{Binding StatusText}" TextTrimming="CharacterEllipsis"/>
+                <ProgressBar Grid.Column="1" Width="120" Height="5" Margin="12,0,0,0"
+                             VerticalAlignment="Center" IsIndeterminate="True"
+                             Visibility="{Binding IsConnecting, Converter={StaticResource BoolToVisibility}}"
+                             ToolTip="Waiting for the initial tree snapshot"/>
+            </Grid>
+        </Border>
+
+        <!-- Two-pane view: element tree | property panel -->
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" MinWidth="220"/>
+                <ColumnDefinition Width="5"/>
+                <ColumnDefinition Width="1.2*" MinWidth="280"/>
+            </Grid.ColumnDefinitions>
+
+            <TreeView x:Name="Tree" Grid.Column="0" ItemsSource="{Binding Roots}" BorderThickness="0">
+                <TreeView.ItemContainerStyle>
+                    <Style TargetType="TreeViewItem">
+                        <!--
+                            TwoWay, not OneWay: LiveTree only ever regenerates a
+                            node's TreeViewItem container when that specific node
+                            is added, removed, or reparented (see LiveTree.cs) — but
+                            even then, a OneWay binding has no way to know the user
+                            expanded that node by hand, since ElementNodeViewModel.
+                            IsExpanded never heard about it. TwoWay keeps the
+                            ViewModel in sync with whatever the user actually did,
+                            so a regenerated container restores the same state
+                            instead of coming back collapsed.
+                        -->
+                        <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}"/>
+                        <Setter Property="Visibility" Value="{Binding IsVisible, Converter={StaticResource BoolToVisibility}}"/>
+                    </Style>
+                </TreeView.ItemContainerStyle>
+            </TreeView>
+
+            <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch" Background="#FFD5D5D5"/>
+
+            <Grid Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <StackPanel Grid.Row="0" DataContext="{Binding SelectedElement}" Margin="10,10,10,4">
+                    <TextBlock Text="{Binding DisplayName}" FontSize="16" FontWeight="Bold" TextWrapping="Wrap"/>
+                    <Grid Margin="0,6,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                            <RowDefinition/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Id:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding Id}" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Key:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Key}" TextWrapping="Wrap" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="2" Grid.Column="0" Text="Framework:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding Framework}" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="3" Grid.Column="0" Text="Class:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding ClassName}" TextWrapping="Wrap" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="4" Grid.Column="0" Text="Text:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding Text}" TextWrapping="Wrap" Margin="0,0,0,2"/>
+                        <TextBlock Grid.Row="5" Grid.Column="0" Text="Bounds:" FontWeight="SemiBold" Margin="0,0,8,2"/>
+                        <TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding BoundsText}" Margin="0,0,0,2"/>
+                    </Grid>
+                    <Separator Margin="0,8,0,4"/>
+                    <TextBlock Text="Properties" FontWeight="Bold"/>
+                    <TextBlock Text="Switch on &quot;UI Automation tree&quot; above to edit Toggle/Value properties — the visual tree is read-only."
+                               Foreground="#FF808080" FontStyle="Italic" TextWrapping="Wrap" Margin="0,2,0,0"
+                               Visibility="{Binding DataContext.UseUia, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource InverseBoolToVisibility}}"/>
+                </StackPanel>
+
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="10,0,10,10">
+                    <ItemsControl ItemsSource="{Binding SelectedElement.PropertyRows}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,2,0,2">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="160"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="{Binding Name}" FontWeight="SemiBold"
+                                               TextWrapping="Wrap" VerticalAlignment="Top" Margin="0,3,8,0"/>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="{Binding Value}" TextWrapping="Wrap" Margin="0,3,0,0"
+                                                   Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=None}"/>
+                                        <StackPanel Orientation="Horizontal"
+                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=Toggle}">
+                                            <TextBlock Text="{Binding Value}" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                                            <Button Content="Toggle" Padding="10,1"
+                                                    Command="{Binding DataContext.ToggleCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                    CommandParameter="{Binding}"/>
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal"
+                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=TextValue}">
+                                            <TextBox Text="{Binding EditText, UpdateSourceTrigger=PropertyChanged}" Width="160" Margin="0,0,8,0"/>
+                                            <Button Content="Set" Padding="10,1"
+                                                    Command="{Binding DataContext.SetValueCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                    CommandParameter="{Binding}"/>
+                                        </StackPanel>
+                                    </StackPanel>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </Grid>
+        </Grid>
+    </DockPanel>
+</Window>

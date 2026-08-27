@@ -96,6 +96,20 @@ $ lvt --name AvaloniaTestApp --format xml --depth 3
 - Target process must match lvt's architecture (x64 or ARM64)
 - The .NET runtime (`hostfxr.dll`) must be installed on the system
 
+## Persistent connections (optional)
+
+`src/plugin.h`'s plugin ABI (v2) has a persistent lifetime group:
+`lvt_connection_open`, `lvt_connection_get_tree`, and
+`lvt_connection_close` (plus the existing `lvt_plugin_free`) must all be
+implemented before lvt enables the connection path. The optional
+`lvt_connection_poll_events`/`lvt_connection_events_free` pair adds push
+event draining. These functions let
+`watch` and MCP sessions reuse one connection across many tree refreshes instead of
+re-injecting every time — see that header's "Persistent connections" section and
+`docs/tap-dll-design.md`'s connection lifecycle for the pattern the built-in XAML/WinUI3
+providers already follow. This plugin does not implement them yet; it still uses the
+original one-shot `lvt_enrich_tree` path, which continues to work unchanged either way.
+
 ## Test app
 
 A simple Avalonia test application is included in `tests/avalonia_test_app/`:

@@ -1078,6 +1078,52 @@ TEST_F(McpSampleFixture, OverlappingRequestsAllGetTheirOwnCorrectAnswer) {
     }
 }
 
+TEST_F(McpSampleFixture, DisconnectRacingVisualReadKeepsServerAndConnectionSafe) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    for (int round = 0; round < 3; ++round) {
+        auto connected = client.call_tool(
+            "connect", json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+        const auto session = connected.value("session", "");
+        ASSERT_FALSE(session.empty());
+
+        // Establish the persistent framework connection first, then race a
+        // second read against disconnect. Depending on task scheduling, the
+        // read may complete before teardown or be refused after the session
+        // is removed; it must never dereference a connection destroyed by
+        // the other request, crash the server, or corrupt request routing.
+        bool warmError = false;
+        client.call_tool("get_visual_tree",
+                         json{{"session", session}, {"fast", true}, {"depth", 2}},
+                         &warmError);
+        ASSERT_FALSE(warmError);
+
+        const int readId = client.send_request(
+            "tools/call",
+            json{{"name", "get_visual_tree"},
+                 {"arguments", json{{"session", session}, {"fast", false}, {"depth", 3}}}});
+        const int disconnectId = client.send_request(
+            "tools/call",
+            json{{"name", "disconnect"}, {"arguments", json{{"session", session}}}});
+
+        auto readResponse = client.await_response(readId);
+        auto disconnectResponse = client.await_response(disconnectId);
+        ASSERT_FALSE(readResponse.is_null());
+        ASSERT_FALSE(disconnectResponse.is_null());
+        EXPECT_EQ(readResponse.value("id", -1), readId);
+        EXPECT_EQ(disconnectResponse.value("id", -1), disconnectId);
+        ASSERT_TRUE(disconnectResponse.contains("result")) << disconnectResponse.dump(2);
+        EXPECT_FALSE(disconnectResponse["result"].value("isError", false))
+            << disconnectResponse.dump(2);
+    }
+
+    auto healthy = client.call_tool("list_apps", json::object());
+    EXPECT_TRUE(healthy.contains("apps")) << healthy.dump(2);
+}
+
 TEST_F(McpSampleFixture, ConcurrentRequestsAcrossTwoSessionsDoNotCrossOver) {
     SkipIfNotReady();
     McpClient client(false);
