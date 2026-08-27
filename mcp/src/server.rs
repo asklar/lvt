@@ -10,12 +10,25 @@
 //! matters: a tool the model cannot see is a tool it cannot be talked into
 //! trying, and it keeps the read-only mode honest in `tools/list`.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, ListResourcesResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
+    SubscribeRequestParams, SubscriptionFilter, UnsubscribeRequestParams,
+};
+use rmcp::service::{RequestContext, SubscriptionContext};
+use rmcp::{
+    tool, tool_handler, tool_router, ErrorData, Peer, RoleServer, ServerHandler,
+};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::{Mutex, watch};
 
 use crate::ffi;
 
@@ -482,12 +495,104 @@ pub struct WaitForArgs {
     pub uia: Option<bool>,
 }
 
+const VISUAL_RESOURCE_PREFIX: &str = "lvt://session/";
+const VISUAL_RESOURCE_SUFFIX: &str = "/visual-tree";
+
+fn visual_resource_uri(session: &str) -> String {
+    format!("{VISUAL_RESOURCE_PREFIX}{session}{VISUAL_RESOURCE_SUFFIX}")
+}
+
+fn session_from_visual_resource(uri: &str) -> Option<String> {
+    let session = uri
+        .strip_prefix(VISUAL_RESOURCE_PREFIX)?
+        .strip_suffix(VISUAL_RESOURCE_SUFFIX)?;
+    let mut chars = session.chars();
+    (chars.next() == Some('s') && chars.clone().next().is_some() &&
+     chars.all(|ch| ch.is_ascii_digit())).then(|| session.to_string())
+}
+
+fn visual_resource(session: &str, process_name: &str) -> Resource {
+    Resource::new(
+        visual_resource_uri(session),
+        format!("visual-tree-{session}"),
+    )
+    .with_title(format!("Visual tree changes for {process_name}"))
+    .with_description(
+        "A session-scoped snapshot/diff stream. Read after a resources/updated \
+         notification to receive the current visual-tree patch.",
+    )
+    .with_mime_type("application/json")
+}
+
+async fn poll_visual_events(session: &str) -> Result<bool, String> {
+    let result = call_lvt(
+        "poll_visual_events",
+        json!({ "session": session }),
+        false,
+    )
+    .await
+    .map_err(|error| error.message.to_string())?;
+    let response: serde_json::Value = serde_json::from_str(&result.json)
+        .map_err(|error| format!("lvt returned malformed event JSON: {error}"))?;
+    if !result.ok {
+        return Err(response
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("visual event polling failed")
+            .to_string());
+    }
+    Ok(response
+        .get("changed")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false))
+}
+
+async fn run_legacy_resource_subscription(
+    session: String,
+    uri: String,
+    peer: Peer<RoleServer>,
+    mut cancelled: watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(200));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = cancelled.changed() => {
+                if changed.is_err() || *cancelled.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                if peer.is_transport_closed() {
+                    break;
+                }
+                match poll_visual_events(&session).await {
+                    Ok(true) => {
+                        if peer
+                            .notify_resource_updated(ResourceUpdatedNotificationParam::new(
+                                uri.clone(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
 // --- server -------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct LvtServer {
     tool_router: ToolRouter<LvtServer>,
     allow_input: bool,
+    legacy_resource_subscriptions: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
 }
 
 /// Forwards to lvt and turns the result into MCP content.
@@ -603,6 +708,10 @@ impl LvtServer {
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn disconnect(&self, Parameters(a): Parameters<SessionArgs>) -> Result<CallToolResult, ErrorData> {
+        let uri = visual_resource_uri(&a.session);
+        if let Some(cancel) = self.legacy_resource_subscriptions.lock().await.remove(&uri) {
+            let _ = cancel.send(true);
+        }
         forward("disconnect", json!({ "session": a.session }), self.allow_input).await
     }
 
@@ -1076,7 +1185,11 @@ impl LvtServer {
         if allow_input {
             router += Self::input_router();
         }
-        Self { tool_router: router, allow_input }
+        Self {
+            tool_router: router,
+            allow_input,
+            legacy_resource_subscriptions: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Tool names this server is currently exposing, sorted. Exists so tests
@@ -1091,14 +1204,184 @@ impl LvtServer {
 }
 
 #[tool_handler(router = self.tool_router)]
+#[allow(deprecated)]
 impl ServerHandler for LvtServer {
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
+        async move {
+            let result = call_lvt("list_sessions", json!({}), false).await?;
+            if !result.ok {
+                return Err(ErrorData::internal_error(result.json, None));
+            }
+            let response: serde_json::Value = serde_json::from_str(&result.json)
+                .map_err(|error| ErrorData::internal_error(
+                    format!("lvt returned malformed session JSON: {error}"), None))?;
+            let mut resources = Vec::new();
+            for session in response
+                .get("sessions")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(id) = session.get("session").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let process_name = session
+                    .get("processName")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("application");
+                resources.push(visual_resource(id, process_name));
+            }
+            Ok(ListResourcesResult::with_all_items(resources))
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_ {
+        async move {
+            let session = session_from_visual_resource(&request.uri).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("unknown lvt visual-tree resource '{}'", request.uri), None)
+            })?;
+            let result = call_lvt(
+                "get_visual_tree_changes",
+                json!({ "session": session }),
+                false,
+            )
+            .await?;
+            if !result.ok {
+                return Err(ErrorData::internal_error(result.json, None));
+            }
+            Ok(ReadResourceResult::new(vec![
+                ResourceContents::TextResourceContents {
+                    uri: request.uri,
+                    mime_type: Some("application/json".to_string()),
+                    text: result.json,
+                    meta: None,
+                },
+            ])
+            .into())
+        }
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let uris = requested
+            .resource_subscriptions
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter(|uri| session_from_visual_resource(uri).is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        Some(SubscriptionFilter::builder().resource_subscriptions(uris).build())
+    }
+
+    fn listen(
+        &self,
+        context: SubscriptionContext,
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
+        async move {
+            let uris = context
+                .accepted()
+                .resource_subscriptions
+                .clone()
+                .unwrap_or_default();
+            let sink = context.sink().clone();
+            let mut interval = tokio::time::interval(Duration::from_millis(200));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = context.cancelled() => break,
+                    _ = interval.tick() => {
+                        if context.request_context().peer.is_transport_closed() {
+                            break;
+                        }
+                        for uri in &uris {
+                            let Some(session) = session_from_visual_resource(uri) else {
+                                continue;
+                            };
+                            match poll_visual_events(&session).await {
+                                Ok(true) if sink
+                                    .notify_resource_updated(uri.clone())
+                                    .await
+                                    .is_err() => return Ok(()),
+                                Ok(_) => {}
+                                Err(_) => return Ok(()),
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
+        let subscriptions = self.legacy_resource_subscriptions.clone();
+        async move {
+            let session = session_from_visual_resource(&request.uri).ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("unknown lvt visual-tree resource '{}'", request.uri), None)
+            })?;
+            poll_visual_events(&session)
+                .await
+                .map_err(|error| ErrorData::invalid_params(error, None))?;
+            let (cancel, cancelled) = watch::channel(false);
+            if let Some(previous) = subscriptions
+                .lock()
+                .await
+                .insert(request.uri.clone(), cancel)
+            {
+                let _ = previous.send(true);
+            }
+            tokio::spawn(run_legacy_resource_subscription(
+                session,
+                request.uri,
+                context.peer,
+                cancelled,
+            ));
+            Ok(())
+        }
+    }
+
+    fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
+        let subscriptions = self.legacy_resource_subscriptions.clone();
+        async move {
+            if let Some(cancel) = subscriptions.lock().await.remove(&request.uri) {
+                let _ = cancel.send(true);
+            }
+            Ok(())
+        }
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut implementation = Implementation::default();
         implementation.name = "lvt".into();
         implementation.version = ffi::version();
 
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .enable_tools()
+            .build();
         info.server_info = implementation;
         info.instructions = Some(
             if self.allow_input {
@@ -1361,6 +1644,37 @@ mod tests {
         let full = LvtServer::new(true).get_info().instructions.unwrap();
         assert!(read_only.contains("--allow-input"), "read-only mode must explain how to enable input");
         assert_ne!(read_only, full);
+    }
+
+    #[test]
+    fn server_advertises_subscribable_resources() {
+        let capabilities = LvtServer::new(false).get_info().capabilities;
+        let resources = capabilities.resources.expect("resources capability is missing");
+        assert_eq!(resources.subscribe, Some(true));
+    }
+
+    #[test]
+    fn visual_resource_uris_round_trip_sessions() {
+        let uri = visual_resource_uri("s42");
+        assert_eq!(uri, "lvt://session/s42/visual-tree");
+        assert_eq!(session_from_visual_resource(&uri).as_deref(), Some("s42"));
+        assert!(session_from_visual_resource("file:///not-lvt").is_none());
+        assert!(session_from_visual_resource("lvt://session/nope/visual-tree").is_none());
+    }
+
+    #[test]
+    fn modern_subscription_filter_accepts_visual_resources_only() {
+        let requested = SubscriptionFilter::builder()
+            .resource_subscription("lvt://session/s1/visual-tree")
+            .resource_subscription("file:///not-lvt")
+            .build();
+        let accepted = LvtServer::new(false)
+            .accepted_subscription_filter(&requested)
+            .expect("subscriptions/listen should be implemented");
+        assert_eq!(
+            accepted.resource_subscriptions,
+            Some(vec!["lvt://session/s1/visual-tree".to_string()])
+        );
     }
 
     #[test]

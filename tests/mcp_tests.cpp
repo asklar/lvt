@@ -146,6 +146,30 @@ public:
 
     json await_response(int id) { return await(id); }
 
+    // Wait for a server-to-client notification already arriving on the stdio
+    // transport. This sends no request: a passing test proves the server
+    // initiated the message rather than answering a client poll.
+    json await_notification(const std::string& method, int timeoutSeconds = 30) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds);
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (size_t i = 0; i < messages_.size(); ++i) {
+                    if (!messages_[i].contains("id") &&
+                        messages_[i].value("method", "") == method) {
+                        auto found = messages_[i];
+                        messages_.erase(messages_.begin() + static_cast<ptrdiff_t>(i));
+                        return found;
+                    }
+                }
+            }
+            if (eof_ || std::chrono::steady_clock::now() >= deadline)
+                return json();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
     // Convenience for tools/call that returns the tool's parsed JSON payload.
     // `isError` reports whether the tool reported failure, which is distinct
     // from a protocol error and is how lvt surfaces "no such element".
@@ -1028,6 +1052,81 @@ TEST_F(McpSampleFixture, VisualPropertiesAndDiffsReuseOnePersistentInjection) {
     EXPECT_EQ(count_tap_set_site_calls() - setSiteBefore, 1)
         << "one MCP session must reuse one TAP injection across tree reads and "
            "get/set/clear property operations";
+}
+
+TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualTreeNotification) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    json serverInfo;
+    ASSERT_TRUE(client.handshake(&serverInfo));
+    ASSERT_TRUE(serverInfo["capabilities"].contains("resources"))
+        << serverInfo.dump(2);
+    EXPECT_TRUE(serverInfo["capabilities"]["resources"].value("subscribe", false));
+
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(visual.contains("root")) << visual.dump(2);
+
+    auto combo = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "ChoiceCombo"}});
+    ASSERT_EQ(combo["elements"].size(), 1u) << combo.dump(2);
+    const auto comboRef = combo["elements"][0].value("ref", "");
+
+    auto listed = client.request("resources/list");
+    ASSERT_TRUE(listed.contains("result")) << listed.dump(2);
+    std::string uri;
+    for (const auto& resource : listed["result"].value("resources", json::array())) {
+        if (resource.value("uri", "").find("/" + session + "/") != std::string::npos) {
+            uri = resource.value("uri", "");
+            break;
+        }
+    }
+    ASSERT_FALSE(uri.empty()) << listed.dump(2);
+
+    auto subscribed = client.request("resources/subscribe", json{{"uri", uri}});
+    ASSERT_TRUE(subscribed.contains("result")) << subscribed.dump(2);
+
+    bool isError = false;
+    auto expanded = client.call_tool(
+        "set_expanded",
+        json{{"session", session}, {"element", comboRef}, {"expanded", true}},
+        &isError);
+    ASSERT_FALSE(isError) << expanded.dump(2);
+
+    // No request is issued between the action and this receive. The message
+    // must originate at the server after its TAP event pump observes the
+    // popup's visual-tree additions.
+    auto notification =
+        client.await_notification("notifications/resources/updated", 20);
+    ASSERT_FALSE(notification.is_null())
+        << "no unsolicited resource update arrived after the visual tree changed";
+    EXPECT_EQ(notification["params"].value("uri", ""), uri);
+
+    auto read = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(read.contains("result")) << read.dump(2);
+    ASSERT_FALSE(read["result"].value("contents", json::array()).empty());
+    const auto patch = json::parse(
+        read["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_FALSE(patch.is_discarded()) << read.dump(2);
+    EXPECT_EQ(patch.value("tree", ""), "visual");
+    EXPECT_TRUE(patch.value("snapshot", false));
+    EXPECT_FALSE(patch.value("events", json::array()).empty());
+
+    auto comboAfterExpand = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "ChoiceCombo"}});
+    if (!comboAfterExpand["elements"].empty()) {
+        auto collapsed = client.call_tool(
+            "set_expanded",
+            json{{"session", session},
+                 {"element", comboAfterExpand["elements"][0].value("ref", "")},
+                 {"expanded", false}},
+            &isError);
+        EXPECT_FALSE(isError) << collapsed.dump(2);
+    }
+    auto unsubscribed = client.request("resources/unsubscribe", json{{"uri", uri}});
+    EXPECT_TRUE(unsubscribed.contains("result")) << unsubscribed.dump(2);
 }
 
 // --- driving the app ----------------------------------------------------

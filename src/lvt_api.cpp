@@ -126,6 +126,9 @@ struct VisualTreeSnapshot {
 
 std::mutex g_visualSnapshotsMutex;
 std::map<std::string, VisualTreeSnapshot> g_visualSnapshots;
+std::mutex g_visualEventGenerationsMutex;
+std::map<DWORD, uint64_t> g_visualEventGenerations;
+std::map<std::string, uint64_t> g_sessionVisualEventGenerations;
 
 std::string add_session(const lvt::TargetInfo& target, bool visualMode) {
     Session session;
@@ -690,20 +693,10 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
     auto connectionLookup = connection_lookup_for_session(session, frameworks);
     tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {}, fastProperties, connectionLookup);
 
-    // Bounds each reused connection's internal pushed-event queue (see
-    // XamlDiagConnection::queue_change_event's cap - this drain just keeps
-    // it small in the common case rather than relying on the cap alone).
-    // Nothing consumes the events themselves yet; a future tool (e.g. a
-    // "wait for tree change" call) could.
-    {
-        std::lock_guard<std::mutex> lock(g_connectionsMutex);
-        auto it = g_sessionConnections.find(session.id);
-        if (it != g_sessionConnections.end()) {
-            for (auto& [label, handle] : it->second) {
-                if (handle) (void)handle->poll_events();
-            }
-        }
-    }
+    // Do not drain the connection's pushed-event queue here.
+    // poll_visual_events consumes it for subscribed MCP visual-tree resources;
+    // providers cap an unconsumed queue, so sessions without a subscriber stay
+    // bounded without stealing notifications from sessions that have one.
     return true;
 }
 
@@ -731,6 +724,19 @@ json method_list_apps(const json& params) {
                         {"title", match.windowTitle}});
     }
     return json{{"apps", apps}};
+}
+
+json method_list_sessions(const json&) {
+    json sessions = json::array();
+    std::lock_guard<std::mutex> lock(g_sessionsMutex);
+    for (const auto& [id, session] : g_sessions) {
+        sessions.push_back({
+            {"session", id},
+            {"processName", session.processName},
+            {"mode", session.visualMode ? "visual" : "uia"},
+        });
+    }
+    return json{{"sessions", std::move(sessions)}};
 }
 
 json method_connect(const json& params) {
@@ -866,6 +872,10 @@ json method_disconnect(const json& params) {
     {
         std::lock_guard<std::mutex> lock(g_visualSnapshotsMutex);
         g_visualSnapshots.erase(id);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_visualEventGenerationsMutex);
+        g_sessionVisualEventGenerations.erase(id);
     }
     if (!stillReferenced)
         forget_target_lock(released);
@@ -1253,6 +1263,73 @@ json method_get_visual_tree_changes(const json& params) {
     return json{{"tree", "visual"},
                 {"snapshot", snapshot},
                 {"events", std::move(events)}};
+}
+
+json method_poll_visual_events(const json& params) {
+    const auto session = require_session(params);
+    // This only exchanges a lightweight acknowledgment with the TAP pipe
+    // worker; it does not call the target UI thread. Taking TargetGuard here
+    // would let a 200ms subscription poll repeatedly jump ahead of a real tree
+    // read or UIA action and starve it.
+    Session stillConnected;
+    if (!find_session(session.id, stillConnected))
+        throw std::runtime_error("unknown session '" + session.id + "'");
+
+    bool needsConnection = true;
+    {
+        std::lock_guard<std::mutex> lock(g_connectionsMutex);
+        auto found = g_sessionConnections.find(session.id);
+        if (found != g_sessionConnections.end()) {
+            for (auto& [label, handle] : found->second) {
+                if ((label == "xaml" || label == "winui3") && handle &&
+                    handle->is_alive()) {
+                    needsConnection = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (needsConnection) {
+        auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
+        (void)connection_lookup_for_session(session, frameworks);
+    }
+
+    size_t eventCount = 0;
+    bool connectionAlive = false;
+    {
+        // Keep handles alive through the pipe acknowledgment. In particular,
+        // a concurrent disconnect cannot erase the final ConnectionHandle
+        // between finding its raw pointer and refresh_events() using it.
+        std::lock_guard<std::mutex> lock(g_connectionsMutex);
+        auto found = g_sessionConnections.find(session.id);
+        if (found != g_sessionConnections.end()) {
+            for (auto& [label, handle] : found->second) {
+                if ((label != "xaml" && label != "winui3") || !handle)
+                    continue;
+                connectionAlive =
+                    (handle->refresh_events() && handle->is_alive()) || connectionAlive;
+                eventCount += handle->poll_events().size();
+            }
+        }
+    }
+    bool changed = false;
+    {
+        // ConnectionRegistry shares one physical TAP connection between MCP
+        // sessions for the same process. poll_events() is destructive, so turn
+        // each drained batch into a process generation: every session then
+        // observes that generation once even if another session drained the
+        // shared queue first.
+        std::lock_guard<std::mutex> lock(g_visualEventGenerationsMutex);
+        auto& generation = g_visualEventGenerations[session.pid];
+        if (eventCount != 0)
+            ++generation;
+        auto& observed = g_sessionVisualEventGenerations[session.id];
+        changed = generation > observed;
+        observed = generation;
+    }
+    return json{{"changed", changed},
+                {"eventCount", eventCount},
+                {"connectionAlive", connectionAlive}};
 }
 
 json method_get_frameworks(const json& params) {
@@ -1985,11 +2062,13 @@ struct MethodEntry {
 
 json dispatch(const std::string& method, const json& params, bool allowInput) {
     if (method == "list_apps")   return method_list_apps(params);
+    if (method == "list_sessions") return method_list_sessions(params);
     if (method == "connect")     return method_connect(params);
     if (method == "disconnect")  return method_disconnect(params);
     if (method == "get_uia_tree")    return method_get_tree(params, true);
     if (method == "get_visual_tree") return method_get_tree(params, false);
     if (method == "get_visual_tree_changes") return method_get_visual_tree_changes(params);
+    if (method == "poll_visual_events") return method_poll_visual_events(params);
     if (method == "get_visual_properties") return method_get_visual_properties(params);
     if (method == "set_visual_property")
         return method_set_visual_property(params, allowInput);

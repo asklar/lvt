@@ -85,6 +85,15 @@ public:
     // refresh.
     virtual std::vector<struct ConnectionEvent> poll_events() = 0;
 
+    // Give a provider with an unsolicited event stream a chance to move bytes
+    // already waiting on its transport into the queue returned by
+    // poll_events(). The default is a no-op so UIA/plugins remain compatible.
+    // XAML uses a lightweight same-pipe acknowledgment rather than rebuilding
+    // the tree or opening another diagnostics connection.
+    virtual bool refresh_events() {
+        return true;
+    }
+
     // Optional framework-native dependency-property operations. XAML and
     // WinUI3 implement these over the same persistent diagnostics connection
     // used by get_tree(); UIA and plugins retain this explicit unsupported

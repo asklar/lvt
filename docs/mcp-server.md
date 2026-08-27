@@ -142,6 +142,25 @@ Its first call returns the current tree as flat `added` events with
 clears the baseline. Changing the `fast` setting also starts a fresh snapshot,
 because full and fast trees intentionally carry different property sets.
 
+The same patch stream is also exposed as a standards-compliant subscribable
+MCP resource at `lvt://session/<session>/visual-tree`. `resources/list`
+discovers resources for connected sessions; `resources/read` returns the next
+snapshot/diff JSON; and `resources/subscribe` opts into
+`notifications/resources/updated`. The notification is server-initiated: a
+lightweight `POLL_EVENTS` acknowledgment drains unsolicited TAP `CHANGE`
+messages without walking the tree, and the server sends the notification as
+soon as one arrives. The client then reads the resource to obtain the
+cumulative patch, so multiple notifications can safely coalesce.
+
+With rmcp 3.1 this is implemented using
+`ServerCapabilities::builder().enable_resources().enable_resources_subscribe()`,
+the `ServerHandler::{list_resources,read_resource,subscribe,unsubscribe}`
+methods, and `Peer<RoleServer>::notify_resource_updated` for MCP 2025-06-18.
+The newer 2026-07-28 subscription lifecycle is supported too through
+`ServerHandler::{accepted_subscription_filter,listen}` and
+`SubscriptionContext::sink().notify_resource_updated`; no custom JSON-RPC
+method or notification is introduced.
+
 ### Editing XAML/WinUI3 dependency properties
 
 `get_visual_properties` accepts a compact `xaml:0x…` or `winui3:0x…` key from

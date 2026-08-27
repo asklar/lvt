@@ -746,6 +746,22 @@ public:
         WritePropertyResult(command);
     }
 
+    void HandlePollEvents(const std::string& line) {
+        std::istringstream tokens(line);
+        std::string verb;
+        std::string commandIdText;
+        std::string extra;
+        uint64_t commandId = 0;
+        tokens >> verb >> commandIdText;
+        if (verb != "POLL_EVENTS" || !ParseUint64(commandIdText, commandId) ||
+            (tokens >> extra)) {
+            LogMsg("HandlePollEvents: malformed command");
+            return;
+        }
+        WriteLine("{\"type\":\"EVENTS_RESULT\",\"commandId\":" +
+                  std::to_string(commandId) + "}");
+    }
+
     DWORD AdviseThreadProcImpl() {
         LogMsg("AdviseThread starting");
 
@@ -828,6 +844,8 @@ public:
                        line->rfind("SET_PROPERTY ", 0) == 0 ||
                        line->rfind("CLEAR_PROPERTY ", 0) == 0) {
                 HandlePropertyCommand(*line);
+            } else if (line->rfind("POLL_EVENTS ", 0) == 0) {
+                HandlePollEvents(*line);
             } else {
                 LogMsg("RunCommandLoop: unknown command, ignoring");
             }

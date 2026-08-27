@@ -195,6 +195,8 @@ Every message on the pipe is one line (UTF-8, `\n`-terminated). lvt.exe → TAP 
 | lvt → TAP | `SET_PROPERTY <id> <handle> <index> <typeHex> <valueHex>` | Create a typed value and set one dependency property |
 | lvt → TAP | `CLEAR_PROPERTY <id> <handle> <index>` | Clear a local value so inheritance/style/default resolution resumes |
 | TAP → lvt | `{"type":"PROPERTY_RESULT","commandId":...}` | Correlated typed property result; unsolicited `CHANGE` lines may appear before it |
+| lvt → TAP | `POLL_EVENTS <id>` | Lightweight barrier used by MCP resource subscriptions to drain preceding unsolicited `CHANGE` lines without walking the tree |
+| TAP → lvt | `{"type":"EVENTS_RESULT","commandId":...}` | Acknowledges `POLL_EVENTS`; any preceding `CHANGE` lines are already queued by the connection |
 | lvt → TAP | `DISCONNECT` | End the connection; TAP DLL replies `BYE`, then runs its cleanup |
 
 Tree responses are parsed and grafted by `graft_xaml_tree_json()` in

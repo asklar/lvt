@@ -545,6 +545,37 @@ public:
         return std::move(m_pendingEvents);
     }
 
+    bool refresh_events() override {
+        std::lock_guard<std::mutex> lock(m_commandMutex);
+        if (!m_alive)
+            return false;
+
+        const auto commandId = next_command_id();
+        if (!m_io->write_line("POLL_EVENTS " + std::to_string(commandId))) {
+            m_alive = false;
+            return false;
+        }
+
+        for (;;) {
+            std::string line;
+            if (!m_io->read_line(5000, line)) {
+                m_alive = false;
+                return false;
+            }
+            json response = json::parse(line, nullptr, false);
+            if (response.is_discarded() || !response.is_object())
+                continue;
+            if (response.value("type", "") == "CHANGE") {
+                queue_change_event(line);
+                continue;
+            }
+            if (response.value("type", "") == "EVENTS_RESULT" &&
+                response.value("commandId", uint64_t{0}) == commandId) {
+                return true;
+            }
+        }
+    }
+
     bool is_alive() const override { return m_alive; }
 
     FrameworkPropertyResult get_properties(uintptr_t handle) override {
