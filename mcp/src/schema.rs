@@ -237,6 +237,34 @@ cached!(visual_tree_changes, {
     }))
 });
 
+cached!(uia_tree_changes, {
+    result(json!({
+        "type": "object",
+        "properties": {
+            "tree": { "type": "string", "enum": ["uia"] },
+            "snapshot": {
+                "type": "boolean",
+                "description": "True when events describe a complete initial snapshot rather than a diff."
+            },
+            "events": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "event": { "type": "string", "enum": ["added", "removed", "changed"] },
+                        "key": { "type": "string" },
+                        "path": { "type": "string" },
+                        "element": element(),
+                        "fields": { "type": "object" }
+                    },
+                    "required": ["event", "key"]
+                }
+            }
+        },
+        "required": ["tree", "snapshot", "events"]
+    }))
+});
+
 cached!(visual_properties, {
     result(json!({
         "type": "object",

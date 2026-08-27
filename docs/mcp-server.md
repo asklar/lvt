@@ -52,6 +52,7 @@ work across them.
 | `connect` | Open a session on a window, by `hwnd`, `pid`, `name` or `title` |
 | `disconnect` | Close a session |
 | `get_uia_tree` | The UI Automation tree — AutomationIds, control types, states, patterns. **This is the tree to automate against.** |
+| `get_uia_tree_changes` | Session-scoped UIA patches: a snapshot on first call, then added/removed/changed events |
 | `get_visual_tree` | The framework-native tree — Win32/XAML/WPF/WinForms/Avalonia/Chromium. Shows *how a UI is built*; drive it from a `visual`-mode session |
 | `get_visual_tree_changes` | Session-scoped visual-tree patches: a snapshot on first call, then added/removed/changed events |
 | `get_visual_properties` | Complete editable XAML/WinUI3 dependency-property metadata for one compact visual key |
@@ -133,24 +134,39 @@ elements, but it will not report arbitrary custom properties the way the
 default (`fast: false`) walk does — use `get_element_properties` for a single
 element's exhaustive property set regardless of which mode built the tree.
 
-### Incremental visual-tree updates
+### Incremental tree updates
 
-`get_visual_tree_changes` retains one previous visual tree per MCP session.
-Its first call returns the current tree as flat `added` events with
-`"snapshot": true`; subsequent calls return the same `added`, `removed`, and
-`changed` patch events as `watch`, with `"snapshot": false`. Disconnecting
-clears the baseline. Changing the `fast` setting also starts a fresh snapshot,
-because full and fast trees intentionally carry different property sets.
+`get_uia_tree_changes` and `get_visual_tree_changes` each retain their own
+previous tree per MCP session. The first call returns the current tree as flat
+`added` events with `"snapshot": true`; subsequent calls return the same
+`added`, `removed`, and `changed` patch events as `watch`, with
+`"snapshot": false`. Disconnecting clears both baselines. Changing the UIA
+view/property options or the visual `fast` setting starts a fresh snapshot,
+because those choices intentionally describe different trees.
 
-The same patch stream is also exposed as a standards-compliant subscribable
-MCP resource at `lvt://session/<session>/visual-tree`. `resources/list`
-discovers resources for connected sessions; `resources/read` returns the next
-snapshot/diff JSON; and `resources/subscribe` opts into
-`notifications/resources/updated`. The notification is server-initiated: a
-lightweight `POLL_EVENTS` acknowledgment drains unsolicited TAP `CHANGE`
-messages without walking the tree, and the server sends the notification as
-soon as one arrives. The client then reads the resource to obtain the
-cumulative patch, so multiple notifications can safely coalesce.
+Every connected session exposes exactly one standards-compliant subscribable
+MCP resource, matching the session's fixed mode:
+
+- `lvt://session/<session>/uia-tree` for the default UIA mode
+- `lvt://session/<session>/visual-tree` for visual mode
+
+`resources/list` discovers those mode-specific resources, `resources/read`
+returns `{ "tree": "uia"|"visual", "snapshot": bool, "events": [...] }`, and
+`resources/subscribe` opts into `notifications/resources/updated`. The server
+diff-polls the appropriate native tree about every 500 ms, with missed ticks
+skipped. This is necessary for both modes: UIA event-handler integration is a
+future optimization, while XAML's structural callbacks do not report
+text/property/bounds changes.
+
+The poll result is cached before the notification is sent, so the following
+`resources/read` is fast and drains that cached patch rather than walking the
+application again. The initial subscribe/read is always a full snapshot.
+Several patches arriving before a read are appended in order; a newer snapshot
+replaces older queued patches. Pending diffs are capped at 10,000 events. If
+appending would exceed that cap, the server replaces the queue with a fresh
+snapshot, preserving a recoverable current state instead of dropping arbitrary
+events. Unsubscribe, disconnect, transport errors, and tree-read errors cancel
+the resource task and clear its cache.
 
 With rmcp 3.1 this is implemented using
 `ServerCapabilities::builder().enable_resources().enable_resources_subscribe()`,

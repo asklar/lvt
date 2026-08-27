@@ -42,6 +42,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using json = nlohmann::json;
@@ -119,16 +120,27 @@ std::map<std::string, Session> g_sessions;
 std::atomic<uint64_t> g_nextSession{1};
 std::atomic<uint64_t> g_nextScreenshot{1};
 
-struct VisualTreeSnapshot {
-    lvt::Element tree;
-    bool fastProperties = false;
+enum class SnapshotTree {
+    visual,
+    uia,
 };
 
-std::mutex g_visualSnapshotsMutex;
-std::map<std::string, VisualTreeSnapshot> g_visualSnapshots;
-std::mutex g_visualEventGenerationsMutex;
-std::map<DWORD, uint64_t> g_visualEventGenerations;
-std::map<std::string, uint64_t> g_sessionVisualEventGenerations;
+struct TreeSnapshotKey {
+    std::string session;
+    SnapshotTree tree = SnapshotTree::visual;
+
+    bool operator<(const TreeSnapshotKey& other) const {
+        return std::tie(session, tree) < std::tie(other.session, other.tree);
+    }
+};
+
+struct TreeSnapshot {
+    lvt::Element tree;
+    std::string optionsKey;
+};
+
+std::mutex g_treeSnapshotsMutex;
+std::map<TreeSnapshotKey, TreeSnapshot> g_treeSnapshots;
 
 std::string add_session(const lvt::TargetInfo& target, bool visualMode) {
     Session session;
@@ -692,11 +704,6 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
     const bool fastProperties = get_bool(params, "fast", false);
     auto connectionLookup = connection_lookup_for_session(session, frameworks);
     tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {}, fastProperties, connectionLookup);
-
-    // Do not drain the connection's pushed-event queue here.
-    // poll_visual_events consumes it for subscribed MCP visual-tree resources;
-    // providers cap an unconsumed queue, so sessions without a subscriber stay
-    // bounded without stealing notifications from sessions that have one.
     return true;
 }
 
@@ -870,12 +877,13 @@ json method_disconnect(const json& params) {
         g_sessionConnections.erase(id);
     }
     {
-        std::lock_guard<std::mutex> lock(g_visualSnapshotsMutex);
-        g_visualSnapshots.erase(id);
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_visualEventGenerationsMutex);
-        g_sessionVisualEventGenerations.erase(id);
+        std::lock_guard<std::mutex> lock(g_treeSnapshotsMutex);
+        for (auto it = g_treeSnapshots.begin(); it != g_treeSnapshots.end();) {
+            if (it->first.session == id)
+                it = g_treeSnapshots.erase(it);
+            else
+                ++it;
+        }
     }
     if (!stillReferenced)
         forget_target_lock(released);
@@ -1229,25 +1237,51 @@ json method_clear_visual_property(const json& params, bool allowInput) {
     return out;
 }
 
-json method_get_visual_tree_changes(const json& params) {
+std::string tree_snapshot_options_key(const json& params, bool uia) {
+    if (!uia)
+        return get_bool(params, "fast", false) ? "fast" : "full";
+
+    json options{
+        {"view", get_string(params, "view", "control")},
+        {"properties", get_string_array(params, "properties")},
+        {"timeoutMs", get_int(params, "timeoutMs", 10000)},
+    };
+    return options.dump();
+}
+
+json method_get_tree_changes(const json& params, bool uia) {
     const auto session = require_session(params);
     lvt::Element current;
     std::string error;
-    if (!build_tree_for(session, params, false, current, error))
+    bool truncated = false;
+    if (!build_tree_for(session, params, uia, current, error, &truncated))
         throw std::runtime_error(error);
+    if (truncated) {
+        throw std::runtime_error(
+            "cannot diff a truncated UI Automation tree; increase timeoutMs and try again");
+    }
 
-    const bool fastProperties = get_bool(params, "fast", false);
+    const TreeSnapshotKey key{session.id, uia ? SnapshotTree::uia : SnapshotTree::visual};
+    const auto optionsKey = tree_snapshot_options_key(params, uia);
+    const bool reset = get_bool(params, "reset", false);
     bool snapshot = false;
     std::vector<lvt::ChangeEvent> changes;
     {
-        std::lock_guard<std::mutex> lock(g_visualSnapshotsMutex);
-        auto found = g_visualSnapshots.find(session.id);
-        if (found == g_visualSnapshots.end() ||
-            found->second.fastProperties != fastProperties) {
+        // Keep the session lock through the baseline update. Disconnect removes
+        // the session before waiting for an in-flight tree walk, so checking
+        // without holding this lock would allow a completed walk to recreate a
+        // snapshot after disconnect had already erased it.
+        std::lock_guard<std::mutex> sessionsLock(g_sessionsMutex);
+        if (!g_sessions.contains(session.id))
+            throw std::runtime_error("this session was disconnected while the request was waiting");
+
+        std::lock_guard<std::mutex> snapshotsLock(g_treeSnapshotsMutex);
+        auto found = g_treeSnapshots.find(key);
+        if (reset || found == g_treeSnapshots.end() ||
+            found->second.optionsKey != optionsKey) {
             snapshot = true;
             changes = lvt::snapshot_added_events(current);
-            g_visualSnapshots[session.id] =
-                VisualTreeSnapshot{std::move(current), fastProperties};
+            g_treeSnapshots[key] = TreeSnapshot{std::move(current), optionsKey};
         } else {
             changes = lvt::diff_trees(found->second.tree, current);
             found->second.tree = std::move(current);
@@ -1260,76 +1294,9 @@ json method_get_visual_tree_changes(const json& params) {
         if (!event.is_discarded())
             events.push_back(std::move(event));
     }
-    return json{{"tree", "visual"},
+    return json{{"tree", uia ? "uia" : "visual"},
                 {"snapshot", snapshot},
                 {"events", std::move(events)}};
-}
-
-json method_poll_visual_events(const json& params) {
-    const auto session = require_session(params);
-    // This only exchanges a lightweight acknowledgment with the TAP pipe
-    // worker; it does not call the target UI thread. Taking TargetGuard here
-    // would let a 200ms subscription poll repeatedly jump ahead of a real tree
-    // read or UIA action and starve it.
-    Session stillConnected;
-    if (!find_session(session.id, stillConnected))
-        throw std::runtime_error("unknown session '" + session.id + "'");
-
-    bool needsConnection = true;
-    {
-        std::lock_guard<std::mutex> lock(g_connectionsMutex);
-        auto found = g_sessionConnections.find(session.id);
-        if (found != g_sessionConnections.end()) {
-            for (auto& [label, handle] : found->second) {
-                if ((label == "xaml" || label == "winui3") && handle &&
-                    handle->is_alive()) {
-                    needsConnection = false;
-                    break;
-                }
-            }
-        }
-    }
-    if (needsConnection) {
-        auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
-        (void)connection_lookup_for_session(session, frameworks);
-    }
-
-    size_t eventCount = 0;
-    bool connectionAlive = false;
-    {
-        // Keep handles alive through the pipe acknowledgment. In particular,
-        // a concurrent disconnect cannot erase the final ConnectionHandle
-        // between finding its raw pointer and refresh_events() using it.
-        std::lock_guard<std::mutex> lock(g_connectionsMutex);
-        auto found = g_sessionConnections.find(session.id);
-        if (found != g_sessionConnections.end()) {
-            for (auto& [label, handle] : found->second) {
-                if ((label != "xaml" && label != "winui3") || !handle)
-                    continue;
-                connectionAlive =
-                    (handle->refresh_events() && handle->is_alive()) || connectionAlive;
-                eventCount += handle->poll_events().size();
-            }
-        }
-    }
-    bool changed = false;
-    {
-        // ConnectionRegistry shares one physical TAP connection between MCP
-        // sessions for the same process. poll_events() is destructive, so turn
-        // each drained batch into a process generation: every session then
-        // observes that generation once even if another session drained the
-        // shared queue first.
-        std::lock_guard<std::mutex> lock(g_visualEventGenerationsMutex);
-        auto& generation = g_visualEventGenerations[session.pid];
-        if (eventCount != 0)
-            ++generation;
-        auto& observed = g_sessionVisualEventGenerations[session.id];
-        changed = generation > observed;
-        observed = generation;
-    }
-    return json{{"changed", changed},
-                {"eventCount", eventCount},
-                {"connectionAlive", connectionAlive}};
 }
 
 json method_get_frameworks(const json& params) {
@@ -2067,8 +2034,8 @@ json dispatch(const std::string& method, const json& params, bool allowInput) {
     if (method == "disconnect")  return method_disconnect(params);
     if (method == "get_uia_tree")    return method_get_tree(params, true);
     if (method == "get_visual_tree") return method_get_tree(params, false);
-    if (method == "get_visual_tree_changes") return method_get_visual_tree_changes(params);
-    if (method == "poll_visual_events") return method_poll_visual_events(params);
+    if (method == "get_uia_tree_changes") return method_get_tree_changes(params, true);
+    if (method == "get_visual_tree_changes") return method_get_tree_changes(params, false);
     if (method == "get_visual_properties") return method_get_visual_properties(params);
     if (method == "set_visual_property")
         return method_set_visual_property(params, allowInput);

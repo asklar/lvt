@@ -11,6 +11,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -126,8 +127,11 @@ public:
         return code;
     }
 
-    void notify(const std::string& method) {
-        write(json{{"jsonrpc", "2.0"}, {"method", method}});
+    void notify(const std::string& method, const json& params = json()) {
+        json message{{"jsonrpc", "2.0"}, {"method", method}};
+        if (!params.is_null())
+            message["params"] = params;
+        write(message);
     }
 
     // Sends a request and returns its response, or a null json on timeout.
@@ -140,7 +144,17 @@ public:
     // genuinely overlap on the runtime's worker threads.
     int send_request(const std::string& method, const json& params = json::object()) {
         const int id = ++nextId_;
-        write(json{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}});
+        auto requestParams = params;
+        if (protocolVersion_ >= "2026-07-28") {
+            requestParams["_meta"] = {
+                {"io.modelcontextprotocol/protocolVersion", protocolVersion_},
+                {"io.modelcontextprotocol/clientCapabilities", json::object()},
+            };
+        }
+        write(json{{"jsonrpc", "2.0"},
+                   {"id", id},
+                   {"method", method},
+                   {"params", std::move(requestParams)}});
         return id;
     }
 
@@ -211,15 +225,18 @@ public:
     }
 
     // initialize + initialized, the handshake every session begins with.
-    bool handshake(json* serverInfo = nullptr) {
+    bool handshake(
+        json* serverInfo = nullptr,
+        const std::string& protocolVersion = "2025-06-18") {
         auto response = request("initialize",
-                                json{{"protocolVersion", "2025-06-18"},
+                                json{{"protocolVersion", protocolVersion},
                                      {"capabilities", json::object()},
                                      {"clientInfo", json{{"name", "lvt-tests"}, {"version", "1"}}}});
         if (response.is_null() || !response.contains("result"))
             return false;
         if (serverInfo)
             *serverInfo = response["result"];
+        protocolVersion_ = response["result"].value("protocolVersion", protocolVersion);
         notify("notifications/initialized");
         return true;
     }
@@ -289,6 +306,7 @@ private:
     std::atomic<bool> stopping_{false};
     bool started_ = false;
     std::atomic<int> nextId_{0};
+    std::string protocolVersion_;
 };
 
 void collect_json_elements(const json& element, std::vector<const json*>& out) {
@@ -478,8 +496,9 @@ protected:
     }
 
     // Connect and return the session id, failing the test if it does not work.
-    static std::string connect(McpClient& client) {
-        auto result = client.call_tool("connect", json{{"hwnd", hwnd_string()}});
+    static std::string connect(McpClient& client, const std::string& mode = "uia") {
+        auto result = client.call_tool(
+            "connect", json{{"hwnd", hwnd_string()}, {"mode", mode}});
         return result.value("session", "");
     }
 
@@ -1054,9 +1073,9 @@ TEST_F(McpSampleFixture, VisualPropertiesAndDiffsReuseOnePersistentInjection) {
            "get/set/clear property operations";
 }
 
-TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualTreeNotification) {
+TEST_F(McpSampleFixture, ResourcesMatchEachSessionsFixedTreeMode) {
     SkipIfNotReady();
-    McpClient client(true);
+    McpClient client(false);
     ASSERT_TRUE(client.started());
     json serverInfo;
     ASSERT_TRUE(client.handshake(&serverInfo));
@@ -1064,40 +1083,90 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualTreeNotification) {
         << serverInfo.dump(2);
     EXPECT_TRUE(serverInfo["capabilities"]["resources"].value("subscribe", false));
 
-    const auto session = connect(client);
-    ASSERT_FALSE(session.empty());
-    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
-    ASSERT_TRUE(visual.contains("root")) << visual.dump(2);
-
-    auto combo = client.call_tool(
-        "find_elements", json{{"session", session}, {"automationId", "ChoiceCombo"}});
-    ASSERT_EQ(combo["elements"].size(), 1u) << combo.dump(2);
-    const auto comboRef = combo["elements"][0].value("ref", "");
+    const auto uiaSession = connect(client);
+    const auto visualSession = connect(client, "visual");
+    ASSERT_FALSE(uiaSession.empty());
+    ASSERT_FALSE(visualSession.empty());
 
     auto listed = client.request("resources/list");
     ASSERT_TRUE(listed.contains("result")) << listed.dump(2);
-    std::string uri;
-    for (const auto& resource : listed["result"].value("resources", json::array())) {
-        if (resource.value("uri", "").find("/" + session + "/") != std::string::npos) {
-            uri = resource.value("uri", "");
+    std::vector<std::string> uris;
+    for (const auto& resource : listed["result"].value("resources", json::array()))
+        uris.push_back(resource.value("uri", ""));
+
+    const auto uiaUri = "lvt://session/" + uiaSession + "/uia-tree";
+    const auto wrongUiaUri = "lvt://session/" + uiaSession + "/visual-tree";
+    const auto visualUri = "lvt://session/" + visualSession + "/visual-tree";
+    const auto wrongVisualUri = "lvt://session/" + visualSession + "/uia-tree";
+    EXPECT_NE(std::find(uris.begin(), uris.end(), uiaUri), uris.end());
+    EXPECT_NE(std::find(uris.begin(), uris.end(), visualUri), uris.end());
+    EXPECT_EQ(std::find(uris.begin(), uris.end(), wrongUiaUri), uris.end());
+    EXPECT_EQ(std::find(uris.begin(), uris.end(), wrongVisualUri), uris.end());
+}
+
+TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(visual.contains("root")) << visual.dump(2);
+    std::vector<const json*> elements;
+    collect_json_elements(visual["root"], elements);
+    const json* status = nullptr;
+    for (const auto* element : elements) {
+        if (element->value("properties", json::object()).value("name", "") == "StatusText") {
+            status = element;
             break;
         }
     }
-    ASSERT_FALSE(uri.empty()) << listed.dump(2);
+    ASSERT_NE(status, nullptr);
+    const auto statusKey = status->value("key", "");
+    ASSERT_EQ(statusKey.rfind("winui3:0x", 0), 0u);
+
+    bool isError = false;
+    auto statusProperties = client.call_tool(
+        "get_visual_properties",
+        json{{"session", session}, {"key", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << statusProperties.dump(2);
+    json textProperty;
+    for (const auto& property : statusProperties.value("properties", json::array())) {
+        if (property.value("name", "") == "Text") {
+            textProperty = property;
+            break;
+        }
+    }
+    ASSERT_FALSE(textProperty.is_null()) << statusProperties.dump(2);
+    const auto originalText = textProperty.value("value", "");
+
+    auto listed = client.request("resources/list");
+    ASSERT_TRUE(listed.contains("result")) << listed.dump(2);
+    const auto uri = "lvt://session/" + session + "/visual-tree";
+    bool foundResource = false;
+    for (const auto& resource : listed["result"].value("resources", json::array()))
+        foundResource = foundResource || resource.value("uri", "") == uri;
+    ASSERT_TRUE(foundResource) << listed.dump(2);
 
     auto subscribed = client.request("resources/subscribe", json{{"uri", uri}});
     ASSERT_TRUE(subscribed.contains("result")) << subscribed.dump(2);
 
-    bool isError = false;
-    auto expanded = client.call_tool(
-        "set_expanded",
-        json{{"session", session}, {"element", comboRef}, {"expanded", true}},
+    const auto changedText = "resource visual mutation";
+    auto changed = client.call_tool(
+        "set_visual_property",
+        json{{"session", session},
+             {"key", statusKey},
+             {"propertyIndex", textProperty.value("propertyIndex", uint32_t{0})},
+             {"valueType", textProperty.value("valueType", "")},
+             {"value", changedText}},
         &isError);
-    ASSERT_FALSE(isError) << expanded.dump(2);
+    ASSERT_FALSE(isError) << changed.dump(2);
 
     // No request is issued between the action and this receive. The message
-    // must originate at the server after its TAP event pump observes the
-    // popup's visual-tree additions.
+    // must originate at the server after its periodic diff observes a
+    // non-structural property/text mutation.
     auto notification =
         client.await_notification("notifications/resources/updated", 20);
     ASSERT_FALSE(notification.is_null())
@@ -1113,20 +1182,166 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualTreeNotification) {
     EXPECT_EQ(patch.value("tree", ""), "visual");
     EXPECT_TRUE(patch.value("snapshot", false));
     EXPECT_FALSE(patch.value("events", json::array()).empty());
-
-    auto comboAfterExpand = client.call_tool(
-        "find_elements", json{{"session", session}, {"automationId", "ChoiceCombo"}});
-    if (!comboAfterExpand["elements"].empty()) {
-        auto collapsed = client.call_tool(
-            "set_expanded",
-            json{{"session", session},
-                 {"element", comboAfterExpand["elements"][0].value("ref", "")},
-                 {"expanded", false}},
-            &isError);
-        EXPECT_FALSE(isError) << collapsed.dump(2);
+    bool sawTextChange = false;
+    for (const auto& event : patch.value("events", json::array())) {
+        const auto fields = event.value("fields", json::object());
+        sawTextChange = sawTextChange ||
+                        (event.value("key", "") == statusKey &&
+                         (fields.contains("text") || fields.contains("properties.Text")));
     }
+    EXPECT_TRUE(sawTextChange) << patch.dump(2);
+
     auto unsubscribed = client.request("resources/unsubscribe", json{{"uri", uri}});
     EXPECT_TRUE(unsubscribed.contains("result")) << unsubscribed.dump(2);
+    auto restored = client.call_tool(
+        "set_visual_property",
+        json{{"session", session},
+             {"key", statusKey},
+             {"propertyIndex", textProperty.value("propertyIndex", uint32_t{0})},
+             {"valueType", textProperty.value("valueType", "")},
+             {"value", originalText}},
+        &isError);
+    EXPECT_FALSE(isError) << restored.dump(2);
+}
+
+TEST_F(McpSampleFixture, ResourceSubscriptionPushesUiaValueChange) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    auto input = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "InputBox"}});
+    ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
+    const auto inputRef = input["elements"][0].value("ref", "");
+    const auto inputKey = input["elements"][0].value("key", "");
+    auto before = client.call_tool(
+        "get_element_properties",
+        json{{"session", session},
+             {"element", inputRef},
+             {"properties", json::array({"Value.Value"})}});
+    const auto originalValue = before["properties"].value("Value.Value", "");
+
+    const auto uri = "lvt://session/" + session + "/uia-tree";
+    auto subscribed = client.request("resources/subscribe", json{{"uri", uri}});
+    ASSERT_TRUE(subscribed.contains("result")) << subscribed.dump(2);
+
+    bool isError = false;
+    const auto changedValue = "resource UIA mutation";
+    auto changed = client.call_tool(
+        "set_value",
+        json{{"session", session}, {"element", inputRef}, {"text", changedValue}},
+        &isError);
+    ASSERT_FALSE(isError) << changed.dump(2);
+
+    // No client request occurs between the mutation response and this await.
+    // A passing test therefore proves standards-compliant server push rather
+    // than a hidden resources/read polling loop in the client.
+    auto notification =
+        client.await_notification("notifications/resources/updated", 20);
+    ASSERT_FALSE(notification.is_null())
+        << "no unsolicited UIA resource update arrived after Value.Value changed";
+    EXPECT_EQ(notification["params"].value("uri", ""), uri);
+
+    auto read = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(read.contains("result")) << read.dump(2);
+    ASSERT_FALSE(read["result"].value("contents", json::array()).empty());
+    const auto patch = json::parse(
+        read["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_FALSE(patch.is_discarded()) << read.dump(2);
+    EXPECT_EQ(patch.value("tree", ""), "uia");
+    EXPECT_TRUE(patch.value("snapshot", false));
+    bool sawValueChange = false;
+    for (const auto& event : patch.value("events", json::array())) {
+        const auto fields = event.value("fields", json::object());
+        sawValueChange = sawValueChange ||
+                         (event.value("key", "") == inputKey &&
+                          (fields.contains("text") ||
+                           fields.contains("properties.Value.Value")));
+    }
+    EXPECT_TRUE(sawValueChange) << patch.dump(2);
+
+    auto unsubscribed = client.request("resources/unsubscribe", json{{"uri", uri}});
+    EXPECT_TRUE(unsubscribed.contains("result")) << unsubscribed.dump(2);
+    auto restored = client.call_tool(
+        "set_value",
+        json{{"session", session}, {"element", inputRef}, {"text", originalValue}},
+        &isError);
+    EXPECT_FALSE(isError) << restored.dump(2);
+}
+
+TEST_F(McpSampleFixture, ModernListenPushesAndCancelsUiaResourceUpdates) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake(nullptr, "2026-07-28"));
+
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    auto checkbox = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "ReadyCheckBox"}});
+    ASSERT_EQ(checkbox["elements"].size(), 1u) << checkbox.dump(2);
+    const auto checkboxRef = checkbox["elements"][0].value("ref", "");
+    const auto checkboxKey = checkbox["elements"][0].value("key", "");
+    const auto uri = "lvt://session/" + session + "/uia-tree";
+
+    const int listenId = client.send_request(
+        "subscriptions/listen",
+        json{{"notifications",
+              json{{"resourceSubscriptions", json::array({uri})}}}});
+    auto acknowledged =
+        client.await_notification("notifications/subscriptions/acknowledged", 20);
+    ASSERT_FALSE(acknowledged.is_null()) << "modern listen was not acknowledged";
+
+    // Modern rmcp acknowledges before entering ServerHandler::listen. The
+    // server therefore publishes the cached initial snapshot once it is ready.
+    auto initialNotification =
+        client.await_notification("notifications/resources/updated", 20);
+    ASSERT_FALSE(initialNotification.is_null());
+    auto initialRead = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(initialRead.contains("result")) << initialRead.dump(2);
+    const auto initialPatch = json::parse(
+        initialRead["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_TRUE(initialPatch.value("snapshot", false)) << initialPatch.dump(2);
+
+    bool isError = false;
+    auto toggled = client.call_tool(
+        "toggle", json{{"session", session}, {"element", checkboxRef}}, &isError);
+    ASSERT_FALSE(isError) << toggled.dump(2);
+
+    // No request is sent between the mutation and this receive.
+    auto changedNotification =
+        client.await_notification("notifications/resources/updated", 20);
+    ASSERT_FALSE(changedNotification.is_null())
+        << "modern subscription did not push the UIA change";
+    auto changedRead = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(changedRead.contains("result")) << changedRead.dump(2);
+    const auto patch = json::parse(
+        changedRead["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_FALSE(patch.value("snapshot", true)) << patch.dump(2);
+    bool sawToggleChange = false;
+    for (const auto& event : patch.value("events", json::array())) {
+        const auto fields = event.value("fields", json::object());
+        sawToggleChange = sawToggleChange ||
+                          (event.value("key", "") == checkboxKey &&
+                           fields.contains("properties.Toggle.ToggleState"));
+    }
+    EXPECT_TRUE(sawToggleChange) << patch.dump(2);
+
+    client.notify(
+        "notifications/cancelled",
+        json{{"requestId", listenId}, {"reason", "test complete"}});
+    Sleep(750);
+
+    auto restored = client.call_tool(
+        "toggle", json{{"session", session}, {"element", checkboxRef}}, &isError);
+    EXPECT_FALSE(isError) << restored.dump(2);
+    auto afterCancellation =
+        client.await_notification("notifications/resources/updated", 2);
+    EXPECT_TRUE(afterCancellation.is_null())
+        << "a cancelled modern subscription must stop its resource watcher";
 }
 
 // --- driving the app ----------------------------------------------------
@@ -3302,6 +3517,7 @@ TEST_F(McpSampleFixture, StructuredContentMatchesTheTextAndTheDeclaredSchema) {
         {"connect", json{{"hwnd", hwnd_string()}}},
         {"get_frameworks", json{{"session", session}}},
         {"get_uia_tree", json{{"session", session}, {"depth", 3}}},
+        {"get_uia_tree_changes", json{{"session", session}}},
         {"get_visual_tree", json{{"session", session}, {"depth", 3}, {"correlate", true}}},
         {"find_elements", json{{"session", session}, {"type", "Button"}}},
         {"get_element_properties", json{{"session", session}, {"element", ref}}},

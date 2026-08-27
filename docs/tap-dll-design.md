@@ -195,8 +195,8 @@ Every message on the pipe is one line (UTF-8, `\n`-terminated). lvt.exe → TAP 
 | lvt → TAP | `SET_PROPERTY <id> <handle> <index> <typeHex> <valueHex>` | Create a typed value and set one dependency property |
 | lvt → TAP | `CLEAR_PROPERTY <id> <handle> <index>` | Clear a local value so inheritance/style/default resolution resumes |
 | TAP → lvt | `{"type":"PROPERTY_RESULT","commandId":...}` | Correlated typed property result; unsolicited `CHANGE` lines may appear before it |
-| lvt → TAP | `POLL_EVENTS <id>` | Lightweight barrier used by MCP resource subscriptions to drain preceding unsolicited `CHANGE` lines without walking the tree |
-| TAP → lvt | `{"type":"EVENTS_RESULT","commandId":...}` | Acknowledges `POLL_EVENTS`; any preceding `CHANGE` lines are already queued by the connection |
+| lvt → TAP | `POLL_EVENTS <id>` | Optional lightweight barrier for consumers of the TAP structural-event queue |
+| TAP → lvt | `{"type":"EVENTS_RESULT","commandId":...}` | Acknowledges `POLL_EVENTS`; any preceding structural `CHANGE` lines are already queued by the connection |
 | lvt → TAP | `DISCONNECT` | End the connection; TAP DLL replies `BYE`, then runs its cleanup |
 
 Tree responses are parsed and grafted by `graft_xaml_tree_json()` in
@@ -208,6 +208,12 @@ unambiguous without adding a JSON dependency to the injected DLL. The pipe
 worker never invokes thread-affine xamlOM methods itself: it synchronously
 dispatches the operation through the existing message-only window, then writes
 the result under the same pipe-write mutex used by tree and `CHANGE` messages.
+
+MCP resource subscriptions do not use `POLL_EVENTS` as their notification
+trigger. `AdviseVisualTreeChange` only reports structural additions/removals, so
+it cannot cover text, dependency-property, or bounds changes. The MCP server
+periodically requests and diffs complete mode-specific snapshots instead,
+caching the resulting patch before sending `notifications/resources/updated`.
 
 ## Static CRT
 

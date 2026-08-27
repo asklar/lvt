@@ -22,13 +22,11 @@ use rmcp::model::{
     ResourceContents, ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo,
     SubscribeRequestParams, SubscriptionFilter, UnsubscribeRequestParams,
 };
-use rmcp::service::{RequestContext, SubscriptionContext};
-use rmcp::{
-    tool, tool_handler, tool_router, ErrorData, Peer, RoleServer, ServerHandler,
-};
-use serde::Deserialize;
+use rmcp::service::{RequestContext, SubscriptionContext, SubscriptionSink};
+use rmcp::{tool, tool_handler, tool_router, ErrorData, Peer, RoleServer, ServerHandler};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{watch, Mutex};
 
 use crate::ffi;
 
@@ -156,6 +154,22 @@ pub struct VisualTreeChangesArgs {
     /// Use the cheaper XAML/WinUI3 property set. Changing this setting resets
     /// the session's diff baseline and returns a fresh snapshot.
     pub fast: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UiaTreeChangesArgs {
+    /// Session id returned by connect.
+    pub session: String,
+    /// UIA tree view: "control" (default), "content", or "raw". Changing it
+    /// resets the session's diff baseline and returns a fresh snapshot.
+    pub view: Option<String>,
+    /// Extra UIA properties to include beyond the default set. Changing this
+    /// list resets the diff baseline.
+    pub properties: Option<Vec<String>>,
+    /// How long the UI Automation walk may take, in milliseconds (default
+    /// 10000). Changing it resets the diff baseline.
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -495,65 +509,618 @@ pub struct WaitForArgs {
     pub uia: Option<bool>,
 }
 
-const VISUAL_RESOURCE_PREFIX: &str = "lvt://session/";
+const RESOURCE_PREFIX: &str = "lvt://session/";
 const VISUAL_RESOURCE_SUFFIX: &str = "/visual-tree";
+const UIA_RESOURCE_SUFFIX: &str = "/uia-tree";
+const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MAX_CACHED_RESOURCE_EVENTS: usize = 10_000;
 
-fn visual_resource_uri(session: &str) -> String {
-    format!("{VISUAL_RESOURCE_PREFIX}{session}{VISUAL_RESOURCE_SUFFIX}")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeMode {
+    Visual,
+    Uia,
 }
 
-fn session_from_visual_resource(uri: &str) -> Option<String> {
-    let session = uri
-        .strip_prefix(VISUAL_RESOURCE_PREFIX)?
-        .strip_suffix(VISUAL_RESOURCE_SUFFIX)?;
-    let mut chars = session.chars();
-    (chars.next() == Some('s') && chars.clone().next().is_some() &&
-     chars.all(|ch| ch.is_ascii_digit())).then(|| session.to_string())
+impl TreeMode {
+    fn from_session_mode(mode: &str) -> Option<Self> {
+        match mode {
+            "visual" => Some(Self::Visual),
+            "uia" => Some(Self::Uia),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Visual => "visual",
+            Self::Uia => "uia",
+        }
+    }
+
+    fn resource_suffix(self) -> &'static str {
+        match self {
+            Self::Visual => VISUAL_RESOURCE_SUFFIX,
+            Self::Uia => UIA_RESOURCE_SUFFIX,
+        }
+    }
+
+    fn changes_method(self) -> &'static str {
+        match self {
+            Self::Visual => "get_visual_tree_changes",
+            Self::Uia => "get_uia_tree_changes",
+        }
+    }
 }
 
-fn visual_resource(session: &str, process_name: &str) -> Resource {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionResource {
+    session: String,
+    tree: TreeMode,
+}
+
+impl SessionResource {
+    fn new(session: impl Into<String>, tree: TreeMode) -> Self {
+        Self {
+            session: session.into(),
+            tree,
+        }
+    }
+
+    fn parse(uri: &str) -> Option<Self> {
+        let remainder = uri.strip_prefix(RESOURCE_PREFIX)?;
+        let (session, tree) = if let Some(session) = remainder.strip_suffix(VISUAL_RESOURCE_SUFFIX)
+        {
+            (session, TreeMode::Visual)
+        } else if let Some(session) = remainder.strip_suffix(UIA_RESOURCE_SUFFIX) {
+            (session, TreeMode::Uia)
+        } else {
+            return None;
+        };
+        let mut chars = session.chars();
+        if chars.next() != Some('s')
+            || chars.clone().next().is_none()
+            || !chars.all(|ch| ch.is_ascii_digit())
+        {
+            return None;
+        }
+        Some(Self::new(session, tree))
+    }
+
+    fn uri(&self) -> String {
+        format!(
+            "{RESOURCE_PREFIX}{}{}",
+            self.session,
+            self.tree.resource_suffix()
+        )
+    }
+}
+
+fn session_resource(resource: &SessionResource, process_name: &str) -> Resource {
+    let tree_title = match resource.tree {
+        TreeMode::Visual => "Visual",
+        TreeMode::Uia => "UI Automation",
+    };
     Resource::new(
-        visual_resource_uri(session),
-        format!("visual-tree-{session}"),
+        resource.uri(),
+        format!("{}-tree-{}", resource.tree.name(), resource.session),
     )
-    .with_title(format!("Visual tree changes for {process_name}"))
+    .with_title(format!("{tree_title} tree changes for {process_name}"))
     .with_description(
         "A session-scoped snapshot/diff stream. Read after a resources/updated \
-         notification to receive the current visual-tree patch.",
+         notification to receive the cached tree patch.",
     )
     .with_mime_type("application/json")
 }
 
-async fn poll_visual_events(session: &str) -> Result<bool, String> {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct TreePatch {
+    tree: String,
+    snapshot: bool,
+    #[serde(default)]
+    events: Vec<serde_json::Value>,
+}
+
+async fn get_tree_patch(resource: &SessionResource, reset: bool) -> Result<TreePatch, String> {
     let result = call_lvt(
-        "poll_visual_events",
-        json!({ "session": session }),
+        resource.tree.changes_method(),
+        json!({ "session": resource.session, "reset": reset }),
         false,
     )
     .await
     .map_err(|error| error.message.to_string())?;
     let response: serde_json::Value = serde_json::from_str(&result.json)
-        .map_err(|error| format!("lvt returned malformed event JSON: {error}"))?;
+        .map_err(|error| format!("lvt returned malformed tree-change JSON: {error}"))?;
     if !result.ok {
         return Err(response
             .get("error")
             .and_then(|value| value.as_str())
-            .unwrap_or("visual event polling failed")
+            .unwrap_or("tree change polling failed")
             .to_string());
     }
-    Ok(response
-        .get("changed")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false))
+    let patch: TreePatch = serde_json::from_value(response)
+        .map_err(|error| format!("lvt returned an invalid tree patch: {error}"))?;
+    if patch.tree != resource.tree.name() {
+        return Err(format!(
+            "lvt returned a '{}' patch for a '{}' resource",
+            patch.tree,
+            resource.tree.name()
+        ));
+    }
+    Ok(patch)
 }
 
-async fn run_legacy_resource_subscription(
+#[derive(Debug, Clone)]
+struct SessionDescriptor {
     session: String,
-    uri: String,
-    peer: Peer<RoleServer>,
+    process_name: String,
+    tree: TreeMode,
+}
+
+async fn list_session_descriptors() -> Result<Vec<SessionDescriptor>, ErrorData> {
+    let result = call_lvt("list_sessions", json!({}), false).await?;
+    if !result.ok {
+        return Err(ErrorData::internal_error(result.json, None));
+    }
+    let response: serde_json::Value = serde_json::from_str(&result.json).map_err(|error| {
+        ErrorData::internal_error(
+            format!("lvt returned malformed session JSON: {error}"),
+            None,
+        )
+    })?;
+    let mut sessions = Vec::new();
+    for session in response
+        .get("sessions")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = session.get("session").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(tree) = session
+            .get("mode")
+            .and_then(|value| value.as_str())
+            .and_then(TreeMode::from_session_mode)
+        else {
+            continue;
+        };
+        sessions.push(SessionDescriptor {
+            session: id.to_string(),
+            process_name: session
+                .get("processName")
+                .and_then(|value| value.as_str())
+                .unwrap_or("application")
+                .to_string(),
+            tree,
+        });
+    }
+    Ok(sessions)
+}
+
+async fn validate_resource(resource: &SessionResource) -> Result<(), ErrorData> {
+    let sessions = list_session_descriptors().await?;
+    match sessions
+        .iter()
+        .find(|session| session.session == resource.session)
+    {
+        Some(session) if session.tree == resource.tree => Ok(()),
+        Some(session) => Err(ErrorData::invalid_params(
+            format!(
+                "session '{}' exposes its {} tree, not the requested {} tree",
+                resource.session,
+                session.tree.name(),
+                resource.tree.name()
+            ),
+            None,
+        )),
+        None => Err(ErrorData::invalid_params(
+            format!("unknown session '{}'", resource.session),
+            None,
+        )),
+    }
+}
+
+#[derive(Clone)]
+enum ResourceSubscriber {
+    Legacy(Peer<RoleServer>),
+    Modern(SubscriptionSink),
+}
+
+impl ResourceSubscriber {
+    async fn notify(&self, uri: String) -> bool {
+        match self {
+            Self::Legacy(peer) => peer
+                .notify_resource_updated(ResourceUpdatedNotificationParam::new(uri))
+                .await
+                .is_ok(),
+            Self::Modern(sink) => sink.notify_resource_updated(uri).await.is_ok(),
+        }
+    }
+}
+
+struct WatcherHandle {
+    generation: u64,
+    cancel: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct ResourceEntry {
+    initialized: bool,
+    cached: Option<TreePatch>,
+    watcher: Option<WatcherHandle>,
+    subscribers: HashMap<u64, ResourceSubscriber>,
+}
+
+#[derive(Default)]
+struct ResourceRegistryInner {
+    // Modern listen and legacy subscribe share these entries so only one
+    // native diff poll can consume a session/tree baseline at a time.
+    entries: HashMap<String, ResourceEntry>,
+    legacy_ids: HashMap<String, u64>,
+    session_epochs: HashMap<String, u64>,
+    next_subscriber: u64,
+    next_generation: u64,
+}
+
+#[derive(Clone, Default)]
+struct ResourceRegistry {
+    inner: Arc<Mutex<ResourceRegistryInner>>,
+}
+
+struct RegisterResult {
+    subscriber_id: u64,
+    watcher: Option<(u64, watch::Receiver<bool>)>,
+}
+
+enum CacheResult {
+    Stale,
+    NoChange,
+    Cached,
+    NeedsSnapshot,
+}
+
+enum MergeResult {
+    NoChange,
+    Cached,
+    NeedsSnapshot,
+}
+
+fn merge_cached_patch(cached: &mut Option<TreePatch>, patch: TreePatch) -> MergeResult {
+    if patch.events.is_empty() && !patch.snapshot {
+        return MergeResult::NoChange;
+    }
+    if patch.snapshot {
+        *cached = Some(patch);
+        return MergeResult::Cached;
+    }
+    if patch.events.len() > MAX_CACHED_RESOURCE_EVENTS {
+        return MergeResult::NeedsSnapshot;
+    }
+    if let Some(current) = cached.as_mut() {
+        if current.events.len().saturating_add(patch.events.len()) > MAX_CACHED_RESOURCE_EVENTS {
+            // Dropping arbitrary diffs would make the remaining sequence
+            // impossible to apply. The watcher replaces it with a snapshot.
+            return MergeResult::NeedsSnapshot;
+        }
+        current.events.extend(patch.events);
+    } else {
+        *cached = Some(patch);
+    }
+    MergeResult::Cached
+}
+
+impl ResourceRegistry {
+    async fn read_state(&self, resource: &SessionResource) -> (Option<TreePatch>, bool, u64) {
+        let uri = resource.uri();
+        let mut inner = self.inner.lock().await;
+        let epoch = *inner.session_epochs.get(&resource.session).unwrap_or(&0);
+        let Some(entry) = inner.entries.get_mut(&uri) else {
+            return (None, false, epoch);
+        };
+        (entry.cached.take(), entry.initialized, epoch)
+    }
+
+    async fn session_epoch(&self, session: &str) -> u64 {
+        let inner = self.inner.lock().await;
+        *inner.session_epochs.get(session).unwrap_or(&0)
+    }
+
+    async fn store_initial(
+        &self,
+        resource: &SessionResource,
+        epoch: u64,
+        patch: TreePatch,
+    ) -> bool {
+        let mut inner = self.inner.lock().await;
+        if *inner.session_epochs.get(&resource.session).unwrap_or(&0) != epoch {
+            return false;
+        }
+        let entry = inner.entries.entry(resource.uri()).or_default();
+        if let Some(watcher) = entry.watcher.take() {
+            let _ = watcher.cancel.send(true);
+        }
+        entry.initialized = true;
+        entry.cached = Some(patch);
+        true
+    }
+
+    async fn mark_initialized(&self, resource: &SessionResource, epoch: u64) -> bool {
+        let mut inner = self.inner.lock().await;
+        if *inner.session_epochs.get(&resource.session).unwrap_or(&0) != epoch {
+            return false;
+        }
+        inner.entries.entry(resource.uri()).or_default().initialized = true;
+        true
+    }
+
+    async fn register(
+        &self,
+        resource: &SessionResource,
+        epoch: u64,
+        subscriber: ResourceSubscriber,
+        legacy: bool,
+    ) -> Option<RegisterResult> {
+        let uri = resource.uri();
+        let mut inner = self.inner.lock().await;
+        if *inner.session_epochs.get(&resource.session).unwrap_or(&0) != epoch {
+            return None;
+        }
+
+        inner.next_subscriber += 1;
+        let subscriber_id = inner.next_subscriber;
+        let previous_legacy = legacy
+            .then(|| inner.legacy_ids.insert(uri.clone(), subscriber_id))
+            .flatten();
+        let needs_watcher = inner
+            .entries
+            .get(&uri)
+            .is_none_or(|entry| entry.watcher.is_none());
+        let watcher = if needs_watcher {
+            inner.next_generation += 1;
+            let generation = inner.next_generation;
+            let (cancel, cancelled) = watch::channel(false);
+            Some((generation, cancel, cancelled))
+        } else {
+            None
+        };
+        let entry = inner.entries.entry(uri).or_default();
+        if let Some(previous) = previous_legacy {
+            entry.subscribers.remove(&previous);
+        }
+        entry.subscribers.insert(subscriber_id, subscriber);
+
+        let watcher = watcher.map(|(generation, cancel, cancelled)| {
+            entry.watcher = Some(WatcherHandle { generation, cancel });
+            (generation, cancelled)
+        });
+        Some(RegisterResult {
+            subscriber_id,
+            watcher,
+        })
+    }
+
+    async fn cache_from_watcher(
+        &self,
+        resource: &SessionResource,
+        epoch: u64,
+        generation: u64,
+        patch: TreePatch,
+    ) -> CacheResult {
+        let uri = resource.uri();
+        let mut inner = self.inner.lock().await;
+        if *inner.session_epochs.get(&resource.session).unwrap_or(&0) != epoch {
+            return CacheResult::Stale;
+        }
+        let Some(entry) = inner.entries.get_mut(&uri) else {
+            return CacheResult::Stale;
+        };
+        if entry.watcher.as_ref().map(|watcher| watcher.generation) != Some(generation)
+            || entry.subscribers.is_empty()
+        {
+            return CacheResult::Stale;
+        }
+        entry.initialized = true;
+        match merge_cached_patch(&mut entry.cached, patch) {
+            MergeResult::NoChange => CacheResult::NoChange,
+            MergeResult::Cached => CacheResult::Cached,
+            MergeResult::NeedsSnapshot => CacheResult::NeedsSnapshot,
+        }
+    }
+
+    async fn subscribers(
+        &self,
+        resource: &SessionResource,
+        generation: u64,
+    ) -> Vec<(u64, ResourceSubscriber)> {
+        let inner = self.inner.lock().await;
+        let Some(entry) = inner.entries.get(&resource.uri()) else {
+            return Vec::new();
+        };
+        if entry.watcher.as_ref().map(|watcher| watcher.generation) != Some(generation) {
+            return Vec::new();
+        }
+        entry
+            .subscribers
+            .iter()
+            .map(|(id, subscriber)| (*id, subscriber.clone()))
+            .collect()
+    }
+
+    async fn remove_subscribers(
+        &self,
+        resource: &SessionResource,
+        generation: u64,
+        subscriber_ids: &[u64],
+    ) {
+        let uri = resource.uri();
+        let mut cancel = None;
+        {
+            let mut inner = self.inner.lock().await;
+            let remove_entry = {
+                let Some(entry) = inner.entries.get_mut(&uri) else {
+                    return;
+                };
+                if entry.watcher.as_ref().map(|watcher| watcher.generation) != Some(generation) {
+                    return;
+                }
+                for id in subscriber_ids {
+                    entry.subscribers.remove(id);
+                }
+                if entry.subscribers.is_empty() {
+                    cancel = entry.watcher.take().map(|watcher| watcher.cancel);
+                    true
+                } else {
+                    false
+                }
+            };
+            inner
+                .legacy_ids
+                .retain(|legacy_uri, id| legacy_uri != &uri || !subscriber_ids.contains(id));
+            if remove_entry {
+                inner.entries.remove(&uri);
+            }
+        }
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(true);
+        }
+    }
+
+    async fn unregister(&self, resource: &SessionResource, subscriber_id: u64) {
+        let generation = {
+            let inner = self.inner.lock().await;
+            inner
+                .entries
+                .get(&resource.uri())
+                .and_then(|entry| entry.watcher.as_ref())
+                .map(|watcher| watcher.generation)
+        };
+        if let Some(generation) = generation {
+            self.remove_subscribers(resource, generation, &[subscriber_id])
+                .await;
+        }
+    }
+
+    async fn unregister_legacy(&self, uri: &str) {
+        let parsed = SessionResource::parse(uri);
+        let subscriber_id = {
+            let inner = self.inner.lock().await;
+            inner.legacy_ids.get(uri).copied()
+        };
+        if let (Some(resource), Some(subscriber_id)) = (parsed, subscriber_id) {
+            self.unregister(&resource, subscriber_id).await;
+        }
+    }
+
+    async fn clear_resource(&self, resource: &SessionResource, epoch: u64) {
+        let uri = resource.uri();
+        let cancel = {
+            let mut inner = self.inner.lock().await;
+            if *inner.session_epochs.get(&resource.session).unwrap_or(&0) != epoch {
+                return;
+            }
+            *inner
+                .session_epochs
+                .entry(resource.session.clone())
+                .or_default() += 1;
+            inner.legacy_ids.remove(&uri);
+            inner
+                .entries
+                .remove(&uri)
+                .and_then(|entry| entry.watcher.map(|watcher| watcher.cancel))
+        };
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(true);
+        }
+    }
+
+    async fn fail_watcher(&self, resource: &SessionResource, epoch: u64, generation: u64) {
+        let uri = resource.uri();
+        let cancel = {
+            let mut inner = self.inner.lock().await;
+            if *inner.session_epochs.get(&resource.session).unwrap_or(&0) != epoch
+                || inner
+                    .entries
+                    .get(&uri)
+                    .and_then(|entry| entry.watcher.as_ref())
+                    .map(|watcher| watcher.generation)
+                    != Some(generation)
+            {
+                return;
+            }
+            *inner
+                .session_epochs
+                .entry(resource.session.clone())
+                .or_default() += 1;
+            inner.legacy_ids.remove(&uri);
+            inner
+                .entries
+                .remove(&uri)
+                .and_then(|entry| entry.watcher.map(|watcher| watcher.cancel))
+        };
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(true);
+        }
+    }
+
+    async fn clear_session(&self, session: &str) {
+        let mut cancellations = Vec::new();
+        {
+            let mut inner = self.inner.lock().await;
+            *inner.session_epochs.entry(session.to_string()).or_default() += 1;
+            let uris = inner
+                .entries
+                .keys()
+                .filter(|uri| {
+                    SessionResource::parse(uri).is_some_and(|resource| resource.session == session)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for uri in uris {
+                inner.legacy_ids.remove(&uri);
+                if let Some(cancel) = inner
+                    .entries
+                    .remove(&uri)
+                    .and_then(|entry| entry.watcher.map(|watcher| watcher.cancel))
+                {
+                    cancellations.push(cancel);
+                }
+            }
+        }
+        for cancel in cancellations {
+            let _ = cancel.send(true);
+        }
+    }
+}
+
+async fn notify_resource_subscribers(
+    registry: &ResourceRegistry,
+    resource: &SessionResource,
+    generation: u64,
+) {
+    let subscribers = registry.subscribers(resource, generation).await;
+    let mut failed = Vec::new();
+    let uri = resource.uri();
+    for (id, subscriber) in subscribers {
+        if !subscriber.notify(uri.clone()).await {
+            failed.push(id);
+        }
+    }
+    if !failed.is_empty() {
+        registry
+            .remove_subscribers(resource, generation, &failed)
+            .await;
+    }
+}
+
+async fn run_resource_watcher(
+    resource: SessionResource,
+    registry: ResourceRegistry,
+    epoch: u64,
+    generation: u64,
     mut cancelled: watch::Receiver<bool>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_millis(200));
+    let start = tokio::time::Instant::now() + RESOURCE_POLL_INTERVAL;
+    let mut interval = tokio::time::interval_at(start, RESOURCE_POLL_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -563,23 +1130,49 @@ async fn run_legacy_resource_subscription(
                 }
             }
             _ = interval.tick() => {
-                if peer.is_transport_closed() {
-                    break;
-                }
-                match poll_visual_events(&session).await {
-                    Ok(true) => {
-                        if peer
-                            .notify_resource_updated(ResourceUpdatedNotificationParam::new(
-                                uri.clone(),
-                            ))
+                let patch = match get_tree_patch(&resource, false).await {
+                    Ok(patch) => patch,
+                    Err(_) => {
+                        registry
+                            .fail_watcher(&resource, epoch, generation)
+                            .await;
+                        break;
+                    }
+                };
+                match registry
+                    .cache_from_watcher(&resource, epoch, generation, patch)
+                    .await
+                {
+                    CacheResult::Stale => break,
+                    CacheResult::NoChange => {}
+                    CacheResult::Cached => {
+                        notify_resource_subscribers(&registry, &resource, generation).await;
+                    }
+                    CacheResult::NeedsSnapshot => {
+                        let snapshot = match get_tree_patch(&resource, true).await {
+                            Ok(snapshot) => snapshot,
+                            Err(_) => {
+                                registry
+                                    .fail_watcher(&resource, epoch, generation)
+                                    .await;
+                                break;
+                            }
+                        };
+                        match registry
+                            .cache_from_watcher(&resource, epoch, generation, snapshot)
                             .await
-                            .is_err()
                         {
-                            break;
+                            CacheResult::Cached => {
+                                notify_resource_subscribers(
+                                    &registry,
+                                    &resource,
+                                    generation,
+                                ).await;
+                            }
+                            CacheResult::Stale => break,
+                            CacheResult::NoChange | CacheResult::NeedsSnapshot => {}
                         }
                     }
-                    Ok(false) => {}
-                    Err(_) => break,
                 }
             }
         }
@@ -592,7 +1185,7 @@ async fn run_legacy_resource_subscription(
 pub struct LvtServer {
     tool_router: ToolRouter<LvtServer>,
     allow_input: bool,
-    legacy_resource_subscriptions: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+    resources: ResourceRegistry,
 }
 
 /// Forwards to lvt and turns the result into MCP content.
@@ -682,8 +1275,16 @@ impl LvtServer {
         output_schema = crate::schema::apps(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn list_apps(&self, Parameters(a): Parameters<ListAppsArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("list_apps", compact(json!({ "name": a.name, "title": a.title })), self.allow_input).await
+    async fn list_apps(
+        &self,
+        Parameters(a): Parameters<ListAppsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        forward(
+            "list_apps",
+            compact(json!({ "name": a.name, "title": a.title })),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -695,11 +1296,19 @@ impl LvtServer {
         output_schema = crate::schema::session(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn connect(&self, Parameters(a): Parameters<ConnectArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn connect(
+        &self,
+        Parameters(a): Parameters<ConnectArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward(
             "connect",
-            compact(json!({ "name": a.name, "title": a.title, "pid": a.pid, "hwnd": a.hwnd,
-                            "mode": a.mode })), self.allow_input).await
+            compact(
+                json!({ "name": a.name, "title": a.title, "pid": a.pid, "hwnd": a.hwnd,
+                            "mode": a.mode }),
+            ),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -707,12 +1316,20 @@ impl LvtServer {
         output_schema = crate::schema::disconnected(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn disconnect(&self, Parameters(a): Parameters<SessionArgs>) -> Result<CallToolResult, ErrorData> {
-        let uri = visual_resource_uri(&a.session);
-        if let Some(cancel) = self.legacy_resource_subscriptions.lock().await.remove(&uri) {
-            let _ = cancel.send(true);
-        }
-        forward("disconnect", json!({ "session": a.session }), self.allow_input).await
+    async fn disconnect(
+        &self,
+        Parameters(a): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = a.session;
+        let result = call_lvt(
+            "disconnect",
+            json!({ "session": session }),
+            self.allow_input,
+        )
+        .await;
+        self.resources.clear_session(&session).await;
+        let result = result?;
+        Ok(tool_result(result.json, result.ok))
     }
 
     #[tool(
@@ -724,8 +1341,36 @@ impl LvtServer {
         output_schema = crate::schema::uia_tree(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn get_uia_tree(&self, Parameters(a): Parameters<TreeArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn get_uia_tree(
+        &self,
+        Parameters(a): Parameters<TreeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward("get_uia_tree", tree_params(a), self.allow_input).await
+    }
+
+    #[tool(
+        description = "Return incremental UI Automation tree changes for this session. The first \
+                       call returns snapshot-added events; later calls return added, removed, and \
+                       changed events from the previous call. This is also the patch format used \
+                       by a UIA session's subscribable tree resource.",
+        output_schema = crate::schema::uia_tree_changes(),
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn get_uia_tree_changes(
+        &self,
+        Parameters(a): Parameters<UiaTreeChangesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        forward(
+            "get_uia_tree_changes",
+            compact(json!({
+                "session": a.session,
+                "view": a.view,
+                "properties": a.properties,
+                "timeoutMs": a.timeout_ms,
+            })),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -742,7 +1387,10 @@ impl LvtServer {
         output_schema = crate::schema::visual_tree(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn get_visual_tree(&self, Parameters(a): Parameters<VisualTreeArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn get_visual_tree(
+        &self,
+        Parameters(a): Parameters<VisualTreeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward("get_visual_tree", visual_tree_params(a), self.allow_input).await
     }
 
@@ -762,7 +1410,8 @@ impl LvtServer {
             "get_visual_tree_changes",
             compact(json!({ "session": a.session, "fast": a.fast })),
             self.allow_input,
-        ).await
+        )
+        .await
     }
 
     #[tool(
@@ -780,7 +1429,8 @@ impl LvtServer {
             "get_visual_properties",
             json!({ "session": a.session, "key": a.key }),
             self.allow_input,
-        ).await
+        )
+        .await
     }
 
     #[tool(
@@ -788,8 +1438,16 @@ impl LvtServer {
         output_schema = crate::schema::frameworks(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn get_frameworks(&self, Parameters(a): Parameters<SessionArgs>) -> Result<CallToolResult, ErrorData> {
-        forward("get_frameworks", json!({ "session": a.session }), self.allow_input).await
+    async fn get_frameworks(
+        &self,
+        Parameters(a): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        forward(
+            "get_frameworks",
+            json!({ "session": a.session }),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -799,7 +1457,10 @@ impl LvtServer {
         output_schema = crate::schema::elements(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn find_elements(&self, Parameters(a): Parameters<FindArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn find_elements(
+        &self,
+        Parameters(a): Parameters<FindArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward(
             "find_elements",
             compact(json!({
@@ -812,7 +1473,10 @@ impl LvtServer {
                 "uia": a.uia,
                 "view": a.view,
                 "timeoutMs": a.timeout_ms,
-            })), self.allow_input).await
+            })),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -835,7 +1499,10 @@ impl LvtServer {
                 "uia": a.uia,
                 "view": a.view,
                 "timeoutMs": a.timeout_ms,
-            })), self.allow_input).await
+            })),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -847,7 +1514,10 @@ impl LvtServer {
         output_schema = crate::schema::screenshot(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn screenshot(&self, Parameters(a): Parameters<ScreenshotArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn screenshot(
+        &self,
+        Parameters(a): Parameters<ScreenshotArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let params = compact(json!({
             "session": a.session,
             "path": a.path,
@@ -865,8 +1535,9 @@ impl LvtServer {
         // repeating a megabyte of it as text would be useless and expensive,
         // and it would bloat the structured copy for no gain, since the image
         // is already carried as an image block.
-        let mut parsed: serde_json::Value = serde_json::from_str(&result.json)
-            .map_err(|e| ErrorData::internal_error(format!("lvt returned malformed JSON: {e}"), None))?;
+        let mut parsed: serde_json::Value = serde_json::from_str(&result.json).map_err(|e| {
+            ErrorData::internal_error(format!("lvt returned malformed JSON: {e}"), None)
+        })?;
         let image = parsed
             .as_object_mut()
             .and_then(|m| m.remove("imageBase64"))
@@ -889,13 +1560,19 @@ impl LvtServer {
         output_schema = crate::schema::hit_test(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn hit_test(&self, Parameters(a): Parameters<HitTestArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn hit_test(
+        &self,
+        Parameters(a): Parameters<HitTestArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward(
             "hit_test",
             compact(json!({
                 "session": a.session, "x": a.x, "y": a.y, "uia": a.uia, "view": a.view,
                 "timeoutMs": a.timeout_ms,
-            })), self.allow_input).await
+            })),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -904,8 +1581,15 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn wait_for(&self, Parameters(a): Parameters<WaitForArgs>) -> Result<CallToolResult, ErrorData> {
-        let method = if a.gone.unwrap_or(false) { "wait_gone" } else { "wait_for" };
+    async fn wait_for(
+        &self,
+        Parameters(a): Parameters<WaitForArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let method = if a.gone.unwrap_or(false) {
+            "wait_gone"
+        } else {
+            "wait_for"
+        };
         forward(
             method,
             compact(json!({
@@ -915,7 +1599,10 @@ impl LvtServer {
                 "waitValue": a.wait_value,
                 "timeoutMs": a.timeout_ms,
                 "uia": a.uia, "view": a.view,
-            })), self.allow_input).await
+            })),
+            self.allow_input,
+        )
+        .await
     }
 }
 
@@ -952,7 +1639,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = true, open_world_hint = true)
     )]
-    async fn click(&self, Parameters(a): Parameters<ClickArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn click(
+        &self,
+        Parameters(a): Parameters<ClickArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward(
             "click",
             compact(json!({
@@ -961,7 +1651,10 @@ impl LvtServer {
                 "button": a.button,
                 "synthetic": a.synthetic,
                 "uia": a.uia, "view": a.view,
-            })), self.allow_input).await
+            })),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -970,7 +1663,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = true, open_world_hint = true)
     )]
-    async fn invoke(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn invoke(
+        &self,
+        Parameters(a): Parameters<ElementArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward("invoke", element_params(a), self.allow_input).await
     }
 
@@ -979,7 +1675,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = true, open_world_hint = true)
     )]
-    async fn toggle(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn toggle(
+        &self,
+        Parameters(a): Parameters<ElementArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward("toggle", element_params(a), self.allow_input).await
     }
 
@@ -989,7 +1688,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn set_value(&self, Parameters(a): Parameters<SetValueArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn set_value(
+        &self,
+        Parameters(a): Parameters<SetValueArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward(
             "set_value",
             compact(json!({
@@ -1018,7 +1720,8 @@ impl LvtServer {
                 "value": a.value,
             }),
             self.allow_input,
-        ).await
+        )
+        .await
     }
 
     #[tool(
@@ -1040,7 +1743,8 @@ impl LvtServer {
                 "propertyIndex": a.property_index,
             }),
             self.allow_input,
-        ).await
+        )
+        .await
     }
 
     #[tool(
@@ -1048,11 +1752,19 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn set_expanded(&self, Parameters(a): Parameters<SetExpandedArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn set_expanded(
+        &self,
+        Parameters(a): Parameters<SetExpandedArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let method = if a.expanded { "expand" } else { "collapse" };
         forward(
             method,
-            compact(json!({ "session": a.session, "element": a.element, "uia": a.uia, "view": a.view })), self.allow_input).await
+            compact(
+                json!({ "session": a.session, "element": a.element, "uia": a.uia, "view": a.view }),
+            ),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -1061,7 +1773,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn select(&self, Parameters(a): Parameters<SelectArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn select(
+        &self,
+        Parameters(a): Parameters<SelectArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let method = match a.mode.as_deref().unwrap_or("replace") {
             "add" => "add_to_selection",
             "remove" => "remove_from_selection",
@@ -1079,7 +1794,12 @@ impl LvtServer {
         };
         forward(
             method,
-            compact(json!({ "session": a.session, "element": a.element, "uia": a.uia, "view": a.view })), self.allow_input).await
+            compact(
+                json!({ "session": a.session, "element": a.element, "uia": a.uia, "view": a.view }),
+            ),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -1087,7 +1807,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn focus(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn focus(
+        &self,
+        Parameters(a): Parameters<ElementArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward("focus", element_params(a), self.allow_input).await
     }
 
@@ -1096,7 +1819,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn select_text(&self, Parameters(a): Parameters<ElementArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn select_text(
+        &self,
+        Parameters(a): Parameters<ElementArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward("select_text", element_params(a), self.allow_input).await
     }
 
@@ -1106,7 +1832,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = false, open_world_hint = true)
     )]
-    async fn scroll(&self, Parameters(a): Parameters<ScrollArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn scroll(
+        &self,
+        Parameters(a): Parameters<ScrollArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward(
             "scroll",
             compact(json!({
@@ -1115,7 +1844,10 @@ impl LvtServer {
                 "direction": a.direction,
                 "amount": a.amount,
                 "uia": a.uia, "view": a.view,
-            })), self.allow_input).await
+            })),
+            self.allow_input,
+        )
+        .await
     }
 
     #[tool(
@@ -1125,7 +1857,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = true, open_world_hint = true)
     )]
-    async fn type_text(&self, Parameters(a): Parameters<TypeTextArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn type_text(
+        &self,
+        Parameters(a): Parameters<TypeTextArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward(
             "type_text",
             compact(json!({
@@ -1139,7 +1874,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = true, open_world_hint = true)
     )]
-    async fn press_key(&self, Parameters(a): Parameters<PressKeyArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn press_key(
+        &self,
+        Parameters(a): Parameters<PressKeyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         forward(
             "press_key",
             compact(json!({
@@ -1152,7 +1890,10 @@ impl LvtServer {
         output_schema = crate::schema::action(),
         annotations(destructive_hint = true, open_world_hint = true)
     )]
-    async fn window_action(&self, Parameters(a): Parameters<WindowActionArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn window_action(
+        &self,
+        Parameters(a): Parameters<WindowActionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let method = match a.action.as_str() {
             "minimize" => "minimize_window",
             "maximize" => "maximize_window",
@@ -1188,7 +1929,7 @@ impl LvtServer {
         Self {
             tool_router: router,
             allow_input,
-            legacy_resource_subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            resources: ResourceRegistry::default(),
         }
     }
 
@@ -1196,8 +1937,12 @@ impl LvtServer {
     /// can assert the `--allow-input` gate without standing up a transport.
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<String> {
-        let mut names: Vec<String> =
-            self.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+        let mut names: Vec<String> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
         names.sort();
         names
     }
@@ -1212,29 +1957,16 @@ impl ServerHandler for LvtServer {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
         async move {
-            let result = call_lvt("list_sessions", json!({}), false).await?;
-            if !result.ok {
-                return Err(ErrorData::internal_error(result.json, None));
-            }
-            let response: serde_json::Value = serde_json::from_str(&result.json)
-                .map_err(|error| ErrorData::internal_error(
-                    format!("lvt returned malformed session JSON: {error}"), None))?;
-            let mut resources = Vec::new();
-            for session in response
-                .get("sessions")
-                .and_then(|value| value.as_array())
+            let resources = list_session_descriptors()
+                .await?
                 .into_iter()
-                .flatten()
-            {
-                let Some(id) = session.get("session").and_then(|value| value.as_str()) else {
-                    continue;
-                };
-                let process_name = session
-                    .get("processName")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("application");
-                resources.push(visual_resource(id, process_name));
-            }
+                .map(|session| {
+                    session_resource(
+                        &SessionResource::new(session.session, session.tree),
+                        &session.process_name,
+                    )
+                })
+                .collect();
             Ok(ListResourcesResult::with_all_items(resources))
         }
     }
@@ -1243,30 +1975,54 @@ impl ServerHandler for LvtServer {
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<ReadResourceResponse, ErrorData>> + Send + '_
+    {
+        let registry = self.resources.clone();
         async move {
-            let session = session_from_visual_resource(&request.uri).ok_or_else(|| {
+            let resource = SessionResource::parse(&request.uri).ok_or_else(|| {
                 ErrorData::invalid_params(
-                    format!("unknown lvt visual-tree resource '{}'", request.uri), None)
+                    format!("unknown lvt tree resource '{}'", request.uri),
+                    None,
+                )
             })?;
-            let result = call_lvt(
-                "get_visual_tree_changes",
-                json!({ "session": session }),
-                false,
-            )
-            .await?;
-            if !result.ok {
-                return Err(ErrorData::internal_error(result.json, None));
-            }
-            Ok(ReadResourceResult::new(vec![
-                ResourceContents::TextResourceContents {
+            let (cached, initialized, epoch) = registry.read_state(&resource).await;
+            let patch = if let Some(cached) = cached {
+                cached
+            } else {
+                if let Err(error) = validate_resource(&resource).await {
+                    return Err(error);
+                }
+                match get_tree_patch(&resource, !initialized).await {
+                    Ok(patch) => {
+                        if !registry.mark_initialized(&resource, epoch).await {
+                            return Err(ErrorData::invalid_params(
+                                format!("session '{}' was disconnected", resource.session),
+                                None,
+                            ));
+                        }
+                        patch
+                    }
+                    Err(error) => {
+                        registry.clear_resource(&resource, epoch).await;
+                        return Err(ErrorData::internal_error(error, None));
+                    }
+                }
+            };
+            let text = serde_json::to_string(&patch).map_err(|error| {
+                ErrorData::internal_error(
+                    format!("could not serialize the cached tree patch: {error}"),
+                    None,
+                )
+            })?;
+            Ok(
+                ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
                     uri: request.uri,
                     mime_type: Some("application/json".to_string()),
-                    text: result.json,
+                    text,
                     meta: None,
-                },
-            ])
-            .into())
+                }])
+                .into(),
+            )
         }
     }
 
@@ -1279,16 +2035,21 @@ impl ServerHandler for LvtServer {
             .as_ref()
             .into_iter()
             .flatten()
-            .filter(|uri| session_from_visual_resource(uri).is_some())
+            .filter(|uri| SessionResource::parse(uri).is_some())
             .cloned()
             .collect::<Vec<_>>();
-        Some(SubscriptionFilter::builder().resource_subscriptions(uris).build())
+        Some(
+            SubscriptionFilter::builder()
+                .resource_subscriptions(uris)
+                .build(),
+        )
     }
 
     fn listen(
         &self,
         context: SubscriptionContext,
     ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
+        let registry = self.resources.clone();
         async move {
             let uris = context
                 .accepted()
@@ -1296,30 +2057,74 @@ impl ServerHandler for LvtServer {
                 .clone()
                 .unwrap_or_default();
             let sink = context.sink().clone();
-            let mut interval = tokio::time::interval(Duration::from_millis(200));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = context.cancelled() => break,
-                    _ = interval.tick() => {
-                        if context.request_context().peer.is_transport_closed() {
-                            break;
-                        }
-                        for uri in &uris {
-                            let Some(session) = session_from_visual_resource(uri) else {
-                                continue;
-                            };
-                            match poll_visual_events(&session).await {
-                                Ok(true) if sink
-                                    .notify_resource_updated(uri.clone())
-                                    .await
-                                    .is_err() => return Ok(()),
-                                Ok(_) => {}
-                                Err(_) => return Ok(()),
-                            }
-                        }
+            let mut registered = Vec::new();
+            for uri in uris {
+                let Some(resource) = SessionResource::parse(&uri) else {
+                    continue;
+                };
+                if let Err(error) = validate_resource(&resource).await {
+                    for (resource, subscriber_id) in registered {
+                        registry.unregister(&resource, subscriber_id).await;
                     }
+                    return Err(error);
                 }
+                let epoch = registry.session_epoch(&resource.session).await;
+                let snapshot = match get_tree_patch(&resource, true).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        registry.clear_resource(&resource, epoch).await;
+                        for (resource, subscriber_id) in registered {
+                            registry.unregister(&resource, subscriber_id).await;
+                        }
+                        return Err(ErrorData::internal_error(error, None));
+                    }
+                };
+                if !registry.store_initial(&resource, epoch, snapshot).await {
+                    for (resource, subscriber_id) in registered {
+                        registry.unregister(&resource, subscriber_id).await;
+                    }
+                    return Err(ErrorData::invalid_params(
+                        format!("session '{}' was disconnected", resource.session),
+                        None,
+                    ));
+                }
+                let Some(result) = registry
+                    .register(
+                        &resource,
+                        epoch,
+                        ResourceSubscriber::Modern(sink.clone()),
+                        false,
+                    )
+                    .await
+                else {
+                    for (resource, subscriber_id) in registered {
+                        registry.unregister(&resource, subscriber_id).await;
+                    }
+                    return Err(ErrorData::invalid_params(
+                        format!("session '{}' was disconnected", resource.session),
+                        None,
+                    ));
+                };
+                if let Some((generation, cancelled)) = result.watcher {
+                    tokio::spawn(run_resource_watcher(
+                        resource.clone(),
+                        registry.clone(),
+                        epoch,
+                        generation,
+                        cancelled,
+                    ));
+                }
+                registered.push((resource, result.subscriber_id));
+                if sink.notify_resource_updated(uri).await.is_err() {
+                    for (resource, subscriber_id) in registered.drain(..) {
+                        registry.unregister(&resource, subscriber_id).await;
+                    }
+                    return Ok(());
+                }
+            }
+            context.cancelled().await;
+            for (resource, subscriber_id) in registered {
+                registry.unregister(&resource, subscriber_id).await;
             }
             Ok(())
         }
@@ -1330,29 +2135,50 @@ impl ServerHandler for LvtServer {
         request: SubscribeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
-        let subscriptions = self.legacy_resource_subscriptions.clone();
+        let registry = self.resources.clone();
         async move {
-            let session = session_from_visual_resource(&request.uri).ok_or_else(|| {
+            let resource = SessionResource::parse(&request.uri).ok_or_else(|| {
                 ErrorData::invalid_params(
-                    format!("unknown lvt visual-tree resource '{}'", request.uri), None)
+                    format!("unknown lvt tree resource '{}'", request.uri),
+                    None,
+                )
             })?;
-            poll_visual_events(&session)
-                .await
-                .map_err(|error| ErrorData::invalid_params(error, None))?;
-            let (cancel, cancelled) = watch::channel(false);
-            if let Some(previous) = subscriptions
-                .lock()
-                .await
-                .insert(request.uri.clone(), cancel)
-            {
-                let _ = previous.send(true);
+            if let Err(error) = validate_resource(&resource).await {
+                return Err(error);
             }
-            tokio::spawn(run_legacy_resource_subscription(
-                session,
-                request.uri,
-                context.peer,
-                cancelled,
-            ));
+            let epoch = registry.session_epoch(&resource.session).await;
+            let snapshot = match get_tree_patch(&resource, true).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    registry.clear_resource(&resource, epoch).await;
+                    return Err(ErrorData::internal_error(error, None));
+                }
+            };
+            if !registry.store_initial(&resource, epoch, snapshot).await {
+                return Err(ErrorData::invalid_params(
+                    format!("session '{}' was disconnected", resource.session),
+                    None,
+                ));
+            }
+            let Some(result) = registry
+                .register(
+                    &resource,
+                    epoch,
+                    ResourceSubscriber::Legacy(context.peer),
+                    true,
+                )
+                .await
+            else {
+                return Err(ErrorData::invalid_params(
+                    format!("session '{}' was disconnected", resource.session),
+                    None,
+                ));
+            };
+            if let Some((generation, cancelled)) = result.watcher {
+                tokio::spawn(run_resource_watcher(
+                    resource, registry, epoch, generation, cancelled,
+                ));
+            }
             Ok(())
         }
     }
@@ -1362,11 +2188,9 @@ impl ServerHandler for LvtServer {
         request: UnsubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<(), ErrorData>> + Send + '_ {
-        let subscriptions = self.legacy_resource_subscriptions.clone();
+        let registry = self.resources.clone();
         async move {
-            if let Some(cancel) = subscriptions.lock().await.remove(&request.uri) {
-                let _ = cancel.send(true);
-            }
+            registry.unregister_legacy(&request.uri).await;
             Ok(())
         }
     }
@@ -1421,13 +2245,14 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    const INSPECT_TOOLS: [&str; 13] = [
+    const INSPECT_TOOLS: [&str; 14] = [
         "connect",
         "disconnect",
         "find_elements",
         "get_element_properties",
         "get_frameworks",
         "get_uia_tree",
+        "get_uia_tree_changes",
         "get_visual_properties",
         "get_visual_tree",
         "get_visual_tree_changes",
@@ -1466,15 +2291,21 @@ mod tests {
         // target must not be listed at all when input is not allowed.
         let names = LvtServer::new(false).tool_names();
         for tool in INPUT_TOOLS {
-            assert!(!names.contains(&tool.to_string()), "{tool} must not be exposed without --allow-input");
+            assert!(
+                !names.contains(&tool.to_string()),
+                "{tool} must not be exposed without --allow-input"
+            );
         }
     }
 
     #[test]
     fn allow_input_server_exposes_both_halves() {
         let names = LvtServer::new(true).tool_names();
-        let mut expected: Vec<String> =
-            INSPECT_TOOLS.iter().chain(INPUT_TOOLS.iter()).map(|s| s.to_string()).collect();
+        let mut expected: Vec<String> = INSPECT_TOOLS
+            .iter()
+            .chain(INPUT_TOOLS.iter())
+            .map(|s| s.to_string())
+            .collect();
         expected.sort();
         assert_eq!(names, expected);
     }
@@ -1510,7 +2341,9 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             assert!(
-                required.iter().all(|field| failure.get(field.as_str().unwrap()).is_some()),
+                required
+                    .iter()
+                    .all(|field| failure.get(field.as_str().unwrap()).is_some()),
                 "tool '{}' would reject its own failure result: {error_branch}",
                 tool.name
             );
@@ -1561,13 +2394,18 @@ mod tests {
         // client sees one answer and a log shows another.
         let payload = r#"{"tree":"uia","elements":[{"id":"e1"}]}"#;
         let result = tool_result(payload.to_string(), true);
-        let structured = result.structured_content.expect("structured content is missing");
+        let structured = result
+            .structured_content
+            .expect("structured content is missing");
         assert_eq!(structured, serde_json::from_str::<Value>(payload).unwrap());
 
         let ContentBlock::Text(text) = &result.content[0] else {
             panic!("the first content block should still be text");
         };
-        assert_eq!(serde_json::from_str::<Value>(&text.text).unwrap(), structured);
+        assert_eq!(
+            serde_json::from_str::<Value>(&text.text).unwrap(),
+            structured
+        );
     }
 
     #[test]
@@ -1577,7 +2415,9 @@ mod tests {
         let result = tool_result(r#"{"ok":false,"error":"nope"}"#.to_string(), false);
         assert_eq!(result.is_error, Some(true));
         assert_eq!(
-            result.structured_content.and_then(|v| v.get("error").cloned()),
+            result
+                .structured_content
+                .and_then(|v| v.get("error").cloned()),
             Some(Value::String("nope".into()))
         );
     }
@@ -1615,7 +2455,11 @@ mod tests {
                 continue;
             }
             let schema = serde_json::to_value(&tool.input_schema).unwrap();
-            let required = schema.get("required").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+            let required = schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
             assert!(
                 required.iter().any(|v| v.as_str() == Some("session")),
                 "tool '{}' must require a session id",
@@ -1626,7 +2470,8 @@ mod tests {
 
     #[test]
     fn compact_drops_nulls_so_lvt_applies_its_own_defaults() {
-        let value = compact(json!({ "session": "s1", "view": serde_json::Value::Null, "depth": 3 }));
+        let value =
+            compact(json!({ "session": "s1", "view": serde_json::Value::Null, "depth": 3 }));
         assert_eq!(value, json!({ "session": "s1", "depth": 3 }));
     }
 
@@ -1642,30 +2487,39 @@ mod tests {
     fn instructions_differ_between_modes_and_mention_the_gate() {
         let read_only = LvtServer::new(false).get_info().instructions.unwrap();
         let full = LvtServer::new(true).get_info().instructions.unwrap();
-        assert!(read_only.contains("--allow-input"), "read-only mode must explain how to enable input");
+        assert!(
+            read_only.contains("--allow-input"),
+            "read-only mode must explain how to enable input"
+        );
         assert_ne!(read_only, full);
     }
 
     #[test]
     fn server_advertises_subscribable_resources() {
         let capabilities = LvtServer::new(false).get_info().capabilities;
-        let resources = capabilities.resources.expect("resources capability is missing");
+        let resources = capabilities
+            .resources
+            .expect("resources capability is missing");
         assert_eq!(resources.subscribe, Some(true));
     }
 
     #[test]
-    fn visual_resource_uris_round_trip_sessions() {
-        let uri = visual_resource_uri("s42");
-        assert_eq!(uri, "lvt://session/s42/visual-tree");
-        assert_eq!(session_from_visual_resource(&uri).as_deref(), Some("s42"));
-        assert!(session_from_visual_resource("file:///not-lvt").is_none());
-        assert!(session_from_visual_resource("lvt://session/nope/visual-tree").is_none());
+    fn resource_uris_round_trip_sessions_and_modes() {
+        let visual = SessionResource::new("s42", TreeMode::Visual);
+        let uia = SessionResource::new("s43", TreeMode::Uia);
+        assert_eq!(visual.uri(), "lvt://session/s42/visual-tree");
+        assert_eq!(uia.uri(), "lvt://session/s43/uia-tree");
+        assert_eq!(SessionResource::parse(&visual.uri()), Some(visual));
+        assert_eq!(SessionResource::parse(&uia.uri()), Some(uia));
+        assert!(SessionResource::parse("file:///not-lvt").is_none());
+        assert!(SessionResource::parse("lvt://session/nope/visual-tree").is_none());
     }
 
     #[test]
-    fn modern_subscription_filter_accepts_visual_resources_only() {
+    fn modern_subscription_filter_accepts_both_tree_resource_kinds() {
         let requested = SubscriptionFilter::builder()
             .resource_subscription("lvt://session/s1/visual-tree")
+            .resource_subscription("lvt://session/s2/uia-tree")
             .resource_subscription("file:///not-lvt")
             .build();
         let accepted = LvtServer::new(false)
@@ -1673,7 +2527,69 @@ mod tests {
             .expect("subscriptions/listen should be implemented");
         assert_eq!(
             accepted.resource_subscriptions,
-            Some(vec!["lvt://session/s1/visual-tree".to_string()])
+            Some(vec![
+                "lvt://session/s1/visual-tree".to_string(),
+                "lvt://session/s2/uia-tree".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn cached_patches_append_in_order_and_snapshots_replace_older_work() {
+        let mut cached = Some(TreePatch {
+            tree: "uia".into(),
+            snapshot: false,
+            events: vec![json!({"event": "changed", "key": "first"})],
+        });
+        assert!(matches!(
+            merge_cached_patch(
+                &mut cached,
+                TreePatch {
+                    tree: "uia".into(),
+                    snapshot: false,
+                    events: vec![json!({"event": "changed", "key": "second"})],
+                }
+            ),
+            MergeResult::Cached
+        ));
+        assert_eq!(
+            cached.as_ref().unwrap().events,
+            vec![
+                json!({"event": "changed", "key": "first"}),
+                json!({"event": "changed", "key": "second"}),
+            ]
+        );
+
+        merge_cached_patch(
+            &mut cached,
+            TreePatch {
+                tree: "uia".into(),
+                snapshot: true,
+                events: vec![json!({"event": "added", "key": "snapshot"})],
+            },
+        );
+        assert!(cached.as_ref().unwrap().snapshot);
+        assert_eq!(
+            cached.as_ref().unwrap().events,
+            vec![json!({"event": "added", "key": "snapshot"})]
+        );
+    }
+
+    #[test]
+    fn an_oversized_pending_diff_requests_a_replacement_snapshot() {
+        let mut cached = None;
+        let result = merge_cached_patch(
+            &mut cached,
+            TreePatch {
+                tree: "visual".into(),
+                snapshot: false,
+                events: vec![Value::Null; MAX_CACHED_RESOURCE_EVENTS + 1],
+            },
+        );
+        assert!(matches!(result, MergeResult::NeedsSnapshot));
+        assert!(
+            cached.is_none(),
+            "an incomplete oversized diff must not be served"
         );
     }
 
