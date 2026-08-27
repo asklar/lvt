@@ -142,7 +142,16 @@ public sealed class CrosshairPicker
         var found = IntPtr.Zero;
         NativeMethods.EnumWindows((hwnd, _) =>
         {
-            if (hwnd == ownHwnd || hwnd == overlayHwnd)
+            // The overlay is deliberately click-through and only visual
+            // feedback for the candidate beneath it. Once it is shown it
+            // covers the cursor by definition, so treating it as an
+            // occluder makes the next mouse move (and mouse-up) resolve to
+            // no target: the rectangle flashes once, then disappears and
+            // nothing can be selected. Always skip it.
+            if (hwnd == overlayHwnd)
+                return true;
+
+            if (hwnd == ownHwnd)
             {
                 // Our own UI can genuinely be the topmost thing at this
                 // exact point — most commonly the cursor is still over the
