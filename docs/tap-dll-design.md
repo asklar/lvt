@@ -26,6 +26,12 @@ sequenceDiagram
         target->>lvt: one JSON line (the current tree)
     end
 
+    opt watch --control property request
+        lvt->>target: GET_PROPERTIES / SET_PROPERTY / CLEAR_PROPERTY
+        target->>target: dispatch xamlOM operation to SetSite's UI thread
+        target->>lvt: correlated PROPERTY_RESULT JSON line
+    end
+
     lvt->>target: "DISCONNECT" (when the caller releases the connection)
     target->>target: UnadviseVisualTreeChange, DestroyWindow, UnregisterClass, COM release
 ```
@@ -185,9 +191,19 @@ Every message on the pipe is one line (UTF-8, `\n`-terminated). lvt.exe → TAP 
 | TAP → lvt | `READY` | Sent once, right after `AdviseVisualTreeChange` succeeds — before any bounds/property collection |
 | lvt → TAP | `GET_TREE` / `GET_TREE FAST` | Request a refresh; `FAST` overrides the connection's default fast-mode setting for this one response |
 | TAP → lvt | `[...]` | One JSON array of root nodes, in response to `GET_TREE` |
+| lvt → TAP | `GET_PROPERTIES <id> <handle>` | Request the deduplicated property chain for one XAML instance handle |
+| lvt → TAP | `SET_PROPERTY <id> <handle> <index> <typeHex> <valueHex>` | Create a typed value and set one dependency property |
+| lvt → TAP | `CLEAR_PROPERTY <id> <handle> <index>` | Clear a local value so inheritance/style/default resolution resumes |
+| TAP → lvt | `{"type":"PROPERTY_RESULT","commandId":...}` | Correlated typed property result; unsolicited `CHANGE` lines may appear before it |
 | lvt → TAP | `DISCONNECT` | End the connection; TAP DLL replies `BYE`, then runs its cleanup |
 
 Parsed and grafted by `graft_xaml_tree_json()` in `xaml_diag_common.cpp`.
+`typeHex` and `valueHex` are the UTF-8 bytes rendered as hexadecimal (with `-`
+for an empty string), so spaces, quotes, newlines, and non-ASCII values remain
+unambiguous without adding a JSON dependency to the injected DLL. The pipe
+worker never invokes thread-affine xamlOM methods itself: it synchronously
+dispatches the operation through the existing message-only window, then writes
+the result under the same pipe-write mutex used by tree and `CHANGE` messages.
 
 ## Static CRT
 

@@ -11,8 +11,12 @@
 #include <wil/resource.h>
 #include <string>
 #include <map>
+#include <set>
+#include <sstream>
 #include <vector>
 #include <algorithm>
+#include <charconv>
+#include <cstdint>
 #include <cstdio>
 #include <cmath>
 #include <mutex>
@@ -140,6 +144,40 @@ struct BatchRequest {
     size_t count;
 };
 
+struct TapProperty {
+    std::wstring name;
+    std::wstring value;
+    std::wstring valueType;
+    std::wstring declaringType;
+    unsigned int propertyIndex = 0;
+    uint64_t metadataBits = 0;
+    bool overridden = false;
+    std::wstring source;
+};
+
+enum class TapPropertyCommandKind {
+    getProperties,
+    setProperty,
+    clearProperty,
+};
+
+// Passed synchronously from the pipe worker to the SetSite/XAML UI thread via
+// SendMessage. The request and result both remain on the worker's stack until
+// the UI-thread call returns.
+struct TapPropertyCommand {
+    TapPropertyCommandKind kind = TapPropertyCommandKind::getProperties;
+    uint64_t commandId = 0;
+    InstanceHandle object = 0;
+    unsigned int propertyIndex = 0;
+    std::wstring valueType;
+    std::wstring value;
+
+    HRESULT hresult = E_FAIL;
+    std::wstring error;
+    std::vector<TapProperty> properties;
+    bool hasValue = false;
+};
+
 // Forward declaration for WndProc
 static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -195,6 +233,7 @@ public:
     // allowed to destroy a window it owns) to destroy m_msgWnd during final
     // cleanup - see CleanupUIResources.
     static constexpr UINT WM_TAP_DESTROY = WM_USER + 102;
+    static constexpr UINT WM_PROPERTY_COMMAND = WM_USER + 103;
 
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -387,6 +426,326 @@ public:
                added ? "add" : "remove", (unsigned long long)handle, (unsigned long long)parent, sent);
     }
 
+    static bool ParseUint64(const std::string& text, uint64_t& value) {
+        if (text.empty())
+            return false;
+        auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 10);
+        return parsed.ec == std::errc() && parsed.ptr == text.data() + text.size();
+    }
+
+    static bool DecodeHexUtf8(const std::string& encoded, std::wstring& value) {
+        if (encoded == "-") {
+            value.clear();
+            return true;
+        }
+        if (encoded.empty() || (encoded.size() % 2) != 0)
+            return false;
+
+        std::string utf8(encoded.size() / 2, '\0');
+        auto nibble = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+            return -1;
+        };
+        for (size_t i = 0; i < utf8.size(); ++i) {
+            int high = nibble(encoded[i * 2]);
+            int low = nibble(encoded[i * 2 + 1]);
+            if (high < 0 || low < 0)
+                return false;
+            utf8[i] = static_cast<char>((high << 4) | low);
+        }
+
+        int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                         utf8.data(), static_cast<int>(utf8.size()),
+                                         nullptr, 0);
+        if (length <= 0)
+            return false;
+        value.resize(length);
+        return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                   utf8.data(), static_cast<int>(utf8.size()),
+                                   value.data(), length) == length;
+    }
+
+    static std::wstring TakeBstr(BSTR& value) {
+        wil::unique_bstr owned(value);
+        value = nullptr;
+        return owned ? std::wstring(owned.get(), SysStringLen(owned.get())) : std::wstring();
+    }
+
+    static void SanitizeTypeName(std::wstring& value) {
+        value.erase(std::remove_if(
+            value.begin(), value.end(),
+            [](wchar_t ch) { return ch < 0x20; }), value.end());
+    }
+
+    static const wchar_t* BaseValueSourceName(BaseValueSource source) {
+        switch (source) {
+        case BaseValueSourceDefault: return L"Default";
+        case BaseValueSourceBuiltInStyle: return L"BuiltInStyle";
+        case BaseValueSourceStyle: return L"Style";
+        case BaseValueSourceLocal: return L"Local";
+        case Inherited: return L"Inherited";
+        case DefaultStyleTrigger: return L"DefaultStyleTrigger";
+        case TemplateTrigger: return L"TemplateTrigger";
+        case StyleTrigger: return L"StyleTrigger";
+        case ImplicitStyleReference: return L"ImplicitStyleReference";
+        case ParentTemplate: return L"ParentTemplate";
+        case ParentTemplateTrigger: return L"ParentTemplateTrigger";
+        case Animation: return L"Animation";
+        case Coercion: return L"Coercion";
+        case BaseValueSourceVisualState: return L"VisualState";
+        default: return L"Unknown";
+        }
+    }
+
+    HRESULT CollectPropertyChain(InstanceHandle object,
+                                 std::vector<TapProperty>& output,
+                                 std::wstring& error) {
+        unsigned int sourceCount = 0;
+        unsigned int propertyCount = 0;
+        PropertyChainSource* rawSources = nullptr;
+        PropertyChainValue* rawProperties = nullptr;
+        HRESULT hr = m_vts->GetPropertyValuesChain(
+            object, &sourceCount, &rawSources, &propertyCount, &rawProperties);
+        wil::unique_cotaskmem sourcesMemory(rawSources);
+        wil::unique_cotaskmem propertiesMemory(rawProperties);
+        if (FAILED(hr)) {
+            error = L"GetPropertyValuesChain failed";
+            return hr;
+        }
+
+        std::vector<std::wstring> sources;
+        sources.reserve(sourceCount);
+        for (unsigned int i = 0; i < sourceCount; ++i) {
+            auto targetType = TakeBstr(rawSources[i].TargetType);
+            auto name = TakeBstr(rawSources[i].Name);
+            auto fileName = TakeBstr(rawSources[i].SrcInfo.FileName);
+            auto hash = TakeBstr(rawSources[i].SrcInfo.Hash);
+            (void)targetType;
+            (void)fileName;
+            (void)hash;
+
+            std::wstring label = BaseValueSourceName(rawSources[i].Source);
+            if (!name.empty())
+                label += L": " + name;
+            sources.push_back(std::move(label));
+        }
+
+        std::set<std::wstring> seenNames;
+        output.reserve(propertyCount);
+        for (unsigned int i = 0; i < propertyCount; ++i) {
+            auto type = TakeBstr(rawProperties[i].Type);
+            auto declaringType = TakeBstr(rawProperties[i].DeclaringType);
+            auto valueType = TakeBstr(rawProperties[i].ValueType);
+            auto itemType = TakeBstr(rawProperties[i].ItemType);
+            auto value = TakeBstr(rawProperties[i].Value);
+            auto name = TakeBstr(rawProperties[i].PropertyName);
+            (void)type;
+            (void)itemType;
+            SanitizeTypeName(declaringType);
+            SanitizeTypeName(valueType);
+
+            // xamlOM orders the chain most-specific first. Preserve that
+            // occurrence and discard later inherited/style duplicates.
+            if (name.empty() || !seenNames.insert(name).second)
+                continue;
+
+            TapProperty property;
+            property.name = std::move(name);
+            property.value = std::move(value);
+            property.valueType = std::move(valueType);
+            property.declaringType = std::move(declaringType);
+            property.propertyIndex = rawProperties[i].Index;
+            property.metadataBits = static_cast<uint64_t>(rawProperties[i].MetadataBits);
+            property.overridden = rawProperties[i].Overridden != FALSE;
+            if (rawProperties[i].PropertyChainIndex < sources.size())
+                property.source = sources[rawProperties[i].PropertyChainIndex];
+            output.push_back(std::move(property));
+        }
+        return S_OK;
+    }
+
+    void ExecutePropertyCommand(TapPropertyCommand& command) {
+        if (!m_vts) {
+            command.hresult = E_NOINTERFACE;
+            command.error = L"IVisualTreeService is unavailable";
+            return;
+        }
+
+        if (command.kind == TapPropertyCommandKind::getProperties) {
+            command.hresult = CollectPropertyChain(
+                command.object, command.properties, command.error);
+            return;
+        }
+
+        if (command.kind == TapPropertyCommandKind::setProperty) {
+            std::vector<TapProperty> currentProperties;
+            std::wstring metadataError;
+            if (SUCCEEDED(CollectPropertyChain(
+                    command.object, currentProperties, metadataError))) {
+                auto property = std::find_if(
+                    currentProperties.begin(), currentProperties.end(),
+                    [&](const TapProperty& candidate) {
+                        return candidate.propertyIndex == command.propertyIndex;
+                    });
+                if (property != currentProperties.end() &&
+                    (property->metadataBits & IsPropertyReadOnly) != 0) {
+                    command.hresult = E_ACCESSDENIED;
+                    command.error = L"SetProperty refused a read-only property";
+                    return;
+                }
+            }
+
+            wil::unique_bstr type(SysAllocStringLen(
+                command.valueType.data(), static_cast<UINT>(command.valueType.size())));
+            wil::unique_bstr value(SysAllocStringLen(
+                command.value.data(), static_cast<UINT>(command.value.size())));
+            if (!type || !value) {
+                command.hresult = E_OUTOFMEMORY;
+                command.error = L"CreateInstance input allocation failed";
+                return;
+            }
+
+            InstanceHandle valueHandle = 0;
+            command.hresult = m_vts->CreateInstance(type.get(), value.get(), &valueHandle);
+            if (FAILED(command.hresult)) {
+                command.error = L"CreateInstance failed for value type '" +
+                                command.valueType + L"' and value '" + command.value + L"'";
+                return;
+            }
+
+            command.hresult = m_vts->SetProperty(
+                command.object, valueHandle, command.propertyIndex);
+            if (FAILED(command.hresult)) {
+                command.error = L"SetProperty failed after CreateInstance succeeded";
+                return;
+            }
+            command.hasValue = true;
+            return;
+        }
+
+        command.hresult = m_vts->ClearProperty(command.object, command.propertyIndex);
+        if (FAILED(command.hresult))
+            command.error = L"ClearProperty failed";
+    }
+
+    std::wstring SerializePropertyResult(const TapPropertyCommand& command) {
+        wchar_t hrText[16];
+        swprintf_s(hrText, L"0x%08X", static_cast<unsigned int>(command.hresult));
+        const bool ok = SUCCEEDED(command.hresult);
+        std::wstring json = L"{\"type\":\"PROPERTY_RESULT\",\"commandId\":" +
+                            std::to_wstring(command.commandId) +
+                            L",\"ok\":" + (ok ? L"true" : L"false") +
+                            L",\"hresult\":\"" + hrText + L"\"";
+        if (!ok) {
+            json += L",\"error\":\"" + Escape(
+                command.error.empty() ? L"Property command failed" : command.error) + L"\"";
+        } else if (command.kind == TapPropertyCommandKind::getProperties) {
+            json += L",\"properties\":[";
+            for (size_t i = 0; i < command.properties.size(); ++i) {
+                if (i) json += L",";
+                const auto& property = command.properties[i];
+                json += L"{\"name\":\"" + Escape(property.name) +
+                        L"\",\"value\":\"" + Escape(property.value) +
+                        L"\",\"valueType\":\"" + Escape(property.valueType) +
+                        L"\",\"declaringType\":\"" + Escape(property.declaringType) +
+                        L"\",\"propertyIndex\":" + std::to_wstring(property.propertyIndex) +
+                        L",\"metadataBits\":" + std::to_wstring(property.metadataBits) +
+                        L",\"overridden\":" + (property.overridden ? L"true" : L"false") +
+                        L",\"source\":\"" + Escape(property.source) + L"\"}";
+            }
+            json += L"]";
+        } else if (command.hasValue) {
+            json += L",\"value\":\"" + Escape(command.value) + L"\"";
+        }
+        json += L"}";
+        return json;
+    }
+
+    void WritePropertyResult(const TapPropertyCommand& command) {
+        std::wstring response = SerializePropertyResult(command);
+        int length = WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, response.data(),
+            static_cast<int>(response.size()), nullptr, 0, nullptr, nullptr);
+        if (length <= 0) {
+            LogMsg("WritePropertyResult: response was not valid UTF-16");
+            return;
+        }
+        std::string utf8(length, '\0');
+        WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, response.data(),
+            static_cast<int>(response.size()), utf8.data(), length, nullptr, nullptr);
+        WriteLine(utf8);
+    }
+
+    void HandlePropertyCommand(const std::string& line) {
+        TapPropertyCommand command;
+        std::istringstream tokens(line);
+        std::string verb;
+        std::string commandIdText;
+        std::string objectText;
+        tokens >> verb >> commandIdText >> objectText;
+
+        uint64_t object = 0;
+        if (!ParseUint64(commandIdText, command.commandId) ||
+            !ParseUint64(objectText, object) || object == 0) {
+            command.hresult = E_INVALIDARG;
+            command.error = L"Malformed property command id or object handle";
+            WritePropertyResult(command);
+            return;
+        }
+        command.object = static_cast<InstanceHandle>(object);
+
+        if (verb == "GET_PROPERTIES") {
+            command.kind = TapPropertyCommandKind::getProperties;
+        } else {
+            std::string indexText;
+            uint64_t index = 0;
+            tokens >> indexText;
+            if (!ParseUint64(indexText, index) || index > UINT_MAX) {
+                command.hresult = E_INVALIDARG;
+                command.error = L"Malformed property index";
+                WritePropertyResult(command);
+                return;
+            }
+            command.propertyIndex = static_cast<unsigned int>(index);
+            if (verb == "SET_PROPERTY") {
+                command.kind = TapPropertyCommandKind::setProperty;
+                std::string encodedType;
+                std::string encodedValue;
+                tokens >> encodedType >> encodedValue;
+                if (!DecodeHexUtf8(encodedType, command.valueType) ||
+                    command.valueType.empty() ||
+                    !DecodeHexUtf8(encodedValue, command.value)) {
+                    command.hresult = E_INVALIDARG;
+                    command.error = L"SET_PROPERTY contains invalid UTF-8 hex fields";
+                    WritePropertyResult(command);
+                    return;
+                }
+            } else {
+                command.kind = TapPropertyCommandKind::clearProperty;
+            }
+        }
+
+        std::string extra;
+        if (tokens >> extra) {
+            command.hresult = E_INVALIDARG;
+            command.error = L"Property command has unexpected trailing fields";
+            WritePropertyResult(command);
+            return;
+        }
+
+        if (!m_msgWnd) {
+            command.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
+            command.error = L"XAML UI-thread dispatcher is unavailable";
+        } else {
+            SendMessageW(m_msgWnd.get(), WM_PROPERTY_COMMAND, 0,
+                         reinterpret_cast<LPARAM>(&command));
+        }
+        WritePropertyResult(command);
+    }
+
     DWORD AdviseThreadProcImpl() {
         LogMsg("AdviseThread starting");
 
@@ -465,6 +824,10 @@ public:
             } else if (line->rfind("GET_TREE", 0) == 0) {
                 bool fast = line->find("FAST") != std::string::npos;
                 HandleGetTree(fast);
+            } else if (line->rfind("GET_PROPERTIES ", 0) == 0 ||
+                       line->rfind("SET_PROPERTY ", 0) == 0 ||
+                       line->rfind("CLEAR_PROPERTY ", 0) == 0) {
+                HandlePropertyCommand(*line);
             } else {
                 LogMsg("RunCommandLoop: unknown command, ignoring");
             }
@@ -698,11 +1061,13 @@ private:
             wil::unique_bstr type(props[i].Type);
             wil::unique_bstr declaringType(props[i].DeclaringType);
             wil::unique_bstr valueTypeBstr(props[i].ValueType);
+            wil::unique_bstr itemType(props[i].ItemType);
             wil::unique_bstr propertyName(props[i].PropertyName);
             wil::unique_bstr propertyValue(props[i].Value);
             props[i].Type = nullptr;
             props[i].DeclaringType = nullptr;
             props[i].ValueType = nullptr;
+            props[i].ItemType = nullptr;
             props[i].PropertyName = nullptr;
             props[i].Value = nullptr;
 
@@ -749,8 +1114,12 @@ private:
         for (unsigned int i = 0; i < srcCount; i++) {
             wil::unique_bstr targetType(sources[i].TargetType);
             wil::unique_bstr sourceName(sources[i].Name);
+            wil::unique_bstr sourceFile(sources[i].SrcInfo.FileName);
+            wil::unique_bstr sourceHash(sources[i].SrcInfo.Hash);
             sources[i].TargetType = nullptr;
             sources[i].Name = nullptr;
+            sources[i].SrcInfo.FileName = nullptr;
+            sources[i].SrcInfo.Hash = nullptr;
         }
         node.hasBounds = hasWidth && hasHeight;
     }
@@ -1167,6 +1536,22 @@ static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         // thread) - see CleanupUIResources for why DestroyWindow cannot be
         // called directly from the worker thread instead.
         DestroyWindow(hwnd);
+        return 0;
+    }
+    if (msg == LvtTap::WM_PROPERTY_COMMAND) {
+        auto* command = reinterpret_cast<TapPropertyCommand*>(lParam);
+        if (command) {
+            command->hresult = E_FAIL;
+            command->error = L"Property command did not complete";
+            command->properties.clear();
+            command->hasValue = false;
+            // ExecutePropertyCommand is called only here, on the message
+            // window's owning XAML UI thread.
+            auto* self = reinterpret_cast<LvtTap*>(
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            if (self)
+                self->ExecutePropertyCommand(*command);
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);

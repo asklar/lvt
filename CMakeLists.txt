@@ -127,6 +127,7 @@ set(LVT_CORE_SOURCES
     src/element_key.cpp
     src/json_serializer.cpp
     src/watch_diff.cpp
+    src/watch_control.cpp
     src/screenshot.cpp
     src/module_util.cpp
     src/input.cpp
@@ -958,6 +959,9 @@ target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
 set(LVT_INTEGRATION_DEPS wpf_sample_app winui3_sample_app)
 if(LVT_BUILD_TOOL)
     list(APPEND LVT_INTEGRATION_DEPS lvt)
+endif()
+if(TARGET lvt_tap)
+    list(APPEND LVT_INTEGRATION_DEPS lvt_tap)
 endif()
 if(LVT_ENABLE_WINFORMS)
     list(APPEND LVT_INTEGRATION_DEPS lvt_winforms_tap winforms_sample_app)

@@ -17,11 +17,14 @@
 #include <wil/resource.h>
 #include <xamlOM.h>
 #include <nlohmann/json.hpp>
+#include <atomic>
+#include <charconv>
 #include <cstdio>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 
 #pragma comment(lib, "userenv.lib")
@@ -491,6 +494,7 @@ public:
 
     ~XamlDiagConnection() override {
         if (m_alive && m_io) {
+            std::lock_guard<std::mutex> lock(m_commandMutex);
             // Best-effort: tell the TAP DLL we're done so it runs its clean
             // teardown instead of just noticing a broken pipe later. A
             // short timeout is fine - we are tearing down either way.
@@ -500,6 +504,7 @@ public:
 
     bool get_tree(Element& root, bool fastProperties,
                   const std::string& /*providerOption*/ = {}) override {
+        std::lock_guard<std::mutex> lock(m_commandMutex);
         if (!m_alive) return false;
         std::string cmd = fastProperties ? "GET_TREE FAST" : "GET_TREE";
         if (!m_io->write_line(cmd)) {
@@ -541,6 +546,33 @@ public:
     }
 
     bool is_alive() const override { return m_alive; }
+
+    FrameworkPropertyResult get_properties(uintptr_t handle) override {
+        const auto commandId = next_command_id();
+        return send_property_command(
+            "GET_PROPERTIES " + std::to_string(commandId) + " " +
+            std::to_string(handle), commandId);
+    }
+
+    FrameworkPropertyResult set_property(
+        uintptr_t handle, uint32_t propertyIndex,
+        const std::string& valueType, const std::string& value) override {
+        const auto commandId = next_command_id();
+        std::ostringstream command;
+        command << "SET_PROPERTY " << commandId << " " << handle << " "
+                << propertyIndex << " " << hex_encode(valueType) << " "
+                << hex_encode(value);
+        return send_property_command(command.str(), commandId);
+    }
+
+    FrameworkPropertyResult clear_property(
+        uintptr_t handle, uint32_t propertyIndex) override {
+        const auto commandId = next_command_id();
+        std::ostringstream command;
+        command << "CLEAR_PROPERTY " << commandId << " " << handle << " "
+                << propertyIndex;
+        return send_property_command(command.str(), commandId);
+    }
 
 private:
     XamlDiagConnection(wil::unique_hfile pipe, std::unique_ptr<DuplexPipeLineIO> io,
@@ -588,10 +620,112 @@ private:
         m_pendingEvents.push_back(std::move(ce));
     }
 
+    static std::string hex_encode(const std::string& value) {
+        static constexpr char digits[] = "0123456789ABCDEF";
+        std::string encoded;
+        encoded.reserve(value.size() * 2);
+        for (unsigned char ch : value) {
+            encoded.push_back(digits[ch >> 4]);
+            encoded.push_back(digits[ch & 0x0F]);
+        }
+        // A dash represents an empty value. An empty token would disappear
+        // when the TAP's command parser splits on whitespace.
+        return encoded.empty() ? "-" : encoded;
+    }
+
+    uint64_t next_command_id() {
+        return m_nextCommandId.fetch_add(1);
+    }
+
+    static HRESULT parse_hresult(const json& response) {
+        auto it = response.find("hresult");
+        if (it == response.end() || !it->is_string())
+            return response.value("ok", false) ? S_OK : E_FAIL;
+        const std::string text = it->get<std::string>();
+        const char* first = text.data();
+        if (text.rfind("0x", 0) == 0 || text.rfind("0X", 0) == 0)
+            first += 2;
+        uint32_t raw = 0;
+        auto parsed = std::from_chars(first, text.data() + text.size(), raw, 16);
+        return parsed.ec == std::errc() && parsed.ptr == text.data() + text.size()
+                   ? static_cast<HRESULT>(raw)
+                   : E_FAIL;
+    }
+
+    FrameworkPropertyResult send_property_command(
+        const std::string& command, uint64_t expectedCommandId) {
+        std::lock_guard<std::mutex> lock(m_commandMutex);
+        FrameworkPropertyResult result;
+        if (!m_alive) {
+            result.hresult = HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE);
+            result.error = "The XAML diagnostics connection is no longer available";
+            return result;
+        }
+
+        if (expectedCommandId == 0 || !m_io->write_line(command)) {
+            m_alive = false;
+            result.hresult = HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE);
+            result.error = "Could not send the property command to the TAP DLL";
+            return result;
+        }
+
+        for (;;) {
+            std::string line;
+            if (!m_io->read_line(kXamlCollectionTimeoutMs, line)) {
+                m_alive = false;
+                result.hresult = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                result.error = "Timed out waiting for the TAP DLL property response";
+                return result;
+            }
+
+            json response = json::parse(line, nullptr, false);
+            if (response.is_discarded() || !response.is_object())
+                continue;
+            if (response.value("type", "") == "CHANGE") {
+                queue_change_event(line);
+                continue;
+            }
+            if (response.value("type", "") != "PROPERTY_RESULT" ||
+                response.value("commandId", uint64_t{0}) != expectedCommandId) {
+                continue;
+            }
+
+            result.ok = response.value("ok", false);
+            result.hresult = parse_hresult(response);
+            result.error = response.value("error", "");
+            if (auto value = response.find("value");
+                value != response.end() && value->is_string()) {
+                result.hasValue = true;
+                result.value = value->get<std::string>();
+            }
+            if (auto properties = response.find("properties");
+                properties != response.end() && properties->is_array()) {
+                result.hasProperties = true;
+                for (const auto& item : *properties) {
+                    if (!item.is_object())
+                        continue;
+                    FrameworkProperty property;
+                    property.name = item.value("name", "");
+                    property.value = item.value("value", "");
+                    property.valueType = item.value("valueType", "");
+                    property.declaringType = item.value("declaringType", "");
+                    property.propertyIndex = item.value("propertyIndex", uint32_t{0});
+                    property.metadataBits = item.value("metadataBits", uint64_t{0});
+                    property.overridden = item.value("overridden", false);
+                    property.source = item.value("source", "");
+                    result.properties.push_back(std::move(property));
+                }
+            }
+            return result;
+        }
+    }
+
     wil::unique_hfile m_pipe;
     std::unique_ptr<DuplexPipeLineIO> m_io;
     std::string m_frameworkLabel;
-    bool m_alive = false;
+    std::atomic_bool m_alive = false;
+    std::atomic_uint64_t m_nextCommandId = 1;
+    std::mutex m_commandMutex;
     std::mutex m_eventsMutex;
     std::vector<ConnectionEvent> m_pendingEvents;
 };

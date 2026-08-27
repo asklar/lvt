@@ -3,6 +3,7 @@
 #include "tree_builder.h"
 #include "json_serializer.h"
 #include "watch_diff.h"
+#include "watch_control.h"
 #include "screenshot.h"
 #include "plugin_loader.h"
 #include "debug.h"
@@ -104,6 +105,7 @@ static void print_usage() {
         "  --element <ref>      Scope the tree to one element's subtree\n"
         "  --depth <n>          Max tree traversal depth (default: unlimited)\n"
         "  --interval <ms>      Watch polling interval (default: 500)\n"
+        "  --control            Watch-only internal NDJSON control channel on stdin\n"
         "  --fast               Skip the XAML/WinUI3 full property chain walk;\n"
         "                       collect bounds/Text/Content the cheap way instead.\n"
         "                       Much faster on rich trees; misses custom properties\n"
@@ -173,6 +175,8 @@ struct Args {
     // parameter. Off by default to keep today's exhaustive property
     // collection as the default behavior.
     bool fastProperties = false;
+    // watch only: accept correlated property requests over redirected stdin.
+    bool control = false;
     // MCP only: expose the tools that can change the target application.
     bool allowInput = false;
 };
@@ -388,6 +392,8 @@ static Args parse_args(int argc, char* argv[]) {
             args.intervalMs = parse_non_negative_int(argv[++i], "--interval");
         } else if (strcmp(arg, "--fast") == 0) {
             args.fastProperties = true;
+        } else if (strcmp(arg, "--control") == 0) {
+            args.control = true;
         } else if (strcmp(arg, "--uia") == 0) {
             args.uia = true;
         } else if (strcmp(arg, "--allow-input") == 0) {
@@ -859,8 +865,125 @@ static void refresh_dead_watch_connections(
     }
 }
 
+class WatchControlInput {
+public:
+    explicit WatchControlInput(HANDLE input) : m_input(input) {}
+
+    bool is_pipe() const {
+        return m_input && m_input != INVALID_HANDLE_VALUE &&
+               GetFileType(m_input) == FILE_TYPE_PIPE;
+    }
+
+    std::vector<std::string> poll_lines() {
+        std::vector<std::string> lines;
+        if (m_closed)
+            return lines;
+
+        for (;;) {
+            DWORD available = 0;
+            if (!PeekNamedPipe(m_input, nullptr, 0, nullptr, &available, nullptr)) {
+                const DWORD error = GetLastError();
+                if (error != ERROR_BROKEN_PIPE && error != ERROR_HANDLE_EOF && lvt::g_debug)
+                    fprintf(stderr, "lvt: watch control stdin failed (error %lu)\n", error);
+                m_closed = true;
+                break;
+            }
+            if (available == 0)
+                break;
+
+            char chunk[8192];
+            const DWORD requested = available < sizeof(chunk)
+                                        ? available
+                                        : static_cast<DWORD>(sizeof(chunk));
+            DWORD read = 0;
+            if (!ReadFile(m_input, chunk, requested, &read, nullptr) || read == 0) {
+                m_closed = true;
+                break;
+            }
+            m_buffer.append(chunk, read);
+        }
+
+        size_t newline = 0;
+        while ((newline = m_buffer.find('\n')) != std::string::npos) {
+            std::string line = m_buffer.substr(0, newline);
+            m_buffer.erase(0, newline + 1);
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            if (!line.empty())
+                lines.push_back(std::move(line));
+        }
+        return lines;
+    }
+
+private:
+    HANDLE m_input = INVALID_HANDLE_VALUE;
+    std::string m_buffer;
+    bool m_closed = false;
+};
+
+static void handle_watch_control_request(
+    const std::string& line,
+    std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
+    auto parsed = lvt::parse_watch_control_request(line);
+    if (!parsed.ok) {
+        printf("%s\n", lvt::serialize_watch_command_error(
+                           parsed.requestId, parsed.hresult, parsed.error).c_str());
+        fflush(stdout);
+        return;
+    }
+
+    lvt::IFrameworkConnection* connection = nullptr;
+    for (auto& [label, handle] : connections) {
+        if (label == parsed.request.element.framework && handle) {
+            connection = handle.get();
+            break;
+        }
+    }
+
+    lvt::FrameworkPropertyResult result;
+    if (!connection || !connection->is_alive()) {
+        result.hresult = HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED);
+        result.error = "No live " + parsed.request.element.framework +
+                       " diagnostics connection is available for this watch session";
+    } else {
+        const auto& request = parsed.request;
+        switch (request.command) {
+        case lvt::WatchControlCommand::getProperties:
+            result = connection->get_properties(request.element.handle);
+            break;
+        case lvt::WatchControlCommand::setProperty:
+            result = connection->set_property(
+                request.element.handle, request.propertyIndex,
+                request.valueType, request.value);
+            break;
+        case lvt::WatchControlCommand::clearProperty:
+            result = connection->clear_property(
+                request.element.handle, request.propertyIndex);
+            break;
+        }
+    }
+
+    printf("%s\n", lvt::serialize_watch_command_result(
+                       parsed.requestId, result).c_str());
+    fflush(stdout);
+}
+
+static void drain_watch_control(
+    WatchControlInput& input,
+    std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
+    for (const auto& line : input.poll_lines())
+        handle_watch_control_request(line, connections);
+}
+
 static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+
+    WatchControlInput controlInput(GetStdHandle(STD_INPUT_HANDLE));
+    if (args.control && !controlInput.is_pipe()) {
+        fprintf(stderr, "lvt: watch --control requires redirected pipe input on stdin\n");
+        SetConsoleCtrlHandler(console_ctrl_handler, FALSE);
+        return 1;
+    }
 
     // Acquired at the start of the session and refreshed whenever a held
     // connection dies (see refresh_dead_watch_connections) - not
@@ -900,12 +1023,16 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     for (const auto& event : lvt::snapshot_added_events(previous))
         printf("%s\n", lvt::serialize_change_event(event).c_str());
     fflush(stdout);
+    if (args.control)
+        drain_watch_control(controlInput, connections);
 
     while (!g_watchStop) {
         auto sleepUntil = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(args.intervalMs);
         while (!g_watchStop && std::chrono::steady_clock::now() < sleepUntil) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            if (args.control)
+                drain_watch_control(controlInput, connections);
         }
         if (g_watchStop)
             break;
@@ -916,6 +1043,8 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
         }
 
         refresh_dead_watch_connections(target, args, connections);
+        if (args.control)
+            drain_watch_control(controlInput, connections);
 
         lvt::Element current;
         if (!build_output_tree(target, args, current, lookup)) {
@@ -976,6 +1105,8 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             printf("%s\n", lvt::serialize_change_event(event).c_str());
         fflush(stdout);
         previous = std::move(current);
+        if (args.control)
+            drain_watch_control(controlInput, connections);
     }
 
     SetConsoleCtrlHandler(console_ctrl_handler, FALSE);
@@ -1164,6 +1295,10 @@ int main(int argc, char* argv[]) {
     }
     if (args.verb == Verb::watch && args.format != "json") {
         fprintf(stderr, "lvt: watch emits JSON events; --format must be json\n");
+        return 1;
+    }
+    if (args.control && args.verb != Verb::watch) {
+        fprintf(stderr, "lvt: --control is only valid with the watch verb\n");
         return 1;
     }
     if (args.format != "json" && args.format != "xml") {
