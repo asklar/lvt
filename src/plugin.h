@@ -101,10 +101,14 @@ typedef void (*LvtPluginFreeFn)(void* ptr);
 // every single time - the same problem this whole mechanism exists to avoid
 // for XAML/WinUI3 (see docs/tap-dll-design.md's connection lifecycle).
 //
-// Every function here is independently optional: lvt core probes each by
-// name via GetProcAddress and only uses the group at all if
-// lvt_connection_open is present. A plugin that implements none of them
-// keeps working exactly as it does today via lvt_enrich_tree.
+// The persistent tree path is enabled only when lvt_connection_open,
+// lvt_connection_get_tree, lvt_connection_close, and the existing
+// lvt_plugin_free export are all present: every successful open must be
+// closeable, and every JSON result must be releasable by its allocating
+// module. Polling is a separate optional pair:
+// lvt_connection_poll_events is used only with
+// lvt_connection_events_free. An incomplete v2 group is treated as v1 and
+// keeps working through lvt_enrich_tree.
 
 struct LvtConnectionEvent {
     uint32_t struct_size;
@@ -159,4 +163,3 @@ typedef void (*LvtConnectionCloseFn)(void* conn);
 #ifdef __cplusplus
 }
 #endif
-

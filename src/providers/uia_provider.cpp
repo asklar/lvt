@@ -620,7 +620,8 @@ UiaConnection::~UiaConnection() {
         CoDecrementMTAUsage(cookie);
 }
 
-bool UiaConnection::get_tree(Element& root, bool fastProperties) {
+bool UiaConnection::get_tree(Element& root, bool fastProperties,
+                             const std::string& /*providerOption*/) {
     (void)fastProperties;
     return get_tree_with_options(root, UiaOptions{});
 }

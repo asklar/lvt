@@ -267,7 +267,7 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
                     // it through the same ConnectionLookup mechanism.
                     auto connection = connectionLookup ? connectionLookup(fi.name) : nullptr;
                     if (connection && connection->is_alive()) {
-                        connection->get_tree(root, fastProperties);
+                        connection->get_tree(root, fastProperties, pluginOption);
                     } else {
                         enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
                     }

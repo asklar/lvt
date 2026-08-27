@@ -32,6 +32,11 @@ public:
 
     IFrameworkConnection* operator->() const { return m_connection.get(); }
     IFrameworkConnection* get() const { return m_connection.get(); }
+    // Keeps an in-flight operation alive independently of the registry
+    // handle. MCP disconnect can erase a session concurrently; callers that
+    // cross that boundary must hold this shared snapshot rather than a raw
+    // pointer into g_sessionConnections.
+    std::shared_ptr<IFrameworkConnection> shared() const { return m_connection; }
     explicit operator bool() const { return m_connection != nullptr; }
 
     // Drop this handle's reference early, before it would otherwise go out

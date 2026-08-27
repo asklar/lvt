@@ -61,7 +61,8 @@ public:
     static std::shared_ptr<UiaConnection> connect(HWND hwnd);
     ~UiaConnection() override;
 
-    bool get_tree(Element& root, bool fastProperties) override;
+    bool get_tree(Element& root, bool fastProperties,
+                  const std::string& providerOption = {}) override;
     bool get_tree_with_options(Element& root, const UiaOptions& options,
                                bool* truncated = nullptr);
     std::vector<ConnectionEvent> poll_events() override;

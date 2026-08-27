@@ -98,8 +98,12 @@ $ lvt --name AvaloniaTestApp --format xml --depth 3
 
 ## Persistent connections (optional)
 
-`src/plugin.h`'s plugin ABI (v2) has optional `lvt_connection_open`/`lvt_connection_get_tree`/
-`lvt_connection_poll_events`/`lvt_connection_close` functions a plugin can implement to let
+`src/plugin.h`'s plugin ABI (v2) has a persistent lifetime group:
+`lvt_connection_open`, `lvt_connection_get_tree`, and
+`lvt_connection_close` (plus the existing `lvt_plugin_free`) must all be
+implemented before lvt enables the connection path. The optional
+`lvt_connection_poll_events`/`lvt_connection_events_free` pair adds push
+event draining. These functions let
 `watch` and MCP sessions reuse one connection across many tree refreshes instead of
 re-injecting every time — see that header's "Persistent connections" section and
 `docs/tap-dll-design.md`'s connection lifecycle for the pattern the built-in XAML/WinUI3

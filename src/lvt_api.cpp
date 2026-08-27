@@ -140,6 +140,11 @@ bool find_session(const std::string& id, Session& out) {
     return true;
 }
 
+bool session_is_active(const std::string& id) {
+    std::lock_guard<std::mutex> lock(g_sessionsMutex);
+    return g_sessions.contains(id);
+}
+
 // --- per-session persistent connections ----------------------------------
 //
 // Session is copied out of g_sessions by find_session/require_session (a
@@ -240,16 +245,22 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 #endif
     }
 
-    // `entry` lives in g_sessionConnections for as long as this session
-    // does (std::map never invalidates other elements' addresses on
-    // insert/erase), so capturing its address is safe for the lookup's
-    // short lifetime - used once, synchronously, within this same
-    // build_tree_for call.
-    auto* connections = &entry;
-    return [connections](const std::string& label) -> lvt::IFrameworkConnection* {
-        for (auto& [lbl, handle] : *connections) {
+    // Do not return raw pointers into g_sessionConnections. `disconnect`
+    // can run concurrently on another MCP worker and erase this entry while
+    // build_tree is still using its lookup. A shared snapshot keeps every
+    // in-flight connection alive until this synchronous build finishes,
+    // independently of the session/registry handle being removed.
+    std::vector<std::pair<std::string, std::shared_ptr<lvt::IFrameworkConnection>>> connections;
+    connections.reserve(entry.size());
+    for (const auto& [label, handle] : entry) {
+        if (handle)
+            connections.emplace_back(label, handle.shared());
+    }
+    return [connections = std::move(connections)](
+               const std::string& label) -> lvt::IFrameworkConnection* {
+        for (const auto& [lbl, connection] : connections) {
             if (lbl == label)
-                return handle.get();
+                return connection.get();
         }
         return nullptr;
     };
@@ -261,7 +272,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 // from the same "connect once, reuse many times" shape, though: a session can
 // keep one client-side IUIAutomation object alive and re-walk through it on
 // every request instead of CoCreateInstance + timeout setup on every call.
-lvt::UiaConnection* uia_connection_for_session(const Session& session) {
+std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& session) {
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
     auto& entry = g_sessionConnections[session.id];
 
@@ -269,7 +280,7 @@ lvt::UiaConnection* uia_connection_for_session(const Session& session) {
         if (it->first != "uia")
             continue;
         if (it->second && it->second->is_alive())
-            return dynamic_cast<lvt::UiaConnection*>(it->second.get());
+            return std::dynamic_pointer_cast<lvt::UiaConnection>(it->second.shared());
 
         it->second.reset();
         entry.erase(it);
@@ -284,8 +295,9 @@ lvt::UiaConnection* uia_connection_for_session(const Session& session) {
     if (!handle)
         return nullptr;
 
+    auto connection = std::dynamic_pointer_cast<lvt::UiaConnection>(handle.shared());
     entry.emplace_back("uia", std::move(handle));
-    return dynamic_cast<lvt::UiaConnection*>(entry.back().second.get());
+    return connection;
 }
 #endif
 
@@ -587,6 +599,14 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         *truncated = false;
     // One walk of a given window at a time; see the note on g_targetLocks.
     TargetGuard guard(session.hwnd);
+    // A request can copy its Session just before a concurrent disconnect
+    // removes it, then wait behind disconnect on this target lock. Refuse
+    // once it reaches the critical section rather than recreating a
+    // connection entry for a session that no longer exists.
+    if (!session_is_active(session.id)) {
+        error = "this session was disconnected while the request was waiting";
+        return false;
+    }
     if (uia) {
 #ifdef LVT_ENABLE_UIA
         lvt::UiaProvider provider;
@@ -616,7 +636,7 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
 
             bool attemptTruncated = false;
             lvt::Element connectedTree;
-            if (auto* connection = uia_connection_for_session(session)) {
+            if (auto connection = uia_connection_for_session(session)) {
                 if (connection->get_tree_with_options(connectedTree, options, &attemptTruncated)) {
                     result = std::move(connectedTree);
                     wasTruncated = attemptTruncated;
@@ -818,9 +838,13 @@ json method_disconnect(const json& params) {
         for (const auto& [_, session] : g_sessions)
             stillReferenced = stillReferenced || session.hwnd == released;
     }
-    if (!stillReferenced)
-        forget_target_lock(released);
     {
+        // Match the lock order used by tree/action reads: target first,
+        // connection map second. This waits for any operation that already
+        // entered the target critical section, while those operations hold
+        // their own shared connection snapshot so teardown cannot invalidate
+        // a raw pointer in flight.
+        TargetGuard guard(released);
         // Dropping this session's ConnectionHandles here releases the
         // registry's references (see connection_registry.h); if this was
         // the last reference to a given (pid, framework) connection, its
@@ -829,6 +853,8 @@ json method_disconnect(const json& params) {
         std::lock_guard<std::mutex> lock(g_connectionsMutex);
         g_sessionConnections.erase(id);
     }
+    if (!stillReferenced)
+        forget_target_lock(released);
     return json{{"disconnected", id}};
 }
 
@@ -1731,6 +1757,8 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     std::optional<TargetGuard> guard;
     if (!isWait)
         guard.emplace(session.hwnd);
+    if (!session_is_active(session.id))
+        throw std::runtime_error("this session was disconnected while the request was waiting");
 
     auto options = uia_options_from(params);
     if (isWait) {
@@ -1744,8 +1772,8 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
         options.timeoutMs = 10000;
     }
 
-    const auto result = lvt::perform_action(session.hwnd, options, request,
-                                            uia_connection_for_session(session));
+    auto connection = uia_connection_for_session(session);
+    const auto result = lvt::perform_action(session.hwnd, options, request, connection.get());
     auto out = action_result_to_json(result, actionName, get_string(params, "element"));
     if (!result.ok)
         throw std::runtime_error(out.dump());

@@ -12,6 +12,7 @@
 #include "providers/winforms_inject.h"
 #include "providers/wpf_inject.h"
 #include "providers/uia_provider.h"
+#include "providers/connection_registry.h"
 #include "providers/uia_props.h"
 #include "input.h"
 #include "providers/uia_actions.h"
@@ -368,6 +369,41 @@ TEST(Element, DefaultValues) {
     EXPECT_TRUE(el.properties.empty());
     EXPECT_TRUE(el.children.empty());
     EXPECT_EQ(el.nativeHandle, 0u);
+}
+
+namespace {
+
+class SnapshotLifetimeConnection final : public IFrameworkConnection {
+public:
+    explicit SnapshotLifetimeConnection(std::shared_ptr<int> destroyed)
+        : destroyed_(std::move(destroyed)) {}
+    ~SnapshotLifetimeConnection() override { ++*destroyed_; }
+
+    bool get_tree(Element&, bool, const std::string& = {}) override { return true; }
+    std::vector<ConnectionEvent> poll_events() override { return {}; }
+    bool is_alive() const override { return true; }
+
+private:
+    std::shared_ptr<int> destroyed_;
+};
+
+} // namespace
+
+TEST(ConnectionHandle, SharedSnapshotOutlivesRegistryHandle) {
+    auto destroyed = std::make_shared<int>(0);
+    auto handle = ConnectionRegistry::instance().acquire(
+        GetCurrentProcessId(), nullptr, "unit-snapshot-lifetime",
+        [destroyed](HWND, DWORD) {
+            return std::make_shared<SnapshotLifetimeConnection>(destroyed);
+        });
+    ASSERT_TRUE(handle);
+
+    auto snapshot = handle.shared();
+    handle.reset();
+    EXPECT_EQ(*destroyed, 0);
+
+    snapshot.reset();
+    EXPECT_EQ(*destroyed, 1);
 }
 
 // ---- Durable element keys and lookup ----

@@ -39,7 +39,12 @@ public:
     // Returns false if the refresh failed (e.g. the pipe broke); callers
     // should treat that the same as is_alive() having gone false and give
     // up on this connection (via the registry) rather than keep retrying it.
-    virtual bool get_tree(Element& root, bool fastProperties) = 0;
+    // `providerOption` carries provider-specific filtering/configuration
+    // through the generic connection path. Built-in providers ignore it;
+    // plugin connections forward it as element_class_filter so persistent
+    // and one-shot plugin collection have identical behavior.
+    virtual bool get_tree(Element& root, bool fastProperties,
+                          const std::string& providerOption = {}) = 0;
 
     // Non-blocking: returns whatever incremental Add/Remove change
     // notifications have arrived since the last call, without triggering a

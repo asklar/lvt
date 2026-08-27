@@ -125,11 +125,14 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
         lp.connection_close = reinterpret_cast<LvtConnectionCloseFn>(
             GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_CLOSE_FUNC));
 
+        const bool supportsPersistentConnections =
+            lp.connection_open && lp.connection_get_tree &&
+            lp.connection_close && lp.free_fn;
         if (g_debug)
             fprintf(stderr, "lvt: loaded plugin '%s' (%s)%s\n",
                     info->name ? info->name : "?",
                     info->description ? info->description : "",
-                    lp.connection_open ? ", supports persistent connections" : "");
+                    supportsPersistentConnections ? ", supports persistent connections" : "");
 
         s_plugins.push_back(std::move(lp));
     } while (FindNextFileW(hFind.get(), &fd));
@@ -328,7 +331,8 @@ public:
             m_plugin->connection_close(m_handle);
     }
 
-    bool get_tree(Element& root, bool /*fastProperties*/) override {
+    bool get_tree(Element& root, bool /*fastProperties*/,
+                  const std::string& providerOption = {}) override {
         // Plugins have no fast/full distinction today - see plugin.h's
         // LvtConnectionGetTreeFn. Accepting and ignoring the parameter here
         // (rather than omitting it) keeps this a drop-in IFrameworkConnection,
@@ -337,7 +341,8 @@ public:
             return false;
 
         char* jsonOut = nullptr;
-        int ok = m_plugin->connection_get_tree(m_handle, nullptr, &jsonOut);
+        const char* filter = providerOption.empty() ? nullptr : providerOption.c_str();
+        int ok = m_plugin->connection_get_tree(m_handle, filter, &jsonOut);
         if (!ok || !jsonOut) {
             m_alive = false;
             return false;
@@ -359,7 +364,8 @@ public:
 
     std::vector<ConnectionEvent> poll_events() override {
         std::vector<ConnectionEvent> result;
-        if (!m_handle || !m_plugin->connection_poll_events)
+        if (!m_handle || !m_plugin->connection_poll_events ||
+            !m_plugin->connection_events_free)
             return result;
 
         LvtConnectionEvent* events = nullptr;
@@ -396,7 +402,11 @@ private:
 
 std::shared_ptr<IFrameworkConnection> open_plugin_connection(
     const PluginFrameworkInfo& pluginFw, HWND hwnd, DWORD pid) {
-    if (!pluginFw.plugin || !pluginFw.plugin->connection_open || !pluginFw.plugin->connection_get_tree)
+    if (!pluginFw.plugin ||
+        !pluginFw.plugin->connection_open ||
+        !pluginFw.plugin->connection_get_tree ||
+        !pluginFw.plugin->connection_close ||
+        !pluginFw.plugin->free_fn)
         return nullptr;
 
     void* handle = pluginFw.plugin->connection_open(hwnd, pid);

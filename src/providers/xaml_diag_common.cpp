@@ -498,7 +498,8 @@ public:
         }
     }
 
-    bool get_tree(Element& root, bool fastProperties) override {
+    bool get_tree(Element& root, bool fastProperties,
+                  const std::string& /*providerOption*/ = {}) override {
         if (!m_alive) return false;
         std::string cmd = fastProperties ? "GET_TREE FAST" : "GET_TREE";
         if (!m_io->write_line(cmd)) {

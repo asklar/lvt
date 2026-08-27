@@ -16,8 +16,9 @@ struct LoadedPlugin {
     LvtDetectFrameworkFn detect;
     LvtEnrichTreeFn enrich;
     LvtPluginFreeFn free_fn;
-    // v2, all optional (see plugin.h's "Persistent connections") - null
-    // when the plugin doesn't export them, which is the common/v1 case.
+    // v2 exports (see plugin.h's "Persistent connections"). The core only
+    // enables persistence when open/get_tree/close and the v1 free_fn are
+    // all present; polling additionally requires its matching free export.
     LvtConnectionOpenFn connection_open = nullptr;
     LvtConnectionGetTreeFn connection_get_tree = nullptr;
     LvtConnectionPollEventsFn connection_poll_events = nullptr;
@@ -53,8 +54,9 @@ bool enrich_with_plugin(Element& root, HWND hwnd, DWORD pid,
 // plugin's optional v2 functions, for reuse across many refreshes the same
 // way make_xaml_diag_connection is for XAML/WinUI3 - see
 // connection_registry.h for how a caller acquires/reuses/releases one.
-// Returns nullptr if the plugin doesn't implement lvt_connection_open (the
-// common case for any plugin still on v1) or the connection failed.
+// Returns nullptr if the plugin doesn't implement the complete required v2
+// lifetime group (open/get_tree/close plus lvt_plugin_free), or connection
+// establishment failed.
 std::shared_ptr<IFrameworkConnection> open_plugin_connection(
     const PluginFrameworkInfo& pluginFw, HWND hwnd, DWORD pid);
 
