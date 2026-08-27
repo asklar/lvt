@@ -209,7 +209,11 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         // only whichever framework labels are still missing instead of treating
         // "entry is non-empty" as "everything this session could ever need is
         // already connected".
-        lvt::Element probeTree = lvt::build_tree(session.hwnd, session.pid, frameworks);
+        // Only the native CoreWindow HWND is needed to resolve the process
+        // for XAML injection. Do not run the detected framework providers
+        // here: that would perform a complete one-shot XAML collection
+        // immediately before opening the persistent connection.
+        lvt::Element probeTree = lvt::build_tree(session.hwnd, session.pid, {});
 #if LVT_ENABLE_XAML
         if (needXaml) {
             auto handle = lvt::ConnectionRegistry::instance().acquire(

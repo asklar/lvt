@@ -2465,7 +2465,7 @@ TEST_F(WinUI3SampleFixture, WatchReusesOnePersistentConnectionAcrossManyTicks) {
     PROCESS_INFORMATION pi{};
 
     auto lvt = get_lvt_path();
-    std::string cmd = make_cmd(lvt, get_pid_arg() + " watch --interval 300");
+    std::string cmd = make_cmd(lvt, get_pid_arg() + " watch --fast --interval 300");
     ASSERT_TRUE(CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
                                CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi));
     wil::unique_handle process(pi.hProcess);
@@ -2499,13 +2499,15 @@ TEST_F(WinUI3SampleFixture, WatchReusesOnePersistentConnectionAcrossManyTicks) {
     ASSERT_FALSE(output.empty()) << "watch emitted nothing";
 
     const int after = count_set_site_calls();
-    // Exactly one new connection is expected for this whole session. Allow
-    // a small margin (e.g. one resync retry if the target was briefly busy)
-    // but this must be nowhere near "one per tick" - at a 300ms interval
-    // over 6 seconds that would be roughly 20.
-    EXPECT_LE(after - before, 2)
-        << "watch re-injected far more than once (SetSite called " << before << " times before, "
-        << after << " times after) - the persistent connection was not reused across ticks";
+    // Exactly one new connection is expected for this whole session. This
+    // used to allow two as a retry margin, which let a real startup bug
+    // escape: acquire_watch_connections built its CoreWindow probe using
+    // the full detected framework list, causing one complete throwaway
+    // injection before opening the persistent connection. The probe is now
+    // deliberately Win32-only; any second SetSite here is a regression.
+    EXPECT_EQ(after - before, 1)
+        << "watch must inject exactly once (SetSite called " << before << " times before, "
+        << after << " times after)";
 }
 
 // --- Cross-architecture behaviour ---

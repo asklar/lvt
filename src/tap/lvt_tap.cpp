@@ -497,7 +497,7 @@ public:
         // chunks; every node still gets collected, in the same order, every
         // request.
         constexpr size_t kBatchSize = 20;
-        if (m_msgWnd) {
+        if (m_msgWnd && !fast) {
             LogMsg("Dispatching CollectBounds to UI thread via SendMessage, %zu nodes in batches of %zu",
                    m_orderedHandles.size(), kBatchSize);
             for (size_t start = 0; start < m_orderedHandles.size(); start += kBatchSize) {
@@ -507,6 +507,12 @@ public:
                 Sleep(1);
             }
             LogMsg("Finished CollectBounds dispatch");
+        } else if (m_msgWnd) {
+            // CollectBounds itself is intentionally a no-op in fast mode,
+            // but dispatching one SendMessage + Sleep per 20-node batch
+            // still cost ~1.9 seconds for Microsoft Store's ~2400-node
+            // tree. Skip the loop itself, not merely its per-node work.
+            LogMsg("Skipped CollectBounds dispatch entirely in fast mode");
         }
         // Get element positions via TransformToVisual (works around broken
         // ActualOffset serialization in WinUI3). Must run on the UI thread.

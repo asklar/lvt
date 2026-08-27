@@ -720,7 +720,17 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
     if (!hasXaml && !hasWinUI3)
         return connections;
 
-    lvt::Element probeTree = lvt::build_tree(target.hwnd, target.pid, frameworks);
+    // XamlProvider::open_connection only needs the CoreWindow HWND from the
+    // native window skeleton so it can resolve the app process behind an
+    // ApplicationFrameHost window. Passing the detected framework list here
+    // used to run every enrichment provider too, including a complete
+    // one-shot XAML injection + full property walk immediately before
+    // opening the persistent connection. Besides contradicting the
+    // connection-reuse design, that redundant probe measured ~25 seconds
+    // against Microsoft Store. An empty framework list still builds the
+    // untrimmed Win32 base tree (build_tree always starts with Win32), which
+    // contains the CoreWindow and is all this probe actually needs.
+    lvt::Element probeTree = lvt::build_tree(target.hwnd, target.pid, {});
 
 #if LVT_ENABLE_XAML
     if (hasXaml) {
