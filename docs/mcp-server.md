@@ -158,6 +158,13 @@ skipped. This is necessary for both modes: UIA event-handler integration is a
 future optimization, while XAML's structural callbacks do not report
 text/property/bounds changes.
 
+Visual resources always poll `get_visual_tree_changes` with `fast: true`,
+matching the Viewer's former `watch --fast` path. The live stream still carries
+the bounds, text, content, and basic state needed to render and search the tree;
+full selected-node dependency properties come separately from
+`get_visual_properties`, avoiding multi-second full-property walks every tick.
+UIA resources use their normal default options.
+
 The poll result is cached before the notification is sent, so the following
 `resources/read` is fast and drains that cached patch rather than walking the
 application again. The initial subscribe/read is always a full snapshot.

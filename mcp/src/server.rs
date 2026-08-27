@@ -620,10 +620,18 @@ struct TreePatch {
     events: Vec<serde_json::Value>,
 }
 
+fn tree_patch_params(resource: &SessionResource, reset: bool) -> serde_json::Value {
+    let mut params = json!({ "session": resource.session, "reset": reset });
+    if resource.tree == TreeMode::Visual {
+        params["fast"] = true.into();
+    }
+    params
+}
+
 async fn get_tree_patch(resource: &SessionResource, reset: bool) -> Result<TreePatch, String> {
     let result = call_lvt(
         resource.tree.changes_method(),
-        json!({ "session": resource.session, "reset": reset }),
+        tree_patch_params(resource, reset),
         false,
     )
     .await
@@ -2513,6 +2521,24 @@ mod tests {
         assert_eq!(SessionResource::parse(&uia.uri()), Some(uia));
         assert!(SessionResource::parse("file:///not-lvt").is_none());
         assert!(SessionResource::parse("lvt://session/nope/visual-tree").is_none());
+    }
+
+    #[test]
+    fn visual_resource_polls_always_use_fast_snapshots() {
+        let visual = SessionResource::new("s1", TreeMode::Visual);
+        let uia = SessionResource::new("s2", TreeMode::Uia);
+        assert_eq!(
+            tree_patch_params(&visual, true),
+            json!({"session": "s1", "reset": true, "fast": true})
+        );
+        assert_eq!(
+            tree_patch_params(&visual, false),
+            json!({"session": "s1", "reset": false, "fast": true})
+        );
+        assert_eq!(
+            tree_patch_params(&uia, true),
+            json!({"session": "s2", "reset": true})
+        );
     }
 
     #[test]
