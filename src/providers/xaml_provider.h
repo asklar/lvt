@@ -16,11 +16,11 @@ public:
     // Establishes a persistent connection (see framework_connection.h) for
     // reuse across many refreshes, e.g. by watch's loop or an MCP session —
     // see connection_registry.h. Uses the CoreWindow already present in
-    // `root` (this tick's Win32 base tree) to resolve which process actually
-    // owns the XAML content — the same resolution enrich() does internally,
-    // exposed here so a caller only pays for it once instead of every
-    // refresh. Returns nullptr if no CoreWindow is present in `root`, or the
-    // connection could not be established.
+    // `root` (UWP), or a Windows.UI.Composition.DesktopWindowContentBridge
+    // (desktop system-XAML island), to resolve which process owns the XAML
+    // content. This is the same resolution enrich() does internally, exposed
+    // so a caller only pays for it once instead of every refresh. Returns
+    // nullptr when neither supported host is present, or connection fails.
     std::shared_ptr<IFrameworkConnection> open_connection(const Element& root, HWND hwnd, DWORD pid);
 
     // Re-locates the CoreWindow in the CURRENT tick's `root` (a fresh Win32

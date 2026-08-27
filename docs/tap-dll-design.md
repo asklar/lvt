@@ -36,7 +36,11 @@ The XAML diagnostics API uses named connections. Each concurrent diagnostics ses
 - **System XAML (UWP):** `"VisualDiagConnection1"`, `"VisualDiagConnection2"`, …
 - **WinUI 3:** `"WinUIVisualDiagConnection1"`, `"WinUIVisualDiagConnection2"`, …
 
-lvt tries connection names sequentially until one succeeds (doesn't return `ERROR_NOT_FOUND`).
+lvt tries connection names sequentially until one succeeds (doesn't return
+`ERROR_NOT_FOUND`). Identifiers are monotonically allocated by a XAML core and
+can grow well beyond 10 in long-lived, multi-window apps, so lvt scans up to
+10,000 names (matching UWPSpy's strategy) rather than assuming a small fixed
+range.
 
 ### Init DLL paths
 
@@ -197,4 +201,3 @@ The TAP DLL is built with `/MT` (static CRT). This is essential because:
 - **Log file:** `%TEMP%\lvt_tap.log` for unpackaged targets, but `%LOCALAPPDATA%\Packages\<PackageFamilyName>\AC\Temp\lvt_tap.log` for AppContainer (UWP/MSIX-packaged) targets — the two are easy to confuse when debugging a packaged app. All TAP DLL operations are logged with millisecond timestamps and thread IDs. Because the TAP DLL never unloads (`DllCanUnloadNow` returns `S_FALSE`, see below), this file accumulates across every run against that target for as long as the target process lives, not just the most recent one.
 - **Debugger:** Use `C:\Debuggers\cdb.exe` to attach to the target process and debug injection issues
 - **File lock:** `lvt_tap.dll` is locked by the target process after injection. Kill the target before rebuilding. For AppContainer targets, the staged copy at `%TEMP%\lvt_tap\` can also be held open by an unrelated, long-lived AppContainer host process from an earlier test run — if a rebuilt DLL isn't taking effect, check for and kill stale processes still holding that staged file before assuming the build itself is broken.
-

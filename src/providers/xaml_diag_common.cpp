@@ -127,7 +127,8 @@ static std::string sanitize(const std::string& s) {
 
 // Collect all DesktopChildSiteBridge elements in tree order
 static void collect_bridges(Element& el, std::vector<Element*>& bridges) {
-    if (el.className == "Microsoft.UI.Content.DesktopChildSiteBridge") {
+    if (el.className == "Microsoft.UI.Content.DesktopChildSiteBridge" ||
+        el.className == "Windows.UI.Composition.DesktopWindowContentBridge") {
         bridges.push_back(&el);
     }
     for (auto& child : el.children) {
@@ -683,7 +684,14 @@ std::shared_ptr<XamlDiagConnection> XamlDiagConnection::connect(
     // connection can still mix fast live-tree polls with an occasional full
     // request the way the old per-call model did.
     std::wstring initData = pipeName;
-    for (int i = 0; i < 10; i++) {
+    // Connection identifiers are monotonically allocated by each XAML core
+    // and can grow well beyond 10 in a long-lived, multi-window process.
+    // Windows Terminal was observed with no endpoint in slots 1..10 despite
+    // an active WinUI tree. UWPSpy uses the same 10,000-attempt ceiling,
+    // citing DXamlCore's own allocation behavior; keep a high finite bound so
+    // a framework-detection false positive cannot loop forever.
+    constexpr int kMaxConnectionIdentifiers = 10000;
+    for (int i = 0; i < kMaxConnectionIdentifiers; i++) {
         wchar_t endPoint[64];
         swprintf_s(endPoint, L"%s%d", connPrefix.c_str(), i + 1);
 

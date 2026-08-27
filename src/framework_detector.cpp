@@ -179,9 +179,16 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
     bool detectedWpf = false;
     bool detectedWinForms = false;
     if (pid) {
-        auto winui = detect_module(pid, L"Microsoft.UI.Xaml.dll");
-        if (winui.found) {
-            result.push_back({Framework::WinUI3, winui.version});
+        auto winuiXaml = detect_module(pid, L"Microsoft.UI.Xaml.dll");
+        auto frameworkUdk = detect_module(pid, L"Microsoft.Internal.FrameworkUdk.dll");
+        // Microsoft.UI.Xaml.dll alone does not mean WinUI 3: WinUI 2 is a
+        // controls library hosted by system Windows.UI.Xaml, and apps such
+        // as Windows Terminal legitimately load both DLLs. WinUI 3's
+        // diagnostics endpoint is exported by the Windows App SDK's
+        // Microsoft.Internal.FrameworkUdk.dll, so require that runtime
+        // signal before selecting the WinUI3 provider.
+        if (winuiXaml.found && frameworkUdk.found) {
+            result.push_back({Framework::WinUI3, winuiXaml.version});
             detectedWinUI3 = true;
         }
         auto xaml = detect_module(pid, L"Windows.UI.Xaml.dll");
