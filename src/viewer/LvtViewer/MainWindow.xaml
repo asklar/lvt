@@ -3,7 +3,8 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="clr-namespace:LvtViewer.ViewModels"
         xmlns:conv="clr-namespace:LvtViewer.Converters"
-        Title="lvt Viewer" Height="760" Width="1150" WindowStartupLocation="CenterScreen">
+        Title="lvt Viewer" Icon="Assets/LvtViewer.ico"
+        Height="760" Width="1150" WindowStartupLocation="CenterScreen">
     <Window.CommandBindings>
         <CommandBinding Command="ApplicationCommands.Find" Executed="Find_Executed"/>
     </Window.CommandBindings>
