@@ -340,5 +340,11 @@ public partial class MainWindow : Window
             e.Handled = true;
         }
     }
-}
 
+    private void Find_Executed(object sender, ExecutedRoutedEventArgs e)
+    {
+        SearchBox.Focus();
+        SearchBox.SelectAll();
+        e.Handled = true;
+    }
+}

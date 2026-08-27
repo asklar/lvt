@@ -4,8 +4,6 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Windows.Threading;
 using LvtViewer.Models;
 using LvtViewer.Services;
@@ -29,7 +27,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private ElementNodeViewModel? _selectedElement;
     private string? _currentHwndHex;
     private IntPtr _currentHwnd;
-    private CancellationTokenSource? _slowConnectHintCts;
 
     public MainViewModel(Dispatcher dispatcher)
     {
@@ -58,7 +55,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _watch.Exited += code => _dispatcher.BeginInvoke(() =>
         {
             Logger.Log("viewmodel", $"watch Exited(code={code}) -> IsConnected=false, clearing tree/selection");
-            _slowConnectHintCts?.Cancel(); // don't let a pending hint override this status
+            IsConnecting = false;
             StatusText = $"lvt watch exited (code {code}) — target likely closed. Re-pick a window to reconnect.";
             // The target's own process may have crashed or been closed: its
             // tree is no longer meaningful, and clearing SelectedElement is
@@ -122,6 +119,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (SetField(ref _isConnected, value))
                 Logger.Log("viewmodel", $"IsConnected -> {value} (crosshair {(value ? "enabled" : "disabled")})");
         }
+    }
+
+    private bool _isConnecting;
+
+    /// <summary>
+    /// True from starting a watch process until its first tree event arrives.
+    /// Drives the status bar's indeterminate progress indicator: the native
+    /// protocol currently exposes phases/timings in logs but no truthful
+    /// percentage during its initial AdviseVisualTreeChange replay.
+    /// </summary>
+    public bool IsConnecting
+    {
+        get => _isConnecting;
+        private set => SetField(ref _isConnecting, value);
     }
 
     /// <summary>
@@ -204,10 +215,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void OnWatchEvent(WatchEventDto evt)
     {
-        // Data has arrived: whatever the slow-connect hint below was about
-        // to say (or already said) no longer applies — the first tick
-        // finished, however long it took.
-        _slowConnectHintCts?.Cancel();
+        // The first event means lvt finished injection/subscription,
+        // collected and serialized the initial snapshot, and began emitting
+        // it. Stop the indeterminate progress UI at that point.
+        if (IsConnecting)
+        {
+            IsConnecting = false;
+            StatusText = UseUia
+                ? "Watching the UI Automation tree live."
+                : "Watching the visual tree live.";
+        }
         // Applied immediately, synchronously, every time — LiveTree.Apply
         // only ever patches the one node (or one parent/child edge) an
         // event actually names, so there is no "whole tree" cost here to
@@ -242,34 +259,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         _filterDebounceTimer.Stop();
         _filterDebounceTimer.Start();
-    }
-
-    /// <summary>
-    /// A rich UI tree's first connect can take well over the couple of
-    /// seconds a user would wait before assuming the viewer is stuck — a
-    /// UWP app like Microsoft Store measured at ~20s for its first watch
-    /// tick (InitializeXamlDiagnosticsEx replaying its whole tree, then the
-    /// property/bounds walk, all before the first line of output). Rather
-    /// than silently sitting on "Connecting…" that whole time, update the
-    /// status once a delay threshold passes to say so explicitly. Canceled
-    /// by OnWatchEvent the moment real data arrives, so this never overwrites
-    /// a status that has since moved on.
-    private async void ArmSlowConnectHint()
-    {
-        _slowConnectHintCts?.Cancel();
-        var cts = new CancellationTokenSource();
-        _slowConnectHintCts = cts;
-        try
-        {
-            await Task.Delay(TimeSpan.FromSeconds(4), cts.Token);
-            if (!cts.IsCancellationRequested)
-                StatusText = "Still connecting — a rich UI tree (e.g. Microsoft Store, File Explorer) " +
-                              "can take 15\u201320+ seconds to load on the first connect. Please wait…";
-        }
-        catch (TaskCanceledException)
-        {
-            // Data arrived first; nothing to show.
-        }
     }
 
     /// <summary>Adds a checkbox (default checked) for any not-yet-seen framework value in this event.</summary>
@@ -395,6 +384,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _currentHwnd = hwnd;
         _currentHwndHex = "0x" + hwnd.ToInt64().ToString("X", CultureInfo.InvariantCulture);
         IsConnected = true;
+        IsConnecting = true;
 
         string processName = "?";
         try
@@ -418,10 +408,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // so this trades nothing the viewer actually shows by default for a
         // dramatically faster live connect on a rich tree.
         _watch.Start(LvtExePath, _currentHwndHex, UseUia, fastProperties: true);
-        ArmSlowConnectHint();
-        StatusText = UseUia
-            ? "Watching the UI Automation tree live."
-            : "Watching the visual tree live.";
     }
 
     private void Reconnect()
@@ -432,11 +418,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _liveTree.Reset();
         StatusText = "Reconnecting…";
         IsConnected = true;
+        IsConnecting = true;
         _watch.Start(LvtExePath, _currentHwndHex, UseUia, fastProperties: true);
-        ArmSlowConnectHint();
-        StatusText = UseUia
-            ? "Watching the UI Automation tree live."
-            : "Watching the visual tree live.";
     }
 
     private static void NativeMethodsWindowInfo(IntPtr hwnd, out uint pid, out string title)
@@ -517,7 +500,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         _filterDebounceTimer.Stop();
-        _slowConnectHintCts?.Cancel();
         _watch.Dispose();
     }
 }

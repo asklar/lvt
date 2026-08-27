@@ -4,6 +4,13 @@
         xmlns:vm="clr-namespace:LvtViewer.ViewModels"
         xmlns:conv="clr-namespace:LvtViewer.Converters"
         Title="lvt Viewer" Height="760" Width="1150" WindowStartupLocation="CenterScreen">
+    <Window.CommandBindings>
+        <CommandBinding Command="ApplicationCommands.Find" Executed="Find_Executed"/>
+    </Window.CommandBindings>
+    <Window.InputBindings>
+        <KeyBinding Key="F" Modifiers="Control" Command="ApplicationCommands.Find"/>
+    </Window.InputBindings>
+
     <Window.Resources>
         <conv:FrameworkToBrushConverter x:Key="FrameworkToBrush"/>
         <conv:EditKindToVisibilityConverter x:Key="EditKindToVisibility"/>
@@ -91,7 +98,7 @@
                 <TextBlock Text="Find:" VerticalAlignment="Center" Margin="0,0,6,0"/>
                 <TextBox x:Name="SearchBox" Width="260" Margin="0,0,6,0"
                          Text="{Binding SearchQuery, UpdateSourceTrigger=PropertyChanged}"
-                         ToolTip="Matches Text, Class, Type, or any property name/value (case-insensitive)"
+                         ToolTip="Find by text, class, type, or property (Ctrl+F)"
                          KeyDown="SearchBox_KeyDown"/>
                 <Button Content="Find Next" Command="{Binding FindNextCommand}" Padding="10,3" Margin="0,0,6,0"/>
                 <Button Content="Find Previous" Command="{Binding FindPreviousCommand}" Padding="10,3"/>
@@ -100,7 +107,17 @@
 
         <!-- Status bar -->
         <Border DockPanel.Dock="Bottom" Background="#FFEFEFEF" BorderBrush="#FFD5D5D5" BorderThickness="0,1,0,0" Padding="6,3">
-            <TextBlock Text="{Binding StatusText}" TextTrimming="CharacterEllipsis"/>
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="{Binding StatusText}" TextTrimming="CharacterEllipsis"/>
+                <ProgressBar Grid.Column="1" Width="120" Height="5" Margin="12,0,0,0"
+                             VerticalAlignment="Center" IsIndeterminate="True"
+                             Visibility="{Binding IsConnecting, Converter={StaticResource BoolToVisibility}}"
+                             ToolTip="Waiting for the initial tree snapshot"/>
+            </Grid>
         </Border>
 
         <!-- Two-pane view: element tree | property panel -->

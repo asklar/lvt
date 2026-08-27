@@ -103,6 +103,7 @@ public sealed class WatchSession : IDisposable
             }
         };
 
+        long startTimestamp = Stopwatch.GetTimestamp();
         try
         {
             process.Start();
@@ -116,7 +117,7 @@ public sealed class WatchSession : IDisposable
             return;
         }
 
-        _ = PumpStdOutAsync(process, cts.Token);
+        _ = PumpStdOutAsync(process, cts.Token, startTimestamp);
         _ = PumpStdErrAsync(process, cts.Token);
     }
 
@@ -156,8 +157,9 @@ public sealed class WatchSession : IDisposable
         try { return process.Id; } catch { return -1; }
     }
 
-    private async Task PumpStdOutAsync(Process process, CancellationToken token)
+    private async Task PumpStdOutAsync(Process process, CancellationToken token, long startTimestamp)
     {
+        bool waitingForFirstEvent = true;
         try
         {
             while (!token.IsCancellationRequested)
@@ -183,6 +185,12 @@ public sealed class WatchSession : IDisposable
                 }
                 if (evt != null)
                 {
+                    if (waitingForFirstEvent)
+                    {
+                        waitingForFirstEvent = false;
+                        Logger.Log("watch",
+                            $"first tree event received after {Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds:F0} ms");
+                    }
                     Logger.Log("watch", $"event={evt.Event} key={Truncate(evt.Key, 60)} path={evt.Path}");
                     EventReceived?.Invoke(evt);
                 }
