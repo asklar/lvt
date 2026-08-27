@@ -138,8 +138,10 @@ Every tool that takes an element accepts these forms:
   so it can be checked rather than assumed.
 - **`e12`** — the element's position in the tree you fetched, read against the
   session's own tree.
-- **A durable key** — a path-based identifier that survives more change. Also
-  self-describing: it names the framework that produced it.
+- **A durable key** — a framework-native identifier that survives more change.
+  XAML/WinUI3 use compact diagnostics handles (`xaml:0x…`, `winui3:0x…`);
+  providers without a process-wide handle use a structural path. Both forms are
+  self-describing.
 - **`uia:<RuntimeId>`** — the UIA runtime identifier.
 
 **A session only accepts references from its own tree.** The other tree's are
@@ -298,8 +300,8 @@ the other's references** rather than guessing what you meant. If you want to
 work the other way round, open a second session — they are independent and cheap.
 
 Durable keys are self-describing — they name the framework that produced them
-(`wpf|…`, `uia|…`) — so they need no qualifier, and they are refused by the
-wrong session just as `eN` refs are.
+(`winui3:0x…`, `wpf|…`, `uia|…`) — so they need no qualifier, and they are
+refused by the wrong session just as `eN` refs are.
 
 ## Prefer patterns over synthetic input
 

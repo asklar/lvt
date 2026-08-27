@@ -149,6 +149,13 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     parent.children.emplace_back();
     Element& el = parent.children.back();
     el.framework = framework;
+    // IXamlDiagnostics supplies an InstanceHandle for every live XAML
+    // object. Preserve it as the provider-native identity: watch_diff can
+    // reconcile directly by handle, compact element keys can avoid
+    // repeating a multi-kilobyte ancestor path, and future property-edit
+    // commands can address the exact object expected by
+    // IVisualTreeService::SetProperty.
+    el.nativeHandle = static_cast<uintptr_t>(j.value("handle", 0ULL));
     el.className = sanitize(j.value("type", ""));
 
     // x:Name is a developer identifier, not user-visible text — store as property

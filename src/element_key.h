@@ -18,17 +18,19 @@ std::string base_identity_key(const Element& el);
 // caused this area's bugs before.
 std::string stable_name_key(const Element& el);
 
-// Assigns every element in `root` a durable, self-describing key
-// ("framework|className", "/"-joined down from the root, each segment
-// disambiguated among just that element's own siblings — by native
-// handle first, then a stable name property, then a local sibling index
-// only as a last resort). Used by dump/query/UIA output, and by
-// watch_diff.cpp to give a *freshly discovered* element (the very first
-// tick, or a genuinely new node appearing later) its initial key.
+// Assigns every element in `root` a durable, self-describing key. XAML and
+// WinUI3 elements with an IXamlDiagnostics InstanceHandle use the compact,
+// process-wide form "xaml:0x..." / "winui3:0x...". Other providers (and the
+// rare XAML node without a handle) use "framework|className" path segments,
+// "/"-joined from the nearest structural ancestor and disambiguated among
+// siblings by native handle first, then a stable name property, then a local
+// sibling index as a last resort. Used by dump/query/UIA output, and by
+// watch_diff.cpp to give a *freshly discovered* element (the first tick, or
+// a genuinely new node appearing later) its initial key.
 //
 // watch's diffing does NOT rely on recomputing this same key fresh on
 // every tick to recognize a persisting element as "the same one" —a
-// purely structural key, with no memory between ticks, cannot do that
+// fallback structural key, with no memory between ticks, cannot do that
 // robustly: it threads every ancestor's own disambiguating segment into
 // each descendant's key, so if *any* ancestor's position among its own
 // same-identity siblings shifts for any reason (extremely common in a

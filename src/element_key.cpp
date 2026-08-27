@@ -46,6 +46,24 @@ static std::string hwnd_key(uintptr_t handle) {
     return out.str();
 }
 
+// XAML diagnostics InstanceHandles are already process-wide object
+// identities. Unlike a sibling index/name path, they do not change when an
+// element is reparented and do not need every ancestor repeated in every
+// descendant's key. They have also been observed stable across independent
+// diagnostics connections to the same live target, which the WinUI
+// integration test guards by dumping twice and querying in a third process.
+// Keep the structural algorithm as the fallback for providers/elements that
+// do not expose such an identity.
+static std::string compact_instance_key(const Element& el) {
+    if (el.nativeHandle == 0 ||
+        (el.framework != "xaml" && el.framework != "winui3"))
+        return {};
+
+    std::ostringstream out;
+    out << el.framework << ":0x" << std::hex << std::uppercase << el.nativeHandle;
+    return out.str();
+}
+
 std::string stable_name_key(const Element& el) {
     for (const char* name : {"AutomationId", "x:Name", "Name", "automationId", "name"}) {
         auto it = el.properties.find(name);
@@ -108,14 +126,21 @@ static void assign_child_keys(Element& parent, const std::string& parentKey) {
 
     for (size_t i = 0; i < parent.children.size(); ++i) {
         auto& child = parent.children[i];
-        auto segment = discriminator_for_child(child, i, baseCounts, hwndCounts, nameCounts);
-        child.key = parentKey.empty() ? segment : parentKey + "/" + segment;
+        auto compact = compact_instance_key(child);
+        if (!compact.empty()) {
+            child.key = std::move(compact);
+        } else {
+            auto segment = discriminator_for_child(child, i, baseCounts, hwndCounts, nameCounts);
+            child.key = parentKey.empty() ? segment : parentKey + "/" + segment;
+        }
         assign_child_keys(child, child.key);
     }
 }
 
 void assign_element_keys(Element& root) {
-    root.key = base_identity_key(root);
+    root.key = compact_instance_key(root);
+    if (root.key.empty())
+        root.key = base_identity_key(root);
     assign_child_keys(root, root.key);
 }
 

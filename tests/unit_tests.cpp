@@ -443,6 +443,31 @@ TEST(ElementKeys, NativeHandlesStayTiedAfterSwap) {
     EXPECT_EQ(root.children[1].key, firstKey);
 }
 
+TEST(ElementKeys, XamlInstanceHandlesUseCompactProcessWideKeys) {
+    Element root = key_el("Window");
+
+    Element panel;
+    panel.type = "Grid";
+    panel.className = "Microsoft.UI.Xaml.Controls.Grid";
+    panel.framework = "winui3";
+    panel.nativeHandle = 0x123456789ABC;
+
+    Element button;
+    button.type = "Button";
+    button.className = "Microsoft.UI.Xaml.Controls.Button";
+    button.framework = "winui3";
+    button.nativeHandle = 0xFEDCBA987654;
+    panel.children.push_back(std::move(button));
+    root.children.push_back(std::move(panel));
+
+    assign_element_keys(root);
+
+    EXPECT_EQ(root.children[0].key, "winui3:0x123456789ABC");
+    EXPECT_EQ(root.children[0].children[0].key, "winui3:0xFEDCBA987654");
+    EXPECT_EQ(root.children[0].children[0].key.find(root.children[0].key),
+              std::string::npos);
+}
+
 TEST(ElementLookup, ResolvesByIdAndDurableKey) {
     Element root = key_el("Window");
     root.children.push_back(key_el("Button", "Save"));
