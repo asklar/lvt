@@ -1,10 +1,46 @@
 #include "element_key.h"
 #include <algorithm>
+#include <charconv>
 #include <iomanip>
 #include <map>
 #include <sstream>
 
 namespace lvt {
+
+bool parse_compact_xaml_key(const std::string& text, CompactXamlKey& out,
+                            std::string& error) {
+    std::string framework;
+    size_t digitsStart = 0;
+    if (text.rfind("xaml:0x", 0) == 0) {
+        framework = "xaml";
+        digitsStart = 7;
+    } else if (text.rfind("winui3:0x", 0) == 0) {
+        framework = "winui3";
+        digitsStart = 9;
+    } else {
+        error = "only compact XAML/WinUI3 keys (xaml:0xHANDLE or "
+                "winui3:0xHANDLE) support native property operations";
+        return false;
+    }
+
+    const char* first = text.data() + digitsStart;
+    const char* last = text.data() + text.size();
+    if (first == last) {
+        error = "XAML element key is missing its hexadecimal instance handle";
+        return false;
+    }
+
+    uintptr_t handle = 0;
+    const auto parsed = std::from_chars(first, last, handle, 16);
+    if (parsed.ec != std::errc() || parsed.ptr != last || handle == 0) {
+        error = "XAML element key has an invalid hexadecimal instance handle";
+        return false;
+    }
+
+    out.framework = std::move(framework);
+    out.handle = handle;
+    return true;
+}
 
 std::string escape_key_part(const std::string& value) {
     std::string result;

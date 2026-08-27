@@ -10,6 +10,7 @@
 #include "screenshot.h"
 #include "target.h"
 #include "tree_builder.h"
+#include "watch_diff.h"
 #include "providers/connection_registry.h"
 
 #ifdef LVT_ENABLE_UIA
@@ -34,6 +35,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -116,6 +118,14 @@ std::mutex g_sessionsMutex;
 std::map<std::string, Session> g_sessions;
 std::atomic<uint64_t> g_nextSession{1};
 std::atomic<uint64_t> g_nextScreenshot{1};
+
+struct VisualTreeSnapshot {
+    lvt::Element tree;
+    bool fastProperties = false;
+};
+
+std::mutex g_visualSnapshotsMutex;
+std::map<std::string, VisualTreeSnapshot> g_visualSnapshots;
 
 std::string add_session(const lvt::TargetInfo& target, bool visualMode) {
     Session session;
@@ -853,6 +863,10 @@ json method_disconnect(const json& params) {
         std::lock_guard<std::mutex> lock(g_connectionsMutex);
         g_sessionConnections.erase(id);
     }
+    {
+        std::lock_guard<std::mutex> lock(g_visualSnapshotsMutex);
+        g_visualSnapshots.erase(id);
+    }
     if (!stillReferenced)
         forget_target_lock(released);
     return json{{"disconnected", id}};
@@ -1056,6 +1070,189 @@ json method_get_tree(const json& params, bool uia) {
     if (truncated)
         out["truncated"] = truncation_note();
     return out;
+}
+
+std::string format_hresult(HRESULT hresult) {
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), "0x%08lX",
+             static_cast<unsigned long>(hresult));
+    return buffer;
+}
+
+uint32_t require_uint32(const json& params, const char* name) {
+    auto it = params.find(name);
+    uint64_t value = 0;
+    if (it == params.end() ||
+        (!it->is_number_unsigned() && !it->is_number_integer())) {
+        throw std::runtime_error(std::string("'") + name +
+                                 "' must be a non-negative 32-bit integer");
+    }
+    if (it->is_number_unsigned()) {
+        value = it->get<uint64_t>();
+    } else {
+        const auto signedValue = it->get<int64_t>();
+        if (signedValue < 0)
+            throw std::runtime_error(std::string("'") + name +
+                                     "' must be a non-negative 32-bit integer");
+        value = static_cast<uint64_t>(signedValue);
+    }
+    if (value > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error(std::string("'") + name +
+                                 "' must be a non-negative 32-bit integer");
+    }
+    return static_cast<uint32_t>(value);
+}
+
+lvt::CompactXamlKey require_compact_xaml_key(const json& params) {
+    const auto keyText = get_string(params, "key");
+    lvt::CompactXamlKey key;
+    std::string error;
+    if (!lvt::parse_compact_xaml_key(keyText, key, error))
+        throw std::runtime_error(error);
+    return key;
+}
+
+lvt::IFrameworkConnection* visual_property_connection(
+    const Session& session, const lvt::CompactXamlKey& key) {
+    const auto hostArch = lvt::get_host_architecture();
+    if (session.architecture != lvt::Architecture::unknown &&
+        hostArch != lvt::Architecture::unknown &&
+        session.architecture != hostArch) {
+        throw std::runtime_error(
+            std::string("native visual properties cannot be read across architectures: this "
+                        "lvt is ") +
+            lvt::architecture_name(hostArch) + " and the target is " +
+            lvt::architecture_name(session.architecture));
+    }
+
+    auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
+    auto lookup = connection_lookup_for_session(session, frameworks);
+    auto* connection = lookup ? lookup(key.framework) : nullptr;
+    if (!connection || !connection->is_alive()) {
+        throw std::runtime_error(
+            "no live " + key.framework +
+            " diagnostics connection is available for this session");
+    }
+    return connection;
+}
+
+json framework_property_result(
+    const std::string& key, const lvt::FrameworkPropertyResult& result) {
+    if (!result.ok) {
+        throw std::runtime_error(json{
+            {"error", result.error.empty() ? "native property operation failed" : result.error},
+            {"hresult", format_hresult(result.hresult)},
+        }.dump());
+    }
+
+    json out{{"ok", true}, {"key", key}};
+    if (result.hasProperties) {
+        out["properties"] = json::array();
+        for (const auto& property : result.properties) {
+            out["properties"].push_back({
+                {"name", property.name},
+                {"value", property.value},
+                {"valueType", property.valueType},
+                {"declaringType", property.declaringType},
+                {"propertyIndex", property.propertyIndex},
+                {"metadataBits", property.metadataBits},
+                {"overridden", property.overridden},
+                {"source", property.source},
+            });
+        }
+    }
+    if (result.hasValue)
+        out["value"] = result.value;
+    return out;
+}
+
+json method_get_visual_properties(const json& params) {
+    const auto session = require_session(params);
+    const auto key = require_compact_xaml_key(params);
+    TargetGuard guard(session.hwnd);
+    auto* connection = visual_property_connection(session, key);
+    return framework_property_result(
+        get_string(params, "key"), connection->get_properties(key.handle));
+}
+
+json method_set_visual_property(const json& params, bool allowInput) {
+    if (!allowInput) {
+        throw std::runtime_error(
+            "'set_visual_property' changes the target application, which needs --allow-input");
+    }
+    const auto session = require_session(params);
+    const auto key = require_compact_xaml_key(params);
+    const auto propertyIndex = require_uint32(params, "propertyIndex");
+    const auto valueType = get_string(params, "valueType");
+    if (valueType.empty())
+        throw std::runtime_error("'valueType' must be a non-empty string");
+    auto valueIt = params.find("value");
+    if (valueIt == params.end() || !valueIt->is_string())
+        throw std::runtime_error("'value' must be a string");
+    const auto value = valueIt->get<std::string>();
+
+    TargetGuard guard(session.hwnd);
+    auto* connection = visual_property_connection(session, key);
+    auto out = framework_property_result(
+        get_string(params, "key"),
+        connection->set_property(key.handle, propertyIndex, valueType, value));
+    out["propertyIndex"] = propertyIndex;
+    return out;
+}
+
+json method_clear_visual_property(const json& params, bool allowInput) {
+    if (!allowInput) {
+        throw std::runtime_error(
+            "'clear_visual_property' changes the target application, which needs --allow-input");
+    }
+    const auto session = require_session(params);
+    const auto key = require_compact_xaml_key(params);
+    const auto propertyIndex = require_uint32(params, "propertyIndex");
+
+    TargetGuard guard(session.hwnd);
+    auto* connection = visual_property_connection(session, key);
+    auto out = framework_property_result(
+        get_string(params, "key"),
+        connection->clear_property(key.handle, propertyIndex));
+    out["propertyIndex"] = propertyIndex;
+    out["cleared"] = true;
+    return out;
+}
+
+json method_get_visual_tree_changes(const json& params) {
+    const auto session = require_session(params);
+    lvt::Element current;
+    std::string error;
+    if (!build_tree_for(session, params, false, current, error))
+        throw std::runtime_error(error);
+
+    const bool fastProperties = get_bool(params, "fast", false);
+    bool snapshot = false;
+    std::vector<lvt::ChangeEvent> changes;
+    {
+        std::lock_guard<std::mutex> lock(g_visualSnapshotsMutex);
+        auto found = g_visualSnapshots.find(session.id);
+        if (found == g_visualSnapshots.end() ||
+            found->second.fastProperties != fastProperties) {
+            snapshot = true;
+            changes = lvt::snapshot_added_events(current);
+            g_visualSnapshots[session.id] =
+                VisualTreeSnapshot{std::move(current), fastProperties};
+        } else {
+            changes = lvt::diff_trees(found->second.tree, current);
+            found->second.tree = std::move(current);
+        }
+    }
+
+    json events = json::array();
+    for (const auto& change : changes) {
+        auto event = json::parse(lvt::serialize_change_event(change), nullptr, false);
+        if (!event.is_discarded())
+            events.push_back(std::move(event));
+    }
+    return json{{"tree", "visual"},
+                {"snapshot", snapshot},
+                {"events", std::move(events)}};
 }
 
 json method_get_frameworks(const json& params) {
@@ -1792,6 +1989,12 @@ json dispatch(const std::string& method, const json& params, bool allowInput) {
     if (method == "disconnect")  return method_disconnect(params);
     if (method == "get_uia_tree")    return method_get_tree(params, true);
     if (method == "get_visual_tree") return method_get_tree(params, false);
+    if (method == "get_visual_tree_changes") return method_get_visual_tree_changes(params);
+    if (method == "get_visual_properties") return method_get_visual_properties(params);
+    if (method == "set_visual_property")
+        return method_set_visual_property(params, allowInput);
+    if (method == "clear_visual_property")
+        return method_clear_visual_property(params, allowInput);
     if (method == "get_frameworks")  return method_get_frameworks(params);
     if (method == "find_elements")   return method_find_elements(params);
     if (method == "get_element_properties") return method_get_element_properties(params);

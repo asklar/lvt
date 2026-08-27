@@ -209,6 +209,79 @@ cached!(visual_tree, {
     }))
 });
 
+cached!(visual_tree_changes, {
+    result(json!({
+        "type": "object",
+        "properties": {
+            "tree": { "type": "string", "enum": ["visual"] },
+            "snapshot": {
+                "type": "boolean",
+                "description": "True when events describe a complete initial snapshot rather than a diff."
+            },
+            "events": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "event": { "type": "string", "enum": ["added", "removed", "changed"] },
+                        "key": { "type": "string" },
+                        "path": { "type": "string" },
+                        "element": element(),
+                        "fields": { "type": "object" }
+                    },
+                    "required": ["event", "key"]
+                }
+            }
+        },
+        "required": ["tree", "snapshot", "events"]
+    }))
+});
+
+cached!(visual_properties, {
+    result(json!({
+        "type": "object",
+        "properties": {
+            "ok": { "const": true },
+            "key": { "type": "string" },
+            "properties": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "value": { "type": "string" },
+                        "valueType": { "type": "string" },
+                        "declaringType": { "type": "string" },
+                        "propertyIndex": { "type": "integer" },
+                        "metadataBits": { "type": "integer" },
+                        "overridden": { "type": "boolean" },
+                        "source": { "type": "string" }
+                    },
+                    "required": [
+                        "name", "value", "valueType", "declaringType", "propertyIndex",
+                        "metadataBits", "overridden", "source"
+                    ]
+                }
+            }
+        },
+        "required": ["ok", "key", "properties"]
+    }))
+});
+
+cached!(visual_property_mutation, {
+    result(json!({
+        "type": "object",
+        "properties": {
+            "ok": { "const": true },
+            "key": { "type": "string" },
+            "propertyIndex": { "type": "integer" },
+            "value": { "type": "string" },
+            "cleared": { "type": "boolean" }
+        },
+        "required": ["ok", "key", "propertyIndex"]
+    }))
+});
+
 cached!(elements, {
     result(json!({
         "type": "object",

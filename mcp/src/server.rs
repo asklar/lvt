@@ -137,6 +137,51 @@ pub struct VisualTreeArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VisualTreeChangesArgs {
+    /// Session id returned by connect.
+    pub session: String,
+    /// Use the cheaper XAML/WinUI3 property set. Changing this setting resets
+    /// the session's diff baseline and returns a fresh snapshot.
+    pub fast: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VisualPropertiesArgs {
+    /// Session id returned by connect.
+    pub session: String,
+    /// Compact XAML diagnostics key from get_visual_tree, such as
+    /// "xaml:0x123" or "winui3:0xABC".
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetVisualPropertyArgs {
+    /// Session id returned by connect.
+    pub session: String,
+    /// Compact XAML diagnostics key from get_visual_tree.
+    pub key: String,
+    /// Dependency-property index returned by get_visual_properties.
+    #[serde(rename = "propertyIndex")]
+    pub property_index: u32,
+    /// xamlOM value type returned by get_visual_properties, such as "Double".
+    #[serde(rename = "valueType")]
+    pub value_type: String,
+    /// Text passed to IVisualTreeService::CreateInstance for conversion.
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClearVisualPropertyArgs {
+    /// Session id returned by connect.
+    pub session: String,
+    /// Compact XAML diagnostics key from get_visual_tree.
+    pub key: String,
+    /// Dependency-property index returned by get_visual_properties.
+    #[serde(rename = "propertyIndex")]
+    pub property_index: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindArgs {
     /// Session id returned by connect.
     pub session: String,
@@ -593,6 +638,43 @@ impl LvtServer {
     }
 
     #[tool(
+        description = "Return incremental framework-native visual-tree changes for this session. \
+                       The first call returns snapshot-added events; later calls return diffs \
+                       from the previous call, retaining watch-style patch semantics without a \
+                       separate watch subprocess.",
+        output_schema = crate::schema::visual_tree_changes(),
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn get_visual_tree_changes(
+        &self,
+        Parameters(a): Parameters<VisualTreeChangesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        forward(
+            "get_visual_tree_changes",
+            compact(json!({ "session": a.session, "fast": a.fast })),
+            self.allow_input,
+        ).await
+    }
+
+    #[tool(
+        description = "Get the complete XAML/WinUI3 dependency-property chain for one visual \
+                       element, including property indexes, value types, source, override state, \
+                       and metadata bits needed to decide whether each value is writable.",
+        output_schema = crate::schema::visual_properties(),
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn get_visual_properties(
+        &self,
+        Parameters(a): Parameters<VisualPropertiesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        forward(
+            "get_visual_properties",
+            json!({ "session": a.session, "key": a.key }),
+            self.allow_input,
+        ).await
+    }
+
+    #[tool(
         description = "List the UI frameworks detected in the connected application, with versions.",
         output_schema = crate::schema::frameworks(),
         annotations(read_only_hint = true, open_world_hint = true)
@@ -807,6 +889,52 @@ impl LvtServer {
     }
 
     #[tool(
+        description = "Set one writable scalar XAML/WinUI3 dependency property using the \
+                       property index and value type returned by get_visual_properties. The \
+                       value is converted by xamlOM before being applied.",
+        output_schema = crate::schema::visual_property_mutation(),
+        annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn set_visual_property(
+        &self,
+        Parameters(a): Parameters<SetVisualPropertyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        forward(
+            "set_visual_property",
+            json!({
+                "session": a.session,
+                "key": a.key,
+                "propertyIndex": a.property_index,
+                "valueType": a.value_type,
+                "value": a.value,
+            }),
+            self.allow_input,
+        ).await
+    }
+
+    #[tool(
+        description = "Clear one XAML/WinUI3 dependency property's local value so its inherited, \
+                       style, or default value becomes effective again. Use the property index \
+                       returned by get_visual_properties.",
+        output_schema = crate::schema::visual_property_mutation(),
+        annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn clear_visual_property(
+        &self,
+        Parameters(a): Parameters<ClearVisualPropertyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        forward(
+            "clear_visual_property",
+            json!({
+                "session": a.session,
+                "key": a.key,
+                "propertyIndex": a.property_index,
+            }),
+            self.allow_input,
+        ).await
+    }
+
+    #[tool(
         description = "Expand or collapse a tree item, combo box, or other expandable control.",
         output_schema = crate::schema::action(),
         annotations(destructive_hint = false, idempotent_hint = true, open_world_hint = true)
@@ -1010,21 +1138,24 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    const INSPECT_TOOLS: [&str; 11] = [
+    const INSPECT_TOOLS: [&str; 13] = [
         "connect",
         "disconnect",
         "find_elements",
         "get_element_properties",
         "get_frameworks",
         "get_uia_tree",
+        "get_visual_properties",
         "get_visual_tree",
+        "get_visual_tree_changes",
         "hit_test",
         "list_apps",
         "screenshot",
         "wait_for",
     ];
 
-    const INPUT_TOOLS: [&str; 12] = [
+    const INPUT_TOOLS: [&str; 14] = [
+        "clear_visual_property",
         "click",
         "focus",
         "invoke",
@@ -1034,6 +1165,7 @@ mod tests {
         "select_text",
         "set_expanded",
         "set_value",
+        "set_visual_property",
         "toggle",
         "type_text",
         "window_action",

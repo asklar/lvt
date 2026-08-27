@@ -37,6 +37,20 @@ std::string read_text_file(const std::string& path) {
     return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 }
 
+int count_tap_set_site_calls() {
+    wchar_t tempPath[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tempPath) == 0)
+        return 0;
+    std::ifstream log(std::wstring(tempPath) + L"lvt_tap.log", std::ios::binary);
+    int count = 0;
+    std::string line;
+    while (std::getline(log, line)) {
+        if (line.find("SetSite called") != std::string::npos)
+            ++count;
+    }
+    return count;
+}
+
 // A live MCP conversation with `lvt mcp` over anonymous pipes.
 //
 // Reading is done on a worker thread: a blocking ReadFile on a pipe cannot be
@@ -490,6 +504,7 @@ TEST(McpServer, ReadOnlyByDefaultAndInputOnlyWithTheFlag) {
     static constexpr const char* kMutating[] = {
         "click", "type_text", "press_key", "set_value", "toggle", "invoke",
         "scroll", "select", "set_expanded", "focus", "select_text", "window_action",
+        "set_visual_property", "clear_visual_property",
     };
 
     {
@@ -842,6 +857,177 @@ TEST_F(McpSampleFixture, VisualTreeIsAvailableAndDiffersFromTheUiaTree) {
     // The visual tree shows implementation structure — HWNDs and framework
     // types — that the UIA tree deliberately hides.
     EXPECT_NE(visual.dump().find("win32"), std::string::npos);
+}
+
+TEST_F(McpSampleFixture, VisualPropertiesAndDiffsReuseOnePersistentInjection) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto schemas = output_schemas(client);
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const int setSiteBefore = count_tap_set_site_calls();
+
+    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(visual.contains("root")) << visual.dump(2);
+    std::vector<const json*> elements;
+    collect_json_elements(visual["root"], elements);
+    const json* button = nullptr;
+    const json* status = nullptr;
+    for (const auto* element : elements) {
+        const auto name =
+            element->value("properties", json::object()).value("name", "");
+        if (name == "PrimaryButton")
+            button = element;
+        else if (name == "StatusText")
+            status = element;
+    }
+    ASSERT_NE(button, nullptr);
+    ASSERT_NE(status, nullptr);
+    const auto key = button->value("key", "");
+    const auto statusKey = status->value("key", "");
+    ASSERT_EQ(key.rfind("winui3:0x", 0), 0u);
+    ASSERT_EQ(statusKey.rfind("winui3:0x", 0), 0u);
+
+    bool isError = false;
+    auto properties = client.call_tool(
+        "get_visual_properties", json{{"session", session}, {"key", key}}, &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    ASSERT_TRUE(properties.contains("properties")) << properties.dump(2);
+    std::string schemaError;
+    EXPECT_TRUE(schema_allows(
+        schemas.at("get_visual_properties"), properties, schemaError)) << schemaError;
+
+    json opacity;
+    for (const auto& property : properties["properties"]) {
+        if (property.value("name", "") == "Opacity") {
+            opacity = property;
+            break;
+        }
+    }
+    ASSERT_FALSE(opacity.is_null()) << "PrimaryButton did not report Opacity";
+    ASSERT_EQ(opacity.value("metadataBits", uint64_t{0}) & 0x2, 0u);
+    const auto propertyIndex = opacity.value("propertyIndex", uint32_t{0});
+    const auto valueType = opacity.value("valueType", "");
+    ASSERT_FALSE(valueType.empty());
+
+    auto initialChanges = client.call_tool(
+        "get_visual_tree_changes", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << initialChanges.dump(2);
+    EXPECT_TRUE(initialChanges.value("snapshot", false));
+    EXPECT_FALSE(initialChanges.value("events", json::array()).empty());
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("get_visual_tree_changes"), initialChanges, schemaError)) << schemaError;
+
+    auto statusProperties = client.call_tool(
+        "get_visual_properties",
+        json{{"session", session}, {"key", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << statusProperties.dump(2);
+    json textProperty;
+    for (const auto& property : statusProperties["properties"]) {
+        if (property.value("name", "") == "Text") {
+            textProperty = property;
+            break;
+        }
+    }
+    ASSERT_FALSE(textProperty.is_null()) << "StatusText did not report Text";
+    const auto originalText = textProperty.value("value", "");
+    const auto changedText = "mcp \"quoted\"\nvalue";
+
+    auto set = client.call_tool(
+        "set_visual_property",
+        json{{"session", session},
+             {"key", key},
+             {"propertyIndex", propertyIndex},
+             {"valueType", valueType},
+             {"value", "0.5"}},
+        &isError);
+    ASSERT_FALSE(isError) << set.dump(2);
+    EXPECT_TRUE(set.value("ok", false));
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("set_visual_property"), set, schemaError)) << schemaError;
+
+    auto setText = client.call_tool(
+        "set_visual_property",
+        json{{"session", session},
+             {"key", statusKey},
+             {"propertyIndex", textProperty.value("propertyIndex", uint32_t{0})},
+             {"valueType", textProperty.value("valueType", "")},
+             {"value", changedText}},
+        &isError);
+    ASSERT_FALSE(isError) << setText.dump(2);
+    auto changedStatus = client.call_tool(
+        "get_visual_properties",
+        json{{"session", session}, {"key", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << changedStatus.dump(2);
+
+    auto changedProperties = client.call_tool(
+        "get_visual_properties", json{{"session", session}, {"key", key}}, &isError);
+    ASSERT_FALSE(isError) << changedProperties.dump(2);
+    auto property_value = [](const json& result, const char* name) {
+        for (const auto& property : result.value("properties", json::array())) {
+            if (property.value("name", "") == name)
+                return property.value("value", "");
+        }
+        return std::string();
+    };
+    ASSERT_FALSE(property_value(changedProperties, "Opacity").empty());
+    EXPECT_NEAR(std::stod(property_value(changedProperties, "Opacity")), 0.5, 0.001);
+    EXPECT_EQ(property_value(changedStatus, "Text"), changedText)
+        << "spaces, quotes, and newlines must survive the persistent TAP protocol";
+
+    auto changes = client.call_tool(
+        "get_visual_tree_changes", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << changes.dump(2);
+    EXPECT_FALSE(changes.value("snapshot", true));
+    bool sawTextChange = false;
+    for (const auto& event : changes.value("events", json::array())) {
+        const auto fields = event.value("fields", json::object());
+        sawTextChange = sawTextChange || fields.contains("text") ||
+                        fields.contains("properties.Text");
+    }
+    EXPECT_TRUE(sawTextChange) << changes.dump(2);
+
+    auto clear = client.call_tool(
+        "clear_visual_property",
+        json{{"session", session}, {"key", key}, {"propertyIndex", propertyIndex}},
+        &isError);
+    ASSERT_FALSE(isError) << clear.dump(2);
+    EXPECT_TRUE(clear.value("cleared", false));
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("clear_visual_property"), clear, schemaError)) << schemaError;
+
+    auto restoreText = client.call_tool(
+        "set_visual_property",
+        json{{"session", session},
+             {"key", statusKey},
+             {"propertyIndex", textProperty.value("propertyIndex", uint32_t{0})},
+             {"valueType", textProperty.value("valueType", "")},
+             {"value", originalText}},
+        &isError);
+    ASSERT_FALSE(isError) << restoreText.dump(2);
+
+    auto clearedProperties = client.call_tool(
+        "get_visual_properties", json{{"session", session}, {"key", key}}, &isError);
+    ASSERT_FALSE(isError) << clearedProperties.dump(2);
+    ASSERT_FALSE(property_value(clearedProperties, "Opacity").empty());
+    EXPECT_NEAR(std::stod(property_value(clearedProperties, "Opacity")), 1.0, 0.001);
+
+    auto afterClear = client.call_tool(
+        "get_visual_tree_changes", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << afterClear.dump(2);
+    EXPECT_FALSE(afterClear.value("snapshot", true));
+
+    auto disconnected = client.call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << disconnected.dump(2);
+    EXPECT_EQ(count_tap_set_site_calls() - setSiteBefore, 1)
+        << "one MCP session must reuse one TAP injection across tree reads and "
+           "get/set/clear property operations";
 }
 
 // --- driving the app ----------------------------------------------------

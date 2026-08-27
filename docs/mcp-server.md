@@ -53,6 +53,8 @@ work across them.
 | `disconnect` | Close a session |
 | `get_uia_tree` | The UI Automation tree — AutomationIds, control types, states, patterns. **This is the tree to automate against.** |
 | `get_visual_tree` | The framework-native tree — Win32/XAML/WPF/WinForms/Avalonia/Chromium. Shows *how a UI is built*; drive it from a `visual`-mode session |
+| `get_visual_tree_changes` | Session-scoped visual-tree patches: a snapshot on first call, then added/removed/changed events |
+| `get_visual_properties` | Complete editable XAML/WinUI3 dependency-property metadata for one compact visual key |
 | `get_frameworks` | UI frameworks detected in the target, with versions |
 | `find_elements` | Match by AutomationId, name, control type or supported pattern |
 | `get_element_properties` | One element's properties, or a named subset |
@@ -68,6 +70,8 @@ work across them.
 | `invoke` | InvokePattern only — never moves the mouse |
 | `toggle` | Flip a checkbox or toggle button |
 | `set_value` | Set a text or numeric value outright |
+| `set_visual_property` | Set a writable scalar XAML/WinUI3 dependency property |
+| `clear_visual_property` | Clear a local XAML/WinUI3 value so inheritance/style/default resolution resumes |
 | `set_expanded` | Expand or collapse a tree item or combo box |
 | `select` | Select a list item or tab (`replace`, `add`, `remove`) |
 | `focus` | Give an element keyboard focus |
@@ -128,6 +132,35 @@ This is enough to browse or search a tree by, and to hit-test/highlight
 elements, but it will not report arbitrary custom properties the way the
 default (`fast: false`) walk does — use `get_element_properties` for a single
 element's exhaustive property set regardless of which mode built the tree.
+
+### Incremental visual-tree updates
+
+`get_visual_tree_changes` retains one previous visual tree per MCP session.
+Its first call returns the current tree as flat `added` events with
+`"snapshot": true`; subsequent calls return the same `added`, `removed`, and
+`changed` patch events as `watch`, with `"snapshot": false`. Disconnecting
+clears the baseline. Changing the `fast` setting also starts a fresh snapshot,
+because full and fast trees intentionally carry different property sets.
+
+### Editing XAML/WinUI3 dependency properties
+
+`get_visual_properties` accepts a compact `xaml:0x…` or `winui3:0x…` key from
+the visual tree and returns the complete deduplicated property chain. Each row
+includes `propertyIndex`, `valueType`, `declaringType`, `metadataBits`,
+`overridden`, and `source`. Structural, UIA, WPF, and other provider keys are
+rejected because they do not identify an `IVisualTreeService` object.
+
+Use the returned index and type without guessing:
+
+```json
+{"name":"set_visual_property","arguments":{"session":"s1","key":"winui3:0x123","propertyIndex":42,"valueType":"Double","value":"100"}}
+{"name":"clear_visual_property","arguments":{"session":"s1","key":"winui3:0x123","propertyIndex":42}}
+```
+
+Setting and clearing require `lvt mcp --allow-input`. Clearing removes the
+local value, allowing its inherited, style, or default value to become active.
+Tree reads and all three property operations share the session's existing
+persistent TAP connection: there is no second injection or side protocol.
 
 ## Addressing elements
 

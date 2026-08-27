@@ -127,7 +127,6 @@ set(LVT_CORE_SOURCES
     src/element_key.cpp
     src/json_serializer.cpp
     src/watch_diff.cpp
-    src/watch_control.cpp
     src/screenshot.cpp
     src/module_util.cpp
     src/input.cpp
@@ -960,9 +959,6 @@ set(LVT_INTEGRATION_DEPS wpf_sample_app winui3_sample_app)
 if(LVT_BUILD_TOOL)
     list(APPEND LVT_INTEGRATION_DEPS lvt)
 endif()
-if(TARGET lvt_tap)
-    list(APPEND LVT_INTEGRATION_DEPS lvt_tap)
-endif()
 if(LVT_ENABLE_WINFORMS)
     list(APPEND LVT_INTEGRATION_DEPS lvt_winforms_tap winforms_sample_app)
 endif()
@@ -994,6 +990,9 @@ if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
         nlohmann_json::nlohmann_json
     )
     add_dependencies(lvt_mcp_tests lvt)
+    if(TARGET lvt_tap)
+        add_dependencies(lvt_mcp_tests lvt_tap)
+    endif()
     if(TARGET winui3_sample_app)
         add_dependencies(lvt_mcp_tests winui3_sample_app)
     endif()

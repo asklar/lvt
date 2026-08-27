@@ -1,11 +1,23 @@
 #pragma once
 #include "element.h"
+#include <cstdint>
 #include <string>
 
 namespace lvt {
 
+struct CompactXamlKey {
+    std::string framework;
+    uintptr_t handle = 0;
+};
+
 std::string escape_key_part(const std::string& value);
 std::string base_identity_key(const Element& el);
+
+// Parse a process-wide XAML diagnostics identity produced by
+// assign_element_keys. Structural and non-XAML keys cannot address an object
+// for IVisualTreeService property operations and are rejected explicitly.
+bool parse_compact_xaml_key(const std::string& text, CompactXamlKey& out,
+                            std::string& error);
 
 // A stable, human-meaningful identifier for `el` drawn from the first of
 // AutomationId / x:Name / Name (and their lowercase property-bag spellings)

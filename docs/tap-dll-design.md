@@ -26,7 +26,7 @@ sequenceDiagram
         target->>lvt: one JSON line (the current tree)
     end
 
-    opt watch --control property request
+    opt Persistent property request (for example, an MCP session)
         lvt->>target: GET_PROPERTIES / SET_PROPERTY / CLEAR_PROPERTY
         target->>target: dispatch xamlOM operation to SetSite's UI thread
         target->>lvt: correlated PROPERTY_RESULT JSON line
@@ -197,7 +197,9 @@ Every message on the pipe is one line (UTF-8, `\n`-terminated). lvt.exe → TAP 
 | TAP → lvt | `{"type":"PROPERTY_RESULT","commandId":...}` | Correlated typed property result; unsolicited `CHANGE` lines may appear before it |
 | lvt → TAP | `DISCONNECT` | End the connection; TAP DLL replies `BYE`, then runs its cleanup |
 
-Parsed and grafted by `graft_xaml_tree_json()` in `xaml_diag_common.cpp`.
+Tree responses are parsed and grafted by `graft_xaml_tree_json()` in
+`xaml_diag_common.cpp`; typed property responses are returned through the
+session's `IFrameworkConnection`.
 `typeHex` and `valueHex` are the UTF-8 bytes rendered as hexadecimal (with `-`
 for an empty string), so spaces, quotes, newlines, and non-ASCII values remain
 unambiguous without adding a JSON dependency to the injected DLL. The pipe

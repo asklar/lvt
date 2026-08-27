@@ -225,7 +225,6 @@ lvt wait-for e9 --wait-prop IsEnabled=true --name myapp
 | `--output <file>` | Write to a file instead of stdout, or the PNG path for `screenshot` |
 | `--format <fmt>` | `json` (default) or `xml` |
 | `--interval <ms>` | Polling interval for `watch` (default: 500) |
-| `--control` | `watch` only: accept correlated NDJSON XAML/WinUI3 property get/set/clear requests on redirected stdin. This is an internal subprocess channel for the viewer |
 | `--fast` | Skip the XAML/WinUI3 property-chain walk (`GetPropertyValuesChain`) in favor of cheap direct property reads. Much faster on a rich tree — still reports bounds, `Text`, `Content`, and basic state, but not arbitrary custom properties. Default is off (today's exhaustive collection) |
 | `--element <ref>` | Scope to a specific element subtree by positional `eN` id, durable key, or `uia:<RuntimeId>` |
 | `--uia` | Use the UI Automation tree instead of the visual tree |
@@ -447,19 +446,6 @@ the positional `e0`, `e1`, ... ids, so unique moved elements are reported as
 instead of the full XAML/WinUI3 property chain, so `changed` events on an
 arbitrary custom property outside bounds/Text/Content/basic state won't be
 reported — only those properties are tracked and diffed in fast mode.
-
-`watch --control` keeps the same persistent XAML/WinUI3 diagnostics connection
-used by tree ticks and also polls redirected stdin without blocking those ticks.
-Each input line is a JSON request with a numeric `requestId`; the matching
-`{"event":"command_result",...}` line is interleaved safely with normal tree
-events on stdout. Property commands accept only compact diagnostics keys such
-as `winui3:0x123`, never structural or UIA keys:
-
-```json
-{"requestId":1,"command":"get_properties","key":"winui3:0x123"}
-{"requestId":2,"command":"set_property","key":"winui3:0x123","propertyIndex":42,"valueType":"Double","value":"100"}
-{"requestId":3,"command":"clear_property","key":"winui3:0x123","propertyIndex":42}
-```
 
 ### JSON
 

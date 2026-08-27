@@ -7,7 +7,6 @@
 #include "element_key.h"
 #include "json_serializer.h"
 #include "watch_diff.h"
-#include "watch_control.h"
 #include "framework_detector.h"
 #include "target.h"
 #include "providers/winforms_inject.h"
@@ -505,126 +504,21 @@ TEST(ElementKeys, XamlInstanceHandlesUseCompactProcessWideKeys) {
               std::string::npos);
 }
 
-// ---- watch --control property protocol ----
-
-TEST(WatchControl, ParsesCompactXamlKeys) {
-    XamlElementKey key;
+TEST(ElementKeys, ParsesOnlyCompactXamlInstanceKeys) {
+    CompactXamlKey key;
     std::string error;
-    ASSERT_TRUE(parse_xaml_element_key("xaml:0x123ABC", key, error));
+    ASSERT_TRUE(parse_compact_xaml_key("xaml:0x123ABC", key, error));
     EXPECT_EQ(key.framework, "xaml");
     EXPECT_EQ(key.handle, 0x123ABCu);
 
-    ASSERT_TRUE(parse_xaml_element_key("winui3:0xFEDCBA987654", key, error));
+    ASSERT_TRUE(parse_compact_xaml_key("winui3:0xFEDCBA987654", key, error));
     EXPECT_EQ(key.framework, "winui3");
     EXPECT_EQ(key.handle, 0xFEDCBA987654u);
-}
 
-TEST(WatchControl, RejectsStructuralAndMalformedKeys) {
-    XamlElementKey key;
-    std::string error;
-    EXPECT_FALSE(parse_xaml_element_key("win32|Window/winui3|Button", key, error));
+    EXPECT_FALSE(parse_compact_xaml_key("win32|Window/winui3|Button", key, error));
     EXPECT_NE(error.find("compact XAML/WinUI3"), std::string::npos);
-    EXPECT_FALSE(parse_xaml_element_key("winui3:0xZZ", key, error));
-    EXPECT_FALSE(parse_xaml_element_key("xaml:0x0", key, error));
-}
-
-TEST(WatchControl, ParsesGetSetAndClearRequests) {
-    auto get = parse_watch_control_request(
-        R"({"requestId":1,"command":"get_properties","key":"xaml:0x123"})");
-    ASSERT_TRUE(get.ok) << get.error;
-    EXPECT_EQ(get.request.requestId, 1u);
-    EXPECT_EQ(get.request.command, WatchControlCommand::getProperties);
-    EXPECT_EQ(get.request.element.framework, "xaml");
-    EXPECT_EQ(get.request.element.handle, 0x123u);
-
-    auto set = parse_watch_control_request(
-        "{\"requestId\":2,\"command\":\"set_property\","
-        "\"key\":\"winui3:0xABC\",\"propertyIndex\":42,"
-        "\"valueType\":\"System.String\",\"value\":\"spaces, \\\"quotes\\\" and\\nnewlines\"}");
-    ASSERT_TRUE(set.ok) << set.error;
-    EXPECT_EQ(set.request.command, WatchControlCommand::setProperty);
-    EXPECT_EQ(set.request.propertyIndex, 42u);
-    EXPECT_EQ(set.request.valueType, "System.String");
-    EXPECT_EQ(set.request.value, "spaces, \"quotes\" and\nnewlines");
-
-    auto clear = parse_watch_control_request(
-        R"({"requestId":3,"command":"clear_property","key":"winui3:0xABC","propertyIndex":42})");
-    ASSERT_TRUE(clear.ok) << clear.error;
-    EXPECT_EQ(clear.request.command, WatchControlCommand::clearProperty);
-    EXPECT_EQ(clear.request.propertyIndex, 42u);
-}
-
-TEST(WatchControl, ReportsActionableParseErrorsWithRequestId) {
-    auto structural = parse_watch_control_request(
-        R"({"requestId":9,"command":"get_properties","key":"win32|Button"})");
-    EXPECT_FALSE(structural.ok);
-    EXPECT_EQ(structural.requestId, 9u);
-    EXPECT_NE(structural.error.find("compact XAML/WinUI3"), std::string::npos);
-
-    auto missingValue = parse_watch_control_request(
-        R"({"requestId":10,"command":"set_property","key":"xaml:0x1","propertyIndex":3,"valueType":"Double"})");
-    EXPECT_FALSE(missingValue.ok);
-    EXPECT_EQ(missingValue.requestId, 10u);
-    EXPECT_NE(missingValue.error.find("string value"), std::string::npos);
-
-    auto overflow = parse_watch_control_request(
-        R"({"requestId":11,"command":"clear_property","key":"xaml:0x1","propertyIndex":4294967296})");
-    EXPECT_FALSE(overflow.ok);
-    EXPECT_NE(overflow.error.find("32-bit"), std::string::npos);
-
-    auto malformed = parse_watch_control_request("{not json");
-    EXPECT_FALSE(malformed.ok);
-    EXPECT_EQ(malformed.requestId, 0u);
-}
-
-TEST(WatchControl, SerializesPropertyAndMutationResults) {
-    FrameworkPropertyResult result;
-    result.ok = true;
-    result.hresult = S_OK;
-    result.error.clear();
-    result.hasProperties = true;
-    FrameworkProperty property;
-    property.name = "Text";
-    property.value = "a \"quoted\"\nvalue";
-    property.valueType = "String";
-    property.declaringType = "Microsoft.UI.Xaml.Controls.TextBlock";
-    property.propertyIndex = 42;
-    property.metadataBits = 0x10;
-    property.overridden = true;
-    property.source = "Local";
-    result.properties.push_back(property);
-
-    auto response = json::parse(serialize_watch_command_result(12, result));
-    EXPECT_EQ(response["event"], "command_result");
-    EXPECT_EQ(response["requestId"], 12);
-    EXPECT_TRUE(response["ok"]);
-    ASSERT_EQ(response["properties"].size(), 1);
-    EXPECT_EQ(response["properties"][0]["value"], property.value);
-    EXPECT_EQ(response["properties"][0]["propertyIndex"], 42);
-    EXPECT_EQ(response["properties"][0]["metadataBits"], 0x10);
-    EXPECT_TRUE(response["properties"][0]["overridden"]);
-
-    result.properties.clear();
-    response = json::parse(serialize_watch_command_result(13, result));
-    EXPECT_TRUE(response["properties"].is_array());
-    EXPECT_TRUE(response["properties"].empty());
-
-    result.hasProperties = false;
-    result.hasValue = true;
-    result.value = "100";
-    response = json::parse(serialize_watch_command_result(14, result));
-    EXPECT_EQ(response["value"], "100");
-    EXPECT_FALSE(response.contains("properties"));
-}
-
-TEST(WatchControl, SerializesFailuresWithHresult) {
-    auto response = json::parse(serialize_watch_command_error(
-        14, E_ACCESSDENIED, "SetProperty refused a read-only property"));
-    EXPECT_EQ(response["event"], "command_result");
-    EXPECT_EQ(response["requestId"], 14);
-    EXPECT_FALSE(response["ok"]);
-    EXPECT_EQ(response["error"], "SetProperty refused a read-only property");
-    EXPECT_EQ(response["hresult"], "0x80070005");
+    EXPECT_FALSE(parse_compact_xaml_key("winui3:0xZZ", key, error));
+    EXPECT_FALSE(parse_compact_xaml_key("xaml:0x0", key, error));
 }
 
 TEST(ElementLookup, ResolvesByIdAndDurableKey) {
