@@ -3,19 +3,8 @@
 #include <algorithm>
 #include <optional>
 #include <string>
-#include <string_view>
 
 namespace lvt::detail {
-
-inline bool is_confirmed_xaml_flags_type(std::string_view typeName) {
-    return typeName == "Windows.UI.Xaml.Input.ManipulationModes" ||
-           typeName == "Microsoft.UI.Xaml.Input.ManipulationModes";
-}
-
-inline bool is_confirmed_xaml_flags_type(std::wstring_view typeName) {
-    return typeName == L"Windows.UI.Xaml.Input.ManipulationModes" ||
-           typeName == L"Microsoft.UI.Xaml.Input.ManipulationModes";
-}
 
 template <typename String, typename Members>
 std::optional<String> canonicalize_enum_member_list(

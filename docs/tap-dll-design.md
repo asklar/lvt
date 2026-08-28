@@ -231,14 +231,16 @@ cached catalog once with `GET_ENUMS`; subsequent property reads reuse it.
 Descriptor choice values are enum member names, which are the canonical strings
 passed to `CreateInstance`, while machine values are retained to translate
 numeric property snapshots and preserve aliases. `GetEnums` exposes no flags
-bit, so the provider carries an explicit, conservative flags classification
-for known XAML runtime types; ordinary enums are never inferred to be flags
-from their numeric shape. Comma-separated values are accepted only for a
-confirmed flags type and only when every trimmed token is a catalog member;
-the normalized member list is then passed to `CreateInstance` as the final
-authority. Composite numeric flags readback is decomposed in stable catalog
-order, and any unknown residual bits remain explicit as `0xXXXXXXXX`.
-Unmatched ordinary-enum numerics remain unchanged.
+bit, so the TAP resolves each enum's WinRT metadata once and checks for
+`System.FlagsAttribute`, caching a per-type `yes`/`no`/`unknown`
+classification with the catalog. Ordinary enums are never inferred to be
+flags from power-of-two member values. Comma-separated values are accepted for
+confirmed flags types and, when metadata is unresolved, are safely deferred to
+`CreateInstance` after every token is checked against the catalog. Confirmed
+non-flags reject comma syntax consistently in host and TAP. Composite numeric
+readback is decomposed only for confirmed flags; unknown residual bits remain
+explicit as `0xXXXXXXXX`, while non-flags and unresolved types preserve the
+original numeric string.
 
 `OnVisualTreeChange` performs no pipe I/O. It only updates the tracked tree and
 enqueues a bounded in-memory structural record. `GET_TREE` and `POLL_EVENTS`

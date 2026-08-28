@@ -2443,7 +2443,8 @@ TEST(XamlEnumParser, DeepCopiesAliasesAndSanitizesTypeNames) {
     ASSERT_EQ(copied.size(), 1u);
     EXPECT_EQ(
         copied[0].name, L"Microsoft.UI.Xaml.TextAlignment");
-    EXPECT_FALSE(copied[0].isFlags);
+    EXPECT_EQ(
+        copied[0].flagsKind, XamlEnumFlagsKind::unknown);
     ASSERT_EQ(copied[0].members.size(), 3u);
     EXPECT_EQ(copied[0].members[0].machineValue, 0);
     EXPECT_EQ(copied[0].members[0].name, L"Left");
@@ -2481,7 +2482,8 @@ TEST(XamlEnumCatalog, AssociatesChoicesCanonicalValuesAndAliases) {
             {0, "Start"},
             {1, "Center"},
             {2, "Right"},
-        });
+        },
+        XamlEnumFlagsKind::nonFlags);
 
     const auto choices =
         catalog.choices_for("Microsoft.UI.Xaml.TextAlignment");
@@ -2519,8 +2521,12 @@ TEST(XamlEnumCatalog, AssociatesChoicesCanonicalValuesAndAliases) {
 TEST(XamlEnumCatalog, ConnectionCatalogsRemainIsolated) {
     XamlEnumCatalog systemXaml;
     XamlEnumCatalog winui;
-    systemXaml.add("Shared.Enum", {{0, "SystemValue"}});
-    winui.add("Shared.Enum", {{0, "WinUIValue"}});
+    systemXaml.add(
+        "Shared.Enum", {{0, "SystemValue"}},
+        XamlEnumFlagsKind::nonFlags);
+    winui.add(
+        "Shared.Enum", {{0, "WinUIValue"}},
+        XamlEnumFlagsKind::nonFlags);
 
     EXPECT_TRUE(systemXaml.accepts("Shared.Enum", "SystemValue"));
     EXPECT_FALSE(systemXaml.accepts("Shared.Enum", "WinUIValue"));
@@ -2539,7 +2545,7 @@ TEST(XamlEnumCatalog, FlagsAcceptCompositeNamesAndPreserveResidualBits) {
             {2, "TranslateY"},
             {4, "Scale"},
         },
-        true);
+        XamlEnumFlagsKind::flags);
 
     EXPECT_EQ(
         catalog.canonical_input(
@@ -2575,14 +2581,56 @@ TEST(XamlEnumCatalog, FlagsAcceptCompositeNamesAndPreserveResidualBits) {
 }
 
 TEST(XamlEnumCatalog, FlagsDetectionIsConservativeAndProviderOwned) {
-    EXPECT_TRUE(detail::is_confirmed_xaml_flags_type(
-        "Microsoft.UI.Xaml.Input.ManipulationModes"));
-    EXPECT_TRUE(detail::is_confirmed_xaml_flags_type(
-        L"Windows.UI.Xaml.Input.ManipulationModes"));
-    EXPECT_FALSE(detail::is_confirmed_xaml_flags_type(
-        "Microsoft.UI.Xaml.TextAlignment"));
-    EXPECT_FALSE(detail::is_confirmed_xaml_flags_type(
-        L"Windows.UI.Xaml.Visibility"));
+    EXPECT_EQ(
+        resolve_xaml_enum_flags_metadata(
+            L"Windows.UI.Text.TextDecorations"),
+        XamlEnumFlagsKind::flags);
+    EXPECT_EQ(
+        resolve_xaml_enum_flags_metadata(
+            L"Windows.UI.Xaml.Input.ManipulationModes"),
+        XamlEnumFlagsKind::flags);
+    EXPECT_EQ(
+        resolve_xaml_enum_flags_metadata(
+            L"Windows.UI.Xaml.TextAlignment"),
+        XamlEnumFlagsKind::nonFlags);
+    EXPECT_EQ(
+        resolve_xaml_enum_flags_metadata(
+            L"Contoso.Unresolvable.CustomEnum"),
+        XamlEnumFlagsKind::unknown);
+}
+
+TEST(XamlEnumCatalog, MetadataClassificationIsCachedPerType) {
+    int probes = 0;
+    XamlEnumFlagsCache cache(
+        [&](std::wstring_view) {
+            ++probes;
+            return XamlEnumFlagsKind::flags;
+        });
+
+    EXPECT_EQ(
+        cache.classify(L"Contoso.Flags"),
+        XamlEnumFlagsKind::flags);
+    EXPECT_EQ(
+        cache.classify(L"Contoso.Flags"),
+        XamlEnumFlagsKind::flags);
+    EXPECT_EQ(probes, 1);
+    EXPECT_EQ(cache.size(), 1u);
+}
+
+TEST(XamlEnumCatalog, UnresolvedTypesDeferCompositeInputWithoutDecomposition) {
+    XamlEnumCatalog catalog;
+    catalog.add(
+        "Contoso.CustomEnum",
+        {{1, "First"}, {2, "Second"}},
+        XamlEnumFlagsKind::unknown);
+
+    EXPECT_EQ(
+        catalog.canonical_input(
+            "Contoso.CustomEnum", " First , Second "),
+        std::optional<std::string>("First,Second"));
+    EXPECT_EQ(
+        catalog.canonical_value("Contoso.CustomEnum", "3"),
+        std::optional<std::string>("3"));
 }
 
 TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {

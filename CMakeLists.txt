@@ -127,6 +127,7 @@ set(LVT_CORE_SOURCES
     src/element_key.cpp
     src/json_serializer.cpp
     src/watch_diff.cpp
+    src/xaml_flags_metadata.cpp
     src/screenshot.cpp
     src/module_util.cpp
     src/input.cpp
@@ -567,11 +568,12 @@ endif()
 if(LVT_ENABLE_XAML OR LVT_ENABLE_WINUI3)
 add_library(lvt_tap SHARED
     src/tap/lvt_tap.cpp
+    src/xaml_flags_metadata.cpp
     src/tap/lvt_tap.def
 )
 target_compile_definitions(lvt_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN)
 target_include_directories(lvt_tap PRIVATE src src/tap/winui3)
-target_link_libraries(lvt_tap PRIVATE WIL::WIL ole32)
+target_link_libraries(lvt_tap PRIVATE WIL::WIL ole32 windowsapp)
 set_property(TARGET lvt_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Place lvt_tap_{arch}.dll next to lvt.exe

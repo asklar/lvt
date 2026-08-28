@@ -897,7 +897,8 @@ private:
                 }
                 catalog.add(
                     typeName, std::move(members),
-                    typeValue.value("flags", false));
+                    parse_xaml_enum_flags_kind(
+                        typeValue.value("flags", "unknown")));
             }
             m_enumCatalog = std::move(catalog);
             return true;

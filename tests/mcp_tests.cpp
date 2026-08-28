@@ -2014,6 +2014,82 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         &isError);
     ASSERT_FALSE(isError) << restoreManipulationMode.dump(2);
 
+    const auto* textDecorations =
+        find_property_descriptor(statusProperties, "TextDecorations");
+    ASSERT_NE(textDecorations, nullptr)
+        << "StatusText did not report TextDecorations";
+    EXPECT_EQ(textDecorations->value("kind", ""), "enum");
+    const auto decorationsDescriptorId =
+        textDecorations->value("descriptorId", "");
+    ASSERT_FALSE(decorationsDescriptorId.empty());
+    const auto decorationChoices =
+        textDecorations->value("choices", json::array());
+    std::string expectedDecorations;
+    bool hasUnderline = false;
+    bool hasStrikethrough = false;
+    for (const auto& choice : decorationChoices) {
+        const auto choiceValue = choice.value("value", "");
+        if (choiceValue != "Underline" &&
+            choiceValue != "Strikethrough") {
+            continue;
+        }
+        hasUnderline = hasUnderline || choiceValue == "Underline";
+        hasStrikethrough =
+            hasStrikethrough || choiceValue == "Strikethrough";
+        if (!expectedDecorations.empty())
+            expectedDecorations += ",";
+        expectedDecorations += choiceValue;
+    }
+    ASSERT_TRUE(hasUnderline) << decorationChoices.dump(2);
+    ASSERT_TRUE(hasStrikethrough) << decorationChoices.dump(2);
+    const auto originalDecorations =
+        typed_property_value(statusProperties, "TextDecorations");
+    ASSERT_FALSE(originalDecorations.empty());
+
+    auto setDecorations = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", decorationsDescriptorId},
+             {"value", " Strikethrough , Underline "}},
+        &isError);
+    ASSERT_FALSE(isError) << setDecorations.dump(2);
+    EXPECT_EQ(
+        setDecorations.value("value", ""), expectedDecorations);
+    auto decoratedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << decoratedProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(decoratedProperties, "TextDecorations"),
+        expectedDecorations);
+
+    auto invalidDecorations = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", decorationsDescriptorId},
+             {"value", "Underline,NotADecoration"}},
+        &isError);
+    EXPECT_TRUE(isError) << invalidDecorations.dump(2);
+    auto afterInvalidDecorations = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << afterInvalidDecorations.dump(2);
+    EXPECT_EQ(
+        typed_property_value(
+            afterInvalidDecorations, "TextDecorations"),
+        expectedDecorations);
+
+    auto restoreDecorations = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", decorationsDescriptorId},
+             {"value", originalDecorations}},
+        &isError);
+    ASSERT_FALSE(isError) << restoreDecorations.dump(2);
+
     auto unknown = client.call_tool(
         "set_property",
         json{{"session", session},

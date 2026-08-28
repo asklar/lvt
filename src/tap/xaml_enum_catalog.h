@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "../xaml_enum_util.h"
+#include "../xaml_flags_metadata.h"
 
 namespace lvt::tap {
 
@@ -22,7 +22,7 @@ struct EnumMember {
 
 struct EnumTypeInfo {
     std::wstring name;
-    bool isFlags = false;
+    XamlEnumFlagsKind flagsKind = XamlEnumFlagsKind::unknown;
     std::vector<EnumMember> members;
 };
 
@@ -116,8 +116,6 @@ inline HRESULT copy_enum_types(
                 values[i].Name, SysStringLen(values[i].Name)));
             if (copied.name.empty())
                 return E_INVALIDARG;
-            copied.isFlags =
-                detail::is_confirmed_xaml_flags_type(copied.name);
 
             const LONG memberCount =
                 intsUpper >= intsLower ? intsUpper - intsLower + 1 : 0;

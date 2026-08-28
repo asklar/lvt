@@ -229,14 +229,19 @@ trusted for mutation. Each persistent XAML connection also fetches its runtime
 enum catalog once. Enum descriptors expose ordered provider-owned choices and
 aliases. Flags values
 accept comma-separated member names only when the provider has explicitly
-confirmed that runtime enum type as flags; surrounding whitespace is
-normalized and every token must exist in the runtime catalog, after which
-`CreateInstance` remains the final validity check. Composite numeric flags
-readback is rendered in stable catalog order, with unknown residual bits
-retained as hexadecimal instead of silently discarded. Unmatched numeric
-values and comma-separated input for ordinary enums are never fabricated into
-combinations. System XAML and WinUI catalogs stay isolated with their owning
-connections. External plugin ABI support is not part of this contract.
+confirmed `System.FlagsAttribute` through WinRT metadata; surrounding
+whitespace is normalized and every token must exist in the runtime catalog,
+after which `CreateInstance` remains the final validity check. Composite
+numeric flags readback is rendered in stable catalog order, with unknown
+residual bits retained as hexadecimal instead of silently discarded.
+Unmatched numeric values and comma-separated input for confirmed ordinary
+enums are never fabricated into combinations. Unresolved/custom enum metadata
+is explicit: validated comma syntax is deferred to `CreateInstance`, but
+numeric values are preserved unchanged because flags semantics are unknown.
+System XAML and WinUI catalogs stay isolated with their owning connections.
+Other built-in provider adapters can implement the same contract without
+adding framework catalogs to clients. External plugin ABI support is not part
+of this contract.
 
 Tree reads and all three property operations share the session's existing
 persistent connection: there is no second injection or side protocol.

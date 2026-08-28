@@ -244,6 +244,7 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     static constexpr size_t kMaxChangeEvents = 4096;
     lvt::BoundedEventQueue<TapChangeEvent, kMaxChangeEvents> m_changeEvents;
     std::vector<lvt::tap::EnumTypeInfo> m_enumCatalog;
+    lvt::XamlEnumFlagsCache m_enumFlagsCache;
     bool m_enumCatalogServed = false;
 
 public:
@@ -518,6 +519,8 @@ public:
             LogMsg("GetEnums deep copy failed: 0x%08X", copyHr);
             return;
         }
+        for (auto& type : copied)
+            type.flagsKind = m_enumFlagsCache.classify(type.name);
         m_enumCatalog = std::move(copied);
     }
 
@@ -529,6 +532,16 @@ public:
                 return type.name == typeName;
             });
         return found == m_enumCatalog.end() ? nullptr : &*found;
+    }
+
+    static const wchar_t* FlagsKindNameWide(
+        lvt::XamlEnumFlagsKind kind) {
+        switch (kind) {
+        case lvt::XamlEnumFlagsKind::nonFlags: return L"no";
+        case lvt::XamlEnumFlagsKind::flags: return L"yes";
+        case lvt::XamlEnumFlagsKind::unknown: return L"unknown";
+        }
+        return L"unknown";
     }
 
     static std::wstring TakeBstr(BSTR& value) {
@@ -726,7 +739,8 @@ public:
                 const auto canonical =
                     lvt::detail::canonicalize_enum_member_list(
                         command.value, enumType->members,
-                        enumType->isFlags);
+                        enumType->flagsKind !=
+                            lvt::XamlEnumFlagsKind::nonFlags);
                 if (!canonical) {
                     command.hresult = E_INVALIDARG;
                     command.error =
@@ -939,8 +953,9 @@ public:
                 response += L",";
             const auto& type = m_enumCatalog[i];
             response += L"{\"name\":\"" + Escape(type.name) +
-                        L"\",\"flags\":" +
-                        (type.isFlags ? L"true" : L"false") +
+                        L"\",\"flags\":\"" +
+                        FlagsKindNameWide(type.flagsKind) +
+                        L"\"" +
                         L",\"members\":[";
             for (size_t j = 0; j < type.members.size(); ++j) {
                 if (j)

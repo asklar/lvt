@@ -2,6 +2,7 @@
 
 #include "framework_connection.h"
 #include "../xaml_enum_util.h"
+#include "../xaml_flags_metadata.h"
 
 #include <algorithm>
 #include <charconv>
@@ -21,7 +22,7 @@ struct XamlEnumMember {
 };
 
 struct XamlEnumTypeInfo {
-    bool isFlags = false;
+    XamlEnumFlagsKind flagsKind = XamlEnumFlagsKind::unknown;
     std::vector<XamlEnumMember> members;
 };
 
@@ -29,10 +30,10 @@ class XamlEnumCatalog {
 public:
     void add(
         std::string typeName, std::vector<XamlEnumMember> members,
-        bool isFlags = false) {
+        XamlEnumFlagsKind flagsKind = XamlEnumFlagsKind::unknown) {
         m_types.insert_or_assign(
             std::move(typeName),
-            XamlEnumTypeInfo{isFlags, std::move(members)});
+            XamlEnumTypeInfo{flagsKind, std::move(members)});
     }
 
     const XamlEnumTypeInfo* find(
@@ -64,7 +65,8 @@ public:
         if (!type)
             return std::nullopt;
         return detail::canonicalize_enum_member_list(
-            value, type->members, type->isFlags);
+            value, type->members,
+            type->flagsKind != XamlEnumFlagsKind::nonFlags);
     }
 
     std::optional<std::string> canonical_value(
@@ -74,7 +76,8 @@ public:
             return std::nullopt;
         if (auto names =
                 detail::canonicalize_enum_member_list(
-                    value, type->members, type->isFlags)) {
+                    value, type->members,
+                    type->flagsKind != XamlEnumFlagsKind::nonFlags)) {
             return names;
         }
 
@@ -89,7 +92,7 @@ public:
             if (member.machineValue == numeric)
                 return member.name;
         }
-        if (!type->isFlags)
+        if (type->flagsKind != XamlEnumFlagsKind::flags)
             return value;
 
         uint32_t remaining = static_cast<uint32_t>(numeric);
