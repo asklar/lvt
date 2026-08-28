@@ -2474,6 +2474,26 @@ TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
         &isError);
     EXPECT_TRUE(isError) << unknown.dump(2);
 
+    DWORD_PTR siblingValue = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kGetOutOfTreeHwndMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &siblingValue),
+        0);
+    char siblingRef[64]{};
+    snprintf(
+        siblingRef, sizeof(siblingRef), "win32:0x%llX",
+        static_cast<unsigned long long>(siblingValue));
+    auto outOfTree = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", siblingRef}},
+        &isError);
+    EXPECT_TRUE(isError) << outOfTree.dump(2);
+    EXPECT_NE(
+        outOfTree.value("error", "").find("unknown"),
+        std::string::npos);
+
     const auto comboKey = combo->value("key", "");
     auto comboProperties = client.call_tool(
         "get_editable_properties",
@@ -2524,6 +2544,144 @@ TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
         firstPart.value("schemaId", ""),
         secondPart.value("schemaId", ""))
         << "status parts should reuse one cached native schema";
+
+    const auto parallelSession = connect(client);
+    ASSERT_FALSE(parallelSession.empty());
+    auto beforeParallelRefresh = client.call_tool(
+        "get_editable_properties",
+        json{{"session", parallelSession}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError) << beforeParallelRefresh.dump(2);
+    auto parallelTree = client.call_tool(
+        "get_visual_tree", json{{"session", parallelSession}},
+        &isError);
+    ASSERT_FALSE(isError) << parallelTree.dump(2);
+    const auto* parallelGeneric = find_by_class(
+        parallelTree["root"], "LvtNativePropertyFixtureText");
+    ASSERT_NE(parallelGeneric, nullptr);
+    auto parallelProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", parallelSession},
+             {"element", parallelGeneric->value("key", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << parallelProperties.dump(2);
+
+    const auto scopedSession = connect(client);
+    ASSERT_FALSE(scopedSession.empty());
+    auto scopedTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", scopedSession}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << scopedTree.dump(2);
+    auto scopedGenericProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", scopedSession}, {"element", genericKey}},
+        &isError);
+    EXPECT_FALSE(isError) << scopedGenericProperties.dump(2);
+    auto unpublishedSibling = client.call_tool(
+        "get_editable_properties",
+        json{{"session", scopedSession}, {"element", comboKey}},
+        &isError);
+    EXPECT_TRUE(isError) << unpublishedSibling.dump(2);
+}
+
+TEST_F(NativeMcpFixture, DisconnectRacingNativePropertyReadDoesNotRecreateSession) {
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto* generic =
+        find_by_class(tree["root"], "LvtNativePropertyFixtureText");
+    const auto* toolbar =
+        find_by_class(tree["root"], "ToolbarWindow32");
+    ASSERT_NE(generic, nullptr);
+    ASSERT_NE(toolbar, nullptr);
+    const auto* apply =
+        find_child(*toolbar, "ToolbarButton", "Apply");
+    ASSERT_NE(apply, nullptr);
+    const auto genericKey = generic->value("key", "");
+    const auto applyKey = apply->value("key", "");
+
+    bool isError = false;
+    auto baseline = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", applyKey}},
+        &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+
+    DWORD_PTR armed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kArmDelayedPointerMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &armed),
+        0);
+
+    const int slow = client.send_request(
+        "tools/call",
+        json{{"name", "get_editable_properties"},
+             {"arguments",
+              json{{"session", session}, {"element", applyKey}}}});
+    Sleep(100);
+    const int queued = client.send_request(
+        "tools/call",
+        json{{"name", "get_editable_properties"},
+             {"arguments",
+              json{{"session", session}, {"element", genericKey}}}});
+    const int disconnecting = client.send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+
+    auto slowResponse = client.await_response(slow);
+    auto queuedResponse = client.await_response(queued);
+    auto disconnected = client.await_response(disconnecting);
+    ASSERT_TRUE(slowResponse.contains("result"));
+    ASSERT_TRUE(queuedResponse.contains("result"));
+    ASSERT_TRUE(disconnected.contains("result"));
+    EXPECT_TRUE(slowResponse["result"].value("isError", false));
+    EXPECT_TRUE(queuedResponse["result"].value("isError", false))
+        << queuedResponse.dump(2);
+    EXPECT_FALSE(disconnected["result"].value("isError", true))
+        << disconnected.dump(2);
+
+    auto oldSession = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError) << oldSession.dump(2);
+    EXPECT_NE(
+        oldSession.value("error", "").find("unknown session"),
+        std::string::npos);
+
+    const auto replacement = connect(client);
+    ASSERT_FALSE(replacement.empty());
+    auto beforeRefresh = client.call_tool(
+        "get_editable_properties",
+        json{{"session", replacement}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError) << beforeRefresh.dump(2);
+    EXPECT_NE(
+        beforeRefresh.value("error", "").find("unknown"),
+        std::string::npos);
+
+    auto replacementTree = client.call_tool(
+        "get_visual_tree", json{{"session", replacement}},
+        &isError);
+    ASSERT_FALSE(isError) << replacementTree.dump(2);
+    const auto* replacementGeneric = find_by_class(
+        replacementTree["root"], "LvtNativePropertyFixtureText");
+    ASSERT_NE(replacementGeneric, nullptr);
+    auto replacementProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", replacement},
+             {"element", replacementGeneric->value("key", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << replacementProperties.dump(2);
 }
 
 TEST_F(McpSampleFixture, ResourcesMatchEachSessionsFixedTreeMode) {

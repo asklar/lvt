@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -32,6 +33,16 @@ NativeMessageResult validate_native_window(
 NativeMessageResult send_native_message(
     const NativeWindowIdentity& identity, UINT message,
     WPARAM wParam = 0, LPARAM lParam = 0, UINT timeoutMs = 1000);
+NativeMessageResult send_native_pointer_message(
+    const NativeWindowIdentity& identity, UINT message,
+    WPARAM wParam, LPARAM lParam, std::shared_ptr<void> keepAlive,
+    UINT timeoutMs = 1000);
+
+// Pointer messages reserve one of a bounded set of lifetime slots. On timeout,
+// keepAlive is retained until the target process exits because
+// SendMessageTimeout may return before the target WndProc stops dereferencing
+// caller-provided memory.
+size_t deferred_native_pointer_message_count_for_testing();
 
 bool native_pointer_operations_allowed(
     Architecture host, Architecture target);
@@ -76,5 +87,9 @@ private:
     void* m_address = nullptr;
     size_t m_size = 0;
 };
+
+NativeMessageResult read_native_toolbar_button_text(
+    const NativeWindowIdentity& identity, int commandId,
+    std::string& text, size_t maximumChars = 1024 * 1024);
 
 } // namespace lvt

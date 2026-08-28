@@ -24,10 +24,45 @@ struct FixtureControls {
     HWND tabControl = nullptr;
     HWND genericText = nullptr;
     HWND stateSummary = nullptr;
+    HWND outOfTree = nullptr;
     HTREEITEM treeRoot = nullptr;
     HTREEITEM treeChild = nullptr;
     HTREEITEM treeGrandchild = nullptr;
 } g_controls;
+
+bool g_delayNextToolbarPointerMessage = false;
+LONG g_delayedPointerState = 0;
+
+bool committed_pointer(const void* pointer) {
+    if (!pointer)
+        return false;
+    MEMORY_BASIC_INFORMATION info{};
+    return VirtualQuery(pointer, &info, sizeof(info)) == sizeof(info) &&
+           info.State == MEM_COMMIT;
+}
+
+LRESULT CALLBACK toolbar_subclass_proc(
+    HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+    UINT_PTR, DWORD_PTR) {
+    if (message == TB_GETBUTTONINFOW &&
+        g_delayNextToolbarPointerMessage) {
+        g_delayNextToolbarPointerMessage = false;
+        InterlockedExchange(&g_delayedPointerState, 1);
+        Sleep(1500);
+
+        auto* info = reinterpret_cast<TBBUTTONINFOW*>(lParam);
+        if (!committed_pointer(info) ||
+            !committed_pointer(info->pszText)) {
+            InterlockedExchange(&g_delayedPointerState, 3);
+            return -1;
+        }
+        const auto result =
+            DefSubclassProc(hwnd, message, wParam, lParam);
+        InterlockedExchange(&g_delayedPointerState, 4);
+        return result;
+    }
+    return DefSubclassProc(hwnd, message, wParam, lParam);
+}
 
 std::wstring window_text(HWND hwnd) {
     if (!hwnd)
@@ -91,11 +126,18 @@ std::wstring toolbar_state(HWND hwnd, int commandId) {
 }
 
 std::wstring toolbar_text(HWND hwnd, int commandId) {
-    wchar_t buffer[128]{};
     const LRESULT length = SendMessageW(
+        hwnd, TB_GETBUTTONTEXTW, commandId, 0);
+    if (length < 0)
+        return L"<error>";
+    std::wstring buffer(static_cast<size_t>(length) + 1, L'\0');
+    const LRESULT copied = SendMessageW(
         hwnd, TB_GETBUTTONTEXTW, commandId,
-        reinterpret_cast<LPARAM>(buffer));
-    return length < 0 ? L"<error>" : std::wstring(buffer);
+        reinterpret_cast<LPARAM>(buffer.data()));
+    if (copied < 0)
+        return L"<error>";
+    buffer.resize(static_cast<size_t>(copied));
+    return buffer;
 }
 
 std::wstring statusbar_text(HWND hwnd, int part) {
@@ -361,12 +403,18 @@ void populate_statusbar() {
         g_controls.statusBar, SB_SETTEXTW, 2, reinterpret_cast<LPARAM>(L"Idle"));
 }
 
-void populate_tabs() {
-    const wchar_t* labels[] = {L"Overview", L"Details", L"Advanced"};
+void populate_tabs(bool duplicateLabels = false, bool includeIdentity = true) {
+    while (TabCtrl_GetItemCount(g_controls.tabControl) > 0)
+        TabCtrl_DeleteItem(g_controls.tabControl, 0);
+
+    const wchar_t* normalLabels[] = {L"Overview", L"Details", L"Advanced"};
+    const wchar_t* duplicate[] = {L"Overview", L"Overview", L"Advanced"};
+    const auto* labels = duplicateLabels ? duplicate : normalLabels;
     for (int index = 0; index < 3; ++index) {
         TCITEMW item{};
-        item.mask = TCIF_TEXT;
+        item.mask = TCIF_TEXT | TCIF_PARAM;
         item.pszText = const_cast<LPWSTR>(labels[index]);
+        item.lParam = includeIdentity ? 3001 + index : 0;
         TabCtrl_InsertItem(g_controls.tabControl, index, &item);
     }
     TabCtrl_SetCurSel(g_controls.tabControl, 1);
@@ -461,6 +509,20 @@ bool create_controls(HWND parent) {
     populate_toolbar();
     populate_statusbar();
     populate_tabs();
+    SetWindowSubclass(
+        g_controls.toolbar, toolbar_subclass_proc, 1, 0);
+
+    g_controls.outOfTree = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        fixture::kGenericChildClass,
+        fixture::kOutOfTreeTitle,
+        WS_OVERLAPPED | WS_CAPTION,
+        1100, 80, 280, 100,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!g_controls.outOfTree)
+        return false;
+    ShowWindow(g_controls.outOfTree, SW_SHOWNOACTIVATE);
+
     set_default_font(parent);
     refresh_state_summary();
     return true;
@@ -500,6 +562,45 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             g_controls.toolbar, TB_SETBUTTONINFOW, 2999,
             reinterpret_cast<LPARAM>(&info));
     }
+    case fixture::kSetLongToolbarTextMessage: {
+        std::wstring text(
+            fixture::kLongToolbarTextLength, L'X');
+        TBBUTTONINFOW info{sizeof(info)};
+        info.dwMask = TBIF_TEXT;
+        info.pszText = text.data();
+        return SendMessageW(
+            g_controls.toolbar, TB_SETBUTTONINFOW,
+            fixture::kToolbarApplyCommand,
+            reinterpret_cast<LPARAM>(&info));
+    }
+    case fixture::kRestoreToolbarTextMessage: {
+        TBBUTTONINFOW info{sizeof(info)};
+        info.dwMask = TBIF_TEXT;
+        info.pszText = const_cast<LPWSTR>(L"Apply");
+        return SendMessageW(
+            g_controls.toolbar, TB_SETBUTTONINFOW,
+            fixture::kToolbarApplyCommand,
+            reinterpret_cast<LPARAM>(&info));
+    }
+    case fixture::kArmDelayedPointerMessage:
+        InterlockedExchange(&g_delayedPointerState, 0);
+        g_delayNextToolbarPointerMessage = true;
+        return TRUE;
+    case fixture::kGetDelayedPointerStateMessage:
+        return InterlockedCompareExchange(
+            &g_delayedPointerState, 0, 0);
+    case fixture::kGetOutOfTreeHwndMessage:
+        return reinterpret_cast<LRESULT>(g_controls.outOfTree);
+    case fixture::kDeleteFirstTabMessage:
+        return TabCtrl_DeleteItem(g_controls.tabControl, 0);
+    case fixture::kMakeDuplicateTabsMessage:
+        populate_tabs(true, false);
+        refresh_state_summary();
+        return TRUE;
+    case fixture::kRestoreTabsMessage:
+        populate_tabs();
+        refresh_state_summary();
+        return TRUE;
     case fixture::kHangMessage:
         Sleep(2500);
         return TRUE;
@@ -520,6 +621,10 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             SendMessageW(g_controls.statusBar, WM_SIZE, wParam, lParam);
         break;
     case WM_DESTROY:
+        if (g_controls.outOfTree && IsWindow(g_controls.outOfTree)) {
+            DestroyWindow(g_controls.outOfTree);
+            g_controls.outOfTree = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     }

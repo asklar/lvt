@@ -195,12 +195,13 @@ std::mutex g_connectionsMutex;
 std::map<std::string, std::vector<std::pair<std::string, lvt::ConnectionHandle>>> g_sessionConnections;
 
 std::string native_connection_registry_key(
-    const char* provider, HWND hwnd) {
-    char value[64]{};
+    const char* provider, HWND hwnd, const std::string& sessionId) {
+    char value[96]{};
     snprintf(
-        value, sizeof(value), "%s@0x%llX", provider,
+        value, sizeof(value), "%s@0x%llX@%s", provider,
         static_cast<unsigned long long>(
-            reinterpret_cast<uintptr_t>(hwnd)));
+            reinterpret_cast<uintptr_t>(hwnd)),
+        sessionId.c_str());
     return value;
 }
 
@@ -269,26 +270,28 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         needWpf || needWinForms) {
         if (needWin32) {
             const auto registryKey =
-                native_connection_registry_key("win32", session.hwnd);
+                native_connection_registry_key(
+                    "win32", session.hwnd, session.id);
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, registryKey,
                 [](HWND hwnd, DWORD pid)
                     -> std::shared_ptr<lvt::IFrameworkConnection> {
                     return lvt::NativePropertyConnection::connect(
-                        hwnd, pid, "win32");
+                        hwnd, pid, "win32", {}, true);
                 });
             if (handle)
                 entry.emplace_back("win32", std::move(handle));
         }
         if (needComCtl) {
             const auto registryKey =
-                native_connection_registry_key("comctl", session.hwnd);
+                native_connection_registry_key(
+                    "comctl", session.hwnd, session.id);
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, registryKey,
                 [comCtlVersion](HWND hwnd, DWORD pid)
                     -> std::shared_ptr<lvt::IFrameworkConnection> {
                     return lvt::NativePropertyConnection::connect(
-                        hwnd, pid, "comctl", comCtlVersion);
+                        hwnd, pid, "comctl", comCtlVersion, true);
                 });
             if (handle)
                 entry.emplace_back("comctl", std::move(handle));
@@ -378,6 +381,28 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
     };
 }
 
+void publish_native_property_targets(
+    const Session& session, const lvt::Element& root) {
+    std::vector<std::shared_ptr<lvt::NativePropertyConnection>> connections;
+    {
+        std::lock_guard<std::mutex> lock(g_connectionsMutex);
+        const auto entry = g_sessionConnections.find(session.id);
+        if (entry == g_sessionConnections.end())
+            return;
+        for (const auto& [label, handle] : entry->second) {
+            if ((label == "win32" || label == "comctl") && handle) {
+                auto native =
+                    std::dynamic_pointer_cast<lvt::NativePropertyConnection>(
+                        handle.shared());
+                if (native)
+                    connections.push_back(std::move(native));
+            }
+        }
+    }
+    for (const auto& connection : connections)
+        connection->publish_targets(root);
+}
+
 #ifdef LVT_ENABLE_UIA
 // UIA mode does not go through build_tree/ConnectionLookup, because the whole
 // UIA tree replaces the visual tree rather than enriching it. It still benefits
@@ -386,6 +411,8 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 // every request instead of CoCreateInstance + timeout setup on every call.
 std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& session) {
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
+    if (!session_is_active(session.id))
+        return nullptr;
     auto& entry = g_sessionConnections[session.id];
 
     for (auto it = entry.begin(); it != entry.end(); ++it) {
@@ -798,11 +825,15 @@ bool lost_populated_injected_host(
 // model that asks "is there a Save button?" and is told "no" will believe it,
 // so a partial walk must never be presented as a complete negative answer.
 bool build_tree_for(const Session& session, const json& params, bool uia,
-                    lvt::Element& tree, std::string& error, bool* truncated = nullptr) {
+                    lvt::Element& tree, std::string& error,
+                    bool* truncated = nullptr,
+                    bool targetAlreadyLocked = false) {
     if (truncated)
         *truncated = false;
     // One walk of a given window at a time; see the note on g_targetLocks.
-    TargetGuard guard(session.hwnd);
+    std::optional<TargetGuard> guard;
+    if (!targetAlreadyLocked)
+        guard.emplace(session.hwnd);
     // A request can copy its Session just before a concurrent disconnect
     // removes it, then wait behind disconnect on this target lock. Refuse
     // once it reaches the critical section rather than recreating a
@@ -1245,6 +1276,8 @@ json method_get_tree(const json& params, bool uia) {
     const int depth = get_int(params, "depth", -1);
     if (depth >= 0)
         lvt::trim_to_depth(*root, depth);
+    if (!uia)
+        publish_native_property_targets(session, *root);
 
     // Correlating needs the other tree too, so it costs a second walk and is
     // asked for rather than assumed. It answers the question a caller
@@ -1339,7 +1372,8 @@ bool parse_compact_property_target(
 }
 
 PropertyTarget require_property_target(
-    const Session& session, const json& params) {
+    const Session& session, const json& params,
+    bool targetAlreadyLocked = false) {
     const auto elementRef = get_string(params, "element");
     if (elementRef.empty())
         throw std::runtime_error("'element' must be a non-empty string");
@@ -1360,7 +1394,9 @@ PropertyTarget require_property_target(
     treeParams["fast"] = true;
     lvt::Element tree;
     std::string error;
-    if (!build_tree_for(session, treeParams, false, tree, error))
+    if (!build_tree_for(
+            session, treeParams, false, tree, error, nullptr,
+            targetAlreadyLocked))
         throw std::runtime_error(error);
     const auto* element = lvt::find_element_by_ref(tree, parsedRef.ref);
     if (!element)
@@ -1375,7 +1411,7 @@ PropertyTarget require_property_target(
     return target;
 }
 
-lvt::IFrameworkConnection* typed_property_connection(
+std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
     const Session& session, const PropertyTarget& target) {
     const auto hostArch = lvt::get_host_architecture();
     const bool nativeProvider =
@@ -1392,8 +1428,25 @@ lvt::IFrameworkConnection* typed_property_connection(
     }
 
     auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
-    auto lookup = connection_lookup_for_session(session, frameworks);
-    auto* connection = lookup ? lookup(target.provider) : nullptr;
+    connection_lookup_for_session(session, frameworks);
+
+    std::shared_ptr<lvt::IFrameworkConnection> connection;
+    {
+        std::lock_guard<std::mutex> lock(g_connectionsMutex);
+        if (!session_is_active(session.id)) {
+            throw std::runtime_error(
+                "this session was disconnected while the request was waiting");
+        }
+        const auto entry = g_sessionConnections.find(session.id);
+        if (entry != g_sessionConnections.end()) {
+            for (const auto& [label, handle] : entry->second) {
+                if (label == target.provider && handle) {
+                    connection = handle.shared();
+                    break;
+                }
+            }
+        }
+    }
     if (!connection || !connection->is_alive()) {
         throw std::runtime_error(
             "provider '" + target.provider +
@@ -1494,12 +1547,13 @@ json property_mutation_result(
 
 json method_get_editable_properties(const json& params) {
     const auto session = require_session(params);
-    const auto target = require_property_target(session, params);
     TargetGuard guard(session.hwnd);
     if (!session_is_active(session.id))
         throw std::runtime_error(
             "this session was disconnected while the property request was waiting");
-    auto* connection = typed_property_connection(session, target);
+    const auto target =
+        require_property_target(session, params, true);
+    auto connection = typed_property_connection(session, target);
     auto result = connection->get_property_snapshot(target.handle);
     if (!result.ok && !connection->is_alive() &&
         session_is_active(session.id)) {
@@ -1520,7 +1574,6 @@ json method_set_property(const json& params, bool allowInput) {
             "client-supplied propertyIndex/valueType fields are not allowed");
     }
     const auto session = require_session(params);
-    const auto target = require_property_target(session, params);
     const auto descriptorId = get_string(params, "descriptorId");
     if (descriptorId.empty())
         throw std::runtime_error("'descriptorId' must be a non-empty string");
@@ -1533,7 +1586,9 @@ json method_set_property(const json& params, bool allowInput) {
     if (!session_is_active(session.id))
         throw std::runtime_error(
             "this session was disconnected while the property mutation was waiting");
-    auto* connection = typed_property_connection(session, target);
+    const auto target =
+        require_property_target(session, params, true);
+    auto connection = typed_property_connection(session, target);
     return property_mutation_result(
         get_string(params, "element"), descriptorId,
         connection->set_property(target.handle, descriptorId, value));
@@ -1550,7 +1605,6 @@ json method_clear_property(const json& params, bool allowInput) {
             "client-supplied propertyIndex/valueType fields are not allowed");
     }
     const auto session = require_session(params);
-    const auto target = require_property_target(session, params);
     const auto descriptorId = get_string(params, "descriptorId");
     if (descriptorId.empty())
         throw std::runtime_error("'descriptorId' must be a non-empty string");
@@ -1559,7 +1613,9 @@ json method_clear_property(const json& params, bool allowInput) {
     if (!session_is_active(session.id))
         throw std::runtime_error(
             "this session was disconnected while the property mutation was waiting");
-    auto* connection = typed_property_connection(session, target);
+    const auto target =
+        require_property_target(session, params, true);
+    auto connection = typed_property_connection(session, target);
     return property_mutation_result(
         get_string(params, "element"), descriptorId,
         connection->clear_property(target.handle, descriptorId));
@@ -1588,6 +1644,8 @@ json method_get_tree_changes(const json& params, bool uia) {
         throw std::runtime_error(
             "cannot diff a truncated UI Automation tree; increase timeoutMs and try again");
     }
+    if (!uia)
+        publish_native_property_targets(session, current);
 
     const TreeSnapshotKey key{
         session.id,

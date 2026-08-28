@@ -215,6 +215,8 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         ? dynamic_cast<NativePropertyConnection*>(connectionLookup("win32"))
         : nullptr;
     Element root = win32.build(hwnd, maxDepth, win32Properties);
+    const auto targetArchitecture =
+        pid ? detect_process_architecture(pid) : Architecture::unknown;
 
     // Layer on framework-specific providers
     for (auto& fi : frameworks) {
@@ -225,7 +227,8 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
                 ? dynamic_cast<NativePropertyConnection*>(
                       connectionLookup("comctl"))
                 : nullptr;
-            comctl.enrich(root, comctlProperties);
+            comctl.enrich(
+                root, targetArchitecture, comctlProperties);
             break;
         }
         case Framework::Xaml: {

@@ -5,6 +5,7 @@
 #include <CommCtrl.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstdint>
@@ -25,6 +26,7 @@ namespace {
 constexpr size_t kMaximumNativeTextChars = 1024 * 1024;
 constexpr size_t kMaximumIdentityScanItems = 256;
 constexpr size_t kControlTextChars = 4096;
+constexpr size_t kMaximumStatusTextChars = 0xFFFF;
 constexpr uint64_t kSyntheticHandleBase = UINT64_C(0x8000000000000000);
 
 enum class TargetKind {
@@ -152,14 +154,6 @@ ReadResult unavailable(std::string reason) {
     return result;
 }
 
-bool is_comctl_class(std::string_view className) {
-    return className == "syslistview32" ||
-           className == "systreeview32" ||
-           className == "toolbarwindow32" ||
-           className == "msctls_statusbar32" ||
-           className == "systabcontrol32";
-}
-
 bool operation_needs_remote_pointer(Operation operation) {
     switch (operation) {
     case Operation::text:
@@ -184,6 +178,14 @@ bool operation_needs_remote_pointer(Operation operation) {
     default:
         return false;
     }
+}
+
+std::shared_ptr<RemoteBuffer> allocate_remote_buffer(
+    const NativeWindowIdentity& identity, size_t size,
+    NativeMessageResult& result) {
+    auto remote = std::make_shared<RemoteBuffer>(
+        RemoteBuffer::allocate(identity, size, result));
+    return *remote ? remote : nullptr;
 }
 
 std::string target_kind_name(TargetKind kind) {
@@ -273,12 +275,13 @@ ReadResult read_window_text(const LiveTarget& live) {
     }
 
     const size_t chars = static_cast<size_t>(length.value) + 1;
-    std::vector<wchar_t> text(chars, L'\0');
+    auto text =
+        std::make_shared<std::vector<wchar_t>>(chars, L'\0');
     // WM_GETTEXT is below WM_USER and User32 marshals its string buffer.
     // Common-control WM_USER messages do not, so those use RemoteBuffer.
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, WM_GETTEXT, chars,
-        reinterpret_cast<LPARAM>(text.data()));
+        reinterpret_cast<LPARAM>(text->data()), text);
     if (!message.ok)
         return read_failure(message);
     const size_t copied = std::min(
@@ -286,7 +289,7 @@ ReadResult read_window_text(const LiveTarget& live) {
         chars - 1);
     ReadResult result;
     result.value = native_utf16_to_utf8(
-        std::wstring_view(text.data(), copied));
+        std::wstring_view(text->data(), copied));
     return result;
 }
 
@@ -295,15 +298,15 @@ PropertyMutationResult set_window_text(
     if (!live.pointerAllowed)
         return mutation_failure(E_ACCESSDENIED, cross_bitness_reason());
 
-    std::wstring text;
+    auto text = std::make_shared<std::wstring>();
     std::string conversionError;
-    if (!native_utf8_to_utf16(value, text, conversionError))
+    if (!native_utf8_to_utf16(value, *text, conversionError))
         return mutation_failure(E_INVALIDARG, conversionError);
-    text.push_back(L'\0');
+    text->push_back(L'\0');
     // WM_SETTEXT has the same system marshalling guarantee as WM_GETTEXT.
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, WM_SETTEXT, 0,
-        reinterpret_cast<LPARAM>(text.data()));
+        reinterpret_cast<LPARAM>(text->data()), text);
     if (!message.ok)
         return mutation_failure(message);
     if (!message.value) {
@@ -319,18 +322,18 @@ ReadResult read_edit_selection(
     if (!live.pointerAllowed)
         return unavailable(cross_bitness_reason());
 
-    DWORD values[2]{};
+    auto values = std::make_shared<std::array<DWORD, 2>>();
     // EM_GETSEL is a system Edit message, so User32 marshals these DWORD
     // outputs. EM_* messages that carry control-defined structures would not.
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, EM_GETSEL,
-        reinterpret_cast<WPARAM>(&values[0]),
-        reinterpret_cast<LPARAM>(&values[1]));
+        reinterpret_cast<WPARAM>(&(*values)[0]),
+        reinterpret_cast<LPARAM>(&(*values)[1]), values);
     if (!message.ok)
         return read_failure(message);
 
     ReadResult result;
-    result.value = std::to_string(values[startValue ? 0 : 1]);
+    result.value = std::to_string((*values)[startValue ? 0 : 1]);
     return result;
 }
 
@@ -343,11 +346,12 @@ bool read_scroll_info(
         failureResult.error = cross_bitness_reason();
         return false;
     }
-    info = {sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS};
+    auto storage = std::make_shared<SCROLLINFO>(
+        SCROLLINFO{sizeof(SCROLLINFO), SIF_RANGE | SIF_PAGE | SIF_POS});
     // Scroll-bar SBM_* messages are system messages and marshal SCROLLINFO.
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, SBM_GETSCROLLINFO, 0,
-        reinterpret_cast<LPARAM>(&info));
+        reinterpret_cast<LPARAM>(storage.get()), storage);
     if (!message.ok) {
         failureResult = std::move(message);
         return false;
@@ -359,6 +363,7 @@ bool read_scroll_info(
             "The scroll bar did not return its current range";
         return false;
     }
+    info = *storage;
     failureResult.ok = true;
     failureResult.hresult = S_OK;
     failureResult.win32Error = ERROR_SUCCESS;
@@ -368,9 +373,10 @@ bool read_scroll_info(
 
 PropertyMutationResult write_scroll_info(
     const LiveTarget& live, const SCROLLINFO& info) {
-    auto message = send_native_message(
+    auto storage = std::make_shared<SCROLLINFO>(info);
+    auto message = send_native_pointer_message(
         live.target.window, SBM_SETSCROLLINFO, TRUE,
-        reinterpret_cast<LPARAM>(&info));
+        reinterpret_cast<LPARAM>(storage.get()), storage);
     if (!message.ok)
         return mutation_failure(message);
     return {.ok = true, .hresult = S_OK};
@@ -394,7 +400,7 @@ bool read_listview_item(
 
     constexpr size_t itemSize = sizeof(LVITEMW);
     constexpr size_t textBytes = kControlTextChars * sizeof(wchar_t);
-    auto remote = RemoteBuffer::allocate(
+    auto remote = allocate_remote_buffer(
         live.target.window, itemSize + textBytes, failureResult);
     if (!remote)
         return false;
@@ -405,14 +411,14 @@ bool read_listview_item(
     item.iSubItem = 0;
     item.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
     item.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote.address()) + itemSize);
+        static_cast<std::byte*>(remote->address()) + itemSize);
     item.cchTextMax = static_cast<int>(kControlTextChars);
-    if (!remote.write(&item, sizeof(item), failureResult))
+    if (!remote->write(&item, sizeof(item), failureResult))
         return false;
 
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, LVM_GETITEMW, 0,
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok) {
         failureResult = std::move(message);
         return false;
@@ -426,8 +432,8 @@ bool read_listview_item(
 
     LVITEMW returned{};
     std::vector<wchar_t> text(kControlTextChars, L'\0');
-    if (!remote.read(&returned, sizeof(returned), failureResult) ||
-        !remote.read(
+    if (!remote->read(&returned, sizeof(returned), failureResult) ||
+        !remote->read(
             text.data(), textBytes, failureResult, itemSize)) {
         return false;
     }
@@ -442,19 +448,19 @@ bool read_listview_item(
 PropertyMutationResult write_listview_item_state(
     const LiveTarget& live, UINT bit, bool value) {
     NativeMessageResult native;
-    auto remote =
-        RemoteBuffer::allocate(live.target.window, sizeof(LVITEMW), native);
+    auto remote = allocate_remote_buffer(
+        live.target.window, sizeof(LVITEMW), native);
     if (!remote)
         return mutation_failure(native);
     LVITEMW item{};
     item.stateMask = bit;
     item.state = value ? bit : 0;
-    if (!remote.write(&item, sizeof(item), native))
+    if (!remote->write(&item, sizeof(item), native))
         return mutation_failure(native);
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, LVM_SETITEMSTATE,
         static_cast<WPARAM>(live.target.index),
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok)
         return mutation_failure(message);
     if (!message.value) {
@@ -476,22 +482,22 @@ PropertyMutationResult write_listview_item_text(
     const size_t itemSize = sizeof(LVITEMW);
     const size_t textBytes = text.size() * sizeof(wchar_t);
     NativeMessageResult native;
-    auto remote = RemoteBuffer::allocate(
+    auto remote = allocate_remote_buffer(
         live.target.window, itemSize + textBytes, native);
     if (!remote)
         return mutation_failure(native);
     LVITEMW item{};
     item.iSubItem = 0;
     item.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote.address()) + itemSize);
-    if (!remote.write(&item, sizeof(item), native) ||
-        !remote.write(text.data(), textBytes, native, itemSize)) {
+        static_cast<std::byte*>(remote->address()) + itemSize);
+    if (!remote->write(&item, sizeof(item), native) ||
+        !remote->write(text.data(), textBytes, native, itemSize)) {
         return mutation_failure(native);
     }
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, LVM_SETITEMTEXTW,
         static_cast<WPARAM>(live.target.index),
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok)
         return mutation_failure(message);
     if (!message.value) {
@@ -512,7 +518,7 @@ bool read_treeview_item(
     NativeMessageResult& failureResult) {
     constexpr size_t itemSize = sizeof(TVITEMW);
     constexpr size_t textBytes = kControlTextChars * sizeof(wchar_t);
-    auto remote = RemoteBuffer::allocate(
+    auto remote = allocate_remote_buffer(
         live.target.window, itemSize + textBytes, failureResult);
     if (!remote)
         return false;
@@ -522,13 +528,13 @@ bool read_treeview_item(
     item.hItem = reinterpret_cast<HTREEITEM>(live.target.itemHandle);
     item.stateMask = TVIS_SELECTED | TVIS_EXPANDED;
     item.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote.address()) + itemSize);
+        static_cast<std::byte*>(remote->address()) + itemSize);
     item.cchTextMax = static_cast<int>(kControlTextChars);
-    if (!remote.write(&item, sizeof(item), failureResult))
+    if (!remote->write(&item, sizeof(item), failureResult))
         return false;
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, TVM_GETITEMW, 0,
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok) {
         failureResult = std::move(message);
         return false;
@@ -542,8 +548,8 @@ bool read_treeview_item(
 
     TVITEMW returned{};
     std::vector<wchar_t> text(kControlTextChars, L'\0');
-    if (!remote.read(&returned, sizeof(returned), failureResult) ||
-        !remote.read(text.data(), textBytes, failureResult, itemSize)) {
+    if (!remote->read(&returned, sizeof(returned), failureResult) ||
+        !remote->read(text.data(), textBytes, failureResult, itemSize)) {
         return false;
     }
     const size_t length = wcsnlen_s(text.data(), text.size());
@@ -564,7 +570,7 @@ PropertyMutationResult write_treeview_item_text(
     const size_t itemSize = sizeof(TVITEMW);
     const size_t textBytes = text.size() * sizeof(wchar_t);
     NativeMessageResult native;
-    auto remote = RemoteBuffer::allocate(
+    auto remote = allocate_remote_buffer(
         live.target.window, itemSize + textBytes, native);
     if (!remote)
         return mutation_failure(native);
@@ -572,14 +578,14 @@ PropertyMutationResult write_treeview_item_text(
     item.mask = TVIF_TEXT;
     item.hItem = reinterpret_cast<HTREEITEM>(live.target.itemHandle);
     item.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote.address()) + itemSize);
-    if (!remote.write(&item, sizeof(item), native) ||
-        !remote.write(text.data(), textBytes, native, itemSize)) {
+        static_cast<std::byte*>(remote->address()) + itemSize);
+    if (!remote->write(&item, sizeof(item), native) ||
+        !remote->write(text.data(), textBytes, native, itemSize)) {
         return mutation_failure(native);
     }
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, TVM_SETITEMW, 0,
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok)
         return mutation_failure(message);
     if (!message.value) {
@@ -593,14 +599,14 @@ PropertyMutationResult write_treeview_item_text(
 bool read_toolbar_button(
     const LiveTarget& live, TBBUTTON& button,
     NativeMessageResult& failureResult) {
-    auto remote = RemoteBuffer::allocate(
+    auto remote = allocate_remote_buffer(
         live.target.window, sizeof(TBBUTTON), failureResult);
     if (!remote)
         return false;
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, TB_GETBUTTON,
         static_cast<WPARAM>(live.target.index),
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok) {
         failureResult = std::move(message);
         return false;
@@ -611,39 +617,18 @@ bool read_toolbar_button(
         failureResult.error = "The toolbar button no longer exists";
         return false;
     }
-    return remote.read(&button, sizeof(button), failureResult);
+    return remote->read(&button, sizeof(button), failureResult);
 }
 
 ReadResult read_toolbar_text(const LiveTarget& live) {
-    NativeMessageResult native;
-    auto remote = RemoteBuffer::allocate(
-        live.target.window, kControlTextChars * sizeof(wchar_t), native);
-    if (!remote)
+    std::string text;
+    auto native = read_native_toolbar_button_text(
+        live.target.window, live.target.commandId, text,
+        kMaximumNativeTextChars);
+    if (!native.ok)
         return read_failure(native);
-    std::vector<wchar_t> zero(kControlTextChars, L'\0');
-    if (!remote.write(zero.data(), zero.size() * sizeof(wchar_t), native))
-        return read_failure(native);
-    auto message = send_native_message(
-        live.target.window, TB_GETBUTTONTEXTW,
-        static_cast<WPARAM>(live.target.commandId),
-        reinterpret_cast<LPARAM>(remote.address()));
-    if (!message.ok)
-        return read_failure(message);
-    if (message.value < 0) {
-        ReadResult result;
-        result.ok = false;
-        result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-        result.error = "The toolbar button text is unavailable";
-        return result;
-    }
-    std::vector<wchar_t> text(kControlTextChars, L'\0');
-    if (!remote.read(text.data(), text.size() * sizeof(wchar_t), native))
-        return read_failure(native);
-    const size_t length = std::min(
-        static_cast<size_t>(message.value), text.size() - 1);
     ReadResult result;
-    result.value = native_utf16_to_utf8(
-        std::wstring_view(text.data(), length));
+    result.value = std::move(text);
     return result;
 }
 
@@ -658,22 +643,22 @@ PropertyMutationResult write_toolbar_text(
     const size_t infoSize = sizeof(TBBUTTONINFOW);
     const size_t textBytes = text.size() * sizeof(wchar_t);
     NativeMessageResult native;
-    auto remote = RemoteBuffer::allocate(
+    auto remote = allocate_remote_buffer(
         live.target.window, infoSize + textBytes, native);
     if (!remote)
         return mutation_failure(native);
     TBBUTTONINFOW info{sizeof(info)};
     info.dwMask = TBIF_TEXT;
     info.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote.address()) + infoSize);
-    if (!remote.write(&info, sizeof(info), native) ||
-        !remote.write(text.data(), textBytes, native, infoSize)) {
+        static_cast<std::byte*>(remote->address()) + infoSize);
+    if (!remote->write(&info, sizeof(info), native) ||
+        !remote->write(text.data(), textBytes, native, infoSize)) {
         return mutation_failure(native);
     }
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, TB_SETBUTTONINFOW,
         static_cast<WPARAM>(live.target.commandId),
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok)
         return mutation_failure(message);
     if (!message.value) {
@@ -699,25 +684,26 @@ bool read_status_text(
         failureResult = std::move(length);
         return false;
     }
-    const size_t chars = static_cast<size_t>(LOWORD(length.value)) + 1;
+    const size_t chars = kMaximumStatusTextChars + 1;
     data.style = HIWORD(length.value);
-    auto remote = RemoteBuffer::allocate(
+    auto remote = allocate_remote_buffer(
         live.target.window, chars * sizeof(wchar_t), failureResult);
     if (!remote)
         return false;
     std::vector<wchar_t> zero(chars, L'\0');
-    if (!remote.write(zero.data(), zero.size() * sizeof(wchar_t), failureResult))
+    if (!remote->write(
+            zero.data(), zero.size() * sizeof(wchar_t), failureResult))
         return false;
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, SB_GETTEXTW,
         static_cast<WPARAM>(live.target.index),
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok) {
         failureResult = std::move(message);
         return false;
     }
     std::vector<wchar_t> text(chars, L'\0');
-    if (!remote.read(
+    if (!remote->read(
             text.data(), text.size() * sizeof(wchar_t), failureResult)) {
         return false;
     }
@@ -740,16 +726,17 @@ PropertyMutationResult write_status_text(
     if (!native_utf8_to_utf16(value, text, conversionError))
         return mutation_failure(E_INVALIDARG, conversionError);
     text.push_back(L'\0');
-    auto remote = RemoteBuffer::allocate(
+    auto remote = allocate_remote_buffer(
         live.target.window, text.size() * sizeof(wchar_t), native);
     if (!remote)
         return mutation_failure(native);
-    if (!remote.write(text.data(), text.size() * sizeof(wchar_t), native))
+    if (!remote->write(
+            text.data(), text.size() * sizeof(wchar_t), native))
         return mutation_failure(native);
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, SB_SETTEXTW,
         static_cast<WPARAM>(live.target.index) | current.style,
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok)
         return mutation_failure(message);
     if (!message.value) {
@@ -760,41 +747,63 @@ PropertyMutationResult write_status_text(
     return {.ok = true, .hresult = S_OK};
 }
 
-ReadResult read_tab_text(const LiveTarget& live) {
+struct TabItemData {
+    std::string text;
+    LPARAM parameter = 0;
+};
+
+bool read_tab_item(
+    const LiveTarget& live, int index, TabItemData& data,
+    NativeMessageResult& failureResult) {
     constexpr size_t itemSize = sizeof(TCITEMW);
     constexpr size_t textBytes = kControlTextChars * sizeof(wchar_t);
-    NativeMessageResult native;
-    auto remote = RemoteBuffer::allocate(
-        live.target.window, itemSize + textBytes, native);
+    auto remote = allocate_remote_buffer(
+        live.target.window, itemSize + textBytes, failureResult);
     if (!remote)
-        return read_failure(native);
+        return false;
     TCITEMW item{};
-    item.mask = TCIF_TEXT;
+    item.mask = TCIF_TEXT | TCIF_PARAM;
     item.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote.address()) + itemSize);
+        static_cast<std::byte*>(remote->address()) + itemSize);
     item.cchTextMax = static_cast<int>(kControlTextChars);
-    if (!remote.write(&item, sizeof(item), native))
-        return read_failure(native);
-    auto message = send_native_message(
+    if (!remote->write(&item, sizeof(item), failureResult))
+        return false;
+    auto message = send_native_pointer_message(
         live.target.window, TCM_GETITEMW,
-        static_cast<WPARAM>(live.target.index),
-        reinterpret_cast<LPARAM>(remote.address()));
-    if (!message.ok)
-        return read_failure(message);
-    if (!message.value) {
-        ReadResult result;
-        result.ok = false;
-        result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_INDEX);
-        result.error = "The tab item no longer exists";
-        return result;
+        static_cast<WPARAM>(index),
+        reinterpret_cast<LPARAM>(remote->address()), remote);
+    if (!message.ok) {
+        failureResult = std::move(message);
+        return false;
     }
+    if (!message.value) {
+        failureResult.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_INDEX);
+        failureResult.win32Error = ERROR_INVALID_INDEX;
+        failureResult.error = "The tab item no longer exists";
+        return false;
+    }
+    TCITEMW returned{};
     std::vector<wchar_t> text(kControlTextChars, L'\0');
-    if (!remote.read(text.data(), textBytes, native, itemSize))
-        return read_failure(native);
+    if (!remote->read(&returned, sizeof(returned), failureResult) ||
+        !remote->read(text.data(), textBytes, failureResult, itemSize)) {
+        return false;
+    }
     const size_t length = wcsnlen_s(text.data(), text.size());
-    ReadResult result;
-    result.value = native_utf16_to_utf8(
+    data.text = native_utf16_to_utf8(
         std::wstring_view(text.data(), length));
+    data.parameter = returned.lParam;
+    return true;
+}
+
+ReadResult read_tab_text(const LiveTarget& live) {
+    TabItemData data;
+    NativeMessageResult native;
+    if (!read_tab_item(
+            live, live.target.index, data, native)) {
+        return read_failure(native);
+    }
+    ReadResult result;
+    result.value = std::move(data.text);
     return result;
 }
 
@@ -809,22 +818,22 @@ PropertyMutationResult write_tab_text(
     const size_t itemSize = sizeof(TCITEMW);
     const size_t textBytes = text.size() * sizeof(wchar_t);
     NativeMessageResult native;
-    auto remote = RemoteBuffer::allocate(
+    auto remote = allocate_remote_buffer(
         live.target.window, itemSize + textBytes, native);
     if (!remote)
         return mutation_failure(native);
     TCITEMW item{};
     item.mask = TCIF_TEXT;
     item.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote.address()) + itemSize);
-    if (!remote.write(&item, sizeof(item), native) ||
-        !remote.write(text.data(), textBytes, native, itemSize)) {
+        static_cast<std::byte*>(remote->address()) + itemSize);
+    if (!remote->write(&item, sizeof(item), native) ||
+        !remote->write(text.data(), textBytes, native, itemSize)) {
         return mutation_failure(native);
     }
-    auto message = send_native_message(
+    auto message = send_native_pointer_message(
         live.target.window, TCM_SETITEMW,
         static_cast<WPARAM>(live.target.index),
-        reinterpret_cast<LPARAM>(remote.address()));
+        reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok)
         return mutation_failure(message);
     if (!message.value) {
@@ -886,6 +895,8 @@ struct NativePropertyConnection::Impl {
     std::string controlVersion;
     mutable std::mutex mutex;
     std::map<uint64_t, Target> targets;
+    std::set<uint64_t> publishedTargets;
+    bool requirePublishedTargets = false;
     std::map<std::string, uint64_t> itemHandles;
     uint64_t nextSyntheticHandle = kSyntheticHandleBase;
     std::map<std::string, std::shared_ptr<const PropertySchema>> schemasByKey;
@@ -960,6 +971,7 @@ struct NativePropertyConnection::Impl {
             }
 
             int matchingIdentity = 0;
+            std::string textFingerprint;
             for (int index = 0; index < count.value; ++index) {
                 ListViewItemData candidate;
                 if (!read_listview_item(live, index, candidate, native)) {
@@ -972,13 +984,20 @@ struct NativePropertyConnection::Impl {
                         : candidate.text == current.text) {
                     ++matchingIdentity;
                 }
+                if (current.parameter == 0) {
+                    textFingerprint +=
+                        std::to_string(candidate.text.size()) + ":" +
+                        candidate.text + "|";
+                }
             }
             live.identity =
                 current.parameter != 0
                     ? "param:" +
                           hex_u64(static_cast<uint64_t>(
                               static_cast<ULONG_PTR>(current.parameter)))
-                    : "text:" + current.text;
+                    : "text:" + current.text +
+                          "|items:" +
+                          hex_u64(stable_hash(textFingerprint));
             if (matchingIdentity != 1) {
                 live.identityVerified = false;
                 live.identityReason =
@@ -1051,7 +1070,22 @@ struct NativePropertyConnection::Impl {
                 error = "The status-bar part index is no longer valid";
                 return false;
             }
-            live.identity = "part:" + std::to_string(target.index);
+            if (!live.pointerAllowed) {
+                live.identityVerified = false;
+                live.identityReason = cross_bitness_reason();
+                return true;
+            }
+            StatusTextData current;
+            NativeMessageResult native;
+            if (!read_status_text(live, current, native)) {
+                hresult = native.hresult;
+                error = native.error;
+                return false;
+            }
+            live.identity =
+                "part:" + std::to_string(target.index) +
+                "|count:" + std::to_string(count.value) +
+                "|text:" + current.text;
             return true;
         }
         case TargetKind::tabItem: {
@@ -1072,13 +1106,69 @@ struct NativePropertyConnection::Impl {
                 live.identityReason = cross_bitness_reason();
                 return true;
             }
-            auto text = read_tab_text(live);
-            if (!text.ok) {
-                hresult = text.hresult;
-                error = text.error;
+            TabItemData current;
+            NativeMessageResult native;
+            if (!read_tab_item(
+                    live, target.index, current, native)) {
+                hresult = native.hresult;
+                error = native.error;
                 return false;
             }
-            live.identity = "text:" + text.value;
+
+            if (count.value >
+                static_cast<LRESULT>(kMaximumIdentityScanItems)) {
+                live.identityVerified = false;
+                live.identityReason =
+                    "The tab control is too large to prove that this item's "
+                    "current identity is unique";
+                live.identity =
+                    current.parameter != 0
+                        ? "param:" +
+                              hex_u64(static_cast<uint64_t>(
+                                  static_cast<ULONG_PTR>(
+                                      current.parameter)))
+                        : "text:" + current.text;
+                return true;
+            }
+
+            int matchingIdentity = 0;
+            std::string textFingerprint;
+            for (int index = 0; index < count.value; ++index) {
+                TabItemData candidate;
+                if (!read_tab_item(
+                        live, index, candidate, native)) {
+                    hresult = native.hresult;
+                    error = native.error;
+                    return false;
+                }
+                if (current.parameter != 0
+                        ? candidate.parameter == current.parameter
+                        : candidate.text == current.text) {
+                    ++matchingIdentity;
+                }
+                if (current.parameter == 0) {
+                    textFingerprint +=
+                        std::to_string(candidate.text.size()) + ":" +
+                        candidate.text + "|";
+                }
+            }
+            live.identity =
+                current.parameter != 0
+                    ? "param:" +
+                          hex_u64(static_cast<uint64_t>(
+                              static_cast<ULONG_PTR>(
+                                  current.parameter)))
+                    : "text:" + current.text +
+                          "|tabs:" +
+                          hex_u64(stable_hash(textFingerprint));
+            if (matchingIdentity != 1) {
+                live.identityVerified = false;
+                live.identityReason =
+                    current.parameter != 0
+                        ? "This tab item has a duplicate application identity"
+                        : "This tab item has no application identity and its "
+                          "current text is not unique";
+            }
             return true;
         }
         }
@@ -1552,31 +1642,16 @@ struct NativePropertyConnection::Impl {
 
     bool get_target(uint64_t handle, Target& target) {
         std::lock_guard<std::mutex> lock(mutex);
+        if (requirePublishedTargets &&
+            !publishedTargets.contains(handle)) {
+            return false;
+        }
         auto found = targets.find(handle);
         if (found != targets.end()) {
             target = found->second;
             return true;
         }
-
-        if (handle > static_cast<uint64_t>(
-                         (std::numeric_limits<uintptr_t>::max)())) {
-            return false;
-        }
-        NativeWindowIdentity identity;
-        auto captured = capture_native_window_identity(
-            reinterpret_cast<HWND>(static_cast<uintptr_t>(handle)),
-            root.pid, identity);
-        if (!captured.ok)
-            return false;
-        const bool common = is_comctl_class(identity.normalizedClass);
-        if ((provider == "comctl") != common)
-            return false;
-
-        Target registered;
-        registered.window = std::move(identity);
-        targets.emplace(handle, registered);
-        target = std::move(registered);
-        return true;
+        return false;
     }
 
     uint64_t register_target(
@@ -1586,6 +1661,8 @@ struct NativePropertyConnection::Impl {
         auto captured =
             capture_native_window_identity(hwnd, root.pid, identity);
         if (!captured.ok)
+            return 0;
+        if (hwnd != root.hwnd && !IsChild(root.hwnd, hwnd))
             return 0;
 
         if (kind == TargetKind::hwnd) {
@@ -2117,6 +2194,28 @@ struct NativePropertyConnection::Impl {
                 break;
             }
             case Operation::tabItemText:
+                if (target.snapshotIdentity.rfind("text:", 0) == 0) {
+                    auto count = send_native_message(
+                        live.target.window, TCM_GETITEMCOUNT);
+                    if (!count.ok)
+                        return mutation_failure(count);
+                    for (int index = 0; index < count.value; ++index) {
+                        if (index == live.target.index)
+                            continue;
+                        TabItemData candidate;
+                        NativeMessageResult native;
+                        if (!read_tab_item(
+                                live, index, candidate, native)) {
+                            return mutation_failure(native);
+                        }
+                        if (candidate.text == *requested) {
+                            return mutation_failure(
+                                E_INVALIDARG,
+                                "The new tab text would make this index "
+                                "identity ambiguous");
+                        }
+                    }
+                }
                 write = write_tab_text(live, *requested);
                 break;
             }
@@ -2160,7 +2259,7 @@ struct NativePropertyConnection::Impl {
 std::shared_ptr<NativePropertyConnection>
 NativePropertyConnection::connect(
     HWND root, DWORD pid, std::string provider,
-    std::string controlVersion) {
+    std::string controlVersion, bool requirePublishedTargets) {
     if (provider != "win32" && provider != "comctl")
         return nullptr;
 
@@ -2175,6 +2274,7 @@ NativePropertyConnection::connect(
     impl->targetArchitecture = detect_process_architecture(pid);
     impl->provider = std::move(provider);
     impl->controlVersion = std::move(controlVersion);
+    impl->requirePublishedTargets = requirePublishedTargets;
     return std::shared_ptr<NativePropertyConnection>(
         new NativePropertyConnection(std::move(impl)));
 }
@@ -2228,6 +2328,26 @@ uint64_t NativePropertyConnection::register_tab_item(
     HWND hwnd, int index) {
     return m_impl->register_target(
         TargetKind::tabItem, hwnd, index, 0, 0);
+}
+
+void NativePropertyConnection::publish_targets(const Element& root) {
+    std::set<uint64_t> handles;
+    const auto collect =
+        [&](const auto& self, const Element& element) -> void {
+        if (element.framework == m_impl->provider &&
+            element.providerHandle != 0) {
+            handles.insert(element.providerHandle);
+        }
+        for (const auto& child : element.children)
+            self(self, child);
+    };
+    collect(collect, root);
+
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    for (const auto handle : handles) {
+        if (m_impl->targets.contains(handle))
+            m_impl->publishedTargets.insert(handle);
+    }
 }
 
 size_t NativePropertyConnection::cached_schema_count_for_testing() const {

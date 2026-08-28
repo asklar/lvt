@@ -1,12 +1,27 @@
 #include "native_message.h"
 
+#include <CommCtrl.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <limits>
+#include <mutex>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace lvt {
 namespace {
+
+constexpr size_t kMaximumDeferredPointerMessages = 64;
+std::atomic<size_t> g_pointerMessageSlots{0};
+std::mutex g_permanentRetirementMutex;
+struct PermanentRetirement {
+    HANDLE process = nullptr;
+    std::shared_ptr<void> keepAlive;
+};
+std::vector<PermanentRetirement> g_permanentRetirements;
 
 NativeMessageResult success(LRESULT value = 0) {
     NativeMessageResult result;
@@ -47,6 +62,46 @@ NativeMessageResult failure(DWORD error, std::string context) {
     result.timedOut = error == ERROR_TIMEOUT;
     result.error = std::move(context) + ": " + win32_error_message(error);
     return result;
+}
+
+bool reserve_pointer_message_slot() {
+    size_t current = g_pointerMessageSlots.load(std::memory_order_relaxed);
+    while (current < kMaximumDeferredPointerMessages) {
+        if (g_pointerMessageSlots.compare_exchange_weak(
+                current, current + 1, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void release_pointer_message_slot() {
+    g_pointerMessageSlots.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void retain_until_process_exit(
+    HANDLE process,
+    std::shared_ptr<void> keepAlive) {
+    try {
+        std::thread(
+            [process, keepAlive = std::move(keepAlive)]() mutable {
+                WaitForSingleObject(process, INFINITE);
+                CloseHandle(process);
+                keepAlive.reset();
+                release_pointer_message_slot();
+            })
+            .detach();
+        return;
+    } catch (const std::system_error&) {
+    }
+
+    // If a waiter cannot be created, retain the allocation permanently rather
+    // than risk freeing memory the target may still dereference. The global
+    // slot cap keeps this fallback bounded.
+    std::lock_guard<std::mutex> lock(g_permanentRetirementMutex);
+    g_permanentRetirements.push_back(
+        {process, std::move(keepAlive)});
 }
 
 } // namespace
@@ -126,6 +181,50 @@ NativeMessageResult send_native_message(
                 : "The native control message failed");
     }
     return success(static_cast<LRESULT>(value));
+}
+
+NativeMessageResult send_native_pointer_message(
+    const NativeWindowIdentity& identity, UINT message,
+    WPARAM wParam, LPARAM lParam, std::shared_ptr<void> keepAlive,
+    UINT timeoutMs) {
+    if (!keepAlive) {
+        return failure(
+            ERROR_INVALID_PARAMETER,
+            "Pointer-bearing native message has no lifetime owner");
+    }
+    auto valid = validate_native_window(identity);
+    if (!valid.ok)
+        return valid;
+    if (!reserve_pointer_message_slot()) {
+        return failure(
+            ERROR_NOT_ENOUGH_MEMORY,
+            "Too many timed-out native pointer messages are awaiting target exit");
+    }
+    HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, identity.pid);
+    if (!process) {
+        release_pointer_message_slot();
+        return failure(
+            GetLastError(),
+            "Could not open the target process for pointer-message lifetime");
+    }
+
+    auto result =
+        send_native_message(identity, message, wParam, lParam, timeoutMs);
+    if (result.ok) {
+        CloseHandle(process);
+        release_pointer_message_slot();
+        return result;
+    }
+
+    // SendMessageTimeout may return while the target WndProc is still using
+    // lParam/wParam. Retain caller memory until the target exits; this is more
+    // conservative than guessing when a reentrant WndProc has really returned.
+    retain_until_process_exit(process, std::move(keepAlive));
+    return result;
+}
+
+size_t deferred_native_pointer_message_count_for_testing() {
+    return g_pointerMessageSlots.load(std::memory_order_acquire);
 }
 
 bool native_pointer_operations_allowed(
@@ -283,6 +382,104 @@ void RemoteBuffer::reset() {
     m_process = nullptr;
     m_address = nullptr;
     m_size = 0;
+}
+
+NativeMessageResult read_native_toolbar_button_text(
+    const NativeWindowIdentity& identity, int commandId,
+    std::string& text, size_t maximumChars) {
+    text.clear();
+    if (maximumChars == 0 ||
+        maximumChars >
+            static_cast<size_t>((std::numeric_limits<int>::max)() - 1)) {
+        return failure(
+            ERROR_INVALID_PARAMETER,
+            "Invalid toolbar text capacity limit");
+    }
+
+    constexpr int kMaximumAttempts = 3;
+    for (int attempt = 0; attempt < kMaximumAttempts; ++attempt) {
+        auto length = send_native_message(
+            identity, TB_GETBUTTONTEXTW,
+            static_cast<WPARAM>(commandId), 0);
+        if (!length.ok)
+            return length;
+        if (length.value < 0)
+            return failure(
+                ERROR_INVALID_DATA,
+                "The toolbar button text is unavailable");
+        if (static_cast<uint64_t>(length.value) > maximumChars) {
+            return failure(
+                ERROR_BUFFER_OVERFLOW,
+                "The toolbar button text exceeds the configured safety limit");
+        }
+
+        const size_t chars = static_cast<size_t>(length.value) + 1;
+        const size_t infoSize = sizeof(TBBUTTONINFOW);
+        NativeMessageResult native;
+        auto remote = std::make_shared<RemoteBuffer>(
+            RemoteBuffer::allocate(
+                identity, infoSize + chars * sizeof(wchar_t), native));
+        if (!*remote)
+            return native;
+
+        TBBUTTONINFOW info{sizeof(info)};
+        info.dwMask = TBIF_TEXT;
+        info.pszText = reinterpret_cast<wchar_t*>(
+            static_cast<std::byte*>(remote->address()) + infoSize);
+        info.cchText = static_cast<int>(chars);
+        std::vector<wchar_t> zero(chars, L'\0');
+        if (!remote->write(&info, sizeof(info), native) ||
+            !remote->write(
+                zero.data(), zero.size() * sizeof(wchar_t),
+                native, infoSize)) {
+            return native;
+        }
+
+        auto copied = send_native_pointer_message(
+            identity, TB_GETBUTTONINFOW,
+            static_cast<WPARAM>(commandId),
+            reinterpret_cast<LPARAM>(remote->address()), remote);
+        if (!copied.ok)
+            return copied;
+        if (copied.value < 0) {
+            return failure(
+                ERROR_INVALID_DATA,
+                "The toolbar button no longer exists");
+        }
+
+        auto after = send_native_message(
+            identity, TB_GETBUTTONTEXTW,
+            static_cast<WPARAM>(commandId), 0);
+        if (!after.ok)
+            return after;
+        if (after.value < 0)
+            return failure(
+                ERROR_INVALID_DATA,
+                "The toolbar button text became unavailable");
+        if (static_cast<uint64_t>(after.value) > maximumChars) {
+            return failure(
+                ERROR_BUFFER_OVERFLOW,
+                "The toolbar button text exceeds the configured safety limit");
+        }
+        if (after.value > length.value)
+            continue;
+
+        std::vector<wchar_t> value(chars, L'\0');
+        if (!remote->read(
+                value.data(), value.size() * sizeof(wchar_t),
+                native, infoSize)) {
+            return native;
+        }
+        const size_t valueLength =
+            wcsnlen_s(value.data(), value.size());
+        text = native_utf16_to_utf8(
+            std::wstring_view(value.data(), valueLength));
+        return success(static_cast<LRESULT>(valueLength));
+    }
+
+    return failure(
+        ERROR_RETRY,
+        "The toolbar button text kept growing while it was read");
 }
 
 } // namespace lvt

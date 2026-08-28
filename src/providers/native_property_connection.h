@@ -24,7 +24,8 @@ class NativePropertyConnection final : public IFrameworkConnection {
 public:
     static std::shared_ptr<NativePropertyConnection> connect(
         HWND root, DWORD pid, std::string provider,
-        std::string controlVersion = {});
+        std::string controlVersion = {},
+        bool requirePublishedTargets = false);
 
     ~NativePropertyConnection() override;
 
@@ -37,6 +38,7 @@ public:
     uint64_t register_toolbar_button(HWND hwnd, int index, int commandId);
     uint64_t register_statusbar_part(HWND hwnd, int index);
     uint64_t register_tab_item(HWND hwnd, int index);
+    void publish_targets(const Element& root);
 
     size_t cached_schema_count_for_testing() const;
 

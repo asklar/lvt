@@ -2720,6 +2720,80 @@ static std::string utf8(const char8_t* value) {
     return reinterpret_cast<const char*>(value);
 }
 
+class ScopedNativeFixtureProcess {
+public:
+    bool start(const fs::path& fixturePath) {
+        STARTUPINFOW startupInfo{sizeof(startupInfo)};
+        PROCESS_INFORMATION processInfo{};
+        std::wstring command = L"\"" + fixturePath.wstring() + L"\"";
+        if (!CreateProcessW(
+                nullptr, command.data(), nullptr, nullptr, FALSE, 0,
+                nullptr, nullptr, &startupInfo, &processInfo)) {
+            return false;
+        }
+        process.reset(processInfo.hProcess);
+        thread.reset(processInfo.hThread);
+        pid = processInfo.dwProcessId;
+        WaitForInputIdle(process.get(), 5000);
+
+        for (int attempt = 0; attempt < 50 && !hwnd; ++attempt) {
+            struct Search {
+                DWORD pid;
+                HWND hwnd;
+            } search{pid, nullptr};
+            EnumWindows(
+                [](HWND candidate, LPARAM parameter) -> BOOL {
+                    auto* search =
+                        reinterpret_cast<Search*>(parameter);
+                    DWORD owner = 0;
+                    GetWindowThreadProcessId(candidate, &owner);
+                    if (owner != search->pid)
+                        return TRUE;
+                    wchar_t className[128]{};
+                    GetClassNameW(
+                        candidate, className,
+                        static_cast<int>(_countof(className)));
+                    if (wcscmp(
+                            className,
+                            native_fixture::kWindowClass) == 0) {
+                        search->hwnd = candidate;
+                        return FALSE;
+                    }
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(&search));
+            hwnd = search.hwnd;
+            if (!hwnd)
+                Sleep(100);
+        }
+        return hwnd != nullptr;
+    }
+
+    ~ScopedNativeFixtureProcess() {
+        stop();
+    }
+
+    void stop() {
+        if (hwnd && IsWindow(hwnd))
+            PostMessageW(hwnd, native_fixture::kCloseMessage, 0, 0);
+        if (process) {
+            if (WaitForSingleObject(process.get(), 5000) != WAIT_OBJECT_0) {
+                TerminateProcess(process.get(), 1);
+                WaitForSingleObject(process.get(), 5000);
+            }
+        }
+        hwnd = nullptr;
+        pid = 0;
+        process.reset();
+        thread.reset();
+    }
+
+    wil::unique_handle process;
+    wil::unique_handle thread;
+    DWORD pid = 0;
+    HWND hwnd = nullptr;
+};
+
 class NativeControlsFixture : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
@@ -3523,6 +3597,23 @@ TEST_F(NativeControlsFixture, ComCtlTypedPropertiesRoundTripAndRejectStaleItems)
     ASSERT_GE(tabs->children.size(), 1u);
     auto tabItemProperties = snapshot(native, tabs->children[0]);
     ASSERT_TRUE(tabItemProperties.ok) << tabItemProperties.error;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kDeleteFirstTabMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
+    auto staleTab = set(
+        native, tabs->children[0], tabItemProperties, "Text",
+        "stale tab write");
+    EXPECT_FALSE(staleTab.ok);
+    EXPECT_NE(
+        staleTab.error.find("changed since"),
+        std::string::npos);
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreTabsMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
     ASSERT_TRUE(set(
         native, tabs->children[0], tabItemProperties, "Text",
         utf8(u8"Overview ✓")).ok);
@@ -3531,6 +3622,28 @@ TEST_F(NativeControlsFixture, ComCtlTypedPropertiesRoundTripAndRejectStaleItems)
     ASSERT_TRUE(set(
         native, tabs->children[0], tabItemProperties, "Text",
         "Overview").ok);
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kMakeDuplicateTabsMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
+    auto duplicateTabs = snapshot(native, tabs->children[0]);
+    ASSERT_TRUE(duplicateTabs.ok) << duplicateTabs.error;
+    const auto* duplicateTabText =
+        native_descriptor(duplicateTabs, "Text");
+    const auto* duplicateTabValue =
+        native_value(duplicateTabs, "Text");
+    ASSERT_NE(duplicateTabText, nullptr);
+    ASSERT_NE(duplicateTabValue, nullptr);
+    EXPECT_FALSE(duplicateTabText->writable);
+    EXPECT_NE(
+        duplicateTabValue->readOnlyReason.find("not unique"),
+        std::string::npos);
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreTabsMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
 
     const auto summary = state_summary();
     EXPECT_NE(
@@ -3556,6 +3669,77 @@ TEST_F(NativeControlsFixture, ComCtlTypedPropertiesRoundTripAndRejectStaleItems)
         summary.find(
             "tab(id=1013)=1:Details;items=Overview|Details|Advanced"),
         std::string::npos);
+}
+
+TEST_F(NativeControlsFixture, ToolbarLongTextIsReadWithoutFixedBufferOverflow) {
+    auto native = native_tree();
+    auto* toolbar = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kToolbarId));
+    ASSERT_NE(toolbar, nullptr);
+    auto* apply = find_native_element_by_text(
+        *toolbar, "ToolbarButton", "Apply");
+    ASSERT_NE(apply, nullptr);
+
+    DWORD_PTR changed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kSetLongToolbarTextMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
+    ASSERT_NE(changed, 0u);
+
+    auto properties = snapshot(native, *apply);
+    ASSERT_TRUE(properties.ok) << properties.error;
+    const auto* text = native_value(properties, "Text");
+    ASSERT_NE(text, nullptr);
+    EXPECT_EQ(
+        text->value.size(),
+        native_fixture::kLongToolbarTextLength);
+    EXPECT_TRUE(std::all_of(
+        text->value.begin(), text->value.end(),
+        [](char value) { return value == 'X'; }));
+
+    auto tree = dump_tree();
+    const json* toolbarJson = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kToolbarId));
+    ASSERT_NE(toolbarJson, nullptr);
+    const json* applyJson = find_element_by_type_property(
+        *toolbarJson, "ToolbarButton", "commandId", "2001");
+    ASSERT_NE(applyJson, nullptr);
+    EXPECT_EQ(
+        applyJson->value("text", "").size(),
+        native_fixture::kLongToolbarTextLength);
+    EXPECT_TRUE(IsWindow(s_hwnd))
+        << "the oversized toolbar read killed the target process";
+
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreToolbarTextMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
+}
+
+TEST_F(NativeControlsFixture, NativeTargetsMustBelongToTheBuiltRootTree) {
+    auto native = native_tree();
+    DWORD_PTR siblingValue = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kGetOutOfTreeHwndMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &siblingValue),
+        0);
+    HWND sibling = reinterpret_cast<HWND>(siblingValue);
+    ASSERT_NE(sibling, nullptr);
+    DWORD siblingPid = 0;
+    GetWindowThreadProcessId(sibling, &siblingPid);
+    EXPECT_EQ(siblingPid, s_pid);
+    EXPECT_FALSE(IsChild(s_hwnd, sibling));
+
+    EXPECT_EQ(native.win32->register_hwnd(sibling), 0u);
+    auto rejected = native.win32->get_property_snapshot(
+        reinterpret_cast<uintptr_t>(sibling));
+    EXPECT_FALSE(rejected.ok);
+    EXPECT_EQ(rejected.hresult, HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
 }
 
 TEST_F(NativeControlsFixture, NativePropertySafetyRejectsHungClosedAndOwnerDataTargets) {
@@ -3621,6 +3805,142 @@ TEST_F(NativeControlsFixture, NativePropertySafetyRejectsHungClosedAndOwnerDataT
             std::string::npos);
     }
     DestroyWindow(owner);
+}
+
+TEST(NativePointerMessageSafety, TimedOutRemoteBufferLivesUntilTargetExit) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+
+    auto win32 = lvt::NativePropertyConnection::connect(
+        fixture.hwnd, fixture.pid, "win32");
+    auto comctl = lvt::NativePropertyConnection::connect(
+        fixture.hwnd, fixture.pid, "comctl", "test");
+    ASSERT_NE(win32, nullptr);
+    ASSERT_NE(comctl, nullptr);
+    auto frameworks =
+        lvt::detect_frameworks(fixture.hwnd, fixture.pid);
+    auto lookup =
+        [&win32, &comctl](const std::string& provider)
+            -> lvt::IFrameworkConnection* {
+        if (provider == "win32")
+            return win32.get();
+        if (provider == "comctl")
+            return comctl.get();
+        return nullptr;
+    };
+    auto tree = lvt::build_tree(
+        fixture.hwnd, fixture.pid, frameworks, -1, {}, false, lookup);
+    auto* toolbar = find_native_element_by_hwnd(
+        tree, GetDlgItem(fixture.hwnd, native_fixture::kToolbarId));
+    ASSERT_NE(toolbar, nullptr);
+    auto* apply = find_native_element_by_text(
+        *toolbar, "ToolbarButton", "Apply");
+    ASSERT_NE(apply, nullptr);
+    auto baseline =
+        comctl->get_property_snapshot(apply->providerHandle);
+    ASSERT_TRUE(baseline.ok) << baseline.error;
+
+    DWORD_PTR armed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            fixture.hwnd, native_fixture::kArmDelayedPointerMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &armed),
+        0);
+    const auto deferredBefore =
+        lvt::deferred_native_pointer_message_count_for_testing();
+    const auto started = std::chrono::steady_clock::now();
+    auto delayed =
+        comctl->get_property_snapshot(apply->providerHandle);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_FALSE(delayed.ok);
+    EXPECT_EQ(delayed.hresult, HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    EXPECT_GT(
+        lvt::deferred_native_pointer_message_count_for_testing(),
+        deferredBefore);
+
+    Sleep(700);
+    DWORD_PTR pointerState = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            fixture.hwnd, native_fixture::kGetDelayedPointerStateMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &pointerState),
+        0);
+    EXPECT_EQ(pointerState, 4u)
+        << "the target observed freed pointer memory after caller timeout";
+    EXPECT_TRUE(IsWindow(fixture.hwnd));
+
+    fixture.stop();
+    for (int attempt = 0;
+         attempt < 100 &&
+         lvt::deferred_native_pointer_message_count_for_testing() !=
+             deferredBefore;
+         ++attempt) {
+        Sleep(20);
+    }
+    EXPECT_EQ(
+        lvt::deferred_native_pointer_message_count_for_testing(),
+        deferredBefore)
+        << "deferred pointer buffers must be released after target exit";
+}
+
+TEST(NativeCrossBitness, PublicBuildTreeSkipsAbiSensitiveComCtlMessages) {
+    const fs::path source = LVT_SOURCE_DIR;
+    const fs::path otherFixture =
+        sizeof(void*) == 8
+            ? source / "build-x86" / "lvt_native_controls_fixture.exe"
+            : source / "build" / "lvt_native_controls_fixture.exe";
+    if (!fs::exists(otherFixture))
+        GTEST_SKIP() << "opposite-architecture fixture is not built";
+
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(otherFixture));
+    ASSERT_NE(
+        lvt::detect_process_architecture(fixture.pid),
+        lvt::get_host_architecture());
+
+    const auto frameworks =
+        lvt::detect_frameworks(fixture.hwnd, fixture.pid);
+    auto tree = lvt::build_tree(
+        fixture.hwnd, fixture.pid, frameworks);
+
+    auto no_logical_child_type =
+        [](const lvt::Element& element, const std::string& type) {
+        return std::none_of(
+            element.children.begin(), element.children.end(),
+            [&type](const lvt::Element& child) {
+                return child.type == type;
+            });
+    };
+
+    auto* listView = find_native_element_by_hwnd(
+        tree, GetDlgItem(fixture.hwnd, native_fixture::kListViewId));
+    auto* treeView = find_native_element_by_hwnd(
+        tree, GetDlgItem(fixture.hwnd, native_fixture::kTreeViewId));
+    auto* toolbar = find_native_element_by_hwnd(
+        tree, GetDlgItem(fixture.hwnd, native_fixture::kToolbarId));
+    auto* status = find_native_element_by_hwnd(
+        tree, GetDlgItem(fixture.hwnd, native_fixture::kStatusBarId));
+    auto* tabs = find_native_element_by_hwnd(
+        tree, GetDlgItem(fixture.hwnd, native_fixture::kTabControlId));
+    ASSERT_NE(listView, nullptr);
+    ASSERT_NE(treeView, nullptr);
+    ASSERT_NE(toolbar, nullptr);
+    ASSERT_NE(status, nullptr);
+    ASSERT_NE(tabs, nullptr);
+    EXPECT_EQ(listView->properties["itemCount"], "3");
+    EXPECT_EQ(listView->properties["viewMode"], "details");
+    EXPECT_EQ(treeView->properties["itemCount"], "3");
+    EXPECT_EQ(toolbar->properties["buttonCount"], "3");
+    EXPECT_EQ(status->properties["partCount"], "3");
+    EXPECT_EQ(tabs->properties["selectedIndex"], "1");
+    EXPECT_TRUE(no_logical_child_type(*listView, "ListViewItem"));
+    EXPECT_TRUE(no_logical_child_type(*treeView, "TreeViewItem"));
+    EXPECT_TRUE(no_logical_child_type(*toolbar, "ToolbarButton"));
+    EXPECT_TRUE(no_logical_child_type(*status, "StatusBarPart"));
+    EXPECT_TRUE(no_logical_child_type(*tabs, "Tab"));
+    EXPECT_TRUE(IsWindow(fixture.hwnd));
 }
 
 // ---- Framework-specific bounds (WinUI3/XAML) ----

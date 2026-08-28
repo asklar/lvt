@@ -1,12 +1,14 @@
 #pragma once
 
 #include <Windows.h>
+#include <cstddef>
 
 namespace lvt::native_fixture {
 
 inline constexpr wchar_t kWindowClass[] = L"LvtNativePropertyFixtureWindow";
 inline constexpr wchar_t kWindowTitle[] = L"LVT Native Property Fixture";
 inline constexpr wchar_t kGenericChildClass[] = L"LvtNativePropertyFixtureText";
+inline constexpr wchar_t kOutOfTreeTitle[] = L"LVT Native Out-of-Tree Window";
 
 inline constexpr int kCheckboxId = 1001;
 inline constexpr int kRadioId = 1002;
@@ -37,6 +39,15 @@ inline constexpr UINT kRestoreListViewIdentityMessage = WM_APP + 0x103;
 inline constexpr UINT kHangMessage = WM_APP + 0x104;
 inline constexpr UINT kMutateToolbarIdentityMessage = WM_APP + 0x105;
 inline constexpr UINT kRestoreToolbarIdentityMessage = WM_APP + 0x106;
+inline constexpr UINT kSetLongToolbarTextMessage = WM_APP + 0x107;
+inline constexpr UINT kRestoreToolbarTextMessage = WM_APP + 0x108;
+inline constexpr UINT kArmDelayedPointerMessage = WM_APP + 0x109;
+inline constexpr UINT kGetDelayedPointerStateMessage = WM_APP + 0x10A;
+inline constexpr UINT kGetOutOfTreeHwndMessage = WM_APP + 0x10B;
+inline constexpr UINT kDeleteFirstTabMessage = WM_APP + 0x10C;
+inline constexpr UINT kMakeDuplicateTabsMessage = WM_APP + 0x10D;
+inline constexpr UINT kRestoreTabsMessage = WM_APP + 0x10E;
 inline constexpr LRESULT kSummaryProtocolVersion = 2;
+inline constexpr size_t kLongToolbarTextLength = 6000;
 
 } // namespace lvt::native_fixture

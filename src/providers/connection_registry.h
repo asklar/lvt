@@ -59,10 +59,10 @@ private:
 // `lvt watch` process or an `lvt mcp` server process) registry of live
 // IFrameworkConnections, keyed by (pid, connection key). Diagnostics
 // providers use framework labels such as "xaml"; native property adapters
-// include their root HWND so two windows in one process do not share item
-// identity maps. Refcounted: multiple acquirers with the same key share one
-// underlying connection; it is only torn down once the last holder releases
-// (or lets its ConnectionHandle go out of scope).
+// include their root HWND and session id so neither windows nor sessions share
+// published item-identity maps. Refcounted: multiple acquirers with the same
+// key share one underlying connection; it is only torn down once the last
+// holder releases (or lets its ConnectionHandle go out of scope).
 //
 // Deliberately per-process only - a connection acquired by one lvt.exe
 // invocation is not visible to another separately-running lvt.exe process
