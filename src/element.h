@@ -24,8 +24,13 @@ struct Element {
     std::map<std::string, std::string> properties;
     std::vector<Element> children;
 
-    // Opaque handle for provider use (e.g. HWND value)
+    // Native pointer-sized identity such as HWND.
     uintptr_t nativeHandle = 0;
+
+    // Framework/provider object identity. Kept separately because some
+    // providers use fixed-width wire handles that are wider than uintptr_t on
+    // x86 (XAML InstanceHandle is MIDL_uhyper).
+    uint64_t providerHandle = 0;
 };
 
 } // namespace lvt

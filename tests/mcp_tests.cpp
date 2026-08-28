@@ -320,6 +320,37 @@ void collect_json_elements(const json& element, std::vector<const json*>& out) {
         collect_json_elements(child, out);
 }
 
+const json* find_property_descriptor(const json& snapshot, const std::string& name) {
+    const auto descriptors = snapshot.find("descriptors");
+    if (descriptors == snapshot.end() || !descriptors->is_array())
+        return nullptr;
+    for (const auto& descriptor : *descriptors) {
+        if (descriptor.value("name", "") == name)
+            return &descriptor;
+    }
+    return nullptr;
+}
+
+const json* find_property_value(const json& snapshot, const std::string& descriptorId) {
+    const auto values = snapshot.find("values");
+    if (values == snapshot.end() || !values->is_array())
+        return nullptr;
+    for (const auto& value : *values) {
+        if (value.value("descriptorId", "") == descriptorId)
+            return &value;
+    }
+    return nullptr;
+}
+
+std::string typed_property_value(const json& snapshot, const std::string& name) {
+    const auto* descriptor = find_property_descriptor(snapshot, name);
+    if (!descriptor)
+        return {};
+    const auto* value =
+        find_property_value(snapshot, descriptor->value("descriptorId", ""));
+    return value ? value->value("value", "") : std::string();
+}
+
 // A JSON Schema checker covering exactly the keywords lvt's output schemas use:
 // type, const, enum, required, properties, items, additionalProperties, anyOf.
 //
@@ -547,7 +578,7 @@ TEST(McpServer, ReadOnlyByDefaultAndInputOnlyWithTheFlag) {
     static constexpr const char* kMutating[] = {
         "click", "type_text", "press_key", "set_value", "toggle", "invoke",
         "scroll", "select", "set_expanded", "focus", "select_text", "window_action",
-        "set_visual_property", "clear_visual_property",
+        "set_property", "clear_property",
     };
 
     {
@@ -902,7 +933,7 @@ TEST_F(McpSampleFixture, VisualTreeIsAvailableAndDiffersFromTheUiaTree) {
     EXPECT_NE(visual.dump().find("win32"), std::string::npos);
 }
 
-TEST_F(McpSampleFixture, VisualPropertiesAndDiffsReuseOnePersistentInjection) {
+TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection) {
     SkipIfNotReady();
     McpClient client(true);
     ASSERT_TRUE(client.started());
@@ -935,25 +966,37 @@ TEST_F(McpSampleFixture, VisualPropertiesAndDiffsReuseOnePersistentInjection) {
 
     bool isError = false;
     auto properties = client.call_tool(
-        "get_visual_properties", json{{"session", session}, {"key", key}}, &isError);
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
     ASSERT_FALSE(isError) << properties.dump(2);
-    ASSERT_TRUE(properties.contains("properties")) << properties.dump(2);
+    ASSERT_TRUE(properties.contains("descriptors")) << properties.dump(2);
+    ASSERT_TRUE(properties.contains("values")) << properties.dump(2);
+    ASSERT_FALSE(properties.value("schemaId", "").empty()) << properties.dump(2);
     std::string schemaError;
     EXPECT_TRUE(schema_allows(
-        schemas.at("get_visual_properties"), properties, schemaError)) << schemaError;
+        schemas.at("get_editable_properties"), properties, schemaError)) << schemaError;
 
-    json opacity;
-    for (const auto& property : properties["properties"]) {
-        if (property.value("name", "") == "Opacity") {
-            opacity = property;
-            break;
-        }
-    }
-    ASSERT_FALSE(opacity.is_null()) << "PrimaryButton did not report Opacity";
-    ASSERT_EQ(opacity.value("metadataBits", uint64_t{0}) & 0x2, 0u);
-    const auto propertyIndex = opacity.value("propertyIndex", uint32_t{0});
-    const auto valueType = opacity.value("valueType", "");
-    ASSERT_FALSE(valueType.empty());
+    const auto* opacity = find_property_descriptor(properties, "Opacity");
+    ASSERT_NE(opacity, nullptr) << "PrimaryButton did not report Opacity";
+    EXPECT_TRUE(opacity->value("writable", false));
+    EXPECT_EQ(opacity->value("kind", ""), "number");
+    const auto opacityDescriptorId = opacity->value("descriptorId", "");
+    ASSERT_FALSE(opacityDescriptorId.empty());
+    EXPECT_FALSE(opacity->contains("propertyIndex"));
+    EXPECT_FALSE(opacity->contains("valueType"));
+
+    auto repeatedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
+    ASSERT_FALSE(isError) << repeatedProperties.dump(2);
+    EXPECT_EQ(
+        repeatedProperties.value("schemaId", ""),
+        properties.value("schemaId", ""));
+    const auto* repeatedOpacity =
+        find_property_descriptor(repeatedProperties, "Opacity");
+    ASSERT_NE(repeatedOpacity, nullptr);
+    EXPECT_EQ(
+        repeatedOpacity->value("descriptorId", ""), opacityDescriptorId);
 
     auto initialChanges = client.call_tool(
         "get_visual_tree_changes", json{{"session", session}}, &isError);
@@ -965,61 +1008,85 @@ TEST_F(McpSampleFixture, VisualPropertiesAndDiffsReuseOnePersistentInjection) {
         schemas.at("get_visual_tree_changes"), initialChanges, schemaError)) << schemaError;
 
     auto statusProperties = client.call_tool(
-        "get_visual_properties",
-        json{{"session", session}, {"key", statusKey}}, &isError);
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
     ASSERT_FALSE(isError) << statusProperties.dump(2);
-    json textProperty;
-    for (const auto& property : statusProperties["properties"]) {
-        if (property.value("name", "") == "Text") {
-            textProperty = property;
-            break;
-        }
-    }
-    ASSERT_FALSE(textProperty.is_null()) << "StatusText did not report Text";
-    const auto originalText = textProperty.value("value", "");
+    const auto* textProperty =
+        find_property_descriptor(statusProperties, "Text");
+    ASSERT_NE(textProperty, nullptr) << "StatusText did not report Text";
+    EXPECT_TRUE(textProperty->value("propertyType", "").ends_with("String"));
+    EXPECT_EQ(textProperty->value("kind", ""), "string")
+        << "TextBlock.Text must be classified from PropertyChainValue.Type, "
+           "not the current value's runtime ValueType";
+    const auto textDescriptorId =
+        textProperty->value("descriptorId", "");
+    ASSERT_FALSE(textDescriptorId.empty());
+    const auto originalText = typed_property_value(statusProperties, "Text");
     const auto changedText = "mcp \"quoted\"\nvalue";
 
-    auto set = client.call_tool(
-        "set_visual_property",
+    auto unknown = client.call_tool(
+        "set_property",
         json{{"session", session},
-             {"key", key},
-             {"propertyIndex", propertyIndex},
-             {"valueType", valueType},
+             {"element", key},
+             {"descriptorId", "not-a-real-descriptor"},
+             {"value", "0.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << unknown.dump(2);
+
+    auto mismatched = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", opacityDescriptorId},
+             {"value", "0.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << mismatched.dump(2);
+
+    auto clientMetadata = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", opacityDescriptorId},
+             {"propertyIndex", 1},
+             {"valueType", "String"},
+             {"value", "0.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << clientMetadata.dump(2);
+
+    auto set = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", opacityDescriptorId},
              {"value", "0.5"}},
         &isError);
     ASSERT_FALSE(isError) << set.dump(2);
     EXPECT_TRUE(set.value("ok", false));
     schemaError.clear();
     EXPECT_TRUE(schema_allows(
-        schemas.at("set_visual_property"), set, schemaError)) << schemaError;
+        schemas.at("set_property"), set, schemaError)) << schemaError;
 
     auto setText = client.call_tool(
-        "set_visual_property",
+        "set_property",
         json{{"session", session},
-             {"key", statusKey},
-             {"propertyIndex", textProperty.value("propertyIndex", uint32_t{0})},
-             {"valueType", textProperty.value("valueType", "")},
+             {"element", statusKey},
+             {"descriptorId", textDescriptorId},
              {"value", changedText}},
         &isError);
     ASSERT_FALSE(isError) << setText.dump(2);
     auto changedStatus = client.call_tool(
-        "get_visual_properties",
-        json{{"session", session}, {"key", statusKey}}, &isError);
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
     ASSERT_FALSE(isError) << changedStatus.dump(2);
 
     auto changedProperties = client.call_tool(
-        "get_visual_properties", json{{"session", session}, {"key", key}}, &isError);
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
     ASSERT_FALSE(isError) << changedProperties.dump(2);
-    auto property_value = [](const json& result, const char* name) {
-        for (const auto& property : result.value("properties", json::array())) {
-            if (property.value("name", "") == name)
-                return property.value("value", "");
-        }
-        return std::string();
-    };
-    ASSERT_FALSE(property_value(changedProperties, "Opacity").empty());
-    EXPECT_NEAR(std::stod(property_value(changedProperties, "Opacity")), 0.5, 0.001);
-    EXPECT_EQ(property_value(changedStatus, "Text"), changedText)
+    ASSERT_FALSE(typed_property_value(changedProperties, "Opacity").empty());
+    EXPECT_NEAR(
+        std::stod(typed_property_value(changedProperties, "Opacity")), 0.5, 0.001);
+    EXPECT_EQ(typed_property_value(changedStatus, "Text"), changedText)
         << "spaces, quotes, and newlines must survive the persistent TAP protocol";
 
     auto changes = client.call_tool(
@@ -1035,30 +1102,33 @@ TEST_F(McpSampleFixture, VisualPropertiesAndDiffsReuseOnePersistentInjection) {
     EXPECT_TRUE(sawTextChange) << changes.dump(2);
 
     auto clear = client.call_tool(
-        "clear_visual_property",
-        json{{"session", session}, {"key", key}, {"propertyIndex", propertyIndex}},
+        "clear_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", opacityDescriptorId}},
         &isError);
     ASSERT_FALSE(isError) << clear.dump(2);
     EXPECT_TRUE(clear.value("cleared", false));
     schemaError.clear();
     EXPECT_TRUE(schema_allows(
-        schemas.at("clear_visual_property"), clear, schemaError)) << schemaError;
+        schemas.at("clear_property"), clear, schemaError)) << schemaError;
 
     auto restoreText = client.call_tool(
-        "set_visual_property",
+        "set_property",
         json{{"session", session},
-             {"key", statusKey},
-             {"propertyIndex", textProperty.value("propertyIndex", uint32_t{0})},
-             {"valueType", textProperty.value("valueType", "")},
+             {"element", statusKey},
+             {"descriptorId", textDescriptorId},
              {"value", originalText}},
         &isError);
     ASSERT_FALSE(isError) << restoreText.dump(2);
 
     auto clearedProperties = client.call_tool(
-        "get_visual_properties", json{{"session", session}, {"key", key}}, &isError);
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
     ASSERT_FALSE(isError) << clearedProperties.dump(2);
-    ASSERT_FALSE(property_value(clearedProperties, "Opacity").empty());
-    EXPECT_NEAR(std::stod(property_value(clearedProperties, "Opacity")), 1.0, 0.001);
+    ASSERT_FALSE(typed_property_value(clearedProperties, "Opacity").empty());
+    EXPECT_NEAR(
+        std::stod(typed_property_value(clearedProperties, "Opacity")), 1.0, 0.001);
 
     auto afterClear = client.call_tool(
         "get_visual_tree_changes", json{{"session", session}}, &isError);
@@ -1129,18 +1199,15 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
 
     bool isError = false;
     auto statusProperties = client.call_tool(
-        "get_visual_properties",
-        json{{"session", session}, {"key", statusKey}}, &isError);
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
     ASSERT_FALSE(isError) << statusProperties.dump(2);
-    json textProperty;
-    for (const auto& property : statusProperties.value("properties", json::array())) {
-        if (property.value("name", "") == "Text") {
-            textProperty = property;
-            break;
-        }
-    }
-    ASSERT_FALSE(textProperty.is_null()) << statusProperties.dump(2);
-    const auto originalText = textProperty.value("value", "");
+    const auto* textProperty =
+        find_property_descriptor(statusProperties, "Text");
+    ASSERT_NE(textProperty, nullptr) << statusProperties.dump(2);
+    const auto textDescriptorId =
+        textProperty->value("descriptorId", "");
+    const auto originalText = typed_property_value(statusProperties, "Text");
 
     auto listed = client.request("resources/list");
     ASSERT_TRUE(listed.contains("result")) << listed.dump(2);
@@ -1172,11 +1239,10 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
 
     const auto changedText = "resource visual mutation";
     auto changed = client.call_tool(
-        "set_visual_property",
+        "set_property",
         json{{"session", session},
-             {"key", statusKey},
-             {"propertyIndex", textProperty.value("propertyIndex", uint32_t{0})},
-             {"valueType", textProperty.value("valueType", "")},
+             {"element", statusKey},
+             {"descriptorId", textDescriptorId},
              {"value", changedText}},
         &isError);
     ASSERT_FALSE(isError) << changed.dump(2);
@@ -1217,11 +1283,10 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
     auto unsubscribed = client.request("resources/unsubscribe", json{{"uri", uri}});
     EXPECT_TRUE(unsubscribed.contains("result")) << unsubscribed.dump(2);
     auto restored = client.call_tool(
-        "set_visual_property",
+        "set_property",
         json{{"session", session},
-             {"key", statusKey},
-             {"propertyIndex", textProperty.value("propertyIndex", uint32_t{0})},
-             {"valueType", textProperty.value("valueType", "")},
+             {"element", statusKey},
+             {"descriptorId", textDescriptorId},
              {"value", originalText}},
         &isError);
     EXPECT_FALSE(isError) << restored.dump(2);

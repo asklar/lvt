@@ -7,7 +7,7 @@ namespace lvt {
 
 struct CompactXamlKey {
     std::string framework;
-    uintptr_t handle = 0;
+    uint64_t handle = 0;
 };
 
 std::string escape_key_part(const std::string& value);
@@ -35,8 +35,9 @@ std::string stable_name_key(const Element& el);
 // process-wide form "xaml:0x..." / "winui3:0x...". Other providers (and the
 // rare XAML node without a handle) use "framework|className" path segments,
 // "/"-joined from the nearest structural ancestor and disambiguated among
-// siblings by native handle first, then a stable name property, then a local
-// sibling index as a last resort. Used by dump/query/UIA output, and by
+// siblings by fixed-width provider handle first, native handle second, then a
+// stable name property, then a local sibling index as a last resort. Used by
+// dump/query/UIA output, and by
 // watch_diff.cpp to give a *freshly discovered* element (the first tick, or
 // a genuinely new node appearing later) its initial key.
 //

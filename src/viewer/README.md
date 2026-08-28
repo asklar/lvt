@@ -98,14 +98,16 @@ All editing uses tools on the same MCP session:
 
 - UIA mode offers `toggle` and `set_value` for properties backed by those
   UI Automation patterns.
-- Visual mode calls `get_visual_properties` for complete XAML/WinUI
-  dependency-property metadata. Writable scalar values are converted by
-  xamlOM and applied with `set_visual_property`; **Clear** calls
-  `clear_visual_property` to restore inherited/style/default resolution.
+- Visual mode calls `get_editable_properties` and renders only the generic
+  descriptor metadata returned by the provider: read-only text, strings,
+  booleans, integers, numbers, and enums. `set_property` and `clear_property`
+  use opaque descriptor ids; the Viewer never sends a framework property
+  index or runtime type.
 
-Read-only, collection, and binding-expression values remain read-only rather
-than pretending arbitrary string assignment is safe. Elements are addressed
-by durable keys, including compact `xaml:0x...`/`winui3:0x...` handles.
+Schemas are cached by `schemaId` while values are refreshed for the selected
+element, so controls sharing a schema reuse editor presentation. UIA's existing
+Toggle/Value rows remain temporary legacy templates until its provider exposes
+the same descriptor contract. Elements are addressed by durable keys.
 
 ## Crosshair targeting
 

@@ -235,7 +235,8 @@ struct Element {
     Bounds bounds;            // Screen coordinates
     std::map<std::string, std::string> properties;
     std::vector<Element> children;
-    uintptr_t nativeHandle;   // Opaque handle (e.g. HWND)
+    uintptr_t nativeHandle;   // Pointer-sized native identity (e.g. HWND)
+    uint64_t providerHandle;  // Fixed-width provider object identity
 };
 ```
 

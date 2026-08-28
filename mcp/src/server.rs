@@ -173,39 +173,38 @@ pub struct UiaTreeChangesArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct VisualPropertiesArgs {
+#[serde(deny_unknown_fields)]
+pub struct EditablePropertiesArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Compact XAML diagnostics key from get_visual_tree, such as
-    /// "xaml:0x123" or "winui3:0xABC".
-    pub key: String,
+    /// Element reference or durable key returned by the session's visual tree.
+    pub element: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SetVisualPropertyArgs {
+#[serde(deny_unknown_fields)]
+pub struct SetPropertyArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Compact XAML diagnostics key from get_visual_tree.
-    pub key: String,
-    /// Dependency-property index returned by get_visual_properties.
-    #[serde(rename = "propertyIndex")]
-    pub property_index: u32,
-    /// xamlOM value type returned by get_visual_properties, such as "Double".
-    #[serde(rename = "valueType")]
-    pub value_type: String,
-    /// Text passed to IVisualTreeService::CreateInstance for conversion.
+    /// Element reference or durable key used with get_editable_properties.
+    pub element: String,
+    /// Opaque provider-owned id returned by get_editable_properties.
+    #[serde(rename = "descriptorId")]
+    pub descriptor_id: String,
+    /// Text converted according to the descriptor's provider-owned declared type.
     pub value: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ClearVisualPropertyArgs {
+#[serde(deny_unknown_fields)]
+pub struct ClearPropertyArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Compact XAML diagnostics key from get_visual_tree.
-    pub key: String,
-    /// Dependency-property index returned by get_visual_properties.
-    #[serde(rename = "propertyIndex")]
-    pub property_index: u32,
+    /// Element reference or durable key used with get_editable_properties.
+    pub element: String,
+    /// Opaque provider-owned id returned by get_editable_properties.
+    #[serde(rename = "descriptorId")]
+    pub descriptor_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1407,19 +1406,20 @@ impl LvtServer {
     }
 
     #[tool(
-        description = "Get the complete XAML/WinUI3 dependency-property chain for one visual \
-                       element, including property indexes, value types, source, override state, \
-                       and metadata bits needed to decide whether each value is writable.",
-        output_schema = crate::schema::visual_properties(),
+        description = "Get provider-owned typed property descriptors and the current live values \
+                       for one visual element. Descriptors are framework-neutral and carry opaque \
+                       ids, editor kinds, choices, writability, clear capability, and declared \
+                       types; live values are returned separately.",
+        output_schema = crate::schema::editable_properties(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn get_visual_properties(
+    async fn get_editable_properties(
         &self,
-        Parameters(a): Parameters<VisualPropertiesArgs>,
+        Parameters(a): Parameters<EditablePropertiesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         forward(
-            "get_visual_properties",
-            json!({ "session": a.session, "key": a.key }),
+            "get_editable_properties",
+            json!({ "session": a.session, "element": a.element }),
             self.allow_input,
         )
         .await
@@ -1692,23 +1692,22 @@ impl LvtServer {
     }
 
     #[tool(
-        description = "Set one writable scalar XAML/WinUI3 dependency property using the \
-                       property index and value type returned by get_visual_properties. The \
-                       value is converted by xamlOM before being applied.",
-        output_schema = crate::schema::visual_property_mutation(),
+        description = "Set one writable typed property using the opaque descriptor id returned \
+                       by get_editable_properties. The provider owns type conversion and rejects \
+                       unknown, stale, read-only, or element-mismatched descriptor ids.",
+        output_schema = crate::schema::property_mutation(),
         annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn set_visual_property(
+    async fn set_property(
         &self,
-        Parameters(a): Parameters<SetVisualPropertyArgs>,
+        Parameters(a): Parameters<SetPropertyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         forward(
-            "set_visual_property",
+            "set_property",
             json!({
                 "session": a.session,
-                "key": a.key,
-                "propertyIndex": a.property_index,
-                "valueType": a.value_type,
+                "element": a.element,
+                "descriptorId": a.descriptor_id,
                 "value": a.value,
             }),
             self.allow_input,
@@ -1717,22 +1716,21 @@ impl LvtServer {
     }
 
     #[tool(
-        description = "Clear one XAML/WinUI3 dependency property's local value so its inherited, \
-                       style, or default value becomes effective again. Use the property index \
-                       returned by get_visual_properties.",
-        output_schema = crate::schema::visual_property_mutation(),
+        description = "Clear one typed property's provider-local override using the opaque \
+                       descriptor id returned by get_editable_properties.",
+        output_schema = crate::schema::property_mutation(),
         annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
-    async fn clear_visual_property(
+    async fn clear_property(
         &self,
-        Parameters(a): Parameters<ClearVisualPropertyArgs>,
+        Parameters(a): Parameters<ClearPropertyArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         forward(
-            "clear_visual_property",
+            "clear_property",
             json!({
                 "session": a.session,
-                "key": a.key,
-                "propertyIndex": a.property_index,
+                "element": a.element,
+                "descriptorId": a.descriptor_id,
             }),
             self.allow_input,
         )
@@ -2241,11 +2239,11 @@ mod tests {
         "connect",
         "disconnect",
         "find_elements",
+        "get_editable_properties",
         "get_element_properties",
         "get_frameworks",
         "get_uia_tree",
         "get_uia_tree_changes",
-        "get_visual_properties",
         "get_visual_tree",
         "get_visual_tree_changes",
         "hit_test",
@@ -2255,7 +2253,7 @@ mod tests {
     ];
 
     const INPUT_TOOLS: [&str; 14] = [
-        "clear_visual_property",
+        "clear_property",
         "click",
         "focus",
         "invoke",
@@ -2265,7 +2263,7 @@ mod tests {
         "select_text",
         "set_expanded",
         "set_value",
-        "set_visual_property",
+        "set_property",
         "toggle",
         "type_text",
         "window_action",

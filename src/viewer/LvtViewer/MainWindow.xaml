@@ -225,38 +225,85 @@
                                     <TextBlock Grid.Column="0" Text="{Binding Name}" FontWeight="SemiBold"
                                                TextWrapping="Wrap" VerticalAlignment="Top" Margin="0,3,8,0"/>
                                     <StackPanel Grid.Column="1">
-                                        <TextBlock Text="{Binding Value}" TextWrapping="Wrap" Margin="0,3,0,0"
-                                                   Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=None}"/>
+                                        <StackPanel Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=ReadOnly}">
+                                            <TextBlock Text="{Binding Value}" TextWrapping="Wrap" Margin="0,3,0,0"/>
+                                            <TextBlock Text="{Binding Details}" Foreground="#FF707070"
+                                                       FontSize="11" TextWrapping="Wrap"/>
+                                        </StackPanel>
                                         <StackPanel Orientation="Horizontal"
-                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=Toggle}">
+                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=LegacyToggle}">
                                             <TextBlock Text="{Binding Value}" VerticalAlignment="Center" Margin="0,0,8,0"/>
                                             <Button Content="Toggle" Padding="10,1"
                                                     Command="{Binding DataContext.ToggleCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                                     CommandParameter="{Binding}"/>
                                         </StackPanel>
                                         <StackPanel Orientation="Horizontal"
-                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=TextValue}">
+                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=LegacyTextValue}">
                                             <TextBox Text="{Binding EditText, UpdateSourceTrigger=PropertyChanged}" Width="160" Margin="0,0,8,0"/>
                                             <Button Content="Set" Padding="10,1"
                                                     Command="{Binding DataContext.SetValueCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                                     CommandParameter="{Binding}"/>
                                         </StackPanel>
-                                        <StackPanel Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=VisualValue}">
-                                            <TextBlock Foreground="#FF707070" FontSize="11" Margin="0,0,0,2">
-                                                <Run Text="{Binding ValueType, Mode=OneWay}"/>
-                                                <Run Text=" · "/>
-                                                <Run Text="{Binding Source, Mode=OneWay}"/>
-                                            </TextBlock>
+                                        <StackPanel Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=String|Integer|Number}">
+                                            <TextBlock Text="{Binding Details}" Foreground="#FF707070"
+                                                       FontSize="11" Margin="0,0,0,2" TextWrapping="Wrap"/>
                                             <StackPanel Orientation="Horizontal">
                                                 <TextBox Text="{Binding EditText, UpdateSourceTrigger=PropertyChanged}"
                                                          Width="180" Margin="0,0,8,0"/>
                                                 <Button Content="Set" Padding="10,1" Margin="0,0,6,0"
-                                                        Command="{Binding DataContext.SetVisualPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        IsEnabled="{Binding CanApply}"
+                                                        Command="{Binding DataContext.SetPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                                         CommandParameter="{Binding}"/>
                                                 <Button Content="Clear" Padding="10,1"
                                                         IsEnabled="{Binding CanClear}"
                                                         ToolTip="Restore the inherited, styled, or default value"
-                                                        Command="{Binding DataContext.ClearVisualPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        Command="{Binding DataContext.ClearPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        CommandParameter="{Binding}"/>
+                                            </StackPanel>
+                                            <TextBlock Text="{Binding ValidationError}" Foreground="#FFC42B1C"
+                                                       FontSize="11" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <StackPanel Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=Boolean}">
+                                            <TextBlock Text="{Binding Details}" Foreground="#FF707070"
+                                                       FontSize="11" Margin="0,0,0,2" TextWrapping="Wrap"/>
+                                            <StackPanel Orientation="Horizontal">
+                                                <ComboBox ItemsSource="{Binding Choices}"
+                                                          DisplayMemberPath="Label"
+                                                          SelectedValuePath="Value"
+                                                          SelectedValue="{Binding EditText, UpdateSourceTrigger=PropertyChanged}"
+                                                          Width="120" Margin="0,0,8,0"/>
+                                                <Button Content="Set" Padding="10,1" Margin="0,0,6,0"
+                                                        IsEnabled="{Binding CanApply}"
+                                                        Command="{Binding DataContext.SetPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        CommandParameter="{Binding}"/>
+                                                <Button Content="Clear" Padding="10,1"
+                                                        IsEnabled="{Binding CanClear}"
+                                                        ToolTip="Restore the inherited, styled, or default value"
+                                                        Command="{Binding DataContext.ClearPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        CommandParameter="{Binding}"/>
+                                            </StackPanel>
+                                            <TextBlock Text="{Binding ValidationError}" Foreground="#FFC42B1C"
+                                                       FontSize="11" TextWrapping="Wrap"/>
+                                        </StackPanel>
+                                        <StackPanel Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=Enumeration}">
+                                            <TextBlock Text="{Binding Details}" Foreground="#FF707070"
+                                                       FontSize="11" Margin="0,0,0,2" TextWrapping="Wrap"/>
+                                            <StackPanel Orientation="Horizontal">
+                                                <ComboBox ItemsSource="{Binding Choices}"
+                                                          DisplayMemberPath="Label"
+                                                          SelectedValuePath="Value"
+                                                          SelectedValue="{Binding EditText, UpdateSourceTrigger=PropertyChanged}"
+                                                          Text="{Binding EditText, UpdateSourceTrigger=PropertyChanged}"
+                                                          IsEditable="True"
+                                                          Width="180" Margin="0,0,8,0"/>
+                                                <Button Content="Set" Padding="10,1" Margin="0,0,6,0"
+                                                        IsEnabled="{Binding CanApply}"
+                                                        Command="{Binding DataContext.SetPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        CommandParameter="{Binding}"/>
+                                                <Button Content="Clear" Padding="10,1"
+                                                        IsEnabled="{Binding CanClear}"
+                                                        ToolTip="Restore the inherited, styled, or default value"
+                                                        Command="{Binding DataContext.ClearPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                                         CommandParameter="{Binding}"/>
                                             </StackPanel>
                                         </StackPanel>

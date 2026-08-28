@@ -4,6 +4,7 @@
 // via IVisualTreeService::AdviseVisualTreeChange → sends JSON over named pipe.
 
 #include <Windows.h>
+#include <atomic>
 #include <objbase.h>
 #include <ocidl.h>
 #include <xamlOM.h>
@@ -24,6 +25,7 @@
 #include <unknwn.h>
 
 #include "xaml_property_filter.h"
+#include "bounded_event_queue.h"
 
 // C++/WinRT projected types for XAML element inspection.
 // System XAML (Windows.UI.Xaml) headers are always available from the Windows SDK.
@@ -147,6 +149,7 @@ struct BatchRequest {
 struct TapProperty {
     std::wstring name;
     std::wstring value;
+    std::wstring propertyType;
     std::wstring valueType;
     std::wstring declaringType;
     unsigned int propertyIndex = 0;
@@ -169,13 +172,21 @@ struct TapPropertyCommand {
     uint64_t commandId = 0;
     InstanceHandle object = 0;
     unsigned int propertyIndex = 0;
-    std::wstring valueType;
     std::wstring value;
 
     HRESULT hresult = E_FAIL;
     std::wstring error;
     std::vector<TapProperty> properties;
     bool hasValue = false;
+};
+
+struct TapChangeEvent {
+    bool added = false;
+    InstanceHandle handle = 0;
+    InstanceHandle parent = 0;
+    unsigned int childIndex = 0;
+    std::wstring type;
+    std::wstring name;
 };
 
 // Forward declaration for WndProc
@@ -219,11 +230,14 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     // redesign: one connect, many requests, instead of the old one-shot
     // "collect once, write once, close" pipe.
     wil::unique_hfile m_pipe;
-    // Guards every write to m_pipe. A GET_TREE response (written from the
-    // worker/command-loop thread) and a pushed CHANGE event (written from
-    // whichever thread XAML's OnVisualTreeChange happens to call back on)
-    // must never interleave their bytes on the wire.
+    // All pipe writes are performed by the command-loop thread. The mutex is
+    // retained because property/tree helpers also funnel through WriteLine,
+    // and keeping one serialization point prevents future concurrent callers
+    // from interleaving records.
     std::mutex m_pipeWriteMutex;
+    std::atomic_bool m_acceptChangeEvents = false;
+    static constexpr size_t kMaxChangeEvents = 4096;
+    lvt::BoundedEventQueue<TapChangeEvent, kMaxChangeEvents> m_changeEvents;
 
 public:
     wil::com_ptr<IVisualTreeService> m_vts;
@@ -378,9 +392,7 @@ public:
         return true;
     }
 
-    // Writes one line (message + '\n') to the pipe. Safe to call from any
-    // thread - guarded (see m_pipeWriteMutex) so a pushed CHANGE event can
-    // never interleave its bytes with a GET_TREE response.
+    // Writes one line (message + '\n') to the pipe.
     bool WriteLine(const std::string& utf8Line) {
         std::lock_guard<std::mutex> lock(m_pipeWriteMutex);
         if (!m_pipe) return false;
@@ -393,26 +405,16 @@ public:
         return ok != FALSE;
     }
 
-    // Writes one unsolicited {"type":"CHANGE",...} line - see
-    // OnVisualTreeChange, which calls this after releasing m_nodesMutex
-    // (never while holding it, to keep lock ordering simple: WriteLine only
-    // ever needs m_pipeWriteMutex). Safe to call before ServeConnection has
-    // run (no pipe yet - SetSiteImpl's synchronous initial replay happens
-    // first) or after the connection has ended: WriteLine just fails
-    // quietly in both cases, same as for any other caller, and a
-    // subsequent GET_TREE response always reflects current reality
-    // regardless of whether this push made it out.
-    void PushChangeEvent(bool added, InstanceHandle handle, InstanceHandle parent,
-                         unsigned int childIndex, const std::wstring& type, const std::wstring& name) {
+    std::string SerializeChangeEvent(const TapChangeEvent& event) {
         std::wstring json = L"{\"type\":\"CHANGE\",\"mutation\":\"";
-        json += added ? L"add" : L"remove";
-        json += L"\",\"handle\":" + std::to_wstring(handle);
-        json += L",\"parent\":" + std::to_wstring(parent);
-        if (added) {
-            json += L",\"childIndex\":" + std::to_wstring(childIndex);
-            json += L",\"elementType\":\"" + Escape(type) + L"\"";
-            if (!name.empty())
-                json += L",\"name\":\"" + Escape(name) + L"\"";
+        json += event.added ? L"add" : L"remove";
+        json += L"\",\"handle\":" + std::to_wstring(event.handle);
+        json += L",\"parent\":" + std::to_wstring(event.parent);
+        if (event.added) {
+            json += L",\"childIndex\":" + std::to_wstring(event.childIndex);
+            json += L",\"elementType\":\"" + Escape(event.type) + L"\"";
+            if (!event.name.empty())
+                json += L",\"name\":\"" + Escape(event.name) + L"\"";
         }
         json += L"}";
 
@@ -421,9 +423,34 @@ public:
         std::string utf8(len, '\0');
         WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
                             utf8.data(), len, nullptr, nullptr);
-        bool sent = WriteLine(utf8);
-        LogMsg("PushChangeEvent: %s handle=%llu parent=%llu sent=%d",
-               added ? "add" : "remove", (unsigned long long)handle, (unsigned long long)parent, sent);
+        return utf8;
+    }
+
+    // Called from XAML's target UI callback. It must never perform pipe I/O,
+    // flush a pipe, or wait for the reader. A bounded queue makes the callback
+    // memory-only; overflow discards partial history and asks the consumer for
+    // a fresh snapshot on the next command-thread drain.
+    void QueueChangeEvent(bool added, InstanceHandle handle, InstanceHandle parent,
+                          unsigned int childIndex, const std::wstring& type,
+                          const std::wstring& name) {
+        if (!m_acceptChangeEvents.load(std::memory_order_relaxed))
+            return;
+
+        m_changeEvents.push(
+            TapChangeEvent{added, handle, parent, childIndex, type, name});
+    }
+
+    // Runs only on the command-loop thread. CHANGE records remain compatible
+    // with the existing connection reader. EVENTS_OVERFLOW is an explicit
+    // reset marker: consumers must treat queued deltas as incomplete and use
+    // the next full GET_TREE snapshot as authoritative.
+    void DrainChangeEvents() {
+        auto drained = m_changeEvents.drain();
+
+        if (drained.snapshotRequired)
+            WriteLine("{\"type\":\"EVENTS_OVERFLOW\"}");
+        for (const auto& event : drained.events)
+            WriteLine(SerializeChangeEvent(event));
     }
 
     static bool ParseUint64(const std::string& text, uint64_t& value) {
@@ -541,8 +568,8 @@ public:
             auto itemType = TakeBstr(rawProperties[i].ItemType);
             auto value = TakeBstr(rawProperties[i].Value);
             auto name = TakeBstr(rawProperties[i].PropertyName);
-            (void)type;
             (void)itemType;
+            SanitizeTypeName(type);
             SanitizeTypeName(declaringType);
             SanitizeTypeName(valueType);
 
@@ -554,6 +581,7 @@ public:
             TapProperty property;
             property.name = std::move(name);
             property.value = std::move(value);
+            property.propertyType = std::move(type);
             property.valueType = std::move(valueType);
             property.declaringType = std::move(declaringType);
             property.propertyIndex = rawProperties[i].Index;
@@ -579,26 +607,49 @@ public:
             return;
         }
 
-        if (command.kind == TapPropertyCommandKind::setProperty) {
+        if (command.kind == TapPropertyCommandKind::setProperty ||
+            command.kind == TapPropertyCommandKind::clearProperty) {
             std::vector<TapProperty> currentProperties;
             std::wstring metadataError;
-            if (SUCCEEDED(CollectPropertyChain(
-                    command.object, currentProperties, metadataError))) {
-                auto property = std::find_if(
-                    currentProperties.begin(), currentProperties.end(),
-                    [&](const TapProperty& candidate) {
-                        return candidate.propertyIndex == command.propertyIndex;
-                    });
-                if (property != currentProperties.end() &&
-                    (property->metadataBits & IsPropertyReadOnly) != 0) {
-                    command.hresult = E_ACCESSDENIED;
-                    command.error = L"SetProperty refused a read-only property";
-                    return;
-                }
+            command.hresult = CollectPropertyChain(
+                command.object, currentProperties, metadataError);
+            if (FAILED(command.hresult)) {
+                command.error = metadataError;
+                return;
+            }
+            auto property = std::find_if(
+                currentProperties.begin(), currentProperties.end(),
+                [&](const TapProperty& candidate) {
+                    return candidate.propertyIndex == command.propertyIndex;
+                });
+            if (property == currentProperties.end()) {
+                command.hresult = E_INVALIDARG;
+                command.error = L"The property descriptor is stale or does not apply to this object";
+                return;
+            }
+            if ((property->metadataBits & IsPropertyReadOnly) != 0) {
+                command.hresult = E_ACCESSDENIED;
+                command.error = L"Property mutation refused a read-only property";
+                return;
+            }
+
+            if (command.kind == TapPropertyCommandKind::clearProperty) {
+                command.hresult = m_vts->ClearProperty(
+                    command.object, command.propertyIndex);
+                if (FAILED(command.hresult))
+                    command.error = L"ClearProperty failed";
+                return;
+            }
+
+            if (property->propertyType.empty()) {
+                command.hresult = E_INVALIDARG;
+                command.error = L"The dependency property's declared type is unavailable";
+                return;
             }
 
             wil::unique_bstr type(SysAllocStringLen(
-                command.valueType.data(), static_cast<UINT>(command.valueType.size())));
+                property->propertyType.data(),
+                static_cast<UINT>(property->propertyType.size())));
             wil::unique_bstr value(SysAllocStringLen(
                 command.value.data(), static_cast<UINT>(command.value.size())));
             if (!type || !value) {
@@ -611,7 +662,8 @@ public:
             command.hresult = m_vts->CreateInstance(type.get(), value.get(), &valueHandle);
             if (FAILED(command.hresult)) {
                 command.error = L"CreateInstance failed for value type '" +
-                                command.valueType + L"' and value '" + command.value + L"'";
+                                property->propertyType + L"' and value '" +
+                                command.value + L"'";
                 return;
             }
 
@@ -624,10 +676,6 @@ public:
             command.hasValue = true;
             return;
         }
-
-        command.hresult = m_vts->ClearProperty(command.object, command.propertyIndex);
-        if (FAILED(command.hresult))
-            command.error = L"ClearProperty failed";
     }
 
     std::wstring SerializePropertyResult(const TapPropertyCommand& command) {
@@ -648,6 +696,7 @@ public:
                 const auto& property = command.properties[i];
                 json += L"{\"name\":\"" + Escape(property.name) +
                         L"\",\"value\":\"" + Escape(property.value) +
+                        L"\",\"propertyType\":\"" + Escape(property.propertyType) +
                         L"\",\"valueType\":\"" + Escape(property.valueType) +
                         L"\",\"declaringType\":\"" + Escape(property.declaringType) +
                         L"\",\"propertyIndex\":" + std::to_wstring(property.propertyIndex) +
@@ -712,14 +761,11 @@ public:
             command.propertyIndex = static_cast<unsigned int>(index);
             if (verb == "SET_PROPERTY") {
                 command.kind = TapPropertyCommandKind::setProperty;
-                std::string encodedType;
                 std::string encodedValue;
-                tokens >> encodedType >> encodedValue;
-                if (!DecodeHexUtf8(encodedType, command.valueType) ||
-                    command.valueType.empty() ||
-                    !DecodeHexUtf8(encodedValue, command.value)) {
+                tokens >> encodedValue;
+                if (!DecodeHexUtf8(encodedValue, command.value)) {
                     command.hresult = E_INVALIDARG;
-                    command.error = L"SET_PROPERTY contains invalid UTF-8 hex fields";
+                    command.error = L"SET_PROPERTY contains an invalid UTF-8 value";
                     WritePropertyResult(command);
                     return;
                 }
@@ -758,6 +804,7 @@ public:
             LogMsg("HandlePollEvents: malformed command");
             return;
         }
+        DrainChangeEvents();
         WriteLine("{\"type\":\"EVENTS_RESULT\",\"commandId\":" +
                   std::to_string(commandId) + "}");
     }
@@ -814,8 +861,10 @@ public:
     void ServeConnection() {
         if (ConnectPipeOnce()) {
             WriteLine("READY");
+            m_acceptChangeEvents.store(true, std::memory_order_release);
             LogMsg("Sent READY, entering command loop");
             RunCommandLoop();
+            m_acceptChangeEvents.store(false, std::memory_order_release);
         } else {
             LogMsg("Failed to connect pipe; cannot serve requests this connection");
         }
@@ -858,6 +907,7 @@ public:
     // response, even an empty "[]", since lvt.exe blocks waiting for one.
     void HandleGetTree(bool fast) {
         m_fastMode = fast;
+        DrainChangeEvents();
 
         {
             std::lock_guard<std::mutex> lock(m_nodesMutex);
@@ -1038,12 +1088,13 @@ public:
             }
         }
 
-        // Pushed outside m_nodesMutex (see PushChangeEvent's comment on
-        // lock ordering). Lets a connected lvt.exe eventually react to real
-        // events instead of only ever polling via GET_TREE - see
-        // IFrameworkConnection::poll_events.
+        // Queue outside m_nodesMutex. The target callback remains memory-only;
+        // the command-loop thread serializes and drains events for GET_TREE or
+        // POLL_EVENTS.
         if (isAdd || isRemove)
-            PushChangeEvent(isAdd, element.Handle, relation.Parent, relation.ChildIndex, type, name);
+            QueueChangeEvent(
+                isAdd, element.Handle, relation.Parent, relation.ChildIndex,
+                type, name);
         return S_OK;
     }
 

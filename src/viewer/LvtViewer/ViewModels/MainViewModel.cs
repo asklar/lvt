@@ -21,6 +21,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly Dispatcher _dispatcher;
     private readonly LiveTree _liveTree = new();
     private readonly McpSession _mcp = new();
+    private readonly Dictionary<string, IReadOnlyList<PropertyDescriptorDto>>
+        _propertySchemas = new(StringComparer.Ordinal);
 
     private string _statusText = "Drag the crosshair onto a window to inspect it.";
     private string _targetText = "No target";
@@ -71,10 +73,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         ToggleCommand = new RelayCommand(p => _ = ToggleAsync(p as PropertyRowViewModel));
         SetValueCommand = new RelayCommand(p => _ = SetValueAsync(p as PropertyRowViewModel));
-        SetVisualPropertyCommand =
-            new RelayCommand(p => _ = SetVisualPropertyAsync(p as PropertyRowViewModel));
-        ClearVisualPropertyCommand =
-            new RelayCommand(p => _ = ClearVisualPropertyAsync(p as PropertyRowViewModel));
+        SetPropertyCommand =
+            new RelayCommand(p => _ = SetPropertyAsync(p as PropertyRowViewModel));
+        ClearPropertyCommand =
+            new RelayCommand(p => _ = ClearPropertyAsync(p as PropertyRowViewModel));
         ReconnectCommand = new RelayCommand(_ => Reconnect(), _ => _currentHwndHex != null);
         FindNextCommand = new RelayCommand(_ => FindNext());
         FindPreviousCommand = new RelayCommand(_ => FindPrevious());
@@ -225,7 +227,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (UseUia)
                 _ = RefreshUiaPropertiesAsync(value);
             else
-                _ = RefreshVisualPropertiesAsync(value);
+                _ = RefreshTypedPropertiesAsync(value);
         }
     }
 
@@ -284,8 +286,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public RelayCommand ToggleCommand { get; }
     public RelayCommand SetValueCommand { get; }
-    public RelayCommand SetVisualPropertyCommand { get; }
-    public RelayCommand ClearVisualPropertyCommand { get; }
+    public RelayCommand SetPropertyCommand { get; }
+    public RelayCommand ClearPropertyCommand { get; }
     public RelayCommand ReconnectCommand { get; }
     public RelayCommand FindNextCommand { get; }
     public RelayCommand FindPreviousCommand { get; }
@@ -351,6 +353,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _liveTree.Reset();
             SelectedElement = null;
             FrameworkFilters.Clear();
+            _propertySchemas.Clear();
         }
 
         Logger.Log(
@@ -619,11 +622,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Logger.Log("properties", $"Loaded UIA properties in {stopwatch.ElapsedMilliseconds} ms");
     }
 
-    private async System.Threading.Tasks.Task RefreshVisualPropertiesAsync(ElementNodeViewModel? node)
+    private async System.Threading.Tasks.Task RefreshTypedPropertiesAsync(ElementNodeViewModel? node)
     {
-        if (node == null ||
-            !(node.Key.StartsWith("xaml:0x", StringComparison.Ordinal) ||
-              node.Key.StartsWith("winui3:0x", StringComparison.Ordinal)))
+        if (node == null)
         {
             IsPropertyPanelLoading = false;
             return;
@@ -631,41 +632,57 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         long propertyVersion = node.PropertyVersion;
         var stopwatch = Stopwatch.StartNew();
-        var result = await _mcp.GetVisualPropertiesAsync(node.Key);
+        var result = await _mcp.GetEditablePropertiesAsync(node.Key);
         if (SelectedElement != node || node.PropertyVersion != propertyVersion)
             return;
         if (!result.Ok)
         {
-            StatusText = $"Could not read visual properties: {result.Error}";
-            IsPropertyPanelLoading = false;
-            return;
-        }
-        if (!result.Payload.TryGetProperty("properties", out var properties))
-        {
+            Logger.Log(
+                "properties",
+                $"No typed property provider for {node.Key}: {result.Error}");
             IsPropertyPanelLoading = false;
             return;
         }
 
-        string propertyJson = properties.GetRawText();
-        var rows = await System.Threading.Tasks.Task.Run(() =>
-        {
-            var values = System.Text.Json.JsonSerializer.Deserialize<List<VisualPropertyDto>>(
-                propertyJson, JsonDefaults.Options) ?? [];
-            return values.Select(property =>
-            {
-                var row = new PropertyRowViewModel(property.Name, property.Value);
-                row.UpdateVisualProperty(property);
-                return row;
-            }).ToList();
-        });
+        string snapshotJson = result.Payload.GetRawText();
+        var snapshot = await System.Threading.Tasks.Task.Run(() =>
+            System.Text.Json.JsonSerializer.Deserialize<PropertySnapshotDto>(
+                snapshotJson, JsonDefaults.Options));
         if (SelectedElement != node || node.PropertyVersion != propertyVersion)
             return;
+        if (snapshot == null || string.IsNullOrWhiteSpace(snapshot.SchemaId))
+        {
+            IsPropertyPanelLoading = false;
+            return;
+        }
 
-        node.ReplaceVisualPropertyRows(rows);
+        if (!_propertySchemas.TryGetValue(snapshot.SchemaId, out var descriptors))
+        {
+            foreach (var descriptor in snapshot.Descriptors)
+                descriptor.PreparePresentation();
+            descriptors = snapshot.Descriptors;
+            _propertySchemas[snapshot.SchemaId] = descriptors;
+        }
+
+        var values = snapshot.Values.ToDictionary(
+            value => value.DescriptorId, StringComparer.Ordinal);
+        var rows = descriptors
+            .Where(descriptor => values.ContainsKey(descriptor.DescriptorId))
+            .Select(descriptor =>
+            {
+                var value = values[descriptor.DescriptorId];
+                var row = new PropertyRowViewModel(descriptor.Name, value.Value);
+                row.UpdateTypedProperty(descriptor, value);
+                return row;
+            })
+            .ToList();
+
+        node.ReplaceTypedPropertyRows(rows);
         IsPropertyPanelLoading = false;
         Logger.Log(
             "properties",
-            $"Loaded {rows.Count} visual properties in {stopwatch.ElapsedMilliseconds} ms");
+            $"Loaded {rows.Count} typed properties from schema {snapshot.SchemaId} " +
+            $"in {stopwatch.ElapsedMilliseconds} ms");
     }
 
     private async System.Threading.Tasks.Task ToggleAsync(PropertyRowViewModel? row)
@@ -690,15 +707,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             : $"set-value failed: {result.Error}";
     }
 
-    private async System.Threading.Tasks.Task SetVisualPropertyAsync(PropertyRowViewModel? row)
+    private async System.Threading.Tasks.Task SetPropertyAsync(PropertyRowViewModel? row)
     {
         var node = SelectedElement;
-        if (row == null || node == null || !row.IsVisualProperty)
+        if (row == null || node == null || !row.IsTypedProperty || !row.CanApply)
             return;
 
         StatusText = $"Setting {row.Name}…";
-        var result = await _mcp.SetVisualPropertyAsync(
-            node.Key, row.PropertyIndex, row.ValueType, row.EditText);
+        var result = await _mcp.SetPropertyAsync(
+            node.Key, row.DescriptorId, row.EditText);
         if (SelectedElement != node)
             return;
         if (!result.Ok)
@@ -707,17 +724,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
         StatusText = $"{row.Name} updated.";
-        await RefreshVisualPropertiesAsync(node);
+        await RefreshTypedPropertiesAsync(node);
     }
 
-    private async System.Threading.Tasks.Task ClearVisualPropertyAsync(PropertyRowViewModel? row)
+    private async System.Threading.Tasks.Task ClearPropertyAsync(PropertyRowViewModel? row)
     {
         var node = SelectedElement;
-        if (row == null || node == null || !row.IsVisualProperty)
+        if (row == null || node == null || !row.IsTypedProperty)
             return;
 
         StatusText = $"Clearing {row.Name}…";
-        var result = await _mcp.ClearVisualPropertyAsync(node.Key, row.PropertyIndex);
+        var result = await _mcp.ClearPropertyAsync(node.Key, row.DescriptorId);
         if (SelectedElement != node)
             return;
         if (!result.Ok)
@@ -726,7 +743,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
         StatusText = $"{row.Name} restored.";
-        await RefreshVisualPropertiesAsync(node);
+        await RefreshTypedPropertiesAsync(node);
     }
 
     private async System.Threading.Tasks.Task HandleTargetClosedAsync()

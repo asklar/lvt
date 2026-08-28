@@ -3,6 +3,7 @@
 
 #include "xaml_diag_common.h"
 #include "framework_connection.h"
+#include "overlapped_io.h"
 #include "../tap/tap_clsid.h"
 #include "../debug.h"
 #include "../bounds_util.h"
@@ -26,6 +27,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 #pragma comment(lib, "userenv.lib")
 
@@ -159,7 +161,7 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
     // repeating a multi-kilobyte ancestor path, and future property-edit
     // commands can address the exact object expected by
     // IVisualTreeService::SetProperty.
-    el.nativeHandle = static_cast<uintptr_t>(j.value("handle", 0ULL));
+    el.providerHandle = j.value("handle", uint64_t{0});
     el.className = sanitize(j.value("type", ""));
 
     // x:Name is a developer identifier, not user-visible text — store as property
@@ -425,7 +427,7 @@ public:
                 DWORD err = GetLastError();
                 if (err == ERROR_IO_PENDING) {
                     if (WaitForSingleObject(m_readEvent.get(), timeoutMs) != WAIT_OBJECT_0) {
-                        CancelIo(m_pipe);
+                        detail::cancel_and_complete_overlapped(m_pipe, ov);
                         return false;
                     }
                     if (!GetOverlappedResult(m_pipe, &ov, &bytesRead, FALSE) || bytesRead == 0)
@@ -454,7 +456,7 @@ public:
             DWORD err = GetLastError();
             if (err != ERROR_IO_PENDING) return false;
             if (WaitForSingleObject(m_writeEvent.get(), timeoutMs) != WAIT_OBJECT_0) {
-                CancelIo(m_pipe);
+                detail::cancel_and_complete_overlapped(m_pipe, ov);
                 return false;
             }
             if (!GetOverlappedResult(m_pipe, &ov, &written, FALSE)) return false;
@@ -467,6 +469,28 @@ private:
     wil::unique_event m_readEvent;
     wil::unique_event m_writeEvent;
     std::string m_buffer;
+};
+
+struct XamlRawProperty {
+    std::string name;
+    std::string value;
+    std::string propertyType;
+    std::string valueType;
+    std::string declaringType;
+    uint32_t propertyIndex = 0;
+    uint64_t metadataBits = 0;
+    bool overridden = false;
+    std::string source;
+};
+
+struct XamlPropertyCommandResult {
+    bool ok = false;
+    HRESULT hresult = E_FAIL;
+    std::string error;
+    bool hasProperties = false;
+    std::vector<XamlRawProperty> properties;
+    bool hasValue = false;
+    std::string value;
 };
 
 // A live, persistent connection to one XAML/WinUI3 diagnostics session in a
@@ -511,11 +535,9 @@ public:
             m_alive = false;
             return false;
         }
-        // A pushed CHANGE event (see lvt_tap.cpp's OnVisualTreeChange/
-        // PushChangeEvent) can arrive on this same stream at any time,
-        // interleaved with the response to this specific request - drain
-        // and queue any of those (they start with '{') before the actual
-        // tree response (a JSON array, starts with '[') turns up.
+        // The TAP command thread drains queued CHANGE/reset records before
+        // this response. Consume those object records before the actual tree
+        // response (a JSON array, starts with '[') turns up.
         for (;;) {
             std::string line;
             if (!m_io->read_line(kXamlCollectionTimeoutMs, line)) {
@@ -525,7 +547,7 @@ public:
                 return false;
             }
             if (!line.empty() && line[0] == '{') {
-                queue_change_event(line);
+                queue_connection_event(line);
                 continue;
             }
             json treeJson;
@@ -566,7 +588,11 @@ public:
             if (response.is_discarded() || !response.is_object())
                 continue;
             if (response.value("type", "") == "CHANGE") {
-                queue_change_event(line);
+                queue_connection_event(line);
+                continue;
+            }
+            if (response.value("type", "") == "EVENTS_OVERFLOW") {
+                queue_connection_event(line);
                 continue;
             }
             if (response.value("type", "") == "EVENTS_RESULT" &&
@@ -578,64 +604,124 @@ public:
 
     bool is_alive() const override { return m_alive; }
 
-    FrameworkPropertyResult get_properties(uintptr_t handle) override {
+    PropertySnapshotResult get_property_snapshot(uint64_t handle) override {
         const auto commandId = next_command_id();
-        return send_property_command(
+        auto raw = send_property_command(
             "GET_PROPERTIES " + std::to_string(commandId) + " " +
             std::to_string(handle), commandId);
+        PropertySnapshotResult result;
+        result.ok = raw.ok;
+        result.hresult = raw.hresult;
+        result.error = std::move(raw.error);
+        if (!raw.ok)
+            return result;
+
+        result.schema = cache_schema(handle, raw.properties);
+        result.values.reserve(raw.properties.size());
+        for (size_t i = 0; i < raw.properties.size(); ++i) {
+            const auto& property = raw.properties[i];
+            const auto& descriptor = result.schema->descriptors[i];
+            PropertyValue value;
+            value.descriptorId = descriptor.descriptorId;
+            value.value = property.value;
+            value.runtimeType = property.valueType;
+            value.canClear = descriptor.supportsClear && property.overridden;
+            value.overridden = property.overridden;
+            value.source = property.source;
+            if (!descriptor.writable)
+                value.readOnlyReason =
+                    "The provider reports this property as read-only or non-scalar";
+            result.values.push_back(std::move(value));
+        }
+        return result;
     }
 
-    FrameworkPropertyResult set_property(
-        uintptr_t handle, uint32_t propertyIndex,
-        const std::string& valueType, const std::string& value) override {
+    PropertyMutationResult set_property(
+        uint64_t handle, const std::string& descriptorId,
+        const std::string& value) override {
+        PropertyMutationResult result;
+        CachedMutation mutation;
+        if (!resolve_mutation(handle, descriptorId, true, mutation, result))
+            return result;
+
         const auto commandId = next_command_id();
         std::ostringstream command;
         command << "SET_PROPERTY " << commandId << " " << handle << " "
-                << propertyIndex << " " << hex_encode(valueType) << " "
-                << hex_encode(value);
-        return send_property_command(command.str(), commandId);
+                << mutation.propertyIndex << " " << hex_encode(value);
+        auto raw = send_property_command(command.str(), commandId);
+        result.ok = raw.ok;
+        result.hresult = raw.hresult;
+        result.error = std::move(raw.error);
+        result.hasValue = raw.hasValue;
+        result.value = raw.hasValue ? value : std::string();
+        return result;
     }
 
-    FrameworkPropertyResult clear_property(
-        uintptr_t handle, uint32_t propertyIndex) override {
+    PropertyMutationResult clear_property(
+        uint64_t handle, const std::string& descriptorId) override {
+        PropertyMutationResult result;
+        CachedMutation mutation;
+        if (!resolve_mutation(handle, descriptorId, false, mutation, result))
+            return result;
+
         const auto commandId = next_command_id();
         std::ostringstream command;
         command << "CLEAR_PROPERTY " << commandId << " " << handle << " "
-                << propertyIndex;
-        return send_property_command(command.str(), commandId);
+                << mutation.propertyIndex;
+        auto raw = send_property_command(command.str(), commandId);
+        result.ok = raw.ok;
+        result.hresult = raw.hresult;
+        result.error = std::move(raw.error);
+        result.cleared = raw.ok;
+        return result;
     }
 
 private:
+    struct CachedMutation {
+        std::string schemaId;
+        uint32_t propertyIndex = 0;
+        bool writable = false;
+        bool supportsClear = false;
+    };
+
     XamlDiagConnection(wil::unique_hfile pipe, std::unique_ptr<DuplexPipeLineIO> io,
                        std::string frameworkLabel)
-        : m_pipe(std::move(pipe)), m_io(std::move(io)), m_frameworkLabel(std::move(frameworkLabel)) {
+        : m_pipe(std::move(pipe)), m_io(std::move(io)),
+          m_frameworkLabel(std::move(frameworkLabel)),
+          m_propertyNamespace(
+              m_frameworkLabel + "-" +
+              std::to_string(s_nextPropertyConnectionId.fetch_add(1))) {
         m_alive = true;
     }
 
-    // Parses one {"type":"CHANGE",...} line (see lvt_tap.cpp's
-    // PushChangeEvent for the exact shape) and queues it for poll_events().
+    // Parses one connection event line and queues it for poll_events().
     // Malformed/unrecognized lines are dropped rather than treated as an
-    // error - a push event is best-effort by design (see PushChangeEvent's
+    // error - a push event is best-effort by design (see QueueChangeEvent's
     // comment), and get_tree()'s own response is never affected by this.
-    void queue_change_event(const std::string& line) {
+    void queue_connection_event(const std::string& line) {
         json ev;
         try {
             ev = json::parse(line);
         } catch (const json::parse_error&) {
             return;
         }
-        if (ev.value("type", "") != "CHANGE")
+        const auto type = ev.value("type", "");
+        if (type != "CHANGE" && type != "EVENTS_OVERFLOW")
             return;
 
         ConnectionEvent ce;
-        ce.mutation = (ev.value("mutation", "") == "remove")
-                          ? ConnectionEvent::Mutation::removed
-                          : ConnectionEvent::Mutation::added;
-        ce.handle = static_cast<uintptr_t>(ev.value("handle", 0ULL));
-        ce.parentHandle = static_cast<uintptr_t>(ev.value("parent", 0ULL));
-        ce.childIndex = ev.value("childIndex", 0);
-        ce.elementType = ev.value("elementType", "");
-        ce.name = ev.value("name", "");
+        if (type == "EVENTS_OVERFLOW") {
+            ce.mutation = ConnectionEvent::Mutation::snapshotRequired;
+        } else {
+            ce.mutation = (ev.value("mutation", "") == "remove")
+                              ? ConnectionEvent::Mutation::removed
+                              : ConnectionEvent::Mutation::added;
+            ce.handle = ev.value("handle", uint64_t{0});
+            ce.parentHandle = ev.value("parent", uint64_t{0});
+            ce.childIndex = ev.value("childIndex", 0);
+            ce.elementType = ev.value("elementType", "");
+            ce.name = ev.value("name", "");
+        }
 
         std::lock_guard<std::mutex> lock(m_eventsMutex);
         // A caller that never calls poll_events() at all (e.g. a one-shot
@@ -646,8 +732,13 @@ private:
         // complete, independent refresh), only as an optional efficiency
         // gain for a caller that does drain regularly.
         constexpr size_t kMaxPendingEvents = 10000;
-        if (m_pendingEvents.size() >= kMaxPendingEvents)
-            m_pendingEvents.erase(m_pendingEvents.begin());
+        if (m_pendingEvents.size() >= kMaxPendingEvents) {
+            m_pendingEvents.clear();
+            ConnectionEvent reset;
+            reset.mutation = ConnectionEvent::Mutation::snapshotRequired;
+            m_pendingEvents.push_back(std::move(reset));
+            return;
+        }
         m_pendingEvents.push_back(std::move(ce));
     }
 
@@ -683,10 +774,113 @@ private:
                    : E_FAIL;
     }
 
-    FrameworkPropertyResult send_property_command(
+    std::shared_ptr<const PropertySchema> cache_schema(
+        uint64_t handle, const std::vector<XamlRawProperty>& properties) {
+        json identity = json::array();
+        for (const auto& property : properties) {
+            identity.push_back({
+                {"name", property.name},
+                {"declaringType", property.declaringType},
+                {"propertyType", property.propertyType},
+                {"propertyIndex", property.propertyIndex},
+                {"metadataBits", property.metadataBits},
+            });
+        }
+        const auto fingerprint = identity.dump();
+
+        std::lock_guard<std::mutex> lock(m_propertyCacheMutex);
+        auto found = m_schemasByFingerprint.find(fingerprint);
+        if (found != m_schemasByFingerprint.end()) {
+            m_elementSchemaIds[handle] = found->second->schemaId;
+            return found->second;
+        }
+
+        auto schema = std::make_shared<PropertySchema>();
+        schema->schemaId =
+            m_propertyNamespace + ":s" + std::to_string(m_nextSchemaId++);
+        schema->descriptors.reserve(properties.size());
+        for (const auto& property : properties) {
+            constexpr uint64_t unsupportedScalarBits =
+                IsValueHandle | IsPropertyReadOnly | IsValueCollection |
+                IsValueCollectionReadOnly | IsValueBindingExpression;
+            const bool writable =
+                !property.propertyType.empty() &&
+                (property.metadataBits & unsupportedScalarBits) == 0;
+
+            PropertyDescriptor descriptor;
+            descriptor.descriptorId =
+                m_propertyNamespace + ":p" +
+                std::to_string(m_nextDescriptorId++);
+            descriptor.name = property.name;
+            descriptor.displayName = property.name;
+            descriptor.provider = m_frameworkLabel;
+            descriptor.framework = m_frameworkLabel;
+            descriptor.declaringType = property.declaringType;
+            descriptor.propertyType = property.propertyType;
+            descriptor.kind =
+                classify_property_editor(property.propertyType, writable);
+            if (descriptor.kind == PropertyEditorKind::boolean) {
+                descriptor.choices = {
+                    {"False", "False"},
+                    {"True", "True"},
+                };
+            }
+            descriptor.writable = writable;
+            descriptor.supportsClear = writable;
+
+            CachedMutation mutation;
+            mutation.schemaId = schema->schemaId;
+            mutation.propertyIndex = property.propertyIndex;
+            mutation.writable = descriptor.writable;
+            mutation.supportsClear = descriptor.supportsClear;
+            m_mutationsByDescriptorId.emplace(
+                descriptor.descriptorId, std::move(mutation));
+            schema->descriptors.push_back(std::move(descriptor));
+        }
+
+        std::shared_ptr<const PropertySchema> immutable = schema;
+        m_schemasByFingerprint.emplace(fingerprint, immutable);
+        m_elementSchemaIds[handle] = schema->schemaId;
+        return immutable;
+    }
+
+    bool resolve_mutation(
+        uint64_t handle, const std::string& descriptorId, bool setting,
+        CachedMutation& mutation, PropertyMutationResult& result) {
+        std::lock_guard<std::mutex> lock(m_propertyCacheMutex);
+        const auto elementSchema = m_elementSchemaIds.find(handle);
+        if (elementSchema == m_elementSchemaIds.end()) {
+            result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_STATE);
+            result.error =
+                "No property schema has been read for this element; call "
+                "get_editable_properties first";
+            return false;
+        }
+        const auto found = m_mutationsByDescriptorId.find(descriptorId);
+        if (found == m_mutationsByDescriptorId.end() ||
+            found->second.schemaId != elementSchema->second) {
+            result.hresult = E_INVALIDARG;
+            result.error =
+                "The property descriptor is unknown, stale, or does not apply "
+                "to this element";
+            return false;
+        }
+        if ((setting && !found->second.writable) ||
+            (!setting && !found->second.supportsClear)) {
+            result.hresult = E_ACCESSDENIED;
+            result.error = setting
+                ? "The property descriptor is read-only"
+                : "The property descriptor does not support clearing";
+            return false;
+        }
+        mutation = found->second;
+        return true;
+    }
+
+    XamlPropertyCommandResult send_property_command(
         const std::string& command, uint64_t expectedCommandId) {
         std::lock_guard<std::mutex> lock(m_commandMutex);
-        FrameworkPropertyResult result;
+        XamlPropertyCommandResult result;
         if (!m_alive) {
             result.hresult = HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE);
             result.error = "The XAML diagnostics connection is no longer available";
@@ -713,7 +907,11 @@ private:
             if (response.is_discarded() || !response.is_object())
                 continue;
             if (response.value("type", "") == "CHANGE") {
-                queue_change_event(line);
+                queue_connection_event(line);
+                continue;
+            }
+            if (response.value("type", "") == "EVENTS_OVERFLOW") {
+                queue_connection_event(line);
                 continue;
             }
             if (response.value("type", "") != "PROPERTY_RESULT" ||
@@ -735,9 +933,10 @@ private:
                 for (const auto& item : *properties) {
                     if (!item.is_object())
                         continue;
-                    FrameworkProperty property;
+                    XamlRawProperty property;
                     property.name = item.value("name", "");
                     property.value = item.value("value", "");
+                    property.propertyType = item.value("propertyType", "");
                     property.valueType = item.value("valueType", "");
                     property.declaringType = item.value("declaringType", "");
                     property.propertyIndex = item.value("propertyIndex", uint32_t{0});
@@ -754,11 +953,20 @@ private:
     wil::unique_hfile m_pipe;
     std::unique_ptr<DuplexPipeLineIO> m_io;
     std::string m_frameworkLabel;
+    std::string m_propertyNamespace;
     std::atomic_bool m_alive = false;
     std::atomic_uint64_t m_nextCommandId = 1;
     std::mutex m_commandMutex;
     std::mutex m_eventsMutex;
     std::vector<ConnectionEvent> m_pendingEvents;
+    std::mutex m_propertyCacheMutex;
+    std::unordered_map<std::string, std::shared_ptr<const PropertySchema>>
+        m_schemasByFingerprint;
+    std::unordered_map<std::string, CachedMutation> m_mutationsByDescriptorId;
+    std::unordered_map<uint64_t, std::string> m_elementSchemaIds;
+    uint64_t m_nextSchemaId = 1;
+    uint64_t m_nextDescriptorId = 1;
+    inline static std::atomic_uint64_t s_nextPropertyConnectionId = 1;
 };
 
 std::shared_ptr<XamlDiagConnection> XamlDiagConnection::connect(
@@ -880,7 +1088,8 @@ std::shared_ptr<XamlDiagConnection> XamlDiagConnection::connect(
 
     if (FAILED(hr)) {
         fprintf(stderr, "lvt: InitializeXamlDiagnosticsEx failed (0x%08lX)\n", hr);
-        CancelIo(pipe.get());
+        if (connectErr == ERROR_IO_PENDING)
+            detail::cancel_and_complete_overlapped(pipe.get(), ov);
         return nullptr;
     }
 
@@ -900,7 +1109,13 @@ std::shared_ptr<XamlDiagConnection> XamlDiagConnection::connect(
         DWORD waitResult = WaitForSingleObject(ov.hEvent, kXamlCollectionTimeoutMs);
         if (waitResult != WAIT_OBJECT_0) {
             fprintf(stderr, "lvt: TAP DLL did not connect (timeout)\n");
-            CancelIo(pipe.get());
+            detail::cancel_and_complete_overlapped(pipe.get(), ov);
+            return nullptr;
+        }
+        DWORD connectedBytes = 0;
+        if (!GetOverlappedResult(pipe.get(), &ov, &connectedBytes, FALSE)) {
+            fprintf(stderr, "lvt: TAP DLL connection failed (error %lu)\n",
+                    GetLastError());
             return nullptr;
         }
     } else if (connectErr != ERROR_PIPE_CONNECTED) {

@@ -259,10 +259,10 @@ public sealed class ElementNodeViewModel : ObservableObject
             return;
         }
 
-        if (row.IsVisualProperty)
+        if (row.IsTypedProperty)
         {
             // Tree patches can carry the same property already represented
-            // by a richer xamlOM descriptor. Refresh its value without
+            // by a richer provider descriptor. Refresh its value without
             // replacing/removing the metadata-backed row.
             if (row.Value != value)
             {
@@ -288,9 +288,9 @@ public sealed class ElementNodeViewModel : ObservableObject
         NotifyIfIdentifyingProperty(name);
     }
 
-    public void ReplaceVisualPropertyRows(IEnumerable<PropertyRowViewModel> rows)
+    public void ReplaceTypedPropertyRows(IEnumerable<PropertyRowViewModel> rows)
     {
-        var merged = PropertyRows.Where(row => !row.IsVisualProperty).ToList();
+        var merged = PropertyRows.Where(row => !row.IsTypedProperty).ToList();
         foreach (var row in rows)
         {
             var treeRow = merged.FirstOrDefault(existing => existing.Name == row.Name);

@@ -379,8 +379,8 @@ public:
             ev.mutation = (events[i].mutation && std::string(events[i].mutation) == "remove")
                               ? ConnectionEvent::Mutation::removed
                               : ConnectionEvent::Mutation::added;
-            ev.handle = events[i].handle;
-            ev.parentHandle = events[i].parent_handle;
+            ev.handle = static_cast<uint64_t>(events[i].handle);
+            ev.parentHandle = static_cast<uint64_t>(events[i].parent_handle);
             ev.childIndex = events[i].child_index;
             ev.elementType = events[i].element_type ? events[i].element_type : "";
             ev.name = events[i].name ? events[i].name : "";

@@ -192,22 +192,32 @@ Every message on the pipe is one line (UTF-8, `\n`-terminated). lvt.exe → TAP 
 | lvt → TAP | `GET_TREE` / `GET_TREE FAST` | Request a refresh; `FAST` overrides the connection's default fast-mode setting for this one response |
 | TAP → lvt | `[...]` | One JSON array of root nodes, in response to `GET_TREE` |
 | lvt → TAP | `GET_PROPERTIES <id> <handle>` | Request the deduplicated property chain for one XAML instance handle |
-| lvt → TAP | `SET_PROPERTY <id> <handle> <index> <typeHex> <valueHex>` | Create a typed value and set one dependency property |
+| lvt → TAP | `SET_PROPERTY <id> <handle> <index> <valueHex>` | Resolve the declared property type, create a typed value, and set one dependency property |
 | lvt → TAP | `CLEAR_PROPERTY <id> <handle> <index>` | Clear a local value so inheritance/style/default resolution resumes |
-| TAP → lvt | `{"type":"PROPERTY_RESULT","commandId":...}` | Correlated typed property result; unsolicited `CHANGE` lines may appear before it |
-| lvt → TAP | `POLL_EVENTS <id>` | Optional lightweight barrier for consumers of the TAP structural-event queue |
-| TAP → lvt | `{"type":"EVENTS_RESULT","commandId":...}` | Acknowledges `POLL_EVENTS`; any preceding structural `CHANGE` lines are already queued by the connection |
+| TAP → lvt | `{"type":"PROPERTY_RESULT","commandId":...}` | Correlated typed property result; queued `CHANGE`/reset lines may precede it |
+| lvt → TAP | `POLL_EVENTS <id>` | Drain the bounded structural-event queue without collecting a tree |
+| TAP → lvt | `{"type":"EVENTS_OVERFLOW"}` | Queued deltas overflowed; discard them and require a fresh snapshot |
+| TAP → lvt | `{"type":"EVENTS_RESULT","commandId":...}` | Acknowledges `POLL_EVENTS`; preceding event records have been drained |
 | lvt → TAP | `DISCONNECT` | End the connection; TAP DLL replies `BYE`, then runs its cleanup |
 
 Tree responses are parsed and grafted by `graft_xaml_tree_json()` in
 `xaml_diag_common.cpp`; typed property responses are returned through the
 session's `IFrameworkConnection`.
-`typeHex` and `valueHex` are the UTF-8 bytes rendered as hexadecimal (with `-`
-for an empty string), so spaces, quotes, newlines, and non-ASCII values remain
-unambiguous without adding a JSON dependency to the injected DLL. The pipe
-worker never invokes thread-affine xamlOM methods itself: it synchronously
-dispatches the operation through the existing message-only window, then writes
-the result under the same pipe-write mutex used by tree and `CHANGE` messages.
+`valueHex` is the UTF-8 value rendered as hexadecimal (with `-` for an empty
+string), so spaces, quotes, newlines, and non-ASCII values remain unambiguous
+without adding a JSON dependency to the injected DLL. The provider resolves
+the client-opaque descriptor id to an internal property index, while the TAP
+uses `PropertyChainValue.Type` as the authoritative declared conversion type.
+The pipe worker never invokes thread-affine xamlOM methods itself: it
+synchronously dispatches the operation through the existing message-only
+window, then writes the result from the command thread.
+
+`OnVisualTreeChange` performs no pipe I/O. It only updates the tracked tree and
+enqueues a bounded in-memory structural record. `GET_TREE` and `POLL_EVENTS`
+drain and serialize that queue from the command thread. If the queue overflows,
+partial history is discarded and `EVENTS_OVERFLOW` tells the connection that a
+full snapshot is required; the target UI thread is never blocked on
+`WriteFile` or `FlushFileBuffers`.
 
 MCP resource subscriptions do not use `POLL_EVENTS` as their notification
 trigger. `AdviseVisualTreeChange` only reports structural additions/removals, so

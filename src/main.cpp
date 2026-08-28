@@ -929,12 +929,12 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
         }
 
         // Drain whatever incremental Add/Remove notifications a connection
-        // pushed since the last tick (see PushChangeEvent in lvt_tap.cpp
+        // queued since the last tick (see QueueChangeEvent in lvt_tap.cpp
         // and IFrameworkConnection::poll_events). watch's own change events
         // (emitted below via diff_trees) already come from comparing two
         // full GET_TREE snapshots, so these are not fed into that today -
-        // this just bounds each connection's internal event queue (see
-        // XamlDiagConnection::queue_change_event's cap) and surfaces them
+        // this just drains each connection's bounded internal event queue
+        // (see XamlDiagConnection::queue_connection_event) and surfaces them
         // for debugging. A future phase could drive watch's ticks from
         // these directly instead of polling on a fixed interval.
         if (lvt::g_debug) {

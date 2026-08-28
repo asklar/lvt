@@ -31,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <charconv>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1207,41 +1208,74 @@ std::string format_hresult(HRESULT hresult) {
     return buffer;
 }
 
-uint32_t require_uint32(const json& params, const char* name) {
-    auto it = params.find(name);
-    uint64_t value = 0;
-    if (it == params.end() ||
-        (!it->is_number_unsigned() && !it->is_number_integer())) {
-        throw std::runtime_error(std::string("'") + name +
-                                 "' must be a non-negative 32-bit integer");
+struct PropertyTarget {
+    std::string provider;
+    uint64_t handle = 0;
+};
+
+bool parse_compact_property_target(
+    const std::string& text, PropertyTarget& out) {
+    const auto marker = text.find(":0x");
+    if (marker == std::string::npos || marker == 0 || marker + 3 >= text.size())
+        return false;
+    if (!std::all_of(text.begin(), text.begin() + marker,
+                     [](unsigned char ch) {
+                         return std::isalnum(ch) != 0 || ch == '_' || ch == '-';
+                     })) {
+        return false;
     }
-    if (it->is_number_unsigned()) {
-        value = it->get<uint64_t>();
-    } else {
-        const auto signedValue = it->get<int64_t>();
-        if (signedValue < 0)
-            throw std::runtime_error(std::string("'") + name +
-                                     "' must be a non-negative 32-bit integer");
-        value = static_cast<uint64_t>(signedValue);
-    }
-    if (value > std::numeric_limits<uint32_t>::max()) {
-        throw std::runtime_error(std::string("'") + name +
-                                 "' must be a non-negative 32-bit integer");
-    }
-    return static_cast<uint32_t>(value);
+
+    uint64_t handle = 0;
+    const char* first = text.data() + marker + 3;
+    const char* last = text.data() + text.size();
+    const auto parsed = std::from_chars(first, last, handle, 16);
+    if (parsed.ec != std::errc() || parsed.ptr != last || handle == 0)
+        return false;
+
+    out.provider = text.substr(0, marker);
+    out.handle = handle;
+    return true;
 }
 
-lvt::CompactXamlKey require_compact_xaml_key(const json& params) {
-    const auto keyText = get_string(params, "key");
-    lvt::CompactXamlKey key;
+PropertyTarget require_property_target(
+    const Session& session, const json& params) {
+    const auto elementRef = get_string(params, "element");
+    if (elementRef.empty())
+        throw std::runtime_error("'element' must be a non-empty string");
+
+    const auto parsedRef = parse_ref(elementRef);
+    if (parsedRef.tree == RefTree::uia) {
+        throw std::runtime_error(
+            "'" + elementRef +
+            "' is a UI Automation reference, but typed visual properties need "
+            "an element from get_visual_tree");
+    }
+
+    PropertyTarget target;
+    if (parse_compact_property_target(parsedRef.ref, target))
+        return target;
+
+    json treeParams = params;
+    treeParams["fast"] = true;
+    lvt::Element tree;
     std::string error;
-    if (!lvt::parse_compact_xaml_key(keyText, key, error))
+    if (!build_tree_for(session, treeParams, false, tree, error))
         throw std::runtime_error(error);
-    return key;
+    const auto* element = lvt::find_element_by_ref(tree, parsedRef.ref);
+    if (!element)
+        throw std::runtime_error("element '" + elementRef + "' not found");
+    if (element->framework.empty() || element->providerHandle == 0) {
+        throw std::runtime_error(
+            "element '" + elementRef +
+            "' has no provider-owned property identity");
+    }
+    target.provider = element->framework;
+    target.handle = element->providerHandle;
+    return target;
 }
 
-lvt::IFrameworkConnection* visual_property_connection(
-    const Session& session, const lvt::CompactXamlKey& key) {
+lvt::IFrameworkConnection* typed_property_connection(
+    const Session& session, const PropertyTarget& target) {
     const auto hostArch = lvt::get_host_architecture();
     if (session.architecture != lvt::Architecture::unknown &&
         hostArch != lvt::Architecture::unknown &&
@@ -1255,96 +1289,157 @@ lvt::IFrameworkConnection* visual_property_connection(
 
     auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
     auto lookup = connection_lookup_for_session(session, frameworks);
-    auto* connection = lookup ? lookup(key.framework) : nullptr;
+    auto* connection = lookup ? lookup(target.provider) : nullptr;
     if (!connection || !connection->is_alive()) {
         throw std::runtime_error(
-            "no live " + key.framework +
-            " diagnostics connection is available for this session");
+            "provider '" + target.provider +
+            "' does not expose a live typed-property connection for this session");
     }
     return connection;
 }
 
-json framework_property_result(
-    const std::string& key, const lvt::FrameworkPropertyResult& result) {
+json property_snapshot_result(
+    const std::string& element, const lvt::PropertySnapshotResult& result) {
     if (!result.ok) {
         throw std::runtime_error(json{
-            {"error", result.error.empty() ? "native property operation failed" : result.error},
+            {"error", result.error.empty() ? "typed property operation failed" : result.error},
             {"hresult", format_hresult(result.hresult)},
         }.dump());
     }
 
-    json out{{"ok", true}, {"key", key}};
-    if (result.hasProperties) {
-        out["properties"] = json::array();
-        for (const auto& property : result.properties) {
-            out["properties"].push_back({
-                {"name", property.name},
-                {"value", property.value},
-                {"valueType", property.valueType},
-                {"declaringType", property.declaringType},
-                {"propertyIndex", property.propertyIndex},
-                {"metadataBits", property.metadataBits},
-                {"overridden", property.overridden},
-                {"source", property.source},
+    if (!result.schema)
+        throw std::runtime_error("typed property provider returned no schema");
+
+    json out{
+        {"ok", true},
+        {"element", element},
+        {"schemaId", result.schema->schemaId},
+        {"descriptors", json::array()},
+        {"values", json::array()},
+    };
+    for (const auto& descriptor : result.schema->descriptors) {
+        json item{
+            {"descriptorId", descriptor.descriptorId},
+            {"name", descriptor.name},
+            {"displayName", descriptor.displayName},
+            {"provider", descriptor.provider},
+            {"framework", descriptor.framework},
+            {"declaringType", descriptor.declaringType},
+            {"propertyType", descriptor.propertyType},
+            {"kind", lvt::property_editor_kind_name(descriptor.kind)},
+            {"choices", json::array()},
+            {"writable", descriptor.writable},
+            {"supportsClear", descriptor.supportsClear},
+            {"description", descriptor.description},
+        };
+        for (const auto& choice : descriptor.choices) {
+            item["choices"].push_back({
+                {"value", choice.value},
+                {"label", choice.label},
             });
         }
+        if (descriptor.minimum)
+            item["minimum"] = *descriptor.minimum;
+        if (descriptor.maximum)
+            item["maximum"] = *descriptor.maximum;
+        if (descriptor.step)
+            item["step"] = *descriptor.step;
+        out["descriptors"].push_back(std::move(item));
     }
-    if (result.hasValue)
-        out["value"] = result.value;
+    for (const auto& value : result.values) {
+        out["values"].push_back({
+            {"descriptorId", value.descriptorId},
+            {"value", value.value},
+            {"runtimeType", value.runtimeType},
+            {"canClear", value.canClear},
+            {"overridden", value.overridden},
+            {"source", value.source},
+            {"unavailableReason", value.unavailableReason},
+            {"readOnlyReason", value.readOnlyReason},
+        });
+    }
     return out;
 }
 
-json method_get_visual_properties(const json& params) {
-    const auto session = require_session(params);
-    const auto key = require_compact_xaml_key(params);
-    TargetGuard guard(session.hwnd);
-    auto* connection = visual_property_connection(session, key);
-    return framework_property_result(
-        get_string(params, "key"), connection->get_properties(key.handle));
+json property_mutation_result(
+    const std::string& element, const std::string& descriptorId,
+    const lvt::PropertyMutationResult& result) {
+    if (!result.ok) {
+        throw std::runtime_error(json{
+            {"error", result.error.empty() ? "typed property mutation failed" : result.error},
+            {"hresult", format_hresult(result.hresult)},
+        }.dump());
+    }
+    json out{
+        {"ok", true},
+        {"element", element},
+        {"descriptorId", descriptorId},
+    };
+    if (result.hasValue)
+        out["value"] = result.value;
+    if (result.cleared)
+        out["cleared"] = true;
+    return out;
 }
 
-json method_set_visual_property(const json& params, bool allowInput) {
+json method_get_editable_properties(const json& params) {
+    const auto session = require_session(params);
+    const auto target = require_property_target(session, params);
+    TargetGuard guard(session.hwnd);
+    auto* connection = typed_property_connection(session, target);
+    return property_snapshot_result(
+        get_string(params, "element"),
+        connection->get_property_snapshot(target.handle));
+}
+
+json method_set_property(const json& params, bool allowInput) {
     if (!allowInput) {
         throw std::runtime_error(
-            "'set_visual_property' changes the target application, which needs --allow-input");
+            "'set_property' changes the target application, which needs --allow-input");
+    }
+    if (params.contains("propertyIndex") || params.contains("valueType")) {
+        throw std::runtime_error(
+            "set_property accepts only a provider-owned 'descriptorId'; "
+            "client-supplied propertyIndex/valueType fields are not allowed");
     }
     const auto session = require_session(params);
-    const auto key = require_compact_xaml_key(params);
-    const auto propertyIndex = require_uint32(params, "propertyIndex");
-    const auto valueType = get_string(params, "valueType");
-    if (valueType.empty())
-        throw std::runtime_error("'valueType' must be a non-empty string");
+    const auto target = require_property_target(session, params);
+    const auto descriptorId = get_string(params, "descriptorId");
+    if (descriptorId.empty())
+        throw std::runtime_error("'descriptorId' must be a non-empty string");
     auto valueIt = params.find("value");
     if (valueIt == params.end() || !valueIt->is_string())
         throw std::runtime_error("'value' must be a string");
     const auto value = valueIt->get<std::string>();
 
     TargetGuard guard(session.hwnd);
-    auto* connection = visual_property_connection(session, key);
-    auto out = framework_property_result(
-        get_string(params, "key"),
-        connection->set_property(key.handle, propertyIndex, valueType, value));
-    out["propertyIndex"] = propertyIndex;
-    return out;
+    auto* connection = typed_property_connection(session, target);
+    return property_mutation_result(
+        get_string(params, "element"), descriptorId,
+        connection->set_property(target.handle, descriptorId, value));
 }
 
-json method_clear_visual_property(const json& params, bool allowInput) {
+json method_clear_property(const json& params, bool allowInput) {
     if (!allowInput) {
         throw std::runtime_error(
-            "'clear_visual_property' changes the target application, which needs --allow-input");
+            "'clear_property' changes the target application, which needs --allow-input");
+    }
+    if (params.contains("propertyIndex") || params.contains("valueType")) {
+        throw std::runtime_error(
+            "clear_property accepts only a provider-owned 'descriptorId'; "
+            "client-supplied propertyIndex/valueType fields are not allowed");
     }
     const auto session = require_session(params);
-    const auto key = require_compact_xaml_key(params);
-    const auto propertyIndex = require_uint32(params, "propertyIndex");
+    const auto target = require_property_target(session, params);
+    const auto descriptorId = get_string(params, "descriptorId");
+    if (descriptorId.empty())
+        throw std::runtime_error("'descriptorId' must be a non-empty string");
 
     TargetGuard guard(session.hwnd);
-    auto* connection = visual_property_connection(session, key);
-    auto out = framework_property_result(
-        get_string(params, "key"),
-        connection->clear_property(key.handle, propertyIndex));
-    out["propertyIndex"] = propertyIndex;
-    out["cleared"] = true;
-    return out;
+    auto* connection = typed_property_connection(session, target);
+    return property_mutation_result(
+        get_string(params, "element"), descriptorId,
+        connection->clear_property(target.handle, descriptorId));
 }
 
 std::string tree_snapshot_options_key(const json& params, bool uia) {
@@ -2157,11 +2252,12 @@ json dispatch(const std::string& method, const json& params, bool allowInput) {
     if (method == "get_visual_tree") return method_get_tree(params, false);
     if (method == "get_uia_tree_changes") return method_get_tree_changes(params, true);
     if (method == "get_visual_tree_changes") return method_get_tree_changes(params, false);
-    if (method == "get_visual_properties") return method_get_visual_properties(params);
-    if (method == "set_visual_property")
-        return method_set_visual_property(params, allowInput);
-    if (method == "clear_visual_property")
-        return method_clear_visual_property(params, allowInput);
+    if (method == "get_editable_properties")
+        return method_get_editable_properties(params);
+    if (method == "set_property")
+        return method_set_property(params, allowInput);
+    if (method == "clear_property")
+        return method_clear_property(params, allowInput);
     if (method == "get_frameworks")  return method_get_frameworks(params);
     if (method == "find_elements")   return method_find_elements(params);
     if (method == "get_element_properties") return method_get_element_properties(params);

@@ -205,17 +205,17 @@ public sealed class McpSession : IAsyncDisposable, IDisposable
     public Task<McpToolResult> SetValueAsync(string element, string text) =>
         CallSessionToolAsync("set_value", new { element, text });
 
-    public Task<McpToolResult> GetVisualPropertiesAsync(string key) =>
-        CallSessionToolAsync("get_visual_properties", new { key });
+    public Task<McpToolResult> GetEditablePropertiesAsync(string element) =>
+        CallSessionToolAsync("get_editable_properties", new { element });
 
-    public Task<McpToolResult> SetVisualPropertyAsync(
-        string key, uint propertyIndex, string valueType, string value) =>
+    public Task<McpToolResult> SetPropertyAsync(
+        string element, string descriptorId, string value) =>
         CallSessionToolAsync(
-            "set_visual_property",
-            new { key, propertyIndex, valueType, value });
+            "set_property",
+            new { element, descriptorId, value });
 
-    public Task<McpToolResult> ClearVisualPropertyAsync(string key, uint propertyIndex) =>
-        CallSessionToolAsync("clear_visual_property", new { key, propertyIndex });
+    public Task<McpToolResult> ClearPropertyAsync(string element, string descriptorId) =>
+        CallSessionToolAsync("clear_property", new { element, descriptorId });
 
     public async Task<McpStartResult> RefreshResourceAsync()
     {

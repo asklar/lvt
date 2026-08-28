@@ -3,38 +3,88 @@
 #include <Windows.h>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace lvt {
 
-// One dependency property reported by a framework-native diagnostics
-// connection. The raw metadata bits intentionally use the xamlOM values so a
-// caller can decide whether a scalar is writable without losing information
-// that a newer SDK may add.
-struct FrameworkProperty {
-    std::string name;
-    std::string value;
-    std::string valueType;
-    std::string declaringType;
-    uint32_t propertyIndex = 0;
-    uint64_t metadataBits = 0;
-    bool overridden = false;
-    std::string source;
+enum class PropertyEditorKind {
+    readonly,
+    string,
+    boolean,
+    integer,
+    number,
+    enumeration,
 };
 
-// Typed result shared by get/set/clear. Providers that do not expose native
-// property editing inherit the default E_NOTIMPL result below; they do not
-// need to pretend the operation succeeded or traffic in provider-specific
-// JSON.
-struct FrameworkPropertyResult {
+const char* property_editor_kind_name(PropertyEditorKind kind);
+PropertyEditorKind classify_property_editor(
+    std::string_view declaredType, bool writable);
+
+struct PropertyChoice {
+    std::string value;
+    std::string label;
+};
+
+// Provider-owned, immutable metadata. Connections cache PropertySchema
+// instances and return shared_ptr<const PropertySchema>; values never live in
+// the schema, so controls sharing one schema can reuse it safely.
+struct PropertyDescriptor {
+    std::string descriptorId;
+    std::string name;
+    std::string displayName;
+    std::string provider;
+    std::string framework;
+    std::string declaringType;
+    std::string propertyType;
+    PropertyEditorKind kind = PropertyEditorKind::readonly;
+    std::vector<PropertyChoice> choices;
+    std::optional<double> minimum;
+    std::optional<double> maximum;
+    std::optional<double> step;
+    bool writable = false;
+    bool supportsClear = false;
+    std::string description;
+};
+
+// Per-element live state. runtimeType is deliberately separate from the
+// descriptor's declared propertyType: evaluated values can change runtime
+// type (or be null), but that must not change editor selection or conversion.
+struct PropertyValue {
+    std::string descriptorId;
+    std::string value;
+    std::string runtimeType;
+    bool canClear = false;
+    bool overridden = false;
+    std::string source;
+    std::string unavailableReason;
+    std::string readOnlyReason;
+};
+
+struct PropertySchema {
+    std::string schemaId;
+    std::vector<PropertyDescriptor> descriptors;
+};
+
+struct PropertySnapshotResult {
     bool ok = false;
     HRESULT hresult = E_NOTIMPL;
-    std::string error = "Native property editing is not supported by this framework connection";
-    bool hasProperties = false;
-    std::vector<FrameworkProperty> properties;
+    std::string error =
+        "Typed properties are not supported by this framework connection";
+    std::shared_ptr<const PropertySchema> schema;
+    std::vector<PropertyValue> values;
+};
+
+struct PropertyMutationResult {
+    bool ok = false;
+    HRESULT hresult = E_NOTIMPL;
+    std::string error =
+        "Typed property mutation is not supported by this framework connection";
     bool hasValue = false;
     std::string value;
+    bool cleared = false;
 };
 
 // A live, reusable connection to one framework "island" (e.g. one XAML or
@@ -94,18 +144,19 @@ public:
         return true;
     }
 
-    // Optional framework-native dependency-property operations. XAML and
-    // WinUI3 implement these over the same persistent diagnostics connection
-    // used by get_tree(); UIA and plugins retain this explicit unsupported
-    // default until they grow an equivalent typed capability.
-    virtual FrameworkPropertyResult get_properties(uintptr_t) {
+    // Optional provider-neutral typed property operations. XAML and WinUI3
+    // implement these over their persistent diagnostics connection. UIA and
+    // the other built-in providers retain explicit unsupported defaults until
+    // their provider-owned schema adapters are implemented.
+    virtual PropertySnapshotResult get_property_snapshot(uint64_t) {
         return {};
     }
-    virtual FrameworkPropertyResult set_property(
-        uintptr_t, uint32_t, const std::string&, const std::string&) {
+    virtual PropertyMutationResult set_property(
+        uint64_t, const std::string&, const std::string&) {
         return {};
     }
-    virtual FrameworkPropertyResult clear_property(uintptr_t, uint32_t) {
+    virtual PropertyMutationResult clear_property(
+        uint64_t, const std::string&) {
         return {};
     }
 
@@ -123,14 +174,14 @@ public:
 // struct is the framework-agnostic version of that, so `watch`'s loop and
 // MCP sessions don't need to know which underlying API produced it.
 struct ConnectionEvent {
-    enum class Mutation { added, removed };
+    enum class Mutation { added, removed, snapshotRequired };
     Mutation mutation = Mutation::added;
 
-    // Native handle identity (e.g. XAML InstanceHandle) — the same value
-    // Element::nativeHandle carries once grafted, so this can be matched
+    // Provider object identity (e.g. XAML InstanceHandle) — the same value
+    // Element::providerHandle carries once grafted, so this can be matched
     // directly against an already-built tree without heuristics.
-    uintptr_t handle = 0;
-    uintptr_t parentHandle = 0;
+    uint64_t handle = 0;
+    uint64_t parentHandle = 0;
     int childIndex = 0;
 
     // Present for `added`; empty for `removed` (nothing more than the

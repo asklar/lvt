@@ -55,7 +55,7 @@ work across them.
 | `get_uia_tree_changes` | Session-scoped UIA patches: a snapshot on first call, then added/removed/changed events |
 | `get_visual_tree` | The framework-native tree — Win32/XAML/WPF/WinForms/Avalonia/Chromium. Shows *how a UI is built*; drive it from a `visual`-mode session |
 | `get_visual_tree_changes` | Session-scoped visual-tree patches: a snapshot on first call, then added/removed/changed events |
-| `get_visual_properties` | Complete editable XAML/WinUI3 dependency-property metadata for one compact visual key |
+| `get_editable_properties` | Provider-owned typed property schema and live values for one visual element |
 | `get_frameworks` | UI frameworks detected in the target, with versions |
 | `find_elements` | Match by AutomationId, name, control type or supported pattern |
 | `get_element_properties` | One element's properties, or a named subset |
@@ -71,8 +71,8 @@ work across them.
 | `invoke` | InvokePattern only — never moves the mouse |
 | `toggle` | Flip a checkbox or toggle button |
 | `set_value` | Set a text or numeric value outright |
-| `set_visual_property` | Set a writable scalar XAML/WinUI3 dependency property |
-| `clear_visual_property` | Clear a local XAML/WinUI3 value so inheritance/style/default resolution resumes |
+| `set_property` | Set a writable typed property by opaque provider descriptor id |
+| `clear_property` | Clear a typed property's local/provider override |
 | `set_expanded` | Expand or collapse a tree item or combo box |
 | `select` | Select a list item or tab (`replace`, `add`, `remove`) |
 | `focus` | Give an element keyboard focus |
@@ -162,7 +162,7 @@ Visual resources always poll `get_visual_tree_changes` with `fast: true`,
 matching the Viewer's former `watch --fast` path. The live stream still carries
 the bounds, text, content, and basic state needed to render and search the tree;
 full selected-node dependency properties come separately from
-`get_visual_properties`, avoiding multi-second full-property walks every tick.
+`get_editable_properties`, avoiding multi-second full-property walks every tick.
 UIA resources use their normal default options.
 
 The poll result is cached before the notification is sent, so the following
@@ -184,25 +184,41 @@ The newer 2026-07-28 subscription lifecycle is supported too through
 `SubscriptionContext::sink().notify_resource_updated`; no custom JSON-RPC
 method or notification is introduced.
 
-### Editing XAML/WinUI3 dependency properties
+### Typed property schemas and mutation
 
-`get_visual_properties` accepts a compact `xaml:0x…` or `winui3:0x…` key from
-the visual tree and returns the complete deduplicated property chain. Each row
-includes `propertyIndex`, `valueType`, `declaringType`, `metadataBits`,
-`overridden`, and `source`. Structural, UIA, WPF, and other provider keys are
-rejected because they do not identify an `IVisualTreeService` object.
+`get_editable_properties` takes an `element` reference or durable visual key.
+It returns a provider-owned `schemaId`, immutable `descriptors`, and separate
+per-element live `values`. Descriptors include an opaque `descriptorId`,
+declared property type, provider/framework identity, editor kind
+(`readonly`, `string`, `boolean`, `integer`, `number`, or `enum`), choices,
+optional numeric limits, writability, and clear capability. Live values carry
+the current value, runtime value type, source, override state, and whether that
+specific value can currently be cleared.
 
-Use the returned index and type without guessing:
+Clients never send a property index or type name. The provider resolves the
+opaque descriptor id and owns conversion:
 
 ```json
-{"name":"set_visual_property","arguments":{"session":"s1","key":"winui3:0x123","propertyIndex":42,"valueType":"Double","value":"100"}}
-{"name":"clear_visual_property","arguments":{"session":"s1","key":"winui3:0x123","propertyIndex":42}}
+{"name":"set_property","arguments":{"session":"s1","element":"winui3:0x123","descriptorId":"winui3-1:p7","value":"100"}}
+{"name":"clear_property","arguments":{"session":"s1","element":"winui3:0x123","descriptorId":"winui3-1:p7"}}
 ```
 
 Setting and clearing require `lvt mcp --allow-input`. Clearing removes the
-local value, allowing its inherited, style, or default value to become active.
+local/provider value, allowing inherited, style, or default resolution to
+resume. Unknown, stale, element-mismatched, and read-only descriptor ids are
+rejected.
+
+The provider-neutral contract is implemented by the XAML/WinUI3 adapter today.
+Its schema cache is connection-scoped and contains metadata only, never live
+values. For xamlOM properties, the descriptor's declared `propertyType` comes
+from `PropertyChainValue.Type` and drives editor selection and `CreateInstance`;
+the evaluated value's `ValueType` is reported only as live `runtimeType` and
+never trusted for mutation. Other built-in provider adapters can implement the
+same contract without adding framework catalogs to clients. External plugin ABI
+support is not part of this contract.
+
 Tree reads and all three property operations share the session's existing
-persistent TAP connection: there is no second injection or side protocol.
+persistent connection: there is no second injection or side protocol.
 
 ## Addressing elements
 

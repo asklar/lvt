@@ -75,12 +75,15 @@ void reconcile_children(const Element& prevParent, const Element& currParent,
     const auto& prevChildren = prevParent.children;
     const auto& currChildren = currParent.children;
 
-    std::unordered_map<uintptr_t, size_t> prevByHwnd;
+    std::unordered_map<uint64_t, size_t> prevByProviderHandle;
+    std::unordered_map<uintptr_t, size_t> prevByNativeHandle;
     std::unordered_map<std::string, size_t> prevByName;
     for (size_t i = 0; i < prevChildren.size(); i++) {
         const auto& p = prevChildren[i];
+        if (p.providerHandle != 0)
+            prevByProviderHandle.emplace(p.providerHandle, i);
         if (p.nativeHandle != 0)
-            prevByHwnd.emplace(p.nativeHandle, i);
+            prevByNativeHandle.emplace(p.nativeHandle, i);
         auto name = stable_name_key(p);
         if (!name.empty())
             prevByName.emplace(base_identity_key(p) + "|" + name, i);
@@ -89,7 +92,8 @@ void reconcile_children(const Element& prevParent, const Element& currParent,
     std::vector<bool> prevUsed(prevChildren.size(), false);
     std::vector<bool> currUsed(currChildren.size(), false);
 
-    // Pass 1+2: native handle, then a stable name property — both already
+    // Pass 1+2+3: provider handle, native handle, then a stable name property
+    // — all already
     // globally unique-enough on their own (assign_element_keys uses the
     // same two, in the same order, as its own segment discriminators), so
     // matching on either needs no further tie-breaking. The base-identity
@@ -98,9 +102,15 @@ void reconcile_children(const Element& prevParent, const Element& currParent,
     for (size_t ci = 0; ci < currChildren.size(); ci++) {
         const auto& c = currChildren[ci];
         std::optional<size_t> matchIdx;
-        if (c.nativeHandle != 0) {
-            auto it = prevByHwnd.find(c.nativeHandle);
-            if (it != prevByHwnd.end() && !prevUsed[it->second] &&
+        if (c.providerHandle != 0) {
+            auto it = prevByProviderHandle.find(c.providerHandle);
+            if (it != prevByProviderHandle.end() && !prevUsed[it->second] &&
+                base_identity_key(prevChildren[it->second]) == base_identity_key(c))
+                matchIdx = it->second;
+        }
+        if (!matchIdx && c.nativeHandle != 0) {
+            auto it = prevByNativeHandle.find(c.nativeHandle);
+            if (it != prevByNativeHandle.end() && !prevUsed[it->second] &&
                 base_identity_key(prevChildren[it->second]) == base_identity_key(c))
                 matchIdx = it->second;
         }
@@ -300,6 +310,7 @@ static Element element_without_children(const Element& el) {
     flat.bounds = el.bounds;
     flat.properties = el.properties;
     flat.nativeHandle = el.nativeHandle;
+    flat.providerHandle = el.providerHandle;
     return flat;
 }
 

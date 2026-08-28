@@ -265,48 +265,90 @@ cached!(uia_tree_changes, {
     }))
 });
 
-cached!(visual_properties, {
+cached!(editable_properties, {
     result(json!({
         "type": "object",
         "properties": {
             "ok": { "const": true },
-            "key": { "type": "string" },
-            "properties": {
+            "element": { "type": "string" },
+            "schemaId": { "type": "string" },
+            "descriptors": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
+                        "descriptorId": { "type": "string" },
                         "name": { "type": "string" },
-                        "value": { "type": "string" },
-                        "valueType": { "type": "string" },
+                        "displayName": { "type": "string" },
+                        "provider": { "type": "string" },
+                        "framework": { "type": "string" },
                         "declaringType": { "type": "string" },
-                        "propertyIndex": { "type": "integer" },
-                        "metadataBits": { "type": "integer" },
-                        "overridden": { "type": "boolean" },
-                        "source": { "type": "string" }
+                        "propertyType": { "type": "string" },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["readonly", "string", "boolean", "integer", "number", "enum"]
+                        },
+                        "choices": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "value": { "type": "string" },
+                                    "label": { "type": "string" }
+                                },
+                                "required": ["value", "label"]
+                            }
+                        },
+                        "minimum": { "type": "number" },
+                        "maximum": { "type": "number" },
+                        "step": { "type": "number" },
+                        "writable": { "type": "boolean" },
+                        "supportsClear": { "type": "boolean" },
+                        "description": { "type": "string" }
                     },
                     "required": [
-                        "name", "value", "valueType", "declaringType", "propertyIndex",
-                        "metadataBits", "overridden", "source"
+                        "descriptorId", "name", "displayName", "provider", "framework",
+                        "declaringType", "propertyType", "kind", "choices", "writable",
+                        "supportsClear", "description"
+                    ]
+                }
+            },
+            "values": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "descriptorId": { "type": "string" },
+                        "value": { "type": "string" },
+                        "runtimeType": { "type": "string" },
+                        "canClear": { "type": "boolean" },
+                        "overridden": { "type": "boolean" },
+                        "source": { "type": "string" },
+                        "unavailableReason": { "type": "string" },
+                        "readOnlyReason": { "type": "string" }
+                    },
+                    "required": [
+                        "descriptorId", "value", "runtimeType", "canClear", "overridden",
+                        "source", "unavailableReason", "readOnlyReason"
                     ]
                 }
             }
         },
-        "required": ["ok", "key", "properties"]
+        "required": ["ok", "element", "schemaId", "descriptors", "values"]
     }))
 });
 
-cached!(visual_property_mutation, {
+cached!(property_mutation, {
     result(json!({
         "type": "object",
         "properties": {
             "ok": { "const": true },
-            "key": { "type": "string" },
-            "propertyIndex": { "type": "integer" },
+            "element": { "type": "string" },
+            "descriptorId": { "type": "string" },
             "value": { "type": "string" },
             "cleared": { "type": "boolean" }
         },
-        "required": ["ok", "key", "propertyIndex"]
+        "required": ["ok", "element", "descriptorId"]
     }))
 });
 

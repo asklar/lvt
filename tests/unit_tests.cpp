@@ -13,10 +13,13 @@
 #include "providers/wpf_inject.h"
 #include "providers/uia_provider.h"
 #include "providers/connection_registry.h"
+#include "providers/framework_connection.h"
+#include "providers/overlapped_io.h"
 #include "providers/uia_props.h"
 #include "input.h"
 #include "providers/uia_actions.h"
 #include "tap/xaml_property_filter.h"
+#include "tap/bounded_event_queue.h"
 #include <oleacc.h>
 #include <UIAutomation.h>
 #include "wil_diagnostics.h"
@@ -486,13 +489,13 @@ TEST(ElementKeys, XamlInstanceHandlesUseCompactProcessWideKeys) {
     panel.type = "Grid";
     panel.className = "Microsoft.UI.Xaml.Controls.Grid";
     panel.framework = "winui3";
-    panel.nativeHandle = 0x123456789ABC;
+    panel.providerHandle = UINT64_C(0x123456789ABC);
 
     Element button;
     button.type = "Button";
     button.className = "Microsoft.UI.Xaml.Controls.Button";
     button.framework = "winui3";
-    button.nativeHandle = 0xFEDCBA987654;
+    button.providerHandle = UINT64_C(0xFEDCBA987654);
     panel.children.push_back(std::move(button));
     root.children.push_back(std::move(panel));
 
@@ -513,12 +516,22 @@ TEST(ElementKeys, ParsesOnlyCompactXamlInstanceKeys) {
 
     ASSERT_TRUE(parse_compact_xaml_key("winui3:0xFEDCBA987654", key, error));
     EXPECT_EQ(key.framework, "winui3");
-    EXPECT_EQ(key.handle, 0xFEDCBA987654u);
+    EXPECT_EQ(key.handle, UINT64_C(0xFEDCBA987654));
+
+    ASSERT_TRUE(parse_compact_xaml_key(
+        "winui3:0xFEDCBA9876543210", key, error));
+    EXPECT_EQ(key.handle, UINT64_C(0xFEDCBA9876543210));
 
     EXPECT_FALSE(parse_compact_xaml_key("win32|Window/winui3|Button", key, error));
     EXPECT_NE(error.find("compact XAML/WinUI3"), std::string::npos);
     EXPECT_FALSE(parse_compact_xaml_key("winui3:0xZZ", key, error));
     EXPECT_FALSE(parse_compact_xaml_key("xaml:0x0", key, error));
+}
+
+TEST(ElementKeys, ProviderHandlesRemain64BitOnEveryArchitecture) {
+    static_assert(sizeof(decltype(Element::providerHandle)) == sizeof(uint64_t));
+    static_assert(sizeof(decltype(CompactXamlKey::handle)) == sizeof(uint64_t));
+    static_assert(sizeof(decltype(ConnectionEvent::handle)) == sizeof(uint64_t));
 }
 
 TEST(ElementLookup, ResolvesByIdAndDurableKey) {
@@ -898,12 +911,98 @@ TEST(WatchDiff, AncestorSiblingChurnDoesNotDestabilizeStableDescendants) {
         EXPECT_NE(event.type, ChangeEvent::Type::Removed)
             << "an ancestor's own index shift destabilized a stable descendant (reported as Removed)";
     }
+
     bool sawTrackedCardMove = std::any_of(events.begin(), events.end(), [](const ChangeEvent& e) {
         return e.type == ChangeEvent::Type::Changed &&
                e.fields.count("path") &&
                e.fields.at("path").oldValue == "0.1" && e.fields.at("path").newValue == "0.2";
     });
     EXPECT_TRUE(sawTrackedCardMove) << "expected the tracked card to be recognized as moved, not replaced";
+}
+
+TEST(WatchDiff, ProviderHandlesAbove32BitsSurviveSiblingReordering) {
+    Element before = diff_el("Window", "Root");
+    Element first = diff_el("Item", "Item", "First");
+    first.providerHandle = UINT64_C(0x100000001);
+    Element second = diff_el("Item", "Item", "Second");
+    second.providerHandle = UINT64_C(0x200000001);
+    before.children = {first, second};
+
+    Element after = diff_el("Window", "Root");
+    after.children = {second, first};
+
+    auto events = diff_trees(before, after);
+
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Added ||
+               event.type == ChangeEvent::Type::Removed;
+    }));
+    EXPECT_NE(after.children[0].key.find("200000001"), std::string::npos);
+    EXPECT_NE(after.children[1].key.find("100000001"), std::string::npos);
+}
+
+TEST(BoundedEventQueue, OverflowRequiresSnapshotAndRecoversAfterDrain) {
+    BoundedEventQueue<int, 2> queue;
+    queue.push(1);
+    queue.push(2);
+    queue.push(3);
+
+    auto overflow = queue.drain();
+    EXPECT_TRUE(overflow.snapshotRequired);
+    EXPECT_TRUE(overflow.events.empty());
+
+    queue.push(4);
+    auto recovered = queue.drain();
+    EXPECT_FALSE(recovered.snapshotRequired);
+    ASSERT_EQ(recovered.events.size(), 1u);
+    EXPECT_EQ(recovered.events[0], 4);
+}
+
+TEST(OverlappedIo, CancellationCompletesBeforeStackStorageIsReleased) {
+    const auto pipeName =
+        std::wstring(L"\\\\.\\pipe\\lvt_overlapped_test_") +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64());
+    wil::unique_hfile server(CreateNamedPipeW(
+        pipeName.c_str(),
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 64, 64, 0, nullptr));
+    ASSERT_TRUE(server);
+
+    wil::unique_event connectEvent(
+        CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ASSERT_TRUE(connectEvent);
+    OVERLAPPED connectOv{};
+    connectOv.hEvent = connectEvent.get();
+    ASSERT_FALSE(ConnectNamedPipe(server.get(), &connectOv));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    wil::unique_hfile client(CreateFileW(
+        pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        OPEN_EXISTING, 0, nullptr));
+    ASSERT_TRUE(client);
+    ASSERT_EQ(WaitForSingleObject(connectEvent.get(), 5000), WAIT_OBJECT_0);
+    DWORD connectedBytes = 0;
+    ASSERT_TRUE(GetOverlappedResult(
+        server.get(), &connectOv, &connectedBytes, FALSE));
+
+    char buffer[8]{};
+    wil::unique_event readEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ASSERT_TRUE(readEvent);
+    OVERLAPPED readOv{};
+    readOv.hEvent = readEvent.get();
+    DWORD bytesRead = 0;
+    ASSERT_FALSE(ReadFile(
+        server.get(), buffer, sizeof(buffer), &bytesRead, &readOv));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    detail::cancel_and_complete_overlapped(server.get(), readOv);
+
+    SetLastError(ERROR_SUCCESS);
+    EXPECT_FALSE(GetOverlappedResult(
+        server.get(), &readOv, &bytesRead, FALSE));
+    EXPECT_EQ(GetLastError(), ERROR_OPERATION_ABORTED);
 }
 
 TEST(WatchDiff, SerializeChangedEvent) {
@@ -1736,6 +1835,42 @@ TEST(XamlPropertyFilter, ArbitraryPropertiesAreCapturedWithRecognizedValueTypes)
     EXPECT_TRUE(lvt::xaml_should_capture_property(L"FontSize", L"14", L"Double"));
     EXPECT_TRUE(lvt::xaml_should_capture_property(L"Opacity", L"0.5", L"Double"));
     EXPECT_TRUE(lvt::xaml_should_capture_property(L"SomeRandomProperty", L"42", L"Int32"));
+}
+
+TEST(TypedPropertyContract, EditorKindUsesDeclaredPropertyType) {
+    EXPECT_EQ(
+        classify_property_editor("String", true),
+        PropertyEditorKind::string);
+    EXPECT_EQ(
+        classify_property_editor("System.Boolean", true),
+        PropertyEditorKind::boolean);
+    EXPECT_EQ(
+        classify_property_editor("Windows.Foundation.Int32", true),
+        PropertyEditorKind::integer);
+    EXPECT_EQ(
+        classify_property_editor("Double", true),
+        PropertyEditorKind::number);
+    EXPECT_EQ(
+        classify_property_editor("Enum", true),
+        PropertyEditorKind::enumeration);
+    EXPECT_EQ(
+        classify_property_editor("String", false),
+        PropertyEditorKind::readonly);
+}
+
+TEST(TypedPropertyContract, EditorKindWireNamesAreProviderNeutral) {
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::readonly), "readonly");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::string), "string");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::boolean), "boolean");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::integer), "integer");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::number), "number");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::enumeration), "enum");
 }
 
 TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {

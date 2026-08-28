@@ -30,7 +30,7 @@ bool parse_compact_xaml_key(const std::string& text, CompactXamlKey& out,
         return false;
     }
 
-    uintptr_t handle = 0;
+    uint64_t handle = 0;
     const auto parsed = std::from_chars(first, last, handle, 16);
     if (parsed.ec != std::errc() || parsed.ptr != last || handle == 0) {
         error = "XAML element key has an invalid hexadecimal instance handle";
@@ -82,6 +82,12 @@ static std::string hwnd_key(uintptr_t handle) {
     return out.str();
 }
 
+static std::string provider_handle_key(uint64_t handle) {
+    std::ostringstream out;
+    out << "provider:0x" << std::hex << std::uppercase << handle;
+    return out.str();
+}
+
 // XAML diagnostics InstanceHandles are already process-wide object
 // identities. Unlike a sibling index/name path, they do not change when an
 // element is reparented and do not need every ancestor repeated in every
@@ -91,12 +97,12 @@ static std::string hwnd_key(uintptr_t handle) {
 // Keep the structural algorithm as the fallback for providers/elements that
 // do not expose such an identity.
 static std::string compact_instance_key(const Element& el) {
-    if (el.nativeHandle == 0 ||
+    if (el.providerHandle == 0 ||
         (el.framework != "xaml" && el.framework != "winui3"))
         return {};
 
     std::ostringstream out;
-    out << el.framework << ":0x" << std::hex << std::uppercase << el.nativeHandle;
+    out << el.framework << ":0x" << std::hex << std::uppercase << el.providerHandle;
     return out.str();
 }
 
@@ -119,9 +125,17 @@ std::string stable_name_key(const Element& el) {
 // diffing, before this).
 static std::string discriminator_for_child(const Element& child, size_t childIndex,
                                            const std::map<std::string, int>& baseCounts,
+                                           const std::map<std::string, int>& providerCounts,
                                            const std::map<std::string, int>& hwndCounts,
                                            const std::map<std::string, int>& nameCounts) {
     auto base = base_identity_key(child);
+    if (child.providerHandle != 0) {
+        auto provider = provider_handle_key(child.providerHandle);
+        auto full = base + "|" + provider;
+        auto count = providerCounts.find(full);
+        if (count == providerCounts.end() || count->second == 1)
+            return full;
+    }
     if (child.nativeHandle != 0) {
         auto hwnd = hwnd_key(child.nativeHandle);
         auto full = base + "|" + hwnd;
@@ -147,12 +161,15 @@ static std::string discriminator_for_child(const Element& child, size_t childInd
 
 static void assign_child_keys(Element& parent, const std::string& parentKey) {
     std::map<std::string, int> baseCounts;
+    std::map<std::string, int> providerCounts;
     std::map<std::string, int> hwndCounts;
     std::map<std::string, int> nameCounts;
 
     for (const auto& child : parent.children) {
         auto base = base_identity_key(child);
         baseCounts[base]++;
+        if (child.providerHandle != 0)
+            providerCounts[base + "|" + provider_handle_key(child.providerHandle)]++;
         if (child.nativeHandle != 0)
             hwndCounts[base + "|" + hwnd_key(child.nativeHandle)]++;
         auto name = stable_name_key(child);
@@ -166,7 +183,8 @@ static void assign_child_keys(Element& parent, const std::string& parentKey) {
         if (!compact.empty()) {
             child.key = std::move(compact);
         } else {
-            auto segment = discriminator_for_child(child, i, baseCounts, hwndCounts, nameCounts);
+            auto segment = discriminator_for_child(
+                child, i, baseCounts, providerCounts, hwndCounts, nameCounts);
             child.key = parentKey.empty() ? segment : parentKey + "/" + segment;
         }
         assign_child_keys(child, child.key);
