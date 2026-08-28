@@ -13,6 +13,11 @@ struct CompactXamlKey {
 std::string escape_key_part(const std::string& value);
 std::string base_identity_key(const Element& el);
 
+// True only for providers whose providerHandle contract explicitly makes the
+// value a process/session-wide object identity. Consumers must use this gate
+// rather than assuming every providerHandle can survive reparenting.
+bool has_process_wide_provider_identity(const Element& el);
+
 // Parse a process-wide XAML diagnostics identity produced by
 // assign_element_keys. Structural and non-XAML keys cannot address an object
 // for IVisualTreeService property operations and are rejected explicitly.

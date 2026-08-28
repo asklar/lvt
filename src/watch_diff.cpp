@@ -5,6 +5,7 @@
 #include <optional>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace lvt {
 
@@ -65,21 +66,103 @@ std::string shallow_shape_signature(const Element& el) {
     return sig;
 }
 
+struct ProcessWideProviderIdentity {
+    std::string framework;
+    uint64_t handle = 0;
+
+    bool operator<(const ProcessWideProviderIdentity& other) const {
+        return framework < other.framework ||
+               (framework == other.framework && handle < other.handle);
+    }
+};
+
+template <typename ElementPtr>
+struct GlobalCandidate {
+    ElementPtr element = nullptr;
+    size_t count = 0;
+};
+
+struct GlobalReconciliation {
+    std::unordered_map<const Element*, Element*> prevToCurr;
+    std::unordered_map<const Element*, const Element*> currToPrev;
+    std::unordered_map<const Element*, std::string> prevPaths;
+    std::unordered_map<const Element*, std::string> currPaths;
+    std::unordered_set<const Element*> processedCurr;
+};
+
+void collect_prev_candidates(
+    const Element& el, const std::string& path,
+    std::map<ProcessWideProviderIdentity, GlobalCandidate<const Element*>>& candidates,
+    std::unordered_map<const Element*, std::string>& paths) {
+    paths.emplace(&el, path);
+    if (has_process_wide_provider_identity(el)) {
+        auto& candidate = candidates[{el.framework, el.providerHandle}];
+        candidate.element = &el;
+        candidate.count++;
+    }
+    for (size_t i = 0; i < el.children.size(); ++i)
+        collect_prev_candidates(el.children[i], path + "." + std::to_string(i),
+                                candidates, paths);
+}
+
+void collect_curr_candidates(
+    Element& el, const std::string& path,
+    std::map<ProcessWideProviderIdentity, GlobalCandidate<Element*>>& candidates,
+    std::unordered_map<const Element*, std::string>& paths) {
+    paths.emplace(&el, path);
+    if (has_process_wide_provider_identity(el)) {
+        auto& candidate = candidates[{el.framework, el.providerHandle}];
+        candidate.element = &el;
+        candidate.count++;
+    }
+    for (size_t i = 0; i < el.children.size(); ++i)
+        collect_curr_candidates(el.children[i], path + "." + std::to_string(i),
+                                candidates, paths);
+}
+
+GlobalReconciliation build_global_reconciliation(Element& before, Element& after) {
+    std::map<ProcessWideProviderIdentity, GlobalCandidate<const Element*>> prevCandidates;
+    std::map<ProcessWideProviderIdentity, GlobalCandidate<Element*>> currCandidates;
+    GlobalReconciliation result;
+    collect_prev_candidates(before, "0", prevCandidates, result.prevPaths);
+    collect_curr_candidates(after, "0", currCandidates, result.currPaths);
+
+    for (const auto& [identity, prevCandidate] : prevCandidates) {
+        auto currIt = currCandidates.find(identity);
+        if (currIt == currCandidates.end() ||
+            prevCandidate.count != 1 || currIt->second.count != 1)
+            continue;
+
+        auto* prev = prevCandidate.element;
+        auto* curr = currIt->second.element;
+        if (base_identity_key(*prev) != base_identity_key(*curr))
+            continue;
+
+        result.prevToCurr.emplace(prev, curr);
+        result.currToPrev.emplace(curr, prev);
+    }
+    return result;
+}
+
 // Matches `prevParent`'s children against `currParent`'s children.
 // `matched` receives (prevIndex, currIndex) pairs; `removedOut`/`addedOut`
 // receive the indices of whatever could not be matched on either side.
-void reconcile_children(const Element& prevParent, const Element& currParent,
+void reconcile_children(const Element& prevParent, Element& currParent,
+                        GlobalReconciliation& global,
                         std::vector<std::pair<size_t, size_t>>& matched,
+                        std::vector<std::pair<const Element*, Element*>>& movedIn,
                         std::vector<size_t>& removedOut,
                         std::vector<size_t>& addedOut) {
     const auto& prevChildren = prevParent.children;
-    const auto& currChildren = currParent.children;
+    auto& currChildren = currParent.children;
 
     std::unordered_map<uint64_t, size_t> prevByProviderHandle;
     std::unordered_map<uintptr_t, size_t> prevByNativeHandle;
     std::unordered_map<std::string, size_t> prevByName;
     for (size_t i = 0; i < prevChildren.size(); i++) {
         const auto& p = prevChildren[i];
+        if (global.prevToCurr.find(&p) != global.prevToCurr.end())
+            continue;
         if (p.providerHandle != 0)
             prevByProviderHandle.emplace(p.providerHandle, i);
         if (p.nativeHandle != 0)
@@ -92,15 +175,32 @@ void reconcile_children(const Element& prevParent, const Element& currParent,
     std::vector<bool> prevUsed(prevChildren.size(), false);
     std::vector<bool> currUsed(currChildren.size(), false);
 
-    // Pass 1+2+3: provider handle, native handle, then a stable name property
-    // — all already
-    // globally unique-enough on their own (assign_element_keys uses the
-    // same two, in the same order, as its own segment discriminators), so
-    // matching on either needs no further tie-breaking. The base-identity
-    // equality check guards against the pathological case of a hwnd being
-    // recycled by Windows for a completely unrelated element.
+    // Process-wide provider identities are matched before any parent-local
+    // heuristic. If both endpoints are still direct children of this matched
+    // parent pair, treat them like an ordinary sibling match. Otherwise claim
+    // the current endpoint as a moved-in subtree root; its old endpoint is
+    // suppressed from the old parent's removal list below.
+    std::unordered_map<const Element*, size_t> directPrevIndices;
+    for (size_t i = 0; i < prevChildren.size(); ++i)
+        directPrevIndices.emplace(&prevChildren[i], i);
+    // Walk current children in encounter order. Process an opted-in global
+    // identity first, then the existing parent-local provider handle, native
+    // handle, and stable-name heuristics. The base-identity equality check
+    // guards against a recycled handle naming an unrelated element.
     for (size_t ci = 0; ci < currChildren.size(); ci++) {
         const auto& c = currChildren[ci];
+        auto globalIt = global.currToPrev.find(&c);
+        if (globalIt != global.currToPrev.end()) {
+            auto directIt = directPrevIndices.find(globalIt->second);
+            if (directIt != directPrevIndices.end()) {
+                matched.push_back({directIt->second, ci});
+                prevUsed[directIt->second] = true;
+            } else {
+                movedIn.push_back({globalIt->second, &currChildren[ci]});
+            }
+            currUsed[ci] = true;
+            continue;
+        }
         std::optional<size_t> matchIdx;
         if (c.providerHandle != 0) {
             auto it = prevByProviderHandle.find(c.providerHandle);
@@ -136,10 +236,12 @@ void reconcile_children(const Element& prevParent, const Element& currParent,
     // existing one does not hijack the existing one's identity.
     std::map<std::string, std::vector<size_t>> prevGroups, currGroups;
     for (size_t i = 0; i < prevChildren.size(); i++)
-        if (!prevUsed[i])
+        if (!prevUsed[i] &&
+            global.prevToCurr.find(&prevChildren[i]) == global.prevToCurr.end())
             prevGroups[base_identity_key(prevChildren[i])].push_back(i);
     for (size_t i = 0; i < currChildren.size(); i++)
-        if (!currUsed[i])
+        if (!currUsed[i] &&
+            global.currToPrev.find(&currChildren[i]) == global.currToPrev.end())
             currGroups[base_identity_key(currChildren[i])].push_back(i);
 
     for (auto& [base, plist] : prevGroups) {
@@ -174,15 +276,17 @@ void reconcile_children(const Element& prevParent, const Element& currParent,
             if (clistUsed[ci])
                 currUsed[clist[ci]] = true;
     }
-    // Mark every matched prev index used (matched above only marked curr).
+    // The grouped matches above marked only their current indices.
     for (auto& [pi, ci] : matched)
         prevUsed[pi] = true;
 
     for (size_t i = 0; i < prevChildren.size(); i++)
-        if (!prevUsed[i])
+        if (!prevUsed[i] &&
+            global.prevToCurr.find(&prevChildren[i]) == global.prevToCurr.end())
             removedOut.push_back(i);
     for (size_t i = 0; i < currChildren.size(); i++)
-        if (!currUsed[i])
+        if (!currUsed[i] &&
+            global.currToPrev.find(&currChildren[i]) == global.currToPrev.end())
             addedOut.push_back(i);
 }
 
@@ -329,21 +433,56 @@ std::vector<ChangeEvent> snapshot_added_events(Element& root) {
 
 namespace {
 
-// Emits one Added/Removed event per node in `node`'s own subtree (itself
-// included), depth-first — matching watch's existing flat, per-node event
-// protocol (see watch_diff.h): the client reconstructs structure from the
-// stream via each event's own "path", never from nested children on a
-// single event.
-void collect_subtree_events(const Element& node, const std::string& path,
-                            ChangeEvent::Type type, std::vector<ChangeEvent>& events) {
+void reconcile_and_collect(const Element& prev, Element& curr,
+                           const std::string& prevPath, const std::string& currPath,
+                           GlobalReconciliation& global,
+                           std::vector<ChangeEvent>& events);
+
+// Emits Added events depth-first, except that a globally recognized node is
+// reconciled against its previous location instead. This matters when a live
+// XAML object is reparented beneath a parent that is itself genuinely new.
+void collect_added_events(Element& node, const std::string& path,
+                          GlobalReconciliation& global,
+                          std::vector<ChangeEvent>& events) {
+    auto globalIt = global.currToPrev.find(&node);
+    if (globalIt != global.currToPrev.end()) {
+        if (global.processedCurr.insert(&node).second) {
+            reconcile_and_collect(*globalIt->second, node,
+                                  global.prevPaths.at(globalIt->second), path,
+                                  global, events);
+        }
+        return;
+    }
+
     ChangeEvent event;
-    event.type = type;
+    event.type = ChangeEvent::Type::Added;
     event.key = node.key;
     event.path = path;
     event.element = element_without_children(node);
     events.push_back(std::move(event));
     for (size_t i = 0; i < node.children.size(); i++)
-        collect_subtree_events(node.children[i], path + "." + std::to_string(i), type, events);
+        collect_added_events(node.children[i], path + "." + std::to_string(i),
+                             global, events);
+}
+
+// Emits Removed events depth-first. A globally matched node (and its subtree)
+// is suppressed here because its current endpoint owns the one recursive
+// reconciliation of that conceptual element.
+void collect_removed_events(const Element& node, const std::string& path,
+                            const GlobalReconciliation& global,
+                            std::vector<ChangeEvent>& events) {
+    if (global.prevToCurr.find(&node) != global.prevToCurr.end())
+        return;
+
+    ChangeEvent event;
+    event.type = ChangeEvent::Type::Removed;
+    event.key = node.key;
+    event.path = path;
+    event.element = element_without_children(node);
+    events.push_back(std::move(event));
+    for (size_t i = 0; i < node.children.size(); i++)
+        collect_removed_events(node.children[i], path + "." + std::to_string(i),
+                               global, events);
 }
 
 // Recursively reconciles `prev` and `curr`, which the caller has already
@@ -355,8 +494,10 @@ void collect_subtree_events(const Element& node, const std::string& path,
 // rather than being recomputed from either tree's structure alone, to
 // survive an ancestor's own position among its siblings shifting.
 void reconcile_and_collect(const Element& prev, Element& curr,
-                          const std::string& prevPath, const std::string& currPath,
-                          std::vector<ChangeEvent>& events) {
+                           const std::string& prevPath, const std::string& currPath,
+                           GlobalReconciliation& global,
+                           std::vector<ChangeEvent>& events) {
+    global.processedCurr.insert(&curr);
     curr.key = prev.key;
 
     auto fields = diff_element_fields(prev, prevPath, curr, currPath);
@@ -371,19 +512,27 @@ void reconcile_and_collect(const Element& prev, Element& curr,
     }
 
     std::vector<std::pair<size_t, size_t>> matched;
+    std::vector<std::pair<const Element*, Element*>> movedIn;
     std::vector<size_t> removed, added;
-    reconcile_children(prev, curr, matched, removed, added);
+    reconcile_children(prev, curr, global, matched, movedIn, removed, added);
 
     for (auto& [pi, ci] : matched)
         reconcile_and_collect(prev.children[pi], curr.children[ci],
                               prevPath + "." + std::to_string(pi),
-                              currPath + "." + std::to_string(ci), events);
+                              currPath + "." + std::to_string(ci), global, events);
+    for (auto& [movedPrev, movedCurr] : movedIn) {
+        if (!global.processedCurr.insert(movedCurr).second)
+            continue;
+        reconcile_and_collect(*movedPrev, *movedCurr,
+                              global.prevPaths.at(movedPrev),
+                              global.currPaths.at(movedCurr), global, events);
+    }
     for (auto ci : added)
-        collect_subtree_events(curr.children[ci], currPath + "." + std::to_string(ci),
-                               ChangeEvent::Type::Added, events);
+        collect_added_events(curr.children[ci], currPath + "." + std::to_string(ci),
+                             global, events);
     for (auto pi : removed)
-        collect_subtree_events(prev.children[pi], prevPath + "." + std::to_string(pi),
-                               ChangeEvent::Type::Removed, events);
+        collect_removed_events(prev.children[pi], prevPath + "." + std::to_string(pi),
+                               global, events);
 }
 
 } // namespace
@@ -400,8 +549,11 @@ std::vector<ChangeEvent> diff_trees(Element& before, Element& after) {
     assign_element_keys(before);
     assign_element_keys(after);
 
+    auto global = build_global_reconciliation(before, after);
+    global.processedCurr.insert(&after);
+
     std::vector<ChangeEvent> events;
-    reconcile_and_collect(before, after, "0", "0", events);
+    reconcile_and_collect(before, after, "0", "0", global, events);
     return events;
 }
 

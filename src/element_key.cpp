@@ -88,6 +88,11 @@ static std::string provider_handle_key(uint64_t handle) {
     return out.str();
 }
 
+bool has_process_wide_provider_identity(const Element& el) {
+    return el.providerHandle != 0 &&
+           (el.framework == "xaml" || el.framework == "winui3");
+}
+
 // XAML diagnostics InstanceHandles are already process-wide object
 // identities. Unlike a sibling index/name path, they do not change when an
 // element is reparented and do not need every ancestor repeated in every
@@ -97,8 +102,7 @@ static std::string provider_handle_key(uint64_t handle) {
 // Keep the structural algorithm as the fallback for providers/elements that
 // do not expose such an identity.
 static std::string compact_instance_key(const Element& el) {
-    if (el.providerHandle == 0 ||
-        (el.framework != "xaml" && el.framework != "winui3"))
+    if (!has_process_wide_provider_identity(el))
         return {};
 
     std::ostringstream out;

@@ -509,6 +509,24 @@ TEST(ElementKeys, XamlInstanceHandlesUseCompactProcessWideKeys) {
               std::string::npos);
 }
 
+TEST(ElementKeys, ProcessWideProviderIdentityIsExplicitOptIn) {
+    Element xaml;
+    xaml.framework = "xaml";
+    xaml.providerHandle = 0x101;
+    EXPECT_TRUE(has_process_wide_provider_identity(xaml));
+
+    Element winui = xaml;
+    winui.framework = "winui3";
+    EXPECT_TRUE(has_process_wide_provider_identity(winui));
+
+    Element wpf = xaml;
+    wpf.framework = "wpf";
+    EXPECT_FALSE(has_process_wide_provider_identity(wpf));
+
+    xaml.providerHandle = 0;
+    EXPECT_FALSE(has_process_wide_provider_identity(xaml));
+}
+
 TEST(ElementKeys, ParsesOnlyCompactXamlInstanceKeys) {
     CompactXamlKey key;
     std::string error;
@@ -728,6 +746,20 @@ static Element diff_el(const std::string& type, const std::string& className,
     return el;
 }
 
+static Element diff_provider_el(const std::string& framework,
+                                const std::string& type,
+                                const std::string& className,
+                                uint64_t providerHandle,
+                                const std::string& text = "") {
+    Element el;
+    el.type = type;
+    el.framework = framework;
+    el.className = className;
+    el.providerHandle = providerHandle;
+    el.text = text;
+    return el;
+}
+
 TEST(WatchDiff, AddedElement) {
     auto before = diff_el("Window", "Root");
     auto after = before;
@@ -788,20 +820,16 @@ TEST(WatchDiff, MovedElement) {
 
     auto events = diff_trees(before, after);
 
-    // Reparenting shows up as Removed (old key) + Added (new key), not a
-    // single Changed/path event, and that is a deliberate trade-off, not a
-    // gap: assign_element_keys (the one, single key algorithm this and
-    // dump/query/UIA output all share — see its doc comment in
-    // element_key.h) always threads the full parent chain into every
-    // element's key, precisely because that per-parent locality is what
-    // keeps an unrelated change elsewhere in the tree from ever touching
-    // this element's key at all (see the
+    // A structural Win32 element without a process-wide provider identity
+    // still shows reparenting as Removed (old key) + Added (new key):
+    // assign_element_keys (the one, single key algorithm this and dump/query/
+    // UIA output all share — see its doc comment in element_key.h) threads
+    // the full parent chain into this element's key, precisely because that
+    // per-parent locality is what keeps an unrelated change elsewhere in the
+    // tree from ever touching this element's key at all (see the
     // DuplicateIdentityElsewhereDoesNotDestabilizeUnrelatedSubtree test
-    // right below). Reparenting inherently changes that chain, so the key
-    // changes with it — for any element, named or not. The information
-    // itself is still fully accurate (Button really did stop existing at
-    // its old position and start existing at its new one); it is just
-    // conveyed as two events instead of a single, more elegant one.
+    // right below). Reparenting changes that chain, so without a stronger
+    // provider contract the information is correctly conveyed as two events.
     //
     // Checked by type+path rather than by vector index/order: diff_trees
     // emits all Added events before all Removed events (see its own
@@ -817,6 +845,194 @@ TEST(WatchDiff, MovedElement) {
     };
     EXPECT_TRUE(hasEvent(ChangeEvent::Type::Removed, "0.1"));
     EXPECT_TRUE(hasEvent(ChangeEvent::Type::Added, "0.0.0"));
+}
+
+TEST(WatchDiff, ProcessWideProviderHandleReparentsFromEarlierToLaterParent) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(diff_provider_el(
+        "xaml", "Button", "Windows.UI.Xaml.Controls.Button", 0xA01, "Move"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(diff_provider_el(
+        "xaml", "Button", "Windows.UI.Xaml.Controls.Button", 0xA01, "Move"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Changed);
+    EXPECT_EQ(events[0].key, "xaml:0xA01");
+    EXPECT_EQ(events[0].path, "0.1.0");
+    ASSERT_TRUE(events[0].fields.count("path"));
+    EXPECT_EQ(events[0].fields["path"].oldValue, "0.0.0");
+    EXPECT_EQ(events[0].fields["path"].newValue, "0.1.0");
+    EXPECT_EQ(after.children[1].children[0].key,
+              before.children[0].children[0].key);
+}
+
+TEST(WatchDiff, ProcessWideProviderHandleReparentsFromLaterToEarlierParent) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[1].children.push_back(diff_provider_el(
+        "winui3", "Button", "Microsoft.UI.Xaml.Controls.Button", 0xB01, "Move"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[0].children.push_back(diff_provider_el(
+        "winui3", "Button", "Microsoft.UI.Xaml.Controls.Button", 0xB01, "Move"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Changed);
+    EXPECT_EQ(events[0].key, "winui3:0xB01");
+    EXPECT_EQ(events[0].path, "0.0.0");
+    ASSERT_TRUE(events[0].fields.count("path"));
+    EXPECT_EQ(events[0].fields["path"].oldValue, "0.1.0");
+    EXPECT_EQ(events[0].fields["path"].newValue, "0.0.0");
+}
+
+TEST(WatchDiff, ReparentedProviderSubtreeIsReconciledExactlyOnce) {
+    auto makeSubtree = [] {
+        auto root = diff_provider_el(
+            "winui3", "Grid", "Microsoft.UI.Xaml.Controls.Grid", 0xC01);
+        auto child = diff_provider_el(
+            "winui3", "Border", "Microsoft.UI.Xaml.Controls.Border", 0xC02);
+        child.children.push_back(diff_provider_el(
+            "winui3", "TextBlock", "Microsoft.UI.Xaml.Controls.TextBlock",
+            0xC03, "Stable"));
+        root.children.push_back(std::move(child));
+        return root;
+    };
+
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(makeSubtree());
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(makeSubtree());
+    after.children[1].children[0].children[0].children[0].text = "Updated";
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 3u);
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Added ||
+               event.type == ChangeEvent::Type::Removed;
+    }));
+
+    const std::map<std::string, std::pair<std::string, std::string>> expectedPaths{
+        {"winui3:0xC01", {"0.0.0", "0.1.0"}},
+        {"winui3:0xC02", {"0.0.0.0", "0.1.0.0"}},
+        {"winui3:0xC03", {"0.0.0.0.0", "0.1.0.0.0"}},
+    };
+    for (const auto& [key, paths] : expectedPaths) {
+        auto matches = std::count_if(events.begin(), events.end(), [&](const auto& event) {
+            return event.key == key;
+        });
+        EXPECT_EQ(matches, 1) << key << " was reconciled more than once";
+        auto event = std::find_if(events.begin(), events.end(), [&](const auto& candidate) {
+            return candidate.key == key;
+        });
+        ASSERT_NE(event, events.end());
+        ASSERT_TRUE(event->fields.count("path"));
+        EXPECT_EQ(event->fields.at("path").oldValue, paths.first);
+        EXPECT_EQ(event->fields.at("path").newValue, paths.second);
+    }
+    auto leaf = std::find_if(events.begin(), events.end(), [](const auto& event) {
+        return event.key == "winui3:0xC03";
+    });
+    ASSERT_NE(leaf, events.end());
+    ASSERT_TRUE(leaf->fields.count("text"));
+    EXPECT_EQ(leaf->fields.at("text").oldValue, "Stable");
+    EXPECT_EQ(leaf->fields.at("text").newValue, "Updated");
+}
+
+TEST(WatchDiff, RecycledIncompatibleProviderHandleIsNotGloballyMatched) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(diff_provider_el(
+        "xaml", "Button", "Windows.UI.Xaml.Controls.Button", 0xD01, "Old"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(diff_provider_el(
+        "xaml", "TextBlock", "Windows.UI.Xaml.Controls.TextBlock", 0xD01, "New"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Changed;
+    }));
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Added;
+    }), 1);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Removed;
+    }), 1);
+}
+
+TEST(WatchDiff, DuplicateProviderHandlesAreNotGloballyMatched) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(diff_provider_el(
+        "winui3", "Item", "Microsoft.UI.Xaml.Controls.Item", 0xE01, "One"));
+    before.children[0].children.push_back(diff_provider_el(
+        "winui3", "Item", "Microsoft.UI.Xaml.Controls.Item", 0xE01, "Two"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(diff_provider_el(
+        "winui3", "Item", "Microsoft.UI.Xaml.Controls.Item", 0xE01, "One"));
+    after.children[1].children.push_back(diff_provider_el(
+        "winui3", "Item", "Microsoft.UI.Xaml.Controls.Item", 0xE01, "Two"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 4u);
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Changed;
+    }));
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Added;
+    }), 2);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Removed;
+    }), 2);
+}
+
+TEST(WatchDiff, ProviderHandleWithoutProcessWideContractIsNotGloballyMatched) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(diff_provider_el(
+        "wpf", "Button", "System.Windows.Controls.Button", 0xF01, "Move"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(diff_provider_el(
+        "wpf", "Button", "System.Windows.Controls.Button", 0xF01, "Move"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Changed;
+    }));
 }
 
 TEST(WatchDiff, DuplicateIdentityElsewhereDoesNotDestabilizeUnrelatedSubtree) {
@@ -1011,13 +1227,17 @@ TEST(WatchDiff, SerializeChangedEvent) {
     ChangeEvent event;
     event.type = ChangeEvent::Type::Changed;
     event.key = "win32|Button|Button";
-    event.path = "0.0";
+    event.path = "0.1.0";
     event.fields["text"] = {"OK", "Cancel"};
+    event.fields["path"] = {"0.0", "0.1.0"};
 
     auto j = json::parse(serialize_change_event(event));
     EXPECT_EQ(j["event"], "changed");
+    EXPECT_EQ(j["path"], "0.1.0");
     EXPECT_EQ(j["fields"]["text"]["old"], "OK");
     EXPECT_EQ(j["fields"]["text"]["new"], "Cancel");
+    EXPECT_EQ(j["fields"]["path"]["old"], "0.0");
+    EXPECT_EQ(j["fields"]["path"]["new"], "0.1.0");
 }
 
 // ---- Large tree serialization ----
