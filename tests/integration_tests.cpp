@@ -659,6 +659,17 @@ static const lvt::Element* find_named_element(
     }
     return nullptr;
 }
+
+static const lvt::PropertyDescriptor* find_property_descriptor(
+    const lvt::PropertySnapshotResult& snapshot, const std::string& name) {
+    if (!snapshot.schema)
+        return nullptr;
+    for (const auto& descriptor : snapshot.schema->descriptors) {
+        if (descriptor.name == name)
+            return &descriptor;
+    }
+    return nullptr;
+}
 #endif
 
 static bool deploy_plugins(const fs::path& source, const fs::path& dest, std::string& error) {
@@ -1042,9 +1053,27 @@ TEST_F(WinFormsSampleFixture, PersistentConnectionReusesServerAndStableIdentity)
     const auto* secondButton = find_named_element(second, "okButton");
     ASSERT_NE(firstButton, nullptr);
     ASSERT_NE(secondButton, nullptr);
-    EXPECT_NE(firstButton->nativeHandle, 0u);
-    EXPECT_EQ(firstButton->nativeHandle, secondButton->nativeHandle);
+    EXPECT_NE(firstButton->providerHandle, 0u);
+    EXPECT_EQ(firstButton->providerHandle, secondButton->providerHandle);
     EXPECT_EQ(firstButton->key, secondButton->key);
+
+    const auto* form = find_named_element(first, "MainForm");
+    ASSERT_NE(form, nullptr);
+    auto propertySnapshot =
+        connection->get_property_snapshot(form->providerHandle);
+    ASSERT_TRUE(propertySnapshot.ok) << propertySnapshot.error;
+    const auto* editableText =
+        find_property_descriptor(propertySnapshot, "EditableText");
+    ASSERT_NE(editableText, nullptr);
+    auto setText = connection->set_property(
+        form->providerHandle, editableText->descriptorId, "integration value");
+    ASSERT_TRUE(setText.ok) << setText.error;
+    EXPECT_EQ(setText.value, "integration value");
+    auto clearText = connection->clear_property(
+        form->providerHandle, editableText->descriptorId);
+    ASSERT_TRUE(clearText.ok) << clearText.error;
+    EXPECT_TRUE(clearText.cleared);
+    EXPECT_EQ(clearText.value, "Default text");
 
     auto afterReads = lvt::managed_connection_capabilities(*connection);
     ASSERT_TRUE(afterReads.has_value());
@@ -1069,7 +1098,7 @@ TEST_F(WinFormsSampleFixture, PersistentConnectionReusesServerAndStableIdentity)
     lvt::assign_element_keys(refreshed);
     const auto* refreshedButton = find_named_element(refreshed, "okButton");
     ASSERT_NE(refreshedButton, nullptr);
-    EXPECT_EQ(refreshedButton->nativeHandle, firstButton->nativeHandle);
+    EXPECT_EQ(refreshedButton->providerHandle, firstButton->providerHandle);
     EXPECT_EQ(refreshedButton->key, firstButton->key);
 }
 #endif
@@ -1295,9 +1324,25 @@ TEST_F(WpfSampleFixture, PersistentConnectionReusesServerAndStableIdentity) {
     const auto* secondButton = find_named_element(second, "OkButton");
     ASSERT_NE(firstButton, nullptr);
     ASSERT_NE(secondButton, nullptr);
-    EXPECT_NE(firstButton->nativeHandle, 0u);
-    EXPECT_EQ(firstButton->nativeHandle, secondButton->nativeHandle);
+    EXPECT_NE(firstButton->providerHandle, 0u);
+    EXPECT_EQ(firstButton->providerHandle, secondButton->providerHandle);
     EXPECT_EQ(firstButton->key, secondButton->key);
+
+    auto propertySnapshot =
+        connection->get_property_snapshot(firstButton->providerHandle);
+    ASSERT_TRUE(propertySnapshot.ok) << propertySnapshot.error;
+    const auto* opacity =
+        find_property_descriptor(propertySnapshot, "Opacity");
+    ASSERT_NE(opacity, nullptr);
+    auto setOpacity = connection->set_property(
+        firstButton->providerHandle, opacity->descriptorId, "0.4");
+    ASSERT_TRUE(setOpacity.ok) << setOpacity.error;
+    EXPECT_NEAR(std::stod(setOpacity.value), 0.4, 0.001);
+    auto clearOpacity = connection->clear_property(
+        firstButton->providerHandle, opacity->descriptorId);
+    ASSERT_TRUE(clearOpacity.ok) << clearOpacity.error;
+    EXPECT_TRUE(clearOpacity.cleared);
+    EXPECT_NEAR(std::stod(clearOpacity.value), 0.75, 0.001);
 
     auto afterReads = lvt::managed_connection_capabilities(*connection);
     ASSERT_TRUE(afterReads.has_value());
@@ -1322,7 +1367,7 @@ TEST_F(WpfSampleFixture, PersistentConnectionReusesServerAndStableIdentity) {
     lvt::assign_element_keys(refreshed);
     const auto* refreshedButton = find_named_element(refreshed, "OkButton");
     ASSERT_NE(refreshedButton, nullptr);
-    EXPECT_EQ(refreshedButton->nativeHandle, firstButton->nativeHandle);
+    EXPECT_EQ(refreshedButton->providerHandle, firstButton->providerHandle);
     EXPECT_EQ(refreshedButton->key, firstButton->key);
 }
 #endif
@@ -1351,6 +1396,11 @@ TEST(ManagedWinFormsConnection, TargetExitBreaksConnectionWithoutBlocking) {
     lvt::WinFormsProvider provider;
     auto connection = provider.open_connection(hwnd, processInfo.dwProcessId);
     ASSERT_NE(connection, nullptr);
+    auto connectedTree = lvt::build_tree(hwnd, processInfo.dwProcessId, {});
+    ASSERT_TRUE(connection->get_tree(connectedTree, false));
+    const auto* connectedForm = find_named_element(connectedTree, "MainForm");
+    ASSERT_NE(connectedForm, nullptr);
+    const uint64_t providerHandle = connectedForm->providerHandle;
     ASSERT_TRUE(TerminateProcess(process.get(), 0));
     ASSERT_EQ(WaitForSingleObject(process.get(), 5000), WAIT_OBJECT_0);
 
@@ -1358,6 +1408,9 @@ TEST(ManagedWinFormsConnection, TargetExitBreaksConnectionWithoutBlocking) {
     EXPECT_FALSE(connection->is_alive());
     lvt::Element root;
     EXPECT_FALSE(connection->get_tree(root, false));
+    auto properties = connection->get_property_snapshot(providerHandle);
+    EXPECT_FALSE(properties.ok);
+    EXPECT_FALSE(properties.error.empty());
     EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(2));
 }
 #endif
@@ -1386,6 +1439,11 @@ TEST(ManagedWpfConnection, TargetExitBreaksConnectionWithoutBlocking) {
     lvt::WpfProvider provider;
     auto connection = provider.open_connection(hwnd, processInfo.dwProcessId);
     ASSERT_NE(connection, nullptr);
+    auto connectedTree = lvt::build_tree(hwnd, processInfo.dwProcessId, {});
+    ASSERT_TRUE(connection->get_tree(connectedTree, false));
+    const auto* connectedButton = find_named_element(connectedTree, "OkButton");
+    ASSERT_NE(connectedButton, nullptr);
+    const uint64_t providerHandle = connectedButton->providerHandle;
     ASSERT_TRUE(TerminateProcess(process.get(), 0));
     ASSERT_EQ(WaitForSingleObject(process.get(), 5000), WAIT_OBJECT_0);
 
@@ -1393,6 +1451,9 @@ TEST(ManagedWpfConnection, TargetExitBreaksConnectionWithoutBlocking) {
     EXPECT_FALSE(connection->is_alive());
     lvt::Element root;
     EXPECT_FALSE(connection->get_tree(root, false));
+    auto properties = connection->get_property_snapshot(providerHandle);
+    EXPECT_FALSE(properties.ok);
+    EXPECT_FALSE(properties.error.empty());
     EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(2));
 }
 #endif

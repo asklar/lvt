@@ -24,15 +24,15 @@ std::string sanitize(const std::string& value) {
     return result;
 }
 
-uintptr_t parse_handle(const json& node, const char* name, int defaultBase = 10) {
+uint64_t parse_handle(const json& node, const char* name, int defaultBase = 10) {
     auto value = node.find(name);
     if (value == node.end())
         return 0;
     if (value->is_number_unsigned())
-        return static_cast<uintptr_t>(value->get<uint64_t>());
+        return value->get<uint64_t>();
     if (value->is_number_integer()) {
         const auto signedValue = value->get<int64_t>();
-        return signedValue > 0 ? static_cast<uintptr_t>(signedValue) : 0;
+        return signedValue > 0 ? static_cast<uint64_t>(signedValue) : 0;
     }
     if (!value->is_string())
         return 0;
@@ -45,13 +45,13 @@ uintptr_t parse_handle(const json& node, const char* name, int defaultBase = 10)
         start = 2;
     }
     try {
-        return static_cast<uintptr_t>(std::stoull(text.substr(start), nullptr, base));
+        return std::stoull(text.substr(start), nullptr, base);
     } catch (...) {
         return 0;
     }
 }
 
-std::string hex_handle(uintptr_t handle) {
+std::string hex_handle(uint64_t handle) {
     std::ostringstream stream;
     stream << "0x" << std::hex << std::uppercase << handle;
     return stream.str();
@@ -69,7 +69,8 @@ void index_by_hwnd(Element& element, std::unordered_map<uintptr_t, Element*>& in
     if (hwnd != element.properties.end()) {
         json value = hwnd->second;
         json wrapper = {{"hwnd", value}};
-        const uintptr_t parsed = parse_handle(wrapper, "hwnd", 16);
+        const uintptr_t parsed = static_cast<uintptr_t>(
+            parse_handle(wrapper, "hwnd", 16));
         if (parsed != 0)
             index[parsed] = &element;
     }
@@ -81,8 +82,8 @@ void apply_properties(Element& element, const json& node) {
     const std::string fullType = sanitize(node.value("type", ""));
     const std::string name = sanitize(node.value("name", ""));
     const std::string text = sanitize(node.value("text", ""));
-    const uintptr_t hwnd = parse_handle(node, "hwnd", 16);
-    const uintptr_t managedHandle = parse_handle(node, "managedHandle");
+    const uint64_t hwnd = parse_handle(node, "hwnd", 16);
+    const uint64_t managedHandle = parse_handle(node, "managedHandle");
 
     element.framework = "winforms";
     if (!fullType.empty()) {
@@ -101,9 +102,10 @@ void apply_properties(Element& element, const json& node) {
     if (managedHandle != 0) {
         element.properties["managedHandle"] = hex_handle(managedHandle);
         element.properties["handleKind"] = hwnd != 0 ? "hwnd+managed" : "managed";
+        element.providerHandle = managedHandle;
     }
-    if (element.nativeHandle == 0)
-        element.nativeHandle = hwnd != 0 ? hwnd : managedHandle;
+    if (element.nativeHandle == 0 && hwnd != 0)
+        element.nativeHandle = static_cast<uintptr_t>(hwnd);
 
     if (node.contains("visible") && node["visible"].is_boolean())
         element.properties["winforms.visible"] =
@@ -125,7 +127,8 @@ bool apply_control_node(
     if (!node.is_object())
         return false;
 
-    const uintptr_t hwnd = parse_handle(node, "hwnd", 16);
+    const uintptr_t hwnd = static_cast<uintptr_t>(
+        parse_handle(node, "hwnd", 16));
     Element* element = nullptr;
     if (hwnd != 0) {
         auto existing = hwndIndex.find(hwnd);

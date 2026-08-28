@@ -65,7 +65,7 @@ flowchart BT
 
 3. **XamlProvider / WinUI3Provider** inject the TAP DLL into the target process, receive the XAML visual tree as JSON over a persistent named pipe, and graft XAML subtrees into matching `DesktopChildSiteBridge` elements in the Win32 tree.
 
-4. **WpfProvider / WinFormsProvider** inject architecture-matched native CLR hosts once per session. The managed tree walker connects one duplex pipe, sends `READY`, and serves correlated `GET_TREE` commands until `DISCONNECT` or target/pipe failure. WPF walks on `Application.Dispatcher`; WinForms uses `Control.BeginInvoke`. Managed object IDs are weakly assigned and the per-connection reverse map is rebuilt on every snapshot, so refreshes preserve identity without retaining dead controls. See [Managed TAP connections](managed-tap-connections.md).
+4. **WpfProvider / WinFormsProvider** inject architecture-matched native CLR hosts once per session. The managed tree walker connects one duplex pipe and serves correlated tree and typed-property commands until `DISCONNECT` or target/pipe failure. WPF dependency-property operations run on `Application.Dispatcher`; WinForms `TypeDescriptor` operations run through the control's owning Form. Managed object IDs are weakly assigned and the per-connection reverse map is rebuilt on every snapshot, so refreshes preserve identity without retaining dead controls. See [Managed TAP connections](managed-tap-connections.md).
 
 ### Reusable connections (`providers/framework_connection.h`, `connection_registry.h`)
 

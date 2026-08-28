@@ -693,7 +693,8 @@ TEST(WinFormsEnrichment, PreservesManagedIdentityForControlsWithoutHwnd) {
     ASSERT_EQ(root.children.size(), 1u);
     const auto& child = root.children[0];
     EXPECT_EQ(child.framework, "winforms");
-    EXPECT_EQ(child.nativeHandle, 2u);
+    EXPECT_EQ(child.nativeHandle, 0u);
+    EXPECT_EQ(child.providerHandle, 2u);
     EXPECT_EQ(child.properties.at("managedHandle"), "0x2");
     EXPECT_EQ(child.properties.at("handleKind"), "managed");
 }
@@ -717,7 +718,8 @@ TEST(WpfTreeJson, PreservesManagedIdentity) {
         R"([{"managedHandle":42,"type":"System.Windows.Controls.Button"}])", "wpf");
     ASSERT_TRUE(roots.has_value());
     ASSERT_EQ(roots->size(), 1u);
-    EXPECT_EQ((*roots)[0].nativeHandle, 42u);
+    EXPECT_EQ((*roots)[0].nativeHandle, 0u);
+    EXPECT_EQ((*roots)[0].providerHandle, 42u);
     EXPECT_EQ((*roots)[0].properties.at("managedHandle"), "0x2A");
     EXPECT_EQ((*roots)[0].properties.at("handleKind"), "managed");
 }

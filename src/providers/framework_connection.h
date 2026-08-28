@@ -148,10 +148,10 @@ public:
         return true;
     }
 
-    // Optional provider-neutral typed property operations. XAML and WinUI3
-    // implement these over their persistent diagnostics connection. UIA and
-    // the other built-in providers retain explicit unsupported defaults until
-    // their provider-owned schema adapters are implemented.
+    // Optional provider-neutral typed property operations. XAML, WinUI3, WPF
+    // and WinForms implement these over their persistent diagnostics
+    // connections. Other built-in providers retain explicit unsupported
+    // defaults until their provider-owned schema adapters are implemented.
     virtual PropertySnapshotResult get_property_snapshot(uint64_t) {
         return {};
     }

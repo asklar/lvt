@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <string>
+#include <tuple>
 
 namespace {
 
@@ -141,14 +142,26 @@ HMODULE LoadHostFxr() {
     WIN32_FIND_DATAW findData{};
     wil::unique_hfind find(FindFirstFileW((fxrDirectory + L"\\*").c_str(), &findData));
     std::wstring hostFxrPath;
+    unsigned latestMajor = 0, latestMinor = 0, latestPatch = 0;
     if (find) {
         do {
             if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
                 findData.cFileName[0] != L'.') {
-                const std::wstring candidate =
-                    fxrDirectory + L"\\" + findData.cFileName + L"\\hostfxr.dll";
-                if (hostFxrPath.empty() || candidate > hostFxrPath)
-                    hostFxrPath = candidate;
+                unsigned major = 0, minor = 0, patch = 0;
+                if (swscanf_s(
+                        findData.cFileName, L"%u.%u.%u",
+                        &major, &minor, &patch) != 3)
+                    continue;
+                if (hostFxrPath.empty() ||
+                    std::tie(major, minor, patch) >
+                        std::tie(latestMajor, latestMinor, latestPatch)) {
+                    latestMajor = major;
+                    latestMinor = minor;
+                    latestPatch = patch;
+                    hostFxrPath =
+                        fxrDirectory + L"\\" + findData.cFileName +
+                        L"\\hostfxr.dll";
+                }
             }
         } while (FindNextFileW(find.get(), &findData));
     }
@@ -160,10 +173,10 @@ bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pipeName) 
     if (!hostFxr)
         return false;
 
-    using InitializeFn = int(STDMETHODCALLTYPE*)(
+    using InitializeFn = int(__cdecl*)(
         const wchar_t*, const void*, void**);
-    using GetDelegateFn = int(STDMETHODCALLTYPE*)(void*, int, void**);
-    using CloseFn = int(STDMETHODCALLTYPE*)(void*);
+    using GetDelegateFn = int(__cdecl*)(void*, int, void**);
+    using CloseFn = int(__cdecl*)(void*);
     auto initialize = reinterpret_cast<InitializeFn>(
         GetProcAddress(hostFxr, "hostfxr_initialize_for_runtime_config"));
     auto getDelegate = reinterpret_cast<GetDelegateFn>(
@@ -230,12 +243,27 @@ DWORD WINAPI WorkerThread(LPVOID) {
         LogMsg("Pipe name is unavailable");
     } else if (GetFileAttributesW(assemblyPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         LogMsg("Managed assembly not found: %ls", assemblyPath.c_str());
-    } else if (TryNetFramework(assemblyPath, pipeName)) {
-        result = 0;
-    } else if (TryNetCore(assemblyPath, pipeName)) {
-        result = 0;
     } else {
-        LogMsg("All CLR hosting attempts failed");
+        const bool hasCoreClr = GetModuleHandleW(L"coreclr.dll") != nullptr;
+        const bool hasFrameworkClr =
+            GetModuleHandleW(L"clr.dll") != nullptr ||
+            GetModuleHandleW(L"mscorwks.dll") != nullptr;
+        bool hosted = false;
+        if (hasCoreClr) {
+            LogMsg("Hosting through the loaded CoreCLR");
+            hosted = TryNetCore(assemblyPath, pipeName);
+        } else if (hasFrameworkClr) {
+            LogMsg("Hosting through the loaded .NET Framework CLR");
+            hosted = TryNetFramework(assemblyPath, pipeName);
+        } else {
+            LogMsg("CLR kind was not detected; trying .NET Framework then CoreCLR");
+            hosted = TryNetFramework(assemblyPath, pipeName) ||
+                     TryNetCore(assemblyPath, pipeName);
+        }
+        if (hosted)
+            result = 0;
+        else
+            LogMsg("All CLR hosting attempts failed");
     }
 
     LogMsg("Persistent managed TAP worker exiting");

@@ -13,12 +13,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 namespace lvt {
@@ -320,6 +322,12 @@ bool wait_for_pipe_connection(
            GetLastError() == ERROR_PIPE_CONNECTED;
 }
 
+struct ManagedCommandResponse {
+    bool completed = false;
+    bool success = false;
+    std::string payload;
+};
+
 class ManagedFrameworkConnection final : public IFrameworkConnection {
 public:
     static std::shared_ptr<ManagedFrameworkConnection> connect(
@@ -486,8 +494,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(m_commandMutex);
             if (m_alive.load()) {
-                std::string ignored;
-                send_command_locked("DISCONNECT", "{}", 2000, ignored);
+                (void)send_command_locked("DISCONNECT", "{}", 2000);
             }
             m_alive.store(false);
             CancelIoEx(m_pipe.get(), nullptr);
@@ -509,12 +516,12 @@ public:
         if (!connection_alive())
             return false;
 
-        std::string treeJson;
-        if (!send_command_locked(
-                "GET_TREE", "{}", m_options.commandTimeoutMs, treeJson)) {
+        auto response = send_command_locked(
+            "GET_TREE", "{}", m_options.commandTimeoutMs);
+        if (!response.completed || !response.success) {
             return false;
         }
-        return m_applyTree && m_applyTree(root, treeJson);
+        return m_applyTree && m_applyTree(root, response.payload);
     }
 
     std::vector<ConnectionEvent> poll_events() override {
@@ -523,6 +530,121 @@ public:
 
     bool is_alive() const override {
         return connection_alive();
+    }
+
+    PropertySnapshotResult get_property_snapshot(uint64_t handle) override {
+        std::lock_guard<std::mutex> lock(m_commandMutex);
+        PropertySnapshotResult result;
+        if (!supports_command("GET_PROPERTIES")) {
+            result.hresult = E_NOTIMPL;
+            result.error =
+                "This managed TAP does not advertise typed property snapshots";
+            return result;
+        }
+
+        auto response = send_command_locked(
+            "GET_PROPERTIES", std::to_string(handle),
+            m_options.commandTimeoutMs);
+        if (!response.completed) {
+            set_transport_error(result);
+            return result;
+        }
+        if (!response.success) {
+            set_command_error(response.payload, result);
+            return result;
+        }
+
+        const json payload = json::parse(response.payload, nullptr, false);
+        if (payload.is_discarded() || !payload.is_object()) {
+            result.hresult = E_FAIL;
+            result.error = "The managed TAP returned an invalid property snapshot";
+            return result;
+        }
+        const std::string schemaId = payload.value("schemaId", "");
+        if (schemaId.empty()) {
+            result.hresult = E_FAIL;
+            result.error = "The managed TAP property snapshot has no schema ID";
+            return result;
+        }
+
+        auto cached = m_schemasById.find(schemaId);
+        if (cached != m_schemasById.end()) {
+            result.schema = cached->second;
+        } else {
+            auto schema = parse_schema(payload, schemaId);
+            if (!schema) {
+                result.hresult = E_FAIL;
+                result.error = "The managed TAP returned an invalid property schema";
+                return result;
+            }
+            result.schema = schema;
+            m_schemasById.emplace(schemaId, std::move(schema));
+        }
+
+        auto values = payload.find("values");
+        if (values == payload.end() || !values->is_array()) {
+            result.hresult = E_FAIL;
+            result.error = "The managed TAP property snapshot has no live values";
+            result.schema.reset();
+            return result;
+        }
+        for (const auto& item : *values) {
+            if (!item.is_object())
+                continue;
+            PropertyValue value;
+            value.descriptorId = item.value("descriptorId", "");
+            value.value = item.value("value", "");
+            value.runtimeType = item.value("runtimeType", "");
+            value.canClear = item.value("canClear", false);
+            value.overridden = item.value("overridden", false);
+            value.source = item.value("source", "");
+            value.unavailableReason = item.value("unavailableReason", "");
+            value.readOnlyReason = item.value("readOnlyReason", "");
+            if (!value.descriptorId.empty())
+                result.values.push_back(std::move(value));
+        }
+        result.ok = true;
+        result.hresult = S_OK;
+        result.error.clear();
+        return result;
+    }
+
+    PropertyMutationResult set_property(
+        uint64_t handle, const std::string& descriptorId,
+        const std::string& value) override {
+        std::lock_guard<std::mutex> lock(m_commandMutex);
+        PropertyMutationResult result;
+        if (!supports_command("SET_PROPERTY")) {
+            result.hresult = E_NOTIMPL;
+            result.error =
+                "This managed TAP does not advertise typed property mutation";
+            return result;
+        }
+        const std::string arguments =
+            std::to_string(handle) + " " + hex_encode(descriptorId) + " " +
+            hex_encode(value);
+        return parse_mutation_response(
+            send_command_locked(
+                "SET_PROPERTY", arguments, m_options.commandTimeoutMs),
+            false);
+    }
+
+    PropertyMutationResult clear_property(
+        uint64_t handle, const std::string& descriptorId) override {
+        std::lock_guard<std::mutex> lock(m_commandMutex);
+        PropertyMutationResult result;
+        if (!supports_command("CLEAR_PROPERTY")) {
+            result.hresult = E_NOTIMPL;
+            result.error =
+                "This managed TAP does not advertise typed property clearing";
+            return result;
+        }
+        const std::string arguments =
+            std::to_string(handle) + " " + hex_encode(descriptorId);
+        return parse_mutation_response(
+            send_command_locked(
+                "CLEAR_PROPERTY", arguments, m_options.commandTimeoutMs),
+            true);
     }
 
     const ManagedConnectionCapabilities& capabilities() const {
@@ -565,24 +687,174 @@ private:
         return true;
     }
 
-    bool send_command_locked(
+    bool supports_command(const std::string& command) const {
+        return std::find(
+                   m_capabilities.commands.begin(),
+                   m_capabilities.commands.end(), command) !=
+               m_capabilities.commands.end();
+    }
+
+    static std::string hex_encode(const std::string& value) {
+        static constexpr char digits[] = "0123456789ABCDEF";
+        std::string encoded;
+        encoded.reserve(value.size() * 2);
+        for (unsigned char byte : value) {
+            encoded.push_back(digits[byte >> 4]);
+            encoded.push_back(digits[byte & 0x0F]);
+        }
+        return encoded.empty() ? "-" : encoded;
+    }
+
+    static PropertyEditorKind parse_editor_kind(const std::string& kind) {
+        if (kind == "string") return PropertyEditorKind::string;
+        if (kind == "boolean") return PropertyEditorKind::boolean;
+        if (kind == "integer") return PropertyEditorKind::integer;
+        if (kind == "number") return PropertyEditorKind::number;
+        if (kind == "enum") return PropertyEditorKind::enumeration;
+        return PropertyEditorKind::readonly;
+    }
+
+    std::shared_ptr<const PropertySchema> parse_schema(
+        const json& payload, const std::string& schemaId) const {
+        auto descriptors = payload.find("descriptors");
+        if (descriptors == payload.end() || !descriptors->is_array())
+            return nullptr;
+
+        auto schema = std::make_shared<PropertySchema>();
+        schema->schemaId = schemaId;
+        for (const auto& item : *descriptors) {
+            if (!item.is_object())
+                return nullptr;
+            PropertyDescriptor descriptor;
+            descriptor.descriptorId = item.value("descriptorId", "");
+            descriptor.name = item.value("name", "");
+            descriptor.displayName = item.value("displayName", descriptor.name);
+            descriptor.provider =
+                item.value("provider", m_options.frameworkLabel);
+            descriptor.framework =
+                item.value("framework", m_options.frameworkLabel);
+            descriptor.declaringType = item.value("declaringType", "");
+            descriptor.propertyType = item.value("propertyType", "");
+            descriptor.kind =
+                parse_editor_kind(item.value("kind", "readonly"));
+            descriptor.writable = item.value("writable", false);
+            descriptor.supportsClear = item.value("supportsClear", false);
+            descriptor.description = item.value("description", "");
+            if (auto choices = item.find("choices");
+                choices != item.end() && choices->is_array()) {
+                for (const auto& choiceItem : *choices) {
+                    if (!choiceItem.is_object())
+                        continue;
+                    PropertyChoice choice;
+                    choice.value = choiceItem.value("value", "");
+                    choice.label = choiceItem.value("label", choice.value);
+                    descriptor.choices.push_back(std::move(choice));
+                }
+            }
+            if (auto minimum = item.find("minimum");
+                minimum != item.end() && minimum->is_number())
+                descriptor.minimum = minimum->get<double>();
+            if (auto maximum = item.find("maximum");
+                maximum != item.end() && maximum->is_number())
+                descriptor.maximum = maximum->get<double>();
+            if (auto step = item.find("step");
+                step != item.end() && step->is_number())
+                descriptor.step = step->get<double>();
+            if (descriptor.descriptorId.empty() || descriptor.name.empty())
+                return nullptr;
+            schema->descriptors.push_back(std::move(descriptor));
+        }
+        return schema;
+    }
+
+    static HRESULT parse_hresult(const json& payload) {
+        const auto hresult = payload.find("hresult");
+        if (hresult == payload.end() || !hresult->is_string())
+            return E_FAIL;
+        std::string text = hresult->get<std::string>();
+        const char* first = text.data();
+        if (text.rfind("0x", 0) == 0 || text.rfind("0X", 0) == 0)
+            first += 2;
+        uint32_t raw = 0;
+        const auto parsed =
+            std::from_chars(first, text.data() + text.size(), raw, 16);
+        return parsed.ec == std::errc() &&
+                       parsed.ptr == text.data() + text.size()
+                   ? static_cast<HRESULT>(raw)
+                   : E_FAIL;
+    }
+
+    template <typename Result>
+    void set_transport_error(Result& result) const {
+        result.hresult = HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE);
+        result.error =
+            "The " + m_options.frameworkLabel +
+            " managed property connection is no longer available";
+    }
+
+    template <typename Result>
+    static void set_command_error(
+        const std::string& payloadText, Result& result) {
+        const json payload = json::parse(payloadText, nullptr, false);
+        if (payload.is_discarded() || !payload.is_object()) {
+            result.hresult = E_FAIL;
+            result.error = payloadText.empty()
+                ? "The managed property command failed"
+                : payloadText;
+            return;
+        }
+        result.hresult = parse_hresult(payload);
+        result.error = payload.value("message", "The managed property command failed");
+    }
+
+    PropertyMutationResult parse_mutation_response(
+        ManagedCommandResponse response, bool clearing) {
+        PropertyMutationResult result;
+        if (!response.completed) {
+            set_transport_error(result);
+            return result;
+        }
+        if (!response.success) {
+            set_command_error(response.payload, result);
+            return result;
+        }
+        const json payload = json::parse(response.payload, nullptr, false);
+        if (payload.is_discarded() || !payload.is_object()) {
+            result.hresult = E_FAIL;
+            result.error = "The managed TAP returned an invalid mutation result";
+            return result;
+        }
+        if (auto value = payload.find("value");
+            value != payload.end() && value->is_string()) {
+            result.hasValue = true;
+            result.value = value->get<std::string>();
+        }
+        result.cleared = clearing && payload.value("cleared", false);
+        result.ok = true;
+        result.hresult = S_OK;
+        result.error.clear();
+        return result;
+    }
+
+    ManagedCommandResponse send_command_locked(
         const std::string& command, const std::string& arguments,
-        DWORD timeoutMs, std::string& payload) {
+        DWORD timeoutMs) {
+        ManagedCommandResponse result;
         if (!connection_alive() || !m_io)
-            return false;
+            return result;
 
         const uint64_t commandId = m_nextCommandId++;
         const std::string id = std::to_string(commandId);
         if (!m_io->write_line(
                 "REQUEST\t" + id + "\t" + command + "\t" + arguments, timeoutMs)) {
             m_alive.store(false);
-            return false;
+            return result;
         }
 
         std::string response;
         if (!m_io->read_line(timeoutMs, response)) {
             m_alive.store(false);
-            return false;
+            return result;
         }
 
         const std::string prefix = "RESPONSE\t" + id + "\t";
@@ -590,27 +862,32 @@ private:
             fprintf(stderr, "lvt: %s TAP DLL returned an uncorrelated response\n",
                     m_options.frameworkLabel.c_str());
             m_alive.store(false);
-            return false;
+            return result;
         }
         const size_t statusEnd = response.find('\t', prefix.size());
         if (statusEnd == std::string::npos) {
             m_alive.store(false);
-            return false;
+            return result;
         }
         const std::string status =
             response.substr(prefix.size(), statusEnd - prefix.size());
-        payload = response.substr(statusEnd + 1);
-        if (status == "OK")
-            return true;
+        result.payload = response.substr(statusEnd + 1);
+        result.completed = true;
+        if (status == "OK") {
+            result.success = true;
+            return result;
+        }
         if (status == "ERROR") {
             if (g_debug)
                 fprintf(stderr, "lvt: %s managed command %s failed: %s\n",
-                        m_options.frameworkLabel.c_str(), command.c_str(), payload.c_str());
-            return false;
+                        m_options.frameworkLabel.c_str(), command.c_str(),
+                        result.payload.c_str());
+            return result;
         }
 
         m_alive.store(false);
-        return false;
+        result.completed = false;
+        return result;
     }
 
     DWORD m_pid = 0;
@@ -621,6 +898,8 @@ private:
     std::unique_ptr<DuplexPipeLineIo> m_io;
     ManagedTreeApplier m_applyTree;
     ManagedConnectionCapabilities m_capabilities;
+    std::unordered_map<std::string, std::shared_ptr<const PropertySchema>>
+        m_schemasById;
     mutable std::atomic_bool m_alive = false;
     uint64_t m_nextCommandId = 1;
     std::mutex m_commandMutex;

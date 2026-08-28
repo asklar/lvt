@@ -216,19 +216,20 @@ rejected. Successful mutations include provider readback of the effective
 returned value is never the caller's input echoed back; a failed readback is
 reported as an explicit mutation failure.
 
-The provider-neutral contract is implemented by the XAML/WinUI3 adapter today.
-Its schema cache is connection-scoped and contains metadata only, never live
-values. For xamlOM properties, the descriptor's declared `propertyType` comes
-from `PropertyChainValue.Type` and drives editor selection and `CreateInstance`;
-the evaluated value's `ValueType` is reported only as live `runtimeType` and
-never trusted for mutation. Each persistent connection also fetches its XAML
-runtime enum catalog once. Enum descriptors expose ordered member-name
-choices; numeric runtime values are translated back to their first canonical
-member name, aliases remain available as separate choices, and values not in
-the catalog are rejected before mutation. System XAML and WinUI catalogs stay
-isolated with their owning connections. Other built-in provider adapters can
-implement the same contract without adding framework catalogs to clients.
-External plugin ABI support is not part of this contract.
+The provider-neutral contract is implemented by XAML/WinUI3, WPF, and WinForms.
+Each schema cache is connection-scoped and contains metadata only, never live
+values. WPF exposes writable scalar dependency properties and preserves local
+value precedence through `SetValue`/`ClearValue`. WinForms uses
+`TypeDescriptor`, including custom descriptors, but admits only a conservative
+scalar/converter allowlist and uses `ResetValue` only when reset is supported.
+For xamlOM properties, the descriptor's declared `propertyType` comes from
+`PropertyChainValue.Type` and drives editor selection and `CreateInstance`; the
+evaluated value's `ValueType` is reported only as live `runtimeType` and never
+trusted for mutation. Each persistent XAML connection also fetches its runtime
+enum catalog once. Enum descriptors expose provider-owned choices, aliases, and
+flags metadata; numeric readback is canonicalized only when the runtime type
+supports it. System XAML and WinUI catalogs stay isolated with their owning
+connections. External plugin ABI support is not part of this contract.
 
 Tree reads and all three property operations share the session's existing
 persistent connection: there is no second injection or side protocol.

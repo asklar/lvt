@@ -25,15 +25,15 @@ std::string sanitize(const std::string& value) {
     return result;
 }
 
-uintptr_t json_handle(const json& node, const char* name) {
+uint64_t json_handle(const json& node, const char* name) {
     auto value = node.find(name);
     if (value == node.end())
         return 0;
     if (value->is_number_unsigned())
-        return static_cast<uintptr_t>(value->get<uint64_t>());
+        return value->get<uint64_t>();
     if (value->is_number_integer()) {
         const auto signedValue = value->get<int64_t>();
-        return signedValue > 0 ? static_cast<uintptr_t>(signedValue) : 0;
+        return signedValue > 0 ? static_cast<uint64_t>(signedValue) : 0;
     }
     if (!value->is_string())
         return 0;
@@ -46,13 +46,13 @@ uintptr_t json_handle(const json& node, const char* name) {
         start = 2;
     }
     try {
-        return static_cast<uintptr_t>(std::stoull(text.substr(start), nullptr, base));
+        return std::stoull(text.substr(start), nullptr, base);
     } catch (...) {
         return 0;
     }
 }
 
-std::string hex_handle(uintptr_t handle) {
+std::string hex_handle(uint64_t handle) {
     std::ostringstream stream;
     stream << "0x" << std::hex << std::uppercase << handle;
     return stream.str();
@@ -66,14 +66,16 @@ void graft_json_node(const json& node, Element& parent, const std::string& frame
     element.type =
         lastDot == std::string::npos ? element.className : element.className.substr(lastDot + 1);
 
-    element.nativeHandle = json_handle(node, "managedHandle");
-    if (element.nativeHandle != 0) {
-        element.properties["managedHandle"] = hex_handle(element.nativeHandle);
+    element.providerHandle = json_handle(node, "managedHandle");
+    if (element.providerHandle != 0) {
+        element.properties["managedHandle"] = hex_handle(element.providerHandle);
         element.properties["handleKind"] = "managed";
     }
-    const uintptr_t hwnd = json_handle(node, "hwnd");
-    if (hwnd != 0)
+    const uint64_t hwnd = json_handle(node, "hwnd");
+    if (hwnd != 0) {
+        element.nativeHandle = static_cast<uintptr_t>(hwnd);
         element.properties["hwnd"] = hex_handle(hwnd);
+    }
 
     const std::string name = sanitize(node.value("name", ""));
     if (!name.empty())

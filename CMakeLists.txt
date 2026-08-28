@@ -615,6 +615,7 @@ add_custom_command(
     DEPENDS
         "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.csproj"
         "${CMAKE_SOURCE_DIR}/src/tap_wpf/WpfTreeWalker.cs"
+        "${CMAKE_SOURCE_DIR}/src/tap_managed/ManagedProtocol.cs"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building managed WPF tree walker assembly"
     VERBATIM
@@ -622,16 +623,25 @@ add_custom_command(
 add_custom_target(lvt_wpf_managed ALL
     DEPENDS "${LVT_WPF_MANAGED_DLL}"
 )
-add_dependencies(lvt_wpf_tap lvt_wpf_managed)
-add_custom_command(TARGET lvt_wpf_tap POST_BUILD
+set(LVT_WPF_RUNTIME_DLL "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.dll")
+set(LVT_WPF_RUNTIME_CONFIG "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.runtimeconfig.json")
+add_custom_command(
+    OUTPUT "${LVT_WPF_RUNTIME_DLL}" "${LVT_WPF_RUNTIME_CONFIG}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${LVT_WPF_MANAGED_DLL}"
-        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.dll"
+        "${LVT_WPF_RUNTIME_DLL}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.runtimeconfig.json"
-        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.runtimeconfig.json"
+        "${LVT_WPF_RUNTIME_CONFIG}"
+    DEPENDS
+        "${LVT_WPF_MANAGED_DLL}"
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.runtimeconfig.json"
     COMMENT "Copying managed WPF tree walker assembly"
 )
+add_custom_target(lvt_wpf_managed_payload ALL
+    DEPENDS "${LVT_WPF_RUNTIME_DLL}" "${LVT_WPF_RUNTIME_CONFIG}"
+)
+add_dependencies(lvt_wpf_tap lvt_wpf_managed_payload)
 endif()
 endif()
 
@@ -663,6 +673,7 @@ add_custom_command(
     DEPENDS
         "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.csproj"
         "${CMAKE_SOURCE_DIR}/src/tap_winforms/WinFormsTreeWalker.cs"
+        "${CMAKE_SOURCE_DIR}/src/tap_managed/ManagedProtocol.cs"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building managed WinForms tree walker assembly"
     VERBATIM
@@ -670,16 +681,25 @@ add_custom_command(
 add_custom_target(lvt_winforms_managed ALL
     DEPENDS "${LVT_WINFORMS_MANAGED_DLL}"
 )
-add_dependencies(lvt_winforms_tap lvt_winforms_managed)
-add_custom_command(TARGET lvt_winforms_tap POST_BUILD
+set(LVT_WINFORMS_RUNTIME_DLL "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.dll")
+set(LVT_WINFORMS_RUNTIME_CONFIG "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.runtimeconfig.json")
+add_custom_command(
+    OUTPUT "${LVT_WINFORMS_RUNTIME_DLL}" "${LVT_WINFORMS_RUNTIME_CONFIG}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${LVT_WINFORMS_MANAGED_DLL}"
-        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.dll"
+        "${LVT_WINFORMS_RUNTIME_DLL}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.runtimeconfig.json"
-        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.runtimeconfig.json"
+        "${LVT_WINFORMS_RUNTIME_CONFIG}"
+    DEPENDS
+        "${LVT_WINFORMS_MANAGED_DLL}"
+        "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.runtimeconfig.json"
     COMMENT "Copying managed WinForms tree walker assembly"
 )
+add_custom_target(lvt_winforms_managed_payload ALL
+    DEPENDS "${LVT_WINFORMS_RUNTIME_DLL}" "${LVT_WINFORMS_RUNTIME_CONFIG}"
+)
+add_dependencies(lvt_winforms_tap lvt_winforms_managed_payload)
 endif()
 endif()
 
@@ -891,10 +911,24 @@ target_compile_definitions(lvt_public_headers_test PRIVATE WIN32_LEAN_AND_MEAN N
 target_link_libraries(lvt_public_headers_test PRIVATE lvt_core)
 
 # WPF sample app used by integration tests
+if(VCPKG_TARGET_TRIPLET MATCHES "arm64")
+    set(LVT_MANAGED_TEST_RID "win-arm64")
+    set(LVT_MANAGED_TEST_PLATFORM "arm64")
+elseif(VCPKG_TARGET_TRIPLET MATCHES "x86")
+    set(LVT_MANAGED_TEST_RID "win-x86")
+    set(LVT_MANAGED_TEST_PLATFORM "x86")
+else()
+    set(LVT_MANAGED_TEST_RID "win-x64")
+    set(LVT_MANAGED_TEST_PLATFORM "x64")
+endif()
 set(WPF_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WpfSample/WpfSample.csproj")
 set(WPF_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WpfSample")
 add_custom_target(wpf_sample_app ALL
-    COMMAND dotnet build "${WPF_SAMPLE_PROJECT}" -c Release -o "${WPF_SAMPLE_OUTPUT_DIR}"
+    COMMAND dotnet publish "${WPF_SAMPLE_PROJECT}" -c Release
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WPF_SAMPLE_OUTPUT_DIR}"
     BYPRODUCTS "${WPF_SAMPLE_OUTPUT_DIR}/WpfSample.exe"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building WPF sample app"
@@ -944,7 +978,11 @@ string(REPLACE "\\" "\\\\" AVALONIA_SAMPLE_EXE_ESCAPED "${AVALONIA_SAMPLE_EXE_NA
 set(WINFORMS_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinFormsSample/WinFormsSample.csproj")
 set(WINFORMS_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinFormsSample")
 add_custom_target(winforms_sample_app ALL
-    COMMAND dotnet build "${WINFORMS_SAMPLE_PROJECT}" -c Release -o "${WINFORMS_SAMPLE_OUTPUT_DIR}" --nologo
+    COMMAND dotnet publish "${WINFORMS_SAMPLE_PROJECT}" -c Release
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WINFORMS_SAMPLE_OUTPUT_DIR}" --nologo
     BYPRODUCTS "${WINFORMS_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building WinForms sample app"

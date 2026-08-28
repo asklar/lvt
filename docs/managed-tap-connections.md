@@ -32,6 +32,13 @@ sequenceDiagram
         managed->>lvt: RESPONSE id OK tree-json
     end
 
+    opt selected-element property operation
+        lvt->>managed: GET_PROPERTIES / SET_PROPERTY / CLEAR_PROPERTY
+        managed->>ui: resolve opaque descriptor and marshal operation
+        ui->>managed: schema + live values, or mutation readback
+        managed->>lvt: correlated response
+    end
+
     lvt->>managed: REQUEST id DISCONNECT {}
     managed->>lvt: RESPONSE id OK {}
     managed->>managed: clear per-connection reverse map
@@ -46,14 +53,18 @@ The pipe also ends the command loop when lvt exits unexpectedly. Native reads an
 Messages are UTF-8, tab-delimited, and newline-terminated:
 
 ```text
-READY  {"protocol":1,"connectionId":"…","assemblyInstanceId":"…","serverStartCount":1,"commands":["GET_TREE","DISCONNECT"]}
+READY  {"protocol":1,"connectionId":"…","assemblyInstanceId":"…","serverStartCount":1,"commands":["GET_TREE","GET_PROPERTIES","SET_PROPERTY","CLEAR_PROPERTY","DISCONNECT"]}
 REQUEST  1  GET_TREE  {}
 RESPONSE 1  OK  [{...}]
-REQUEST  2  DISCONNECT {}
-RESPONSE 2  OK  {}
+REQUEST  2  GET_PROPERTIES  42
+RESPONSE 2  OK  {"schemaId":"…","descriptors":[...],"values":[...]}
+REQUEST  3  SET_PROPERTY  42 descriptor-id-as-utf8-hex value-as-utf8-hex
+RESPONSE 3  OK  {"value":"read back from target"}
+REQUEST  4  DISCONNECT {}
+RESPONSE 4  OK  {}
 ```
 
-Tabs above represent literal tab characters. Request IDs make responses unambiguous even as new commands are added. The final JSON argument slot and the advertised command list are extension points for later managed property operations; this layer intentionally does not define the shared property descriptor contract.
+Tabs above represent literal tab characters. Request IDs make responses unambiguous. Descriptor IDs and values use UTF-8 hexadecimal tokens, so whitespace and newlines cannot change framing. The managed server validates connection-scoped opaque descriptor IDs; callers never provide a CLR property name or type.
 
 ## Identity and object lifetime
 
@@ -61,13 +72,31 @@ Each managed assembly assigns controls/objects IDs through a `ConditionalWeakTab
 
 - WPF emits a managed handle for every visual or logical `DependencyObject`.
 - WinForms emits both the managed handle and an HWND when the control already owns one. Reading the tree never creates a handle merely to obtain identity.
-- Native `Element::nativeHandle`, `properties.managedHandle`, and compact durable keys preserve this identity across refreshes. WinForms keeps the HWND as `nativeHandle` when one exists and retains the managed handle alongside it for future command routing.
+- Native `Element::providerHandle`, `properties.managedHandle`, and compact durable keys preserve managed identity across refreshes. WinForms keeps any existing HWND separately as `nativeHandle`; property routing always uses the 64-bit provider handle.
+
+## Typed property policies
+
+Schemas are connection-scoped, immutable metadata. Live values are returned separately on every `GET_PROPERTIES`; reconnecting creates a new descriptor namespace and invalidates old IDs.
+
+### WPF
+
+WPF enumerates `DependencyPropertyDescriptor` metadata for the target's runtime `Type` and caches it without retaining target objects. Only writable dependency properties with conservative scalar types are exposed. Ordinary CLR properties and object graphs are excluded. Editor kinds come from the dependency property's declared `PropertyType`; enum choices come from `Enum.GetValues`.
+
+Reads use `GetValue`. Mutations use `SetValue` and `ClearValue` on the application dispatcher and return a fresh readback. `ReadLocalValue` determines `overridden` and `canClear`; clearing removes the local value so style, inheritance, or default precedence resumes.
+
+### WinForms
+
+WinForms uses `TypeDescriptor.GetProperties(control)`, including custom type-description providers. The schema cache key combines runtime type, provider/type-descriptor identity, and a descriptor metadata signature. Cached entries contain no controls.
+
+Only browsable, readable/writable, non-indexed properties are considered. The allowlist is string, Boolean, character, numeric primitive/decimal, enum, and nullable forms, with exact built-in converter types audited before inclusion. Controls, object graphs, collections, delegates, images, fonts, and arbitrary converters are excluded.
+
+Reads and writes use the current `PropertyDescriptor`. Clear is advertised only for descriptors with reset metadata, is enabled live only when `CanResetValue` succeeds, and executes `ResetValue`. Set and reset responses contain the value read back from the target.
 
 ## UI-thread rules
 
 The pipe thread never reads framework objects directly.
 
-- WPF queues the complete walk with `Application.Dispatcher.InvokeAsync` and applies a finite timeout.
-- WinForms finds an existing top-level control and queues the complete walk with `BeginInvoke`; there is no direct off-thread fallback.
+- WPF queues tree and property work with `Application.Dispatcher.InvokeAsync` and applies a finite timeout.
+- WinForms records each control's owning top-level control/Form during the tree walk and queues property work through that owner's `BeginInvoke`; there is no direct off-thread fallback.
 
 A timeout returns a correlated command error while leaving the transport available for a later retry. Broken transport or target exit marks the native connection dead so the registry can replace it.

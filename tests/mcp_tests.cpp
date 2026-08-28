@@ -802,6 +802,220 @@ TEST(McpManagedFrameworks, WpfConnectionPersistsAcrossTreeReads) {
     verify_managed_mcp_connection(
         WPF_SAMPLE_EXE_PATH, "OkButton", "wpf:0x", L"lvt_wpf_tap.log");
 }
+
+TEST(McpManagedFrameworks, WpfTypedDependencyProperties) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WPF_SAMPLE_EXE_PATH));
+    const int startsBefore =
+        count_managed_tap_starts(L"lvt_wpf_tap.log", sample.pid());
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const json* button = find_managed_named_element(tree["root"], "OkButton");
+    const json* textBox = find_managed_named_element(tree["root"], "NameBox");
+    const json* window =
+        find_managed_named_element(tree["root"], "MainWindowRoot");
+    ASSERT_NE(button, nullptr);
+    ASSERT_NE(textBox, nullptr);
+    ASSERT_NE(window, nullptr);
+    const std::string buttonKey = button->value("key", "");
+    const std::string textBoxKey = textBox->value("key", "");
+    ASSERT_EQ(buttonKey.rfind("wpf:0x", 0), 0u);
+    ASSERT_EQ(textBoxKey.rfind("wpf:0x", 0), 0u);
+
+    bool isError = false;
+    auto buttonProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", buttonKey}}, &isError);
+    ASSERT_FALSE(isError) << buttonProperties.dump(2);
+    auto repeatedButtonProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", buttonKey}}, &isError);
+    ASSERT_FALSE(isError) << repeatedButtonProperties.dump(2);
+    EXPECT_EQ(
+        repeatedButtonProperties.value("schemaId", ""),
+        buttonProperties.value("schemaId", ""));
+
+    const auto* opacity = find_property_descriptor(buttonProperties, "Opacity");
+    const auto* enabled = find_property_descriptor(buttonProperties, "IsEnabled");
+    const auto* alignment =
+        find_property_descriptor(buttonProperties, "HorizontalAlignment");
+    ASSERT_NE(opacity, nullptr) << buttonProperties.dump(2);
+    ASSERT_NE(enabled, nullptr) << buttonProperties.dump(2);
+    ASSERT_NE(alignment, nullptr) << buttonProperties.dump(2);
+    EXPECT_EQ(opacity->value("kind", ""), "number");
+    EXPECT_EQ(enabled->value("kind", ""), "boolean");
+    EXPECT_EQ(alignment->value("kind", ""), "enum");
+    EXPECT_TRUE(opacity->value("supportsClear", false));
+    EXPECT_TRUE(enabled->value("supportsClear", false));
+    EXPECT_TRUE(alignment->value("supportsClear", false));
+    EXPECT_EQ(find_property_descriptor(buttonProperties, "ActualWidth"), nullptr)
+        << "read-only dependency properties must be excluded";
+
+    auto windowProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", window->value("key", "")}},
+        &isError);
+    ASSERT_FALSE(isError) << windowProperties.dump(2);
+    EXPECT_EQ(
+        find_property_descriptor(windowProperties, "OrdinaryClrProperty"),
+        nullptr) << "ordinary CLR properties must not enter the WPF DP schema";
+
+    std::set<std::string> alignmentChoices;
+    for (const auto& choice : alignment->value("choices", json::array()))
+        alignmentChoices.insert(choice.value("value", ""));
+    EXPECT_TRUE(alignmentChoices.contains("Left"));
+    EXPECT_TRUE(alignmentChoices.contains("Right"));
+    EXPECT_TRUE(alignmentChoices.contains("Stretch"));
+
+    const std::string opacityId = opacity->value("descriptorId", "");
+    const std::string enabledId = enabled->value("descriptorId", "");
+    const std::string alignmentId = alignment->value("descriptorId", "");
+    ASSERT_FALSE(opacityId.empty());
+    ASSERT_FALSE(enabledId.empty());
+    ASSERT_FALSE(alignmentId.empty());
+    EXPECT_NEAR(
+        std::stod(typed_property_value(buttonProperties, "Opacity")), 0.75, 0.001);
+    EXPECT_EQ(typed_property_value(buttonProperties, "IsEnabled"), "true");
+    EXPECT_EQ(
+        typed_property_value(buttonProperties, "HorizontalAlignment"), "Left");
+
+    auto setOpacity = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", opacityId}, {"value", "0.4"}},
+        &isError);
+    ASSERT_FALSE(isError) << setOpacity.dump(2);
+    EXPECT_NEAR(std::stod(setOpacity.value("value", "")), 0.4, 0.001);
+    auto changedButton = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", buttonKey}}, &isError);
+    ASSERT_FALSE(isError) << changedButton.dump(2);
+    const auto* changedOpacityValue =
+        find_property_value(changedButton, opacityId);
+    ASSERT_NE(changedOpacityValue, nullptr);
+    EXPECT_TRUE(changedOpacityValue->value("canClear", false));
+    EXPECT_TRUE(changedOpacityValue->value("overridden", false));
+    EXPECT_EQ(changedOpacityValue->value("source", ""), "Local");
+    auto clearOpacity = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", opacityId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearOpacity.dump(2);
+    EXPECT_TRUE(clearOpacity.value("cleared", false));
+    EXPECT_NEAR(std::stod(clearOpacity.value("value", "")), 0.75, 0.001);
+    auto restoredButton = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", buttonKey}}, &isError);
+    ASSERT_FALSE(isError) << restoredButton.dump(2);
+    const auto* restoredOpacity =
+        find_property_value(restoredButton, opacityId);
+    ASSERT_NE(restoredOpacity, nullptr);
+    EXPECT_FALSE(restoredOpacity->value("canClear", true));
+    EXPECT_FALSE(restoredOpacity->value("overridden", true));
+    EXPECT_NE(restoredOpacity->value("source", ""), "Local");
+
+    auto setEnabled = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", enabledId}, {"value", "false"}},
+        &isError);
+    ASSERT_FALSE(isError) << setEnabled.dump(2);
+    EXPECT_EQ(setEnabled.value("value", ""), "false");
+    auto clearEnabled = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", enabledId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearEnabled.dump(2);
+    EXPECT_EQ(clearEnabled.value("value", ""), "true");
+
+    auto setAlignment = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", alignmentId}, {"value", "Right"}},
+        &isError);
+    ASSERT_FALSE(isError) << setAlignment.dump(2);
+    EXPECT_EQ(setAlignment.value("value", ""), "Right");
+    auto clearAlignment = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", alignmentId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearAlignment.dump(2);
+    EXPECT_EQ(clearAlignment.value("value", ""), "Left");
+
+    auto textProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", textBoxKey}}, &isError);
+    ASSERT_FALSE(isError) << textProperties.dump(2);
+    const auto* text = find_property_descriptor(textProperties, "Text");
+    ASSERT_NE(text, nullptr) << textProperties.dump(2);
+    EXPECT_EQ(text->value("kind", ""), "string");
+    const std::string textId = text->value("descriptorId", "");
+    auto setText = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", textBoxKey},
+             {"descriptorId", textId}, {"value", "Grace Hopper"}},
+        &isError);
+    ASSERT_FALSE(isError) << setText.dump(2);
+    EXPECT_EQ(setText.value("value", ""), "Grace Hopper");
+    auto clearText = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", textBoxKey},
+             {"descriptorId", textId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearText.dump(2);
+    EXPECT_EQ(clearText.value("value", ""), "");
+
+    auto deadIdentity = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", "wpf:0x7FFFFFFFFFFFFFFF"}},
+        &isError);
+    EXPECT_TRUE(isError) << deadIdentity.dump(2);
+    EXPECT_NE(deadIdentity.value("error", "").find("dead"), std::string::npos);
+
+    auto disconnected = client.call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << disconnected.dump(2);
+    EXPECT_EQ(
+        count_managed_tap_starts(L"lvt_wpf_tap.log", sample.pid()) -
+            startsBefore,
+        1) << "tree and dependency-property commands must share one injection";
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string reconnectedSession = connected.value("session", "");
+    ASSERT_FALSE(reconnectedSession.empty()) << connected.dump(2);
+    tree = client.call_tool(
+        "get_visual_tree", json{{"session", reconnectedSession}});
+    button = find_managed_named_element(tree["root"], "OkButton");
+    ASSERT_NE(button, nullptr);
+    auto staleDescriptor = client.call_tool(
+        "set_property",
+        json{{"session", reconnectedSession},
+             {"element", button->value("key", "")},
+             {"descriptorId", opacityId},
+             {"value", "0.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << staleDescriptor.dump(2);
+    EXPECT_NE(
+        staleDescriptor.value("error", "").find("stale"),
+        std::string::npos);
+    client.call_tool(
+        "disconnect", json{{"session", reconnectedSession}}, &isError);
+    ASSERT_FALSE(isError);
+}
 #endif
 
 #if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED
@@ -809,6 +1023,212 @@ TEST(McpManagedFrameworks, WinFormsConnectionPersistsAcrossTreeReads) {
     verify_managed_mcp_connection(
         WINFORMS_SAMPLE_EXE_PATH, "okButton", "winforms:0x",
         L"lvt_winforms_tap.log");
+}
+
+TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_SAMPLE_EXE_PATH));
+    const int startsBefore =
+        count_managed_tap_starts(L"lvt_winforms_tap.log", sample.pid());
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const json* form = find_managed_named_element(tree["root"], "MainForm");
+    ASSERT_NE(form, nullptr);
+    const std::string formKey = form->value("key", "");
+    ASSERT_EQ(formKey.rfind("winforms:0x", 0), 0u);
+
+    bool isError = false;
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    auto repeated = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << repeated.dump(2);
+    EXPECT_EQ(
+        repeated.value("schemaId", ""), properties.value("schemaId", ""));
+
+    const auto* text = find_property_descriptor(properties, "EditableText");
+    const auto* retry = find_property_descriptor(properties, "RetryCount");
+    const auto* mode = find_property_descriptor(properties, "Mode");
+    const auto* providerText =
+        find_property_descriptor(properties, "ProviderText");
+    const auto* throwing =
+        find_property_descriptor(properties, "ThrowingValue");
+    ASSERT_NE(text, nullptr) << properties.dump(2);
+    ASSERT_NE(retry, nullptr) << properties.dump(2);
+    ASSERT_NE(mode, nullptr) << properties.dump(2);
+    ASSERT_NE(providerText, nullptr) << properties.dump(2);
+    ASSERT_NE(throwing, nullptr) << properties.dump(2);
+    EXPECT_EQ(text->value("kind", ""), "string");
+    EXPECT_EQ(retry->value("kind", ""), "integer");
+    EXPECT_EQ(mode->value("kind", ""), "enum");
+    EXPECT_EQ(providerText->value("kind", ""), "string");
+    EXPECT_TRUE(text->value("supportsClear", false));
+    EXPECT_TRUE(providerText->value("supportsClear", false));
+    EXPECT_EQ(find_property_descriptor(properties, "ReadOnlyValue"), nullptr);
+    EXPECT_EQ(find_property_descriptor(properties, "UnsafeFontProperty"), nullptr);
+    EXPECT_EQ(find_property_descriptor(properties, "Controls"), nullptr);
+
+    std::set<std::string> modeChoices;
+    for (const auto& choice : mode->value("choices", json::array()))
+        modeChoices.insert(choice.value("value", ""));
+    EXPECT_EQ(
+        modeChoices,
+        (std::set<std::string>{"Advanced", "Basic", "Expert"}));
+
+    const std::string textId = text->value("descriptorId", "");
+    const std::string retryId = retry->value("descriptorId", "");
+    const std::string modeId = mode->value("descriptorId", "");
+    const std::string providerTextId =
+        providerText->value("descriptorId", "");
+    const std::string throwingId = throwing->value("descriptorId", "");
+
+    auto setText = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", textId}, {"value", "Changed text"}},
+        &isError);
+    ASSERT_FALSE(isError) << setText.dump(2);
+    EXPECT_EQ(setText.value("value", ""), "Changed text");
+    auto changed = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << changed.dump(2);
+    const auto* changedText = find_property_value(changed, textId);
+    ASSERT_NE(changedText, nullptr);
+    EXPECT_TRUE(changedText->value("canClear", false));
+    EXPECT_TRUE(changedText->value("overridden", false));
+    EXPECT_EQ(changedText->value("source", ""), "Modified");
+    auto clearText = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", textId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearText.dump(2);
+    EXPECT_TRUE(clearText.value("cleared", false));
+    EXPECT_EQ(clearText.value("value", ""), "Default text");
+    auto resetSnapshot = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << resetSnapshot.dump(2);
+    const auto* resetTextValue =
+        find_property_value(resetSnapshot, textId);
+    ASSERT_NE(resetTextValue, nullptr);
+    EXPECT_FALSE(resetTextValue->value("canClear", true));
+    EXPECT_FALSE(resetTextValue->value("overridden", true));
+    EXPECT_EQ(resetTextValue->value("source", ""), "Default");
+
+    auto setRetry = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", retryId}, {"value", "9"}},
+        &isError);
+    ASSERT_FALSE(isError) << setRetry.dump(2);
+    EXPECT_EQ(setRetry.value("value", ""), "9");
+    auto clearRetry = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", retryId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearRetry.dump(2);
+    EXPECT_EQ(clearRetry.value("value", ""), "5");
+
+    auto setMode = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", modeId}, {"value", "Advanced"}},
+        &isError);
+    ASSERT_FALSE(isError) << setMode.dump(2);
+    EXPECT_EQ(setMode.value("value", ""), "Advanced");
+    auto clearMode = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", modeId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearMode.dump(2);
+    EXPECT_EQ(clearMode.value("value", ""), "Basic");
+
+    auto setProviderText = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", providerTextId}, {"value", "Custom descriptor"}},
+        &isError);
+    ASSERT_FALSE(isError) << setProviderText.dump(2);
+    EXPECT_EQ(setProviderText.value("value", ""), "Custom descriptor");
+    auto clearProviderText = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", providerTextId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearProviderText.dump(2);
+    EXPECT_EQ(clearProviderText.value("value", ""), "Provider default");
+
+    auto setterFailure = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", throwingId}, {"value", "rejected"}},
+        &isError);
+    EXPECT_TRUE(isError) << setterFailure.dump(2);
+    EXPECT_NE(
+        setterFailure.value("error", "").find("rejected"),
+        std::string::npos);
+
+    auto invalidNumber = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", retryId}, {"value", "9.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << invalidNumber.dump(2);
+
+    auto deadIdentity = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", "winforms:0x7FFFFFFFFFFFFFFF"}},
+        &isError);
+    EXPECT_TRUE(isError) << deadIdentity.dump(2);
+    EXPECT_NE(deadIdentity.value("error", "").find("dead"), std::string::npos);
+
+    auto disconnected = client.call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << disconnected.dump(2);
+    EXPECT_EQ(
+        count_managed_tap_starts(L"lvt_winforms_tap.log", sample.pid()) -
+            startsBefore,
+        1) << "tree and TypeDescriptor property commands must share one injection";
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string reconnectedSession = connected.value("session", "");
+    ASSERT_FALSE(reconnectedSession.empty()) << connected.dump(2);
+    tree = client.call_tool(
+        "get_visual_tree", json{{"session", reconnectedSession}});
+    form = find_managed_named_element(tree["root"], "MainForm");
+    ASSERT_NE(form, nullptr);
+    auto staleDescriptor = client.call_tool(
+        "set_property",
+        json{{"session", reconnectedSession},
+             {"element", form->value("key", "")},
+             {"descriptorId", textId},
+             {"value", "stale"}},
+        &isError);
+    EXPECT_TRUE(isError) << staleDescriptor.dump(2);
+    EXPECT_NE(
+        staleDescriptor.value("error", "").find("stale"),
+        std::string::npos);
+    client.call_tool(
+        "disconnect", json{{"session", reconnectedSession}}, &isError);
+    ASSERT_FALSE(isError);
 }
 #endif
 
