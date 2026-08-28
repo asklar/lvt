@@ -933,6 +933,19 @@ add_custom_target(winforms_sample_app ALL
 file(TO_NATIVE_PATH "${WINFORMS_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe" WINFORMS_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" WINFORMS_SAMPLE_EXE_ESCAPED "${WINFORMS_SAMPLE_EXE_NATIVE}")
 
+# Native Win32/Common Controls sample app used by integration tests and future
+# property-editing coverage. It deliberately builds for the active CMake
+# architecture, so the same fixture source is usable in x64 and x86 test builds.
+add_executable(lvt_native_controls_fixture WIN32
+    tests/apps/NativeControlsFixture/main.cpp
+    tests/apps/NativeControlsFixture/NativeControlsFixture.rc
+)
+target_compile_definitions(lvt_native_controls_fixture PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
+)
+target_link_libraries(lvt_native_controls_fixture PRIVATE comctl32)
+target_link_options(lvt_native_controls_fixture PRIVATE "/MANIFEST:NO")
+
 # Integration tests — require a running Notepad instance
 add_executable(lvt_integration_tests
     tests/integration_tests.cpp
@@ -945,6 +958,7 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
     AVALONIA_SAMPLE_EXE_PATH="${AVALONIA_SAMPLE_EXE_ESCAPED}"
     WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
+    "NATIVE_CONTROLS_FIXTURE_EXE_PATH=\"$<TARGET_FILE:lvt_native_controls_fixture>\""
     # Lets tests assert on repository files, e.g. that the packaged skill has
     # not drifted from the one this repo's own agent reads.
     "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
@@ -955,7 +969,11 @@ target_link_libraries(lvt_integration_tests PRIVATE
     comctl32
 )
 target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
-set(LVT_INTEGRATION_DEPS wpf_sample_app winui3_sample_app)
+set(LVT_INTEGRATION_DEPS
+    wpf_sample_app
+    winui3_sample_app
+    lvt_native_controls_fixture
+)
 if(LVT_BUILD_TOOL)
     list(APPEND LVT_INTEGRATION_DEPS lvt)
 endif()

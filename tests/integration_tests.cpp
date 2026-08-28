@@ -16,8 +16,11 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 
+#include "apps/NativeControlsFixture/native_controls_fixture_ids.h"
+
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+namespace native_fixture = lvt::native_fixture;
 
 // Locate lvt.exe relative to this test binary
 static std::string get_lvt_path() {
@@ -532,6 +535,23 @@ static const json* find_element_by_type_property(const json& el,
     if (el.contains("children") && el["children"].is_array()) {
         for (auto& child : el["children"]) {
             if (auto* found = find_element_by_type_property(child, type, property, value))
+                return found;
+        }
+    }
+    return nullptr;
+}
+
+static const json* find_element_by_hwnd(const json& el, HWND hwnd) {
+    char buffer[32]{};
+    snprintf(buffer, sizeof(buffer), "0x%p", hwnd);
+    if (el.contains("properties") &&
+        el["properties"].value("hwnd", "") == buffer) {
+        return &el;
+    }
+
+    if (el.contains("children") && el["children"].is_array()) {
+        for (auto& child : el["children"]) {
+            if (auto* found = find_element_by_hwnd(child, hwnd))
                 return found;
         }
     }
@@ -1772,6 +1792,324 @@ TEST_F(ComCtlWindowFixture, DurableKeysCoverFullStaticTreeAndQueryRoundTrips) {
 
     auto byKey = run_command(make_cmd(lvt, get_hwnd_arg() + " query " + cmd_escape_arg(key) + " index"));
     EXPECT_EQ(trim_crlf(byKey), "0");
+}
+
+// ---- Standalone native Win32/Common Controls fixture ----
+
+class NativeControlsFixture : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        const fs::path fixturePath = NATIVE_CONTROLS_FIXTURE_EXE_PATH;
+        ASSERT_TRUE(fs::exists(fixturePath))
+            << "Native controls fixture not built at " << fixturePath.string();
+
+        STARTUPINFOW startupInfo{sizeof(startupInfo)};
+        PROCESS_INFORMATION processInfo{};
+        std::wstring command = L"\"" + fixturePath.wstring() + L"\"";
+        ASSERT_TRUE(CreateProcessW(
+            nullptr,
+            command.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            0,
+            nullptr,
+            nullptr,
+            &startupInfo,
+            &processInfo))
+            << "Failed to launch native controls fixture (error "
+            << GetLastError() << ")";
+
+        s_process.reset(processInfo.hProcess);
+        s_thread.reset(processInfo.hThread);
+        s_pid = processInfo.dwProcessId;
+        WaitForInputIdle(s_process.get(), 5000);
+
+        for (int attempt = 0; attempt < 50 && !s_hwnd; ++attempt) {
+            EnumWindows(
+                [](HWND hwnd, LPARAM parameter) -> BOOL {
+                    DWORD pid = 0;
+                    GetWindowThreadProcessId(hwnd, &pid);
+                    if (pid != s_pid)
+                        return TRUE;
+
+                    wchar_t className[128]{};
+                    wchar_t title[128]{};
+                    GetClassNameW(hwnd, className, static_cast<int>(_countof(className)));
+                    GetWindowTextW(hwnd, title, static_cast<int>(_countof(title)));
+                    if (wcscmp(className, native_fixture::kWindowClass) == 0 &&
+                        wcscmp(title, native_fixture::kWindowTitle) == 0) {
+                        *reinterpret_cast<HWND*>(parameter) = hwnd;
+                        return FALSE;
+                    }
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(&s_hwnd));
+            if (!s_hwnd)
+                Sleep(100);
+        }
+
+        ASSERT_NE(s_hwnd, nullptr) << "Native controls fixture window was not created";
+        ASSERT_TRUE(IsWindowVisible(s_hwnd));
+    }
+
+    static void TearDownTestSuite() {
+        if (s_hwnd && IsWindow(s_hwnd))
+            PostMessageW(s_hwnd, native_fixture::kCloseMessage, 0, 0);
+
+        if (s_process) {
+            const DWORD waitResult = WaitForSingleObject(s_process.get(), 5000);
+            if (waitResult != WAIT_OBJECT_0) {
+                ADD_FAILURE() << "Native controls fixture did not close cleanly";
+                TerminateProcess(s_process.get(), 1);
+                WaitForSingleObject(s_process.get(), 5000);
+            } else {
+                DWORD exitCode = 1;
+                ASSERT_TRUE(GetExitCodeProcess(s_process.get(), &exitCode));
+                EXPECT_EQ(exitCode, 0u);
+            }
+        }
+
+        s_hwnd = nullptr;
+        s_process.reset();
+        s_thread.reset();
+        s_pid = 0;
+    }
+
+    static HWND control(int id) {
+        return GetDlgItem(s_hwnd, id);
+    }
+
+    static std::string get_hwnd_arg() {
+        char buffer[64]{};
+        sprintf_s(
+            buffer,
+            "--hwnd 0x%llX",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_hwnd)));
+        return buffer;
+    }
+
+    static json dump_tree() {
+        auto output = run_command(make_cmd(get_lvt_path(), get_hwnd_arg()));
+        auto tree = json::parse(output, nullptr, false);
+        EXPECT_FALSE(tree.is_discarded()) << "Output is not valid JSON:\n" << output;
+        return tree;
+    }
+
+    static wil::unique_handle s_process;
+    static wil::unique_handle s_thread;
+    static DWORD s_pid;
+    static HWND s_hwnd;
+};
+
+wil::unique_handle NativeControlsFixture::s_process;
+wil::unique_handle NativeControlsFixture::s_thread;
+DWORD NativeControlsFixture::s_pid = 0;
+HWND NativeControlsFixture::s_hwnd = nullptr;
+
+TEST_F(NativeControlsFixture, ProviderDumpExposesAllControlsAndBaselineValues) {
+    auto frameworkOutput =
+        run_command(make_cmd(get_lvt_path(), get_hwnd_arg() + " frameworks"));
+    EXPECT_NE(frameworkOutput.find("win32"), std::string::npos);
+    EXPECT_NE(frameworkOutput.find("comctl"), std::string::npos);
+
+    auto tree = dump_tree();
+    ASSERT_FALSE(tree.is_discarded());
+    ASSERT_TRUE(tree.contains("root"));
+    EXPECT_EQ(tree["root"].value("className", ""), "LvtNativePropertyFixtureWindow");
+    EXPECT_EQ(tree["root"].value("text", ""), "LVT Native Property Fixture");
+
+    struct ExpectedControl {
+        int id;
+        const char* className;
+        const char* type;
+        const char* text;
+        const char* framework;
+    };
+    const ExpectedControl expectedControls[] = {
+        {native_fixture::kCheckboxId, "Button", "Button", "Tri-state check", "win32"},
+        {native_fixture::kRadioId, "Button", "Button", "Primary radio", "win32"},
+        {native_fixture::kButtonId, "Button", "Button", "Fixture action", "win32"},
+        {native_fixture::kEditId, "Edit", "Edit", "Editable seed", "win32"},
+        {native_fixture::kReadOnlyEditId, "Edit", "Edit", "Read-only seed", "win32"},
+        {native_fixture::kComboBoxId, "ComboBox", "ComboBox", "", "win32"},
+        {native_fixture::kListBoxId, "ListBox", "ListBox", "", "win32"},
+        {native_fixture::kScrollBarId, "ScrollBar", "ScrollBar", "", "win32"},
+        {native_fixture::kListViewId, "SysListView32", "ListView", "", "comctl"},
+        {native_fixture::kTreeViewId, "SysTreeView32", "TreeView", "", "comctl"},
+        {native_fixture::kToolbarId, "ToolbarWindow32", "Toolbar", "", "comctl"},
+        {native_fixture::kStatusBarId, "msctls_statusbar32", "StatusBar", "", "comctl"},
+        {native_fixture::kTabControlId, "SysTabControl32", "TabControl", "", "comctl"},
+        {native_fixture::kGenericTextId, "LvtNativePropertyFixtureText", "Window",
+         "Generic child seed", "win32"},
+    };
+
+    for (const auto& expected : expectedControls) {
+        const HWND hwnd = control(expected.id);
+        ASSERT_NE(hwnd, nullptr) << "Control ID " << expected.id << " was not created";
+        const json* element = find_element_by_hwnd(tree["root"], hwnd);
+        ASSERT_NE(element, nullptr)
+            << "Control ID " << expected.id << " was not present in the provider dump";
+        EXPECT_EQ(element->value("className", ""), expected.className)
+            << "Control ID " << expected.id;
+        EXPECT_EQ(element->value("type", ""), expected.type)
+            << "Control ID " << expected.id;
+        EXPECT_EQ(element->value("text", ""), expected.text)
+            << "Control ID " << expected.id;
+        EXPECT_EQ(element->value("framework", ""), expected.framework)
+            << "Control ID " << expected.id;
+    }
+
+    const json* listView =
+        find_element_by_hwnd(tree["root"], control(native_fixture::kListViewId));
+    ASSERT_NE(listView, nullptr);
+    EXPECT_EQ((*listView)["properties"].value("itemCount", ""), "3");
+    EXPECT_EQ((*listView)["properties"].value("columnCount", ""), "2");
+    EXPECT_EQ((*listView)["properties"].value("viewMode", ""), "details");
+    const json* alpha =
+        find_element_by_type_property(*listView, "ListViewItem", "index", "0");
+    const json* beta =
+        find_element_by_type_property(*listView, "ListViewItem", "index", "1");
+    const json* gamma =
+        find_element_by_type_property(*listView, "ListViewItem", "index", "2");
+    ASSERT_NE(alpha, nullptr);
+    ASSERT_NE(beta, nullptr);
+    ASSERT_NE(gamma, nullptr);
+    EXPECT_EQ((*alpha)["properties"].value("index", ""), "0");
+    EXPECT_EQ((*beta)["properties"].value("index", ""), "1");
+    EXPECT_EQ((*beta)["properties"].value("selected", ""), "true");
+    EXPECT_EQ((*gamma)["properties"].value("index", ""), "2");
+
+    const json* treeView =
+        find_element_by_hwnd(tree["root"], control(native_fixture::kTreeViewId));
+    ASSERT_NE(treeView, nullptr);
+    EXPECT_EQ((*treeView)["properties"].value("itemCount", ""), "3");
+    ASSERT_FALSE((*treeView)["children"].empty());
+    EXPECT_EQ(
+        (*treeView)["children"][0]["properties"].value("expanded", ""), "true");
+    EXPECT_EQ(
+        (*treeView)["children"][0]["properties"].value("hasChildren", ""), "true");
+
+    const json* toolbar =
+        find_element_by_hwnd(tree["root"], control(native_fixture::kToolbarId));
+    ASSERT_NE(toolbar, nullptr);
+    EXPECT_EQ((*toolbar)["properties"].value("buttonCount", ""), "3");
+    const json* apply = find_element_by_type_property(
+        *toolbar, "ToolbarButton", "commandId", "2001");
+    const json* pin = find_element_by_type_property(
+        *toolbar, "ToolbarButton", "commandId", "2002");
+    const json* disabled = find_element_by_type_property(
+        *toolbar, "ToolbarButton", "commandId", "2003");
+    ASSERT_NE(apply, nullptr);
+    ASSERT_NE(pin, nullptr);
+    ASSERT_NE(disabled, nullptr);
+    EXPECT_EQ(apply->value("text", ""), "Apply");
+    EXPECT_EQ(pin->value("text", ""), "Pinned");
+    EXPECT_EQ((*pin)["properties"].value("checked", ""), "true");
+    EXPECT_EQ(disabled->value("text", ""), "Disabled");
+    EXPECT_EQ((*disabled)["properties"].value("enabled", ""), "false");
+
+    const json* status =
+        find_element_by_hwnd(tree["root"], control(native_fixture::kStatusBarId));
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ((*status)["properties"].value("partCount", ""), "3");
+    ASSERT_EQ((*status)["children"].size(), 3u);
+    EXPECT_EQ((*status)["children"][0].value("text", ""), "Ready");
+    EXPECT_EQ((*status)["children"][1].value("text", ""), "3 items");
+    EXPECT_EQ((*status)["children"][2].value("text", ""), "Idle");
+
+    const json* tabs =
+        find_element_by_hwnd(tree["root"], control(native_fixture::kTabControlId));
+    ASSERT_NE(tabs, nullptr);
+    EXPECT_EQ((*tabs)["properties"].value("tabCount", ""), "3");
+    EXPECT_EQ((*tabs)["properties"].value("selectedIndex", ""), "1");
+    ASSERT_EQ((*tabs)["children"].size(), 3u);
+    EXPECT_EQ((*tabs)["children"][0]["properties"].value("index", ""), "0");
+    EXPECT_EQ((*tabs)["children"][1]["properties"].value("index", ""), "1");
+    EXPECT_EQ((*tabs)["children"][1]["properties"].value("selected", ""), "true");
+    EXPECT_EQ((*tabs)["children"][2]["properties"].value("index", ""), "2");
+}
+
+TEST_F(NativeControlsFixture, ReadOnlySummaryReportsCompleteNativeState) {
+    const LONG_PTR windowExStyle = GetWindowLongPtrW(s_hwnd, GWL_EXSTYLE);
+    EXPECT_NE(windowExStyle & WS_EX_NOACTIVATE, 0);
+    const LONG_PTR checkboxStyle =
+        GetWindowLongPtrW(control(native_fixture::kCheckboxId), GWL_STYLE);
+    EXPECT_EQ(checkboxStyle & BS_TYPEMASK, BS_AUTO3STATE);
+    const LONG_PTR radioStyle =
+        GetWindowLongPtrW(control(native_fixture::kRadioId), GWL_STYLE);
+    EXPECT_EQ(radioStyle & BS_TYPEMASK, BS_AUTORADIOBUTTON);
+    const LONG_PTR readOnlyStyle =
+        GetWindowLongPtrW(control(native_fixture::kReadOnlyEditId), GWL_STYLE);
+    EXPECT_NE(readOnlyStyle & ES_READONLY, 0);
+    EXPECT_EQ(
+        SendMessageW(control(native_fixture::kCheckboxId), BM_GETCHECK, 0, 0),
+        BST_INDETERMINATE);
+    EXPECT_EQ(
+        SendMessageW(control(native_fixture::kRadioId), BM_GETCHECK, 0, 0),
+        BST_CHECKED);
+    EXPECT_EQ(
+        SendMessageW(control(native_fixture::kComboBoxId), CB_GETCOUNT, 0, 0), 3);
+    EXPECT_EQ(
+        SendMessageW(control(native_fixture::kComboBoxId), CB_GETCURSEL, 0, 0), 1);
+    EXPECT_EQ(
+        SendMessageW(control(native_fixture::kListBoxId), LB_GETCOUNT, 0, 0), 4);
+    EXPECT_EQ(
+        SendMessageW(control(native_fixture::kListBoxId), LB_GETCURSEL, 0, 0), 2);
+
+    DWORD_PTR protocolVersion = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kRefreshSummaryMessage,
+            0,
+            0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000,
+            &protocolVersion),
+        0);
+    ASSERT_EQ(
+        protocolVersion,
+        static_cast<DWORD_PTR>(native_fixture::kSummaryProtocolVersion));
+
+    auto tree = dump_tree();
+    ASSERT_FALSE(tree.is_discarded());
+    const json* summary =
+        find_element_by_hwnd(tree["root"], control(native_fixture::kStateSummaryId));
+    ASSERT_NE(summary, nullptr);
+    EXPECT_EQ(summary->value("className", ""), "Static");
+    const std::string text = summary->value("text", "");
+    EXPECT_NE(text.find("protocol=1"), std::string::npos);
+    EXPECT_NE(text.find("checkbox(id=1001)=2"), std::string::npos);
+    EXPECT_NE(text.find("radio(id=1002)=1"), std::string::npos);
+    EXPECT_NE(text.find("button(id=1003)=Fixture action"), std::string::npos);
+    EXPECT_NE(text.find("edit(id=1004)=Editable seed"), std::string::npos);
+    EXPECT_NE(text.find("readonly(id=1005)=Read-only seed"), std::string::npos);
+    EXPECT_NE(
+        text.find("combo(id=1006)=1:Green;items=Red|Green|Blue"),
+        std::string::npos);
+    EXPECT_NE(
+        text.find("listbox(id=1007)=2:Gamma;items=Alpha|Beta|Gamma|Delta"),
+        std::string::npos);
+    EXPECT_NE(text.find("scrollbar(id=1008)=10,110,10,42"), std::string::npos);
+    EXPECT_NE(
+        text.find(
+            "listview(id=1009)=1:Beta row;items=Alpha row|Beta row|Gamma row"),
+        std::string::npos);
+    EXPECT_NE(
+        text.find(
+            "tree(id=1010)=Fixture Root[expanded]/Fixture Child[expanded]/"
+            "Fixture Grandchild"),
+        std::string::npos);
+    EXPECT_NE(
+        text.find(
+            "toolbar(id=1011)=2001:enabled,2002:enabled+checked,2003:disabled"),
+        std::string::npos);
+    EXPECT_NE(text.find("status(id=1012)=Ready|3 items|Idle"), std::string::npos);
+    EXPECT_NE(
+        text.find("tab(id=1013)=1:Details;items=Overview|Details|Advanced"),
+        std::string::npos);
+    EXPECT_NE(text.find("generic(id=1014)=Generic child seed"), std::string::npos);
 }
 
 // ---- Framework-specific bounds (WinUI3/XAML) ----
