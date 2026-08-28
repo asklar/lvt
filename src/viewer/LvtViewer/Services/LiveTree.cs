@@ -141,6 +141,14 @@ public sealed class LiveTree
     {
         if (_byKey.TryGetValue(evt.Key, out var node))
         {
+            // A process-wide provider key can be reparented as an add at the
+            // new path followed by a remove at the old path. Never let that
+            // stale removal delete the already-moved node. Native diffing
+            // should ultimately report this as one path change, but the
+            // client must remain order-safe at the protocol boundary.
+            if (!string.IsNullOrEmpty(evt.Path) &&
+                !string.Equals(node.Path, evt.Path, StringComparison.Ordinal))
+                return;
             DetachFromParent(node);
             _byKey.Remove(evt.Key);
         }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -26,8 +27,11 @@ public sealed record McpToolResult(bool Ok, JsonElement Payload, string Error = 
 /// </summary>
 public sealed class McpSession : IAsyncDisposable, IDisposable
 {
+    private sealed record PendingRequest(
+        int Generation, TaskCompletionSource<JsonElement> Completion);
+
     private readonly object _stateGate = new();
-    private readonly Dictionary<long, TaskCompletionSource<JsonElement>> _pending = new();
+    private readonly Dictionary<long, PendingRequest> _pending = new();
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly SemaphoreSlim _resourceReadGate = new(1, 1);
@@ -431,10 +435,11 @@ public sealed class McpSession : IAsyncDisposable, IDisposable
         string method, object? parameters, TimeSpan timeout, CancellationToken cancellationToken)
     {
         long id = Interlocked.Increment(ref _nextRequestId);
+        int generation = CurrentGeneration;
         var completion = new TaskCompletionSource<JsonElement>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_stateGate)
-            _pending.Add(id, completion);
+            _pending.Add(id, new PendingRequest(generation, completion));
 
         try
         {
@@ -557,10 +562,11 @@ public sealed class McpSession : IAsyncDisposable, IDisposable
                     if (root.TryGetProperty("id", out var idProperty) &&
                         idProperty.TryGetInt64(out long id))
                     {
-                        TaskCompletionSource<JsonElement>? completion = null;
+                        PendingRequest? pending = null;
                         lock (_stateGate)
-                            _pending.TryGetValue(id, out completion);
-                        completion?.TrySetResult(root.Clone());
+                            _pending.TryGetValue(id, out pending);
+                        if (pending?.Generation == generation)
+                            pending.Completion.TrySetResult(root.Clone());
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
@@ -580,7 +586,7 @@ public sealed class McpSession : IAsyncDisposable, IDisposable
         }
         finally
         {
-            FailPending("MCP server output closed");
+            FailPendingGeneration(generation, "MCP server output closed");
         }
     }
 
@@ -696,8 +702,29 @@ public sealed class McpSession : IAsyncDisposable, IDisposable
         List<TaskCompletionSource<JsonElement>> pending;
         lock (_stateGate)
         {
-            pending = new(_pending.Values);
+            pending = _pending.Values.Select(request => request.Completion).ToList();
             _pending.Clear();
+        }
+        var failure = JsonSerializer.SerializeToElement(
+            new { jsonrpc = "2.0", error = new { message = error } });
+        foreach (var completion in pending)
+            completion.TrySetResult(failure);
+    }
+
+    private void FailPendingGeneration(int generation, string error)
+    {
+        List<TaskCompletionSource<JsonElement>> pending = new();
+        lock (_stateGate)
+        {
+            foreach (var pair in _pending.ToList())
+            {
+                var id = pair.Key;
+                var request = pair.Value;
+                if (request.Generation != generation)
+                    continue;
+                pending.Add(request.Completion);
+                _pending.Remove(id);
+            }
         }
         var failure = JsonSerializer.SerializeToElement(
             new { jsonrpc = "2.0", error = new { message = error } });

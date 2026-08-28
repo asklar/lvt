@@ -621,7 +621,11 @@ struct TreePatch {
 }
 
 fn tree_patch_params(resource: &SessionResource, reset: bool) -> serde_json::Value {
-    let mut params = json!({ "session": resource.session, "reset": reset });
+    let mut params = json!({
+        "session": resource.session,
+        "reset": reset,
+        "consumer": "resource",
+    });
     if resource.tree == TreeMode::Visual {
         params["fast"] = true.into();
     }
@@ -755,6 +759,7 @@ struct WatcherHandle {
 struct ResourceEntry {
     initialized: bool,
     cached: Option<TreePatch>,
+    needs_snapshot: bool,
     watcher: Option<WatcherHandle>,
     subscribers: HashMap<u64, ResourceSubscriber>,
 }
@@ -817,6 +822,24 @@ fn merge_cached_patch(cached: &mut Option<TreePatch>, patch: TreePatch) -> Merge
     MergeResult::Cached
 }
 
+fn merge_resource_entry(entry: &mut ResourceEntry, patch: TreePatch) -> CacheResult {
+    entry.initialized = true;
+    if entry.needs_snapshot && !patch.snapshot {
+        return CacheResult::NeedsSnapshot;
+    }
+    match merge_cached_patch(&mut entry.cached, patch) {
+        MergeResult::NoChange => CacheResult::NoChange,
+        MergeResult::Cached => {
+            entry.needs_snapshot = false;
+            CacheResult::Cached
+        }
+        MergeResult::NeedsSnapshot => {
+            entry.needs_snapshot = true;
+            CacheResult::NeedsSnapshot
+        }
+    }
+}
+
 impl ResourceRegistry {
     async fn read_state(&self, resource: &SessionResource) -> (Option<TreePatch>, bool, u64) {
         let uri = resource.uri();
@@ -849,6 +872,7 @@ impl ResourceRegistry {
         }
         entry.initialized = true;
         entry.cached = Some(patch);
+        entry.needs_snapshot = false;
         true
     }
 
@@ -927,12 +951,7 @@ impl ResourceRegistry {
         {
             return CacheResult::Stale;
         }
-        entry.initialized = true;
-        match merge_cached_patch(&mut entry.cached, patch) {
-            MergeResult::NoChange => CacheResult::NoChange,
-            MergeResult::Cached => CacheResult::Cached,
-            MergeResult::NeedsSnapshot => CacheResult::NeedsSnapshot,
-        }
+        merge_resource_entry(entry, patch)
     }
 
     async fn subscribers(
@@ -2494,15 +2513,21 @@ mod tests {
         let uia = SessionResource::new("s2", TreeMode::Uia);
         assert_eq!(
             tree_patch_params(&visual, true),
-            json!({"session": "s1", "reset": true, "fast": true})
+            json!({
+                "session": "s1", "reset": true,
+                "consumer": "resource", "fast": true
+            })
         );
         assert_eq!(
             tree_patch_params(&visual, false),
-            json!({"session": "s1", "reset": false, "fast": true})
+            json!({
+                "session": "s1", "reset": false,
+                "consumer": "resource", "fast": true
+            })
         );
         assert_eq!(
             tree_patch_params(&uia, true),
-            json!({"session": "s2", "reset": true})
+            json!({"session": "s2", "reset": true, "consumer": "resource"})
         );
     }
 
@@ -2582,6 +2607,63 @@ mod tests {
             cached.is_none(),
             "an incomplete oversized diff must not be served"
         );
+    }
+
+    #[test]
+    fn overflow_recovery_rejects_diffs_until_snapshot_succeeds() {
+        let mut entry = ResourceEntry {
+            initialized: true,
+            cached: Some(TreePatch {
+                tree: "visual".into(),
+                snapshot: false,
+                events: vec![json!({"event": "changed", "key": "before"})],
+            }),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            merge_resource_entry(
+                &mut entry,
+                TreePatch {
+                    tree: "visual".into(),
+                    snapshot: false,
+                    events: vec![Value::Null; MAX_CACHED_RESOURCE_EVENTS + 1],
+                }
+            ),
+            CacheResult::NeedsSnapshot
+        ));
+        assert!(entry.needs_snapshot);
+
+        assert!(matches!(
+            merge_resource_entry(
+                &mut entry,
+                TreePatch {
+                    tree: "visual".into(),
+                    snapshot: false,
+                    events: vec![json!({"event": "changed", "key": "lost"})],
+                }
+            ),
+            CacheResult::NeedsSnapshot
+        ));
+        assert_eq!(
+            entry.cached.as_ref().unwrap().events,
+            vec![json!({"event": "changed", "key": "before"})],
+            "ordinary diffs must not be accepted while a replacement snapshot is pending"
+        );
+
+        assert!(matches!(
+            merge_resource_entry(
+                &mut entry,
+                TreePatch {
+                    tree: "visual".into(),
+                    snapshot: true,
+                    events: vec![json!({"event": "added", "key": "replacement"})],
+                }
+            ),
+            CacheResult::Cached
+        ));
+        assert!(!entry.needs_snapshot);
+        assert!(entry.cached.as_ref().unwrap().snapshot);
     }
 
     #[test]

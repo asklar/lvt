@@ -159,6 +159,7 @@ public sealed class ElementNodeViewModel : ObservableObject
         get => _propertyRows;
         private set => SetField(ref _propertyRows, value);
     }
+    public long PropertyVersion { get; private set; }
 
     public ObservableCollection<ElementNodeViewModel> Children { get; } = new();
 
@@ -215,6 +216,7 @@ public sealed class ElementNodeViewModel : ObservableObject
         foreach (var stale in PropertyRows.Where(r => !seen.Contains(r.Name) && !r.IsEditable).ToList())
         {
             PropertyRows.Remove(stale);
+            PropertyVersion++;
             NotifyIfIdentifyingProperty(stale.Name);
         }
     }
@@ -252,6 +254,7 @@ public sealed class ElementNodeViewModel : ObservableObject
             if (value.Length == 0)
                 return; // never was there; nothing to show
             PropertyRows.Add(new PropertyRowViewModel(name, value));
+            PropertyVersion++;
             NotifyIfIdentifyingProperty(name);
             return;
         }
@@ -261,7 +264,11 @@ public sealed class ElementNodeViewModel : ObservableObject
             // Tree patches can carry the same property already represented
             // by a richer xamlOM descriptor. Refresh its value without
             // replacing/removing the metadata-backed row.
-            row.Value = value;
+            if (row.Value != value)
+            {
+                row.Value = value;
+                PropertyVersion++;
+            }
             NotifyIfIdentifyingProperty(name);
             return;
         }
@@ -269,10 +276,15 @@ public sealed class ElementNodeViewModel : ObservableObject
         if (value.Length == 0 && !row.IsEditable)
         {
             PropertyRows.Remove(row);
+            PropertyVersion++;
             NotifyIfIdentifyingProperty(name);
             return;
         }
-        row.Value = value;
+        if (row.Value != value)
+        {
+            row.Value = value;
+            PropertyVersion++;
+        }
         NotifyIfIdentifyingProperty(name);
     }
 
@@ -291,12 +303,14 @@ public sealed class ElementNodeViewModel : ObservableObject
         // made selecting a node look frozen while WPF repeatedly remeasured
         // the property panel.
         PropertyRows = new ObservableCollection<PropertyRowViewModel>(merged);
+        PropertyVersion++;
         OnPropertyChanged(nameof(DisplayName));
     }
 
     public void ReplacePropertyRows(IEnumerable<PropertyRowViewModel> rows)
     {
         PropertyRows = new ObservableCollection<PropertyRowViewModel>(rows);
+        PropertyVersion++;
         OnPropertyChanged(nameof(DisplayName));
     }
 

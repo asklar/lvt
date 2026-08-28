@@ -128,9 +128,11 @@ enum class SnapshotTree {
 struct TreeSnapshotKey {
     std::string session;
     SnapshotTree tree = SnapshotTree::visual;
+    std::string consumer;
 
     bool operator<(const TreeSnapshotKey& other) const {
-        return std::tie(session, tree) < std::tie(other.session, other.tree);
+        return std::tie(session, tree, consumer) <
+               std::tie(other.session, other.tree, other.consumer);
     }
 };
 
@@ -644,6 +646,61 @@ bool missing_injected_framework_content(const lvt::Element& tree) {
     inspect_injected_framework_shape(tree, shape);
     return (shape.xamlHost && !shape.xamlContent) ||
            (shape.winui3Host && !shape.winui3Content);
+}
+
+const char* injected_framework_for_host(const lvt::Element& element) {
+    if (element.className == "Windows.UI.Core.CoreWindow" ||
+        element.className == "Windows.UI.Composition.DesktopWindowContentBridge")
+        return "xaml";
+    if (element.className == "Microsoft.UI.Content.DesktopChildSiteBridge" ||
+        element.className == "WinUIDesktopWin32WindowClass")
+        return "winui3";
+    return nullptr;
+}
+
+bool has_framework_descendant(
+    const lvt::Element& element, const std::string& framework) {
+    for (const auto& child : element.children) {
+        if (child.framework == framework &&
+            (child.className.rfind("Windows.UI.Xaml.", 0) == 0 ||
+             child.className.rfind("Microsoft.UI.Xaml.", 0) == 0))
+            return true;
+        if (has_framework_descendant(child, framework))
+            return true;
+    }
+    return false;
+}
+
+std::string injected_host_identity(const lvt::Element& element) {
+    if (element.nativeHandle != 0)
+        return element.className + "#" + std::to_string(element.nativeHandle);
+    return element.key;
+}
+
+void collect_injected_host_state(
+    const lvt::Element& element, std::map<std::string, bool>& hosts) {
+    if (const char* framework = injected_framework_for_host(element)) {
+        hosts[injected_host_identity(element)] =
+            has_framework_descendant(element, framework);
+    }
+    for (const auto& child : element.children)
+        collect_injected_host_state(child, hosts);
+}
+
+bool lost_populated_injected_host(
+    const lvt::Element& previous, const lvt::Element& current) {
+    std::map<std::string, bool> previousHosts;
+    std::map<std::string, bool> currentHosts;
+    collect_injected_host_state(previous, previousHosts);
+    collect_injected_host_state(current, currentHosts);
+    for (const auto& [identity, hadContent] : previousHosts) {
+        if (!hadContent)
+            continue;
+        auto found = currentHosts.find(identity);
+        if (found != currentHosts.end() && !found->second)
+            return true;
+    }
+    return false;
 }
 
 // Build the tree a request asked for. `uia` selects the view; the visual tree
@@ -1314,7 +1371,11 @@ json method_get_tree_changes(const json& params, bool uia) {
             "cannot diff a truncated UI Automation tree; increase timeoutMs and try again");
     }
 
-    const TreeSnapshotKey key{session.id, uia ? SnapshotTree::uia : SnapshotTree::visual};
+    const TreeSnapshotKey key{
+        session.id,
+        uia ? SnapshotTree::uia : SnapshotTree::visual,
+        get_string(params, "consumer", "tool"),
+    };
     const auto optionsKey = tree_snapshot_options_key(params, uia);
     const bool reset = get_bool(params, "reset", false);
     bool snapshot = false;
@@ -1330,6 +1391,13 @@ json method_get_tree_changes(const json& params, bool uia) {
 
         std::lock_guard<std::mutex> snapshotsLock(g_treeSnapshotsMutex);
         auto found = g_treeSnapshots.find(key);
+        if (!uia && !reset && found != g_treeSnapshots.end() &&
+            found->second.optionsKey == optionsKey &&
+            lost_populated_injected_host(found->second.tree, current)) {
+            throw std::runtime_error(
+                "one XAML/WinUI host temporarily lost its framework subtree; "
+                "the previous MCP snapshot was preserved");
+        }
         if (reset || found == g_treeSnapshots.end() ||
             found->second.optionsKey != optionsKey) {
             snapshot = true;

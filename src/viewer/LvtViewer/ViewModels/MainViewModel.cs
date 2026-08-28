@@ -316,6 +316,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                    row.Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
                    row.Value.Contains(query, StringComparison.OrdinalIgnoreCase);
         };
+        if (view.CanChangeLiveFiltering)
+        {
+            view.LiveFilteringProperties.Add(nameof(PropertyRowViewModel.Value));
+            view.IsLiveFiltering = true;
+        }
         SelectedPropertyRows = view;
     }
 
@@ -577,9 +582,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        long propertyVersion = node.PropertyVersion;
         var stopwatch = Stopwatch.StartNew();
         var result = await _mcp.GetElementPropertiesAsync(node.Key);
-        if (SelectedElement != node)
+        if (SelectedElement != node || node.PropertyVersion != propertyVersion)
             return;
         if (!result.Ok)
         {
@@ -605,7 +611,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                             : property.Value.ToString()))
                     .ToList();
             });
-            if (SelectedElement != node)
+            if (SelectedElement != node || node.PropertyVersion != propertyVersion)
                 return;
             node.ReplacePropertyRows(rows);
         }
@@ -623,9 +629,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        long propertyVersion = node.PropertyVersion;
         var stopwatch = Stopwatch.StartNew();
         var result = await _mcp.GetVisualPropertiesAsync(node.Key);
-        if (SelectedElement != node)
+        if (SelectedElement != node || node.PropertyVersion != propertyVersion)
             return;
         if (!result.Ok)
         {
@@ -651,7 +658,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 return row;
             }).ToList();
         });
-        if (SelectedElement != node)
+        if (SelectedElement != node || node.PropertyVersion != propertyVersion)
             return;
 
         node.ReplaceVisualPropertyRows(rows);

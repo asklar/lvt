@@ -997,10 +997,21 @@ public:
                 if (relation.Parent != 0) {
                     auto it = m_nodes.find(relation.Parent);
                     if (it != m_nodes.end()) {
-                        it->second.childHandles.push_back(element.Handle);
+                        auto& children = it->second.childHandles;
+                        children.erase(
+                            std::remove(children.begin(), children.end(), element.Handle),
+                            children.end());
+                        const auto index = std::min<size_t>(
+                            relation.ChildIndex, children.size());
+                        children.insert(children.begin() + index, element.Handle);
                     }
                 } else {
-                    m_roots.push_back(element.Handle);
+                    m_roots.erase(
+                        std::remove(m_roots.begin(), m_roots.end(), element.Handle),
+                        m_roots.end());
+                    const auto index = std::min<size_t>(
+                        relation.ChildIndex, m_roots.size());
+                    m_roots.insert(m_roots.begin() + index, element.Handle);
                 }
             } else if (isRemove) {
                 // Essential for a persistent connection, not optional: the
