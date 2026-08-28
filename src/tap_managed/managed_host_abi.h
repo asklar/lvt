@@ -32,12 +32,9 @@ using load_assembly_and_get_function_pointer_fn = int(__stdcall*)(
     void* reserved,
     void** delegate);
 
-// The managed RunServerDelegate is explicitly marked StdCall in both TAP
-// assemblies. It is a custom delegate passed to
-// load_assembly_and_get_function_pointer, not an UnmanagedCallersOnly entry
-// point, because the same net48 assembly must also support
-// ExecuteInDefaultAppDomain.
-using managed_run_server_fn = int(__stdcall*)(
-    const wchar_t* pipeName, int32_t pipeNameBytes);
+// Official default managed component entry point returned when
+// delegate_type_name is null.
+using component_entry_point_fn = int(__stdcall*)(
+    void* arguments, int32_t argumentBytes);
 
 } // namespace lvt::managed_host_abi

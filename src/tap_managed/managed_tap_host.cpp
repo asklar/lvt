@@ -124,7 +124,8 @@ bool TryNetFramework(const std::wstring& assemblyPath, const std::wstring& pipeN
 
     DWORD returnValue = 1;
     result = runtimeHost->ExecuteInDefaultAppDomain(
-        assemblyPath.c_str(), g_config.frameworkTypeName, g_config.methodName,
+        assemblyPath.c_str(), g_config.frameworkTypeName,
+        g_config.frameworkMethodName,
         pipeName.c_str(), &returnValue);
     LogMsg("ExecuteInDefaultAppDomain returned 0x%08X, value=%lu", result, returnValue);
     return SUCCEEDED(result);
@@ -216,10 +217,10 @@ bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pipeName) 
     auto loadAssembly =
         reinterpret_cast<load_assembly_and_get_function_pointer_fn>(
             loadAndGetPointer);
-    managed_run_server_fn runServer = nullptr;
+    component_entry_point_fn runServer = nullptr;
     result = loadAssembly(
-        assemblyPath.c_str(), g_config.coreTypeName, g_config.methodName,
-        g_config.coreDelegateTypeName, nullptr,
+        assemblyPath.c_str(), g_config.coreTypeName, g_config.coreMethodName,
+        nullptr, nullptr,
         reinterpret_cast<void**>(&runServer));
     if (result < 0 || !runServer) {
         close(hostContext);
@@ -227,7 +228,9 @@ bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pipeName) 
     }
 
     const int returnValue =
-        runServer(pipeName.c_str(), static_cast<int>(pipeName.size() * sizeof(wchar_t)));
+        runServer(
+            const_cast<wchar_t*>(pipeName.c_str()),
+            static_cast<int>(pipeName.size() * sizeof(wchar_t)));
     LogMsg("Managed server returned %d", returnValue);
     close(hostContext);
     return returnValue == 0;

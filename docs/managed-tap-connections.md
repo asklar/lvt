@@ -11,10 +11,13 @@ WPF and WinForms enrichment uses the same lifetime shape as the XAML providers: 
 
 The native TAP names remain architecture-specific (`x86`, `x64`, `arm64`); the managed assemblies remain AnyCPU.
 The host ABI follows the official .NET declarations exactly: hostfxr exports
-use `HOSTFXR_CALLTYPE` (`__cdecl` on Windows), while
-`load_assembly_and_get_function_pointer` and the explicitly annotated managed
-`RunServerDelegate` use `CORECLR_DELEGATE_CALLTYPE`/`StdCall`. This distinction
-is mandatory on x86, where mixing the conventions corrupts ESP.
+use `HOSTFXR_CALLTYPE` (`__cdecl` on Windows), while all returned runtime
+delegates use `CORECLR_DELEGATE_CALLTYPE` (`__stdcall` on x86). The CoreCLR path
+requests the official default `component_entry_point_fn` by passing a null
+delegate type; its managed `RunServerCore(IntPtr, int)` method matches that
+signature. The named `RunServerDelegate` remains explicitly annotated
+`StdCall`, but the host does not depend on a custom-delegate thunk. This
+distinction is mandatory on x86, where mixing conventions corrupts ESP.
 
 ## Lifetime
 

@@ -321,7 +321,7 @@ namespace LvtWinFormsTap
             public uint HResultCode { get; private set; }
         }
 
-        public static int RunServer(IntPtr pipeNamePtr, int pipeNameLength)
+        public static int RunServerCore(IntPtr pipeNamePtr, int pipeNameLength)
         {
             try
             {

@@ -8,8 +8,8 @@ const ManagedTapHostConfig kConfig{
     L"LvtWpfTap.dll",
     L"LvtWpfTap.WpfTreeWalker",
     L"LvtWpfTap.WpfTreeWalker, LvtWpfTap",
-    L"LvtWpfTap.WpfTreeWalker+RunServerDelegate, LvtWpfTap",
     L"RunServer",
+    L"RunServerCore",
     L"lvt_wpf_pipe",
     L"lvt_wpf_tap.log",
 };

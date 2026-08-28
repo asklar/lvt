@@ -8,8 +8,8 @@ const ManagedTapHostConfig kConfig{
     L"LvtWinFormsTap.dll",
     L"LvtWinFormsTap.WinFormsTreeWalker",
     L"LvtWinFormsTap.WinFormsTreeWalker, LvtWinFormsTap",
-    L"LvtWinFormsTap.WinFormsTreeWalker+RunServerDelegate, LvtWinFormsTap",
     L"RunServer",
+    L"RunServerCore",
     L"lvt_winforms_pipe",
     L"lvt_winforms_tap.log",
 };
