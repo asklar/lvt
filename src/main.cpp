@@ -640,6 +640,10 @@ static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
     lvt::Element tree;
     if (!build_root_tree(target, args, tree, connectionLookup))
         return false;
+    const bool incompleteWpf =
+        lvt::framework_refresh_incomplete(tree, "wpf");
+    const bool incompleteWinForms =
+        lvt::framework_refresh_incomplete(tree, "winforms");
 
     lvt::Element* outputRoot = &tree;
     if (!args.elementId.empty()) {
@@ -654,6 +658,10 @@ static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
         lvt::trim_to_depth(*outputRoot, args.depth);
 
     outputTree = *outputRoot;
+    if (incompleteWpf)
+        lvt::mark_framework_refresh_incomplete(outputTree, "wpf");
+    if (incompleteWinForms)
+        lvt::mark_framework_refresh_incomplete(outputTree, "winforms");
     return true;
 }
 
@@ -676,6 +684,8 @@ static void collect_frameworks_present(const lvt::Element& el, std::set<std::str
 // kept as a secondary safety net for whatever is left over that: a
 // genuinely hung target, or a walk slower even than the new timeout.
 static bool lost_injected_framework_content(const lvt::Element& previous, const lvt::Element& current) {
+    if (lvt::has_incomplete_framework_refresh(current))
+        return true;
     std::set<std::string> prevFrameworks, currFrameworks;
     collect_frameworks_present(previous, prevFrameworks);
     collect_frameworks_present(current, currFrameworks);
@@ -922,8 +932,10 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             if (lvt::g_debug)
                 fprintf(stderr, "lvt: retrying initial watch connection (attempt %d)\n", attempt + 1);
             Sleep(static_cast<DWORD>(300 * attempt));
+            refresh_dead_watch_connections(target, args, connections);
         }
-        built = build_output_tree(target, args, previous, lookup);
+        built = build_output_tree(target, args, previous, lookup) &&
+                !lvt::has_incomplete_framework_refresh(previous);
     }
     if (!built)
         return 1;
@@ -997,9 +1009,18 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
                 if (lvt::g_debug)
                     fprintf(stderr, "lvt: injected framework content vanished this tick; retrying (attempt %d)\n", extra + 1);
                 Sleep(1000);
+                refresh_dead_watch_connections(target, args, connections);
                 lvt::Element retryTree;
                 if (build_output_tree(target, args, retryTree, lookup))
                     current = std::move(retryTree);
+            }
+            if (lost_injected_framework_content(previous, current)) {
+                if (lvt::g_debug) {
+                    fprintf(stderr,
+                            "lvt: preserving the previous watch snapshot after an "
+                            "incomplete framework refresh\n");
+                }
+                continue;
             }
         }
 

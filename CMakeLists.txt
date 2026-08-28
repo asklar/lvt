@@ -1003,6 +1003,10 @@ target_compile_definitions(lvt_native_controls_fixture PRIVATE
 target_link_libraries(lvt_native_controls_fixture PRIVATE comctl32)
 target_link_options(lvt_native_controls_fixture PRIVATE "/MANIFEST:NO")
 
+add_executable(lvt_managed_pipe_spoof
+    tests/apps/ManagedPipeSpoof/main.cpp
+)
+
 # Integration tests — require a running Notepad instance
 add_executable(lvt_integration_tests
     tests/integration_tests.cpp
@@ -1016,6 +1020,7 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     AVALONIA_SAMPLE_EXE_PATH="${AVALONIA_SAMPLE_EXE_ESCAPED}"
     WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
     "NATIVE_CONTROLS_FIXTURE_EXE_PATH=\"$<TARGET_FILE:lvt_native_controls_fixture>\""
+    "MANAGED_PIPE_SPOOF_EXE_PATH=\"$<TARGET_FILE:lvt_managed_pipe_spoof>\""
     # Lets tests assert on repository files, e.g. that the packaged skill has
     # not drifted from the one this repo's own agent reads.
     "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
@@ -1031,6 +1036,7 @@ set(LVT_INTEGRATION_DEPS
     wpf_sample_app
     winui3_sample_app
     lvt_native_controls_fixture
+    lvt_managed_pipe_spoof
 )
 if(LVT_BUILD_TOOL)
     list(APPEND LVT_INTEGRATION_DEPS lvt)

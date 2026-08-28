@@ -14,6 +14,7 @@
 #include "providers/uia_provider.h"
 #include "providers/connection_registry.h"
 #include "providers/framework_connection.h"
+#include "providers/managed_connection.h"
 #include "providers/overlapped_io.h"
 #include "providers/xaml_enum_catalog.h"
 #include "providers/uia_props.h"
@@ -559,6 +560,27 @@ TEST(ElementKeys, ManagedFrameworkHandlesUseCompactSessionKeys) {
     EXPECT_EQ(root.children[1].key, "winforms:0x5678");
 }
 
+TEST(ElementKeys, WinFormsManagedIdentitySurvivesHwndRecreation) {
+    Element original;
+    original.type = "Button";
+    original.className = "System.Windows.Forms.Button";
+    original.framework = "winforms";
+    original.providerHandle = 0x1234;
+    original.nativeHandle = 0x100;
+    assign_element_keys(original);
+
+    Element recreated = original;
+    recreated.nativeHandle = 0x200;
+    assign_element_keys(recreated);
+    EXPECT_EQ(recreated.key, original.key);
+
+    Element reusedHwnd = original;
+    reusedHwnd.providerHandle = 0x5678;
+    reusedHwnd.nativeHandle = 0x100;
+    assign_element_keys(reusedHwnd);
+    EXPECT_NE(reusedHwnd.key, original.key);
+}
+
 TEST(ElementKeys, ParsesOnlyCompactXamlInstanceKeys) {
     CompactXamlKey key;
     std::string error;
@@ -697,6 +719,70 @@ TEST(WinFormsEnrichment, PreservesManagedIdentityForControlsWithoutHwnd) {
     EXPECT_EQ(child.providerHandle, 2u);
     EXPECT_EQ(child.properties.at("managedHandle"), "0x2");
     EXPECT_EQ(child.properties.at("handleKind"), "managed");
+}
+
+TEST(WinFormsEnrichment, HwndIndexSurvivesHandlelessChildInsertion) {
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+    root.nativeHandle = 0x100;
+
+    Element first;
+    first.type = "Window";
+    first.framework = "win32";
+    first.nativeHandle = 0x200;
+    Element later;
+    later.type = "Window";
+    later.framework = "win32";
+    later.nativeHandle = 0x300;
+    root.children = {first, later};
+    root.children.shrink_to_fit();
+
+    ASSERT_TRUE(apply_winforms_control_json(
+        root,
+        R"([{"hwnd":"100","managedHandle":1,"type":"System.Windows.Forms.Form","children":[)"
+        R"({"hwnd":"200","managedHandle":2,"type":"System.Windows.Forms.Button","name":"first"},)"
+        R"({"managedHandle":3,"type":"System.Windows.Forms.Control","name":"handleless"},)"
+        R"({"hwnd":"300","managedHandle":4,"type":"System.Windows.Forms.Button","name":"later"})"
+        R"(]}])"));
+
+    ASSERT_EQ(root.children.size(), 3u);
+    EXPECT_EQ(root.children[0].properties.at("name"), "first");
+    EXPECT_EQ(root.children[0].providerHandle, 2u);
+    EXPECT_EQ(root.children[1].properties.at("name"), "later");
+    EXPECT_EQ(root.children[1].providerHandle, 4u);
+    EXPECT_EQ(root.children[2].properties.at("name"), "handleless");
+    EXPECT_EQ(root.children[2].providerHandle, 3u);
+}
+
+namespace {
+
+class FailingManagedTreeConnection final : public IFrameworkConnection {
+public:
+    bool get_tree(Element&, bool, const std::string& = {}) override {
+        return false;
+    }
+    std::vector<ConnectionEvent> poll_events() override { return {}; }
+    bool is_alive() const override { return true; }
+};
+
+} // namespace
+
+TEST(ManagedFrameworkCompleteness, FailedRefreshIsExplicit) {
+    FailingManagedTreeConnection connection;
+    std::vector<FrameworkInfo> frameworks{
+        {Framework::Wpf, "", "wpf"},
+        {Framework::WinForms, "", "winforms"},
+    };
+    auto tree = build_tree(
+        nullptr, GetCurrentProcessId(), frameworks, -1, {}, false,
+        [&connection](const std::string&) -> IFrameworkConnection* {
+            return &connection;
+        });
+
+    EXPECT_TRUE(framework_refresh_incomplete(tree, "wpf"));
+    EXPECT_TRUE(framework_refresh_incomplete(tree, "winforms"));
+    EXPECT_TRUE(has_incomplete_framework_refresh(tree));
 }
 
 TEST(WpfTreeJson, ZeroSizeIsMarkedRatherThanSilentlyOmitted) {

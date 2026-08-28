@@ -682,7 +682,8 @@ void inspect_injected_framework_shape(
 bool missing_injected_framework_content(const lvt::Element& tree) {
     InjectedFrameworkShape shape;
     inspect_injected_framework_shape(tree, shape);
-    return (shape.xamlHost && !shape.xamlContent) ||
+    return lvt::has_incomplete_framework_refresh(tree) ||
+           (shape.xamlHost && !shape.xamlContent) ||
            (shape.winui3Host && !shape.winui3Content);
 }
 
@@ -850,8 +851,8 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
     }
 
     error =
-        "the XAML/WinUI host is still present but its framework tree is temporarily "
-        "unavailable; the previous MCP snapshot was preserved";
+        "an injected framework host is still present but its framework tree is "
+        "temporarily unavailable; the previous MCP snapshot was preserved";
     return false;
 }
 

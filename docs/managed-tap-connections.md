@@ -48,6 +48,15 @@ sequenceDiagram
 
 The pipe also ends the command loop when lvt exits unexpectedly. Native reads and writes wait on both their overlapped-I/O event and the target process handle, so a target exit fails promptly instead of leaving a blocked thread. Before reconnecting, lvt verifies that the previous native TAP module has completed its safe worker-thread unload.
 
+Connection bootstrap is serialized across lvt processes by a named mutex keyed
+by target PID and framework. The mutex covers module inspection, sidecar
+creation, `LoadLibraryW`, pipe acceptance, and the `READY` handshake, preventing
+simultaneous injectors from adding an unmatched module reference. Sidecar,
+mutex, and pipe ACLs are restricted to SYSTEM plus the current/target user.
+After every pipe connection, lvt verifies `GetNamedPipeClientProcessId` against
+the intended target PID before reading `READY`; mismatched clients are
+disconnected and the server resumes waiting.
+
 ## Protocol
 
 Messages are UTF-8, tab-delimited, and newline-terminated:
@@ -100,3 +109,9 @@ The pipe thread never reads framework objects directly.
 - WinForms records each control's owning top-level control/Form during the tree walk and queues property work through that owner's `BeginInvoke`; there is no direct off-thread fallback.
 
 A timeout returns a correlated command error while leaving the transport available for a later retry. Broken transport or target exit marks the native connection dead so the registry can replace it.
+
+If a WPF or WinForms `GET_TREE` fails after native HWND labeling, the provider
+marks the result as an incomplete framework refresh. Watch retries and retains
+its previous snapshot rather than emitting false subtree removals. MCP visual
+reads and resources likewise retry and refuse to advance their baseline to the
+host-only tree.

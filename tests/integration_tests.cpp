@@ -9,12 +9,15 @@
 #include <cstdio>
 #include <string>
 #include <array>
+#include <atomic>
 #include <map>
 #include <set>
 #include <vector>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <nlohmann/json.hpp>
+#include <thread>
 #include "element_key.h"
 #include "lvt_config.h"
 #if LVT_ENABLE_WPF || LVT_ENABLE_WINFORMS
@@ -33,6 +36,81 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 namespace native_fixture = lvt::native_fixture;
+
+#if LVT_ENABLE_WPF || LVT_ENABLE_WINFORMS
+TEST(ManagedConnectionSecurity, RejectsSpoofedPipeClientProcess) {
+    const std::wstring pipeName =
+        L"\\\\.\\pipe\\lvt_spoof_test_" +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64());
+    wil::unique_hfile pipe(CreateNamedPipeW(
+        pipeName.c_str(),
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 4096, 4096, 5000, nullptr));
+    ASSERT_TRUE(pipe);
+
+    wil::unique_event event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ASSERT_TRUE(event);
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.get();
+    ASSERT_FALSE(ConnectNamedPipe(pipe.get(), &overlapped));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION processInfo{};
+    const std::wstring spoofPath =
+        fs::path(MANAGED_PIPE_SPOOF_EXE_PATH).wstring();
+    std::wstring command =
+        L"\"" + spoofPath + L"\" \"" +
+        pipeName + L"\"";
+    ASSERT_TRUE(CreateProcessW(
+        nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+        nullptr, nullptr, &startup, &processInfo));
+    wil::unique_handle spoofProcess(processInfo.hProcess);
+    wil::unique_handle spoofThread(processInfo.hThread);
+
+    ASSERT_EQ(WaitForSingleObject(event.get(), 5000), WAIT_OBJECT_0);
+    DWORD connectedBytes = 0;
+    ASSERT_TRUE(GetOverlappedResult(
+        pipe.get(), &overlapped, &connectedBytes, FALSE));
+    EXPECT_FALSE(lvt::detail::managed_pipe_client_matches_pid(
+        pipe.get(), GetCurrentProcessId()));
+
+    ASSERT_TRUE(DisconnectNamedPipe(pipe.get()));
+    ASSERT_EQ(WaitForSingleObject(spoofProcess.get(), 5000), WAIT_OBJECT_0);
+
+    ResetEvent(event.get());
+    ZeroMemory(&overlapped, sizeof(overlapped));
+    overlapped.hEvent = event.get();
+    ASSERT_FALSE(ConnectNamedPipe(pipe.get(), &overlapped));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    std::atomic_bool expectedClientOpened = false;
+    std::thread expectedClient([&pipeName, &expectedClientOpened] {
+        wil::unique_hfile client(CreateFileW(
+            pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            OPEN_EXISTING, 0, nullptr));
+        if (!client)
+            return;
+        expectedClientOpened = true;
+        char byte = 0;
+        DWORD read = 0;
+        ReadFile(client.get(), &byte, 1, &read, nullptr);
+    });
+    const DWORD expectedWait = WaitForSingleObject(event.get(), 5000);
+    if (expectedWait == WAIT_OBJECT_0) {
+        EXPECT_TRUE(GetOverlappedResult(
+            pipe.get(), &overlapped, &connectedBytes, FALSE));
+        EXPECT_TRUE(lvt::detail::managed_pipe_client_matches_pid(
+            pipe.get(), GetCurrentProcessId()));
+    }
+    DisconnectNamedPipe(pipe.get());
+    expectedClient.join();
+    ASSERT_EQ(expectedWait, WAIT_OBJECT_0);
+    EXPECT_TRUE(expectedClientOpened);
+}
+#endif
 
 // Locate lvt.exe relative to this test binary
 static std::string get_lvt_path() {
@@ -1020,6 +1098,48 @@ TEST_F(WinFormsSampleFixture, DurableKeyContract) {
     auto queriedType = query_prop_until(lvt, get_pid_arg(), okKey, "winforms.type",
                                         "System.Windows.Forms.Button");
     EXPECT_EQ(queriedType, "System.Windows.Forms.Button");
+}
+
+TEST_F(WinFormsSampleFixture, ConcurrentCollectorsDoNotPinTapModule) {
+    SkipIfNotReady();
+    const auto lvt = get_lvt_path();
+    const auto command = make_cmd(lvt, get_pid_arg());
+    std::promise<void> start;
+    std::shared_future<void> startSignal(start.get_future());
+    auto first = std::async(std::launch::async, [startSignal, command] {
+        startSignal.wait();
+        return run_command(command);
+    });
+    auto second = std::async(std::launch::async, [startSignal, command] {
+        startSignal.wait();
+        return run_command(command);
+    });
+    start.set_value();
+
+    auto firstTree = json::parse(first.get(), nullptr, false);
+    auto secondTree = json::parse(second.get(), nullptr, false);
+    ASSERT_FALSE(firstTree.is_discarded());
+    ASSERT_FALSE(secondTree.is_discarded());
+    const bool firstManaged =
+        firstTree.contains("root") &&
+        json_tree_has_named_control(firstTree["root"], "okButton");
+    const bool secondManaged =
+        secondTree.contains("root") &&
+        json_tree_has_named_control(secondTree["root"], "okButton");
+    EXPECT_TRUE(firstManaged || secondManaged)
+        << "at least one simultaneous collector must own the managed session";
+
+    auto reconnected = dump_ready_tree(
+        lvt, get_pid_arg(),
+        [](const json& tree) {
+            return tree.contains("root") &&
+                   json_tree_has_named_control(tree["root"], "okButton");
+        },
+        20);
+    EXPECT_TRUE(
+        reconnected.contains("root") &&
+        json_tree_has_named_control(reconnected["root"], "okButton"))
+        << "concurrent LoadLibrary callers must not pin the TAP after both exit";
 }
 
 #if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED

@@ -39,6 +39,11 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
                    bool fastProperties = false,
                    const ConnectionLookup& connectionLookup = {});
 
+void mark_framework_refresh_incomplete(Element& root, const std::string& framework);
+bool framework_refresh_incomplete(
+    const Element& root, const std::string& framework);
+bool has_incomplete_framework_refresh(const Element& root);
+
 // Assign deterministic element IDs (e0, e1, ...) in depth-first order.
 void assign_element_ids(Element& root);
 

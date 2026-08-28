@@ -13,11 +13,10 @@ static void label_winforms_like_windows(Element& el) {
     }
 }
 
-void WinFormsProvider::enrich(Element& root, HWND hwnd, DWORD pid) {
+bool WinFormsProvider::enrich(Element& root, HWND hwnd, DWORD pid) {
     label_winforms_like_windows(root);
     auto connection = open_connection(hwnd, pid);
-    if (connection)
-        connection->get_tree(root, false);
+    return connection && connection->get_tree(root, false);
 }
 
 std::shared_ptr<IFrameworkConnection> WinFormsProvider::open_connection(
@@ -25,10 +24,10 @@ std::shared_ptr<IFrameworkConnection> WinFormsProvider::open_connection(
     return open_winforms_connection(hwnd, pid);
 }
 
-void WinFormsProvider::enrich_with_connection(
+bool WinFormsProvider::enrich_with_connection(
     Element& root, IFrameworkConnection& connection) {
     label_winforms_like_windows(root);
-    connection.get_tree(root, false);
+    return connection.get_tree(root, false);
 }
 
 } // namespace lvt

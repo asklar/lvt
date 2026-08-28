@@ -1230,6 +1230,55 @@ TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
         "disconnect", json{{"session", reconnectedSession}}, &isError);
     ASSERT_FALSE(isError);
 }
+
+TEST(McpManagedFrameworks, FailedWinFormsRefreshDoesNotAdvanceSnapshot) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_SAMPLE_EXE_PATH));
+
+    McpClient owner(false);
+    ASSERT_TRUE(owner.started());
+    ASSERT_TRUE(owner.handshake());
+    auto ownerConnected = owner.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string ownerSession = ownerConnected.value("session", "");
+    ASSERT_FALSE(ownerSession.empty()) << ownerConnected.dump(2);
+    auto ownerTree = owner.call_tool(
+        "get_visual_tree", json{{"session", ownerSession}});
+    ASSERT_TRUE(ownerTree.contains("root")) << ownerTree.dump(2);
+
+    McpClient observer(false);
+    ASSERT_TRUE(observer.started());
+    ASSERT_TRUE(observer.handshake());
+    auto observerConnected = observer.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string observerSession =
+        observerConnected.value("session", "");
+    ASSERT_FALSE(observerSession.empty()) << observerConnected.dump(2);
+
+    bool isError = false;
+    auto failed = observer.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", observerSession}}, &isError);
+    EXPECT_TRUE(isError) << failed.dump(2);
+    EXPECT_NE(
+        failed.value("error", "").find("temporarily unavailable"),
+        std::string::npos) << failed.dump(2);
+
+    owner.call_tool(
+        "disconnect", json{{"session", ownerSession}}, &isError);
+    ASSERT_FALSE(isError);
+
+    auto recovered = observer.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", observerSession}}, &isError);
+    ASSERT_FALSE(isError) << recovered.dump(2);
+    EXPECT_TRUE(recovered.value("snapshot", false))
+        << "the failed host-only refresh must not create or advance a baseline";
+    EXPECT_FALSE(recovered.value("events", json::array()).empty());
+    observer.call_tool(
+        "disconnect", json{{"session", observerSession}}, &isError);
+    ASSERT_FALSE(isError);
+}
 #endif
 
 TEST(McpServer, CallingAWithheldToolIsRejectedRatherThanSilentlyIgnored) {

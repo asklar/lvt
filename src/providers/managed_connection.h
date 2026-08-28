@@ -38,4 +38,8 @@ std::shared_ptr<IFrameworkConnection> open_managed_framework_connection(
 std::optional<ManagedConnectionCapabilities> managed_connection_capabilities(
     IFrameworkConnection& connection);
 
+namespace detail {
+bool managed_pipe_client_matches_pid(HANDLE pipe, DWORD expectedPid);
+}
+
 } // namespace lvt

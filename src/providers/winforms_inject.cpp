@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
 namespace lvt {
 
@@ -62,9 +63,23 @@ std::string simple_type_name(const std::string& fullType) {
     return lastDot == std::string::npos ? fullType : fullType.substr(lastDot + 1);
 }
 
-void index_by_hwnd(Element& element, std::unordered_map<uintptr_t, Element*>& index) {
+using ElementPath = std::vector<size_t>;
+
+Element* resolve_path(Element& root, const ElementPath& path) {
+    Element* current = &root;
+    for (size_t childIndex : path) {
+        if (childIndex >= current->children.size())
+            return nullptr;
+        current = &current->children[childIndex];
+    }
+    return current;
+}
+
+void index_by_hwnd(
+    Element& element, ElementPath& path,
+    std::unordered_map<uintptr_t, ElementPath>& index) {
     if (element.nativeHandle != 0)
-        index[element.nativeHandle] = &element;
+        index[element.nativeHandle] = path;
     auto hwnd = element.properties.find("hwnd");
     if (hwnd != element.properties.end()) {
         json value = hwnd->second;
@@ -72,10 +87,13 @@ void index_by_hwnd(Element& element, std::unordered_map<uintptr_t, Element*>& in
         const uintptr_t parsed = static_cast<uintptr_t>(
             parse_handle(wrapper, "hwnd", 16));
         if (parsed != 0)
-            index[parsed] = &element;
+            index[parsed] = path;
     }
-    for (auto& child : element.children)
-        index_by_hwnd(child, index);
+    for (size_t childIndex = 0; childIndex < element.children.size(); ++childIndex) {
+        path.push_back(childIndex);
+        index_by_hwnd(element.children[childIndex], path, index);
+        path.pop_back();
+    }
 }
 
 void apply_properties(Element& element, const json& node) {
@@ -122,26 +140,37 @@ void apply_properties(Element& element, const json& node) {
 }
 
 bool apply_control_node(
-    const json& node, std::unordered_map<uintptr_t, Element*>& hwndIndex,
-    Element* managedParent) {
+    const json& node, std::unordered_map<uintptr_t, ElementPath>& hwndIndex,
+    Element& root, const ElementPath& managedParentPath) {
     if (!node.is_object())
         return false;
 
     const uintptr_t hwnd = static_cast<uintptr_t>(
         parse_handle(node, "hwnd", 16));
-    Element* element = nullptr;
+    ElementPath elementPath;
+    bool foundElement = false;
     if (hwnd != 0) {
         auto existing = hwndIndex.find(hwnd);
-        if (existing != hwndIndex.end())
-            element = existing->second;
+        if (existing != hwndIndex.end()) {
+            elementPath = existing->second;
+            foundElement = true;
+        }
     }
 
-    if (!element && managedParent) {
+    if (!foundElement) {
+        Element* managedParent = resolve_path(root, managedParentPath);
+        if (!managedParent)
+            return false;
+        const size_t childIndex = managedParent->children.size();
         managedParent->children.emplace_back();
-        element = &managedParent->children.back();
+        elementPath = managedParentPath;
+        elementPath.push_back(childIndex);
+        foundElement = true;
         if (hwnd != 0)
-            hwndIndex[hwnd] = element;
+            hwndIndex[hwnd] = elementPath;
     }
+
+    Element* element = resolve_path(root, elementPath);
     if (!element)
         return false;
 
@@ -149,7 +178,9 @@ bool apply_control_node(
     bool applied = true;
     if (node.contains("children") && node["children"].is_array()) {
         for (const auto& child : node["children"])
-            applied = apply_control_node(child, hwndIndex, element) || applied;
+            applied = apply_control_node(
+                          child, hwndIndex, root, elementPath) ||
+                      applied;
     }
     return applied;
 }
@@ -163,15 +194,18 @@ bool apply_winforms_control_json(Element& root, const std::string& jsonText) {
     if (tree.is_discarded())
         return false;
 
-    std::unordered_map<uintptr_t, Element*> hwndIndex;
-    index_by_hwnd(root, hwndIndex);
+    std::unordered_map<uintptr_t, ElementPath> hwndIndex;
+    ElementPath rootPath;
+    index_by_hwnd(root, rootPath, hwndIndex);
 
     bool applied = false;
     if (tree.is_array()) {
         for (const auto& node : tree)
-            applied = apply_control_node(node, hwndIndex, &root) || applied;
+            applied = apply_control_node(
+                          node, hwndIndex, root, rootPath) ||
+                      applied;
     } else if (tree.is_object()) {
-        applied = apply_control_node(tree, hwndIndex, &root);
+        applied = apply_control_node(tree, hwndIndex, root, rootPath);
     }
     return applied;
 }

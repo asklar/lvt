@@ -27,6 +27,33 @@
 
 namespace lvt {
 
+namespace {
+
+constexpr const char* kIncompleteFrameworkPrefix = "lvt.incomplete.";
+
+} // namespace
+
+void mark_framework_refresh_incomplete(
+    Element& root, const std::string& framework) {
+    root.properties[kIncompleteFrameworkPrefix + framework] = "true";
+}
+
+bool framework_refresh_incomplete(
+    const Element& root, const std::string& framework) {
+    const auto found =
+        root.properties.find(kIncompleteFrameworkPrefix + framework);
+    return found != root.properties.end() && found->second == "true";
+}
+
+bool has_incomplete_framework_refresh(const Element& root) {
+    return std::any_of(
+        root.properties.begin(), root.properties.end(),
+        [](const auto& property) {
+            return property.first.rfind(kIncompleteFrameworkPrefix, 0) == 0 &&
+                   property.second == "true";
+        });
+}
+
 static void assign_ids_recursive(Element& el, int& counter) {
     el.id = "e" + std::to_string(counter++);
     for (auto& child : el.children) {
@@ -241,24 +268,30 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         case Framework::Wpf: {
 #if LVT_ENABLE_WPF
             WpfProvider wpf;
+            bool complete = false;
             auto connection = connectionLookup ? connectionLookup("wpf") : nullptr;
             if (connection && connection->is_alive()) {
-                wpf.enrich_with_connection(root, *connection);
+                complete = wpf.enrich_with_connection(root, *connection);
             } else if (!connectionLookup) {
-                wpf.enrich(root, hwnd, pid);
+                complete = wpf.enrich(root, hwnd, pid);
             }
+            if (!complete)
+                mark_framework_refresh_incomplete(root, "wpf");
 #endif
             break;
         }
         case Framework::WinForms: {
 #if LVT_ENABLE_WINFORMS
             WinFormsProvider winforms;
+            bool complete = false;
             auto connection = connectionLookup ? connectionLookup("winforms") : nullptr;
             if (connection && connection->is_alive()) {
-                winforms.enrich_with_connection(root, *connection);
+                complete = winforms.enrich_with_connection(root, *connection);
             } else if (!connectionLookup) {
-                winforms.enrich(root, hwnd, pid);
+                complete = winforms.enrich(root, hwnd, pid);
             }
+            if (!complete)
+                mark_framework_refresh_incomplete(root, "winforms");
 #endif
             break;
         }

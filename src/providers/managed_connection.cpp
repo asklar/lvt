@@ -15,6 +15,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <fstream>
 #include <limits>
@@ -22,10 +23,21 @@
 #include <sstream>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace lvt {
 
 using json = nlohmann::json;
+
+namespace detail {
+
+bool managed_pipe_client_matches_pid(HANDLE pipe, DWORD expectedPid) {
+    ULONG clientPid = 0;
+    return GetNamedPipeClientProcessId(pipe, &clientPid) &&
+           clientPid == expectedPid;
+}
+
+} // namespace detail
 
 namespace {
 
@@ -49,7 +61,110 @@ std::wstring sidecar_path(const ManagedConnectionOptions& options, DWORD pid) {
            std::to_wstring(pid) + L".txt";
 }
 
-bool write_pipe_name_file(const std::wstring& path, const std::wstring& pipeName) {
+struct RestrictedSecurity {
+    wil::unique_hlocal descriptor;
+    SECURITY_ATTRIBUTES attributes{};
+
+    explicit operator bool() const {
+        return descriptor != nullptr;
+    }
+};
+
+std::wstring process_user_sid(DWORD pid) {
+    wil::unique_handle process(OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!process)
+        return {};
+    wil::unique_handle token;
+    HANDLE rawToken = nullptr;
+    if (!OpenProcessToken(process.get(), TOKEN_QUERY, &rawToken))
+        return {};
+    token.reset(rawToken);
+
+    DWORD bytes = 0;
+    GetTokenInformation(token.get(), TokenUser, nullptr, 0, &bytes);
+    if (bytes == 0)
+        return {};
+    std::vector<unsigned char> buffer(bytes);
+    if (!GetTokenInformation(
+            token.get(), TokenUser, buffer.data(), bytes, &bytes))
+        return {};
+
+    const auto* tokenUser =
+        reinterpret_cast<const TOKEN_USER*>(buffer.data());
+    LPWSTR rawSid = nullptr;
+    if (!ConvertSidToStringSidW(tokenUser->User.Sid, &rawSid))
+        return {};
+    wil::unique_hlocal sid(rawSid);
+    return rawSid;
+}
+
+RestrictedSecurity make_restricted_security(DWORD targetPid) {
+    const std::wstring currentSid = process_user_sid(GetCurrentProcessId());
+    const std::wstring targetSid = process_user_sid(targetPid);
+    if (currentSid.empty())
+        return {};
+
+    std::wstring sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;" + currentSid + L")";
+    if (!targetSid.empty() && targetSid != currentSid)
+        sddl += L"(A;;GA;;;" + targetSid + L")";
+
+    PSECURITY_DESCRIPTOR rawDescriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.c_str(), SDDL_REVISION_1, &rawDescriptor, nullptr))
+        return {};
+
+    RestrictedSecurity security;
+    security.descriptor.reset(rawDescriptor);
+    security.attributes.nLength = sizeof(SECURITY_ATTRIBUTES);
+    security.attributes.lpSecurityDescriptor = security.descriptor.get();
+    security.attributes.bInheritHandle = FALSE;
+    return security;
+}
+
+class CrossProcessConnectLock {
+public:
+    bool acquire(
+        DWORD targetPid, const std::string& frameworkLabel,
+        SECURITY_ATTRIBUTES* securityAttributes, HANDLE targetProcess,
+        DWORD timeoutMs) {
+        std::wstring label;
+        label.reserve(frameworkLabel.size());
+        for (unsigned char character : frameworkLabel) {
+            label.push_back(std::isalnum(character)
+                                ? static_cast<wchar_t>(character)
+                                : L'_');
+        }
+        const std::wstring name =
+            L"Local\\lvt-managed-connect-" + label + L"-" +
+            std::to_wstring(targetPid);
+        m_mutex.reset(CreateMutexW(
+            securityAttributes, FALSE, name.c_str()));
+        if (!m_mutex)
+            return false;
+
+        HANDLE waits[2] = {m_mutex.get(), targetProcess};
+        const DWORD count = targetProcess ? 2 : 1;
+        const DWORD wait =
+            WaitForMultipleObjects(count, waits, FALSE, timeoutMs);
+        m_owned =
+            wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED_0;
+        return m_owned;
+    }
+
+    ~CrossProcessConnectLock() {
+        if (m_owned)
+            ReleaseMutex(m_mutex.get());
+    }
+
+private:
+    wil::unique_handle m_mutex;
+    bool m_owned = false;
+};
+
+bool write_pipe_name_file(
+    const std::wstring& path, const std::wstring& pipeName,
+    SECURITY_ATTRIBUTES* securityAttributes) {
     const int byteCount = WideCharToMultiByte(
         CP_UTF8, 0, pipeName.c_str(), static_cast<int>(pipeName.size()),
         nullptr, 0, nullptr, nullptr);
@@ -63,11 +178,17 @@ bool write_pipe_name_file(const std::wstring& path, const std::wstring& pipeName
         return false;
     }
 
-    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
-    if (!stream)
+    wil::unique_hfile file(CreateFileW(
+        path.c_str(), GENERIC_WRITE, 0, securityAttributes, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY, nullptr));
+    if (!file)
         return false;
-    stream.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
-    return stream.good();
+    DWORD written = 0;
+    return WriteFile(
+               file.get(), utf8.data(), static_cast<DWORD>(utf8.size()),
+               &written, nullptr) &&
+           written == static_cast<DWORD>(utf8.size()) &&
+           FlushFileBuffers(file.get());
 }
 
 std::wstring file_name(const std::wstring& path) {
@@ -322,6 +443,42 @@ bool wait_for_pipe_connection(
            GetLastError() == ERROR_PIPE_CONNECTED;
 }
 
+bool wait_for_expected_pipe_client(
+    HANDLE pipe, HANDLE process, DWORD expectedPid, OVERLAPPED& overlapped,
+    DWORD connectError, DWORD timeoutMs) {
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    for (;;) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline)
+            return false;
+        const DWORD remaining = static_cast<DWORD>(
+            std::min<ULONGLONG>(
+                deadline - now, std::numeric_limits<DWORD>::max()));
+        if (!wait_for_pipe_connection(
+                pipe, process, overlapped, connectError, remaining))
+            return false;
+        if (detail::managed_pipe_client_matches_pid(pipe, expectedPid))
+            return true;
+
+        ULONG actualPid = 0;
+        GetNamedPipeClientProcessId(pipe, &actualPid);
+        if (g_debug) {
+            fprintf(stderr,
+                    "lvt: rejected managed pipe client pid %lu; expected %lu\n",
+                    static_cast<DWORD>(actualPid), expectedPid);
+        }
+        DisconnectNamedPipe(pipe);
+        const HANDLE event = overlapped.hEvent;
+        ResetEvent(event);
+        ZeroMemory(&overlapped, sizeof(overlapped));
+        overlapped.hEvent = event;
+        const BOOL connectedSynchronously =
+            ConnectNamedPipe(pipe, &overlapped);
+        connectError =
+            connectedSynchronously ? ERROR_SUCCESS : GetLastError();
+    }
+}
+
 struct ManagedCommandResponse {
     bool completed = false;
     bool success = false;
@@ -366,6 +523,26 @@ public:
         if (!process)
             return nullptr;
 
+        auto security = make_restricted_security(pid);
+        if (!security) {
+            fprintf(stderr,
+                    "lvt: could not create restricted %s connection security\n",
+                    options.frameworkLabel.c_str());
+            return nullptr;
+        }
+
+        CrossProcessConnectLock connectLock;
+        if (!connectLock.acquire(
+                pid, options.frameworkLabel, &security.attributes,
+                process.get(), options.connectTimeoutMs + 5000)) {
+            if (g_debug) {
+                fprintf(stderr,
+                        "lvt: could not acquire the %s connection ownership mutex\n",
+                        options.frameworkLabel.c_str());
+            }
+            return nullptr;
+        }
+
         const std::wstring tapName = file_name(tapPath);
         bool moduleStateKnown = false;
         if (remote_module_loaded(pid, tapName, moduleStateKnown)) {
@@ -384,30 +561,19 @@ public:
         if (pipeName.empty())
             return nullptr;
         const std::wstring sidecar = sidecar_path(options, pid);
-        if (!write_pipe_name_file(sidecar, pipeName)) {
+        if (!write_pipe_name_file(
+                sidecar, pipeName, &security.attributes)) {
             fprintf(stderr, "lvt: failed to write %s pipe bootstrap file\n",
                     options.frameworkLabel.c_str());
             return nullptr;
         }
-
-        SECURITY_ATTRIBUTES securityAttributes{};
-        securityAttributes.nLength = sizeof(securityAttributes);
-        PSECURITY_DESCRIPTOR rawDescriptor = nullptr;
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                L"D:(A;;GRGW;;;WD)(A;;GRGW;;;AC)", SDDL_REVISION_1,
-                &rawDescriptor, nullptr)) {
-            DeleteFileW(sidecar.c_str());
-            return nullptr;
-        }
-        wil::unique_hlocal securityDescriptor(rawDescriptor);
-        securityAttributes.lpSecurityDescriptor = securityDescriptor.get();
 
         wil::unique_hfile pipe(CreateNamedPipeW(
             pipeName.c_str(),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1, 1024 * 1024, 1024 * 1024, options.commandTimeoutMs,
-            &securityAttributes));
+            &security.attributes));
         if (!pipe) {
             DeleteFileW(sidecar.c_str());
             fprintf(stderr, "lvt: failed to create %s named pipe (error %lu)\n",
@@ -432,8 +598,8 @@ public:
             return nullptr;
         }
 
-        const bool connected = wait_for_pipe_connection(
-            pipe.get(), process.get(), connectOverlapped, connectError,
+        const bool connected = wait_for_expected_pipe_client(
+            pipe.get(), process.get(), pid, connectOverlapped, connectError,
             options.connectTimeoutMs);
         DeleteFileW(sidecar.c_str());
         if (!connected) {
