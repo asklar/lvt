@@ -1153,6 +1153,23 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
     auto subscribed = client.request("resources/subscribe", json{{"uri", uri}});
     ASSERT_TRUE(subscribed.contains("result")) << subscribed.dump(2);
 
+    auto initialRead = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(initialRead.contains("result")) << initialRead.dump(2);
+    ASSERT_FALSE(initialRead["result"].value("contents", json::array()).empty());
+    const auto initialPatch = json::parse(
+        initialRead["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_FALSE(initialPatch.is_discarded()) << initialRead.dump(2);
+    EXPECT_TRUE(initialPatch.value("snapshot", false));
+
+    // Direct tools and subscribed resources are independent consumers. Give
+    // the direct tool its own baseline before the mutation; consuming its
+    // later diff must not advance or steal the resource stream's baseline.
+    auto directInitial = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}, {"fast", true}}, &isError);
+    ASSERT_FALSE(isError) << directInitial.dump(2);
+    EXPECT_TRUE(directInitial.value("snapshot", false));
+
     const auto changedText = "resource visual mutation";
     auto changed = client.call_tool(
         "set_visual_property",
@@ -1163,6 +1180,12 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
              {"value", changedText}},
         &isError);
     ASSERT_FALSE(isError) << changed.dump(2);
+
+    auto directChanged = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}, {"fast", true}}, &isError);
+    ASSERT_FALSE(isError) << directChanged.dump(2);
+    EXPECT_FALSE(directChanged.value("snapshot", true));
 
     // No request is issued between the action and this receive. The message
     // must originate at the server after its periodic diff observes a
@@ -1180,7 +1203,7 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
         read["result"]["contents"][0].value("text", ""), nullptr, false);
     ASSERT_FALSE(patch.is_discarded()) << read.dump(2);
     EXPECT_EQ(patch.value("tree", ""), "visual");
-    EXPECT_TRUE(patch.value("snapshot", false));
+    EXPECT_FALSE(patch.value("snapshot", true));
     EXPECT_FALSE(patch.value("events", json::array()).empty());
     bool sawTextChange = false;
     for (const auto& event : patch.value("events", json::array())) {
