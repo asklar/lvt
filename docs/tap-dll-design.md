@@ -230,7 +230,11 @@ their BSTR elements), and the outer CoTaskMem array. The host fetches that
 cached catalog once with `GET_ENUMS`; subsequent property reads reuse it.
 Descriptor choice values are enum member names, which are the canonical strings
 passed to `CreateInstance`, while machine values are retained to translate
-numeric property snapshots and preserve aliases.
+numeric property snapshots and preserve aliases. Comma-separated flags values
+are accepted only when every trimmed token is a catalog member; the normalized
+member list is then passed to `CreateInstance` as the final authority.
+Composite numeric readback is decomposed in stable catalog order, and any
+unknown residual bits remain explicit as `0xXXXXXXXX`.
 
 `OnVisualTreeChange` performs no pipe I/O. It only updates the tracked tree and
 enqueues a bounded in-memory structural record. `GET_TREE` and `POLL_EVENTS`

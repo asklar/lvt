@@ -1,8 +1,11 @@
 #pragma once
 
 #include "framework_connection.h"
+#include "../xaml_enum_util.h"
 
+#include <algorithm>
 #include <charconv>
+#include <cstdio>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -43,14 +46,15 @@ public:
 
     bool accepts(
         const std::string& typeName, const std::string& value) const {
+        return canonical_input(typeName, value).has_value();
+    }
+
+    std::optional<std::string> canonical_input(
+        const std::string& typeName, const std::string& value) const {
         const auto* members = find(typeName);
         if (!members)
-            return false;
-        for (const auto& member : *members) {
-            if (member.name == value)
-                return true;
-        }
-        return false;
+            return std::nullopt;
+        return detail::canonicalize_enum_member_list(value, *members);
     }
 
     std::optional<std::string> canonical_value(
@@ -58,9 +62,9 @@ public:
         const auto* members = find(typeName);
         if (!members)
             return std::nullopt;
-        for (const auto& member : *members) {
-            if (member.name == value)
-                return member.name;
+        if (auto names =
+                detail::canonicalize_enum_member_list(value, *members)) {
+            return names;
         }
 
         int32_t numeric = 0;
@@ -74,7 +78,39 @@ public:
             if (member.machineValue == numeric)
                 return member.name;
         }
-        return std::nullopt;
+
+        uint32_t remaining = static_cast<uint32_t>(numeric);
+        std::string composite;
+        std::vector<uint32_t> seenValues;
+        for (const auto& member : *members) {
+            const auto bits = static_cast<uint32_t>(member.machineValue);
+            if (bits == 0 ||
+                std::find(
+                    seenValues.begin(), seenValues.end(), bits) !=
+                    seenValues.end()) {
+                continue;
+            }
+            seenValues.push_back(bits);
+            if ((remaining & bits) != bits)
+                continue;
+            if (!composite.empty())
+                composite += ",";
+            composite += member.name;
+            remaining &= ~bits;
+        }
+        if (remaining != 0) {
+            char residual[16];
+            snprintf(residual, sizeof(residual), "0x%08X", remaining);
+            if (!composite.empty())
+                composite += ",";
+            composite += residual;
+        }
+        if (!composite.empty())
+            return composite;
+
+        // A zero value without a named zero/None member still needs to remain
+        // explicit; inventing a member name would misrepresent the runtime.
+        return std::string("0");
     }
 
     size_t size() const noexcept { return m_types.size(); }

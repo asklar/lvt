@@ -653,19 +653,24 @@ public:
         CachedMutation mutation;
         if (!resolve_mutation(handle, descriptorId, true, mutation, result))
             return result;
-        if (mutation.kind == PropertyEditorKind::enumeration &&
-            !m_enumCatalog.accepts(mutation.propertyType, value)) {
-            result.hresult = E_INVALIDARG;
-            result.error =
-                "The value is not a named member of enum type '" +
-                mutation.propertyType + "'";
-            return result;
+        std::string valueToSet = value;
+        if (mutation.kind == PropertyEditorKind::enumeration) {
+            const auto canonical = m_enumCatalog.canonical_input(
+                mutation.propertyType, value);
+            if (!canonical) {
+                result.hresult = E_INVALIDARG;
+                result.error =
+                    "The value contains a member not present in enum type '" +
+                    mutation.propertyType + "'";
+                return result;
+            }
+            valueToSet = *canonical;
         }
 
         const auto commandId = next_command_id();
         std::ostringstream command;
         command << "SET_PROPERTY " << commandId << " " << handle << " "
-                << mutation.propertyIndex << " " << hex_encode(value);
+                << mutation.propertyIndex << " " << hex_encode(valueToSet);
         auto raw = send_property_command(command.str(), commandId);
         result.ok = raw.ok;
         result.hresult = raw.hresult;

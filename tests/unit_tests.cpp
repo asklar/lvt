@@ -2519,6 +2519,51 @@ TEST(XamlEnumCatalog, ConnectionCatalogsRemainIsolated) {
     EXPECT_FALSE(winui.accepts("Shared.Enum", "SystemValue"));
 }
 
+TEST(XamlEnumCatalog, FlagsAcceptCompositeNamesAndPreserveResidualBits) {
+    XamlEnumCatalog catalog;
+    catalog.add(
+        "Microsoft.UI.Xaml.Input.ManipulationModes",
+        {
+            {0, "None"},
+            {1, "TranslateX"},
+            {1, "TranslateHorizontal"},
+            {2, "TranslateY"},
+            {4, "Scale"},
+        });
+
+    EXPECT_EQ(
+        catalog.canonical_input(
+            "Microsoft.UI.Xaml.Input.ManipulationModes",
+            " TranslateX , Scale "),
+        std::optional<std::string>("TranslateX,Scale"));
+    EXPECT_TRUE(catalog.accepts(
+        "Microsoft.UI.Xaml.Input.ManipulationModes",
+        "TranslateHorizontal,Scale"));
+    EXPECT_EQ(
+        catalog.canonical_input(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", " None "),
+        std::optional<std::string>("None"));
+    EXPECT_FALSE(catalog.accepts(
+        "Microsoft.UI.Xaml.Input.ManipulationModes",
+        "TranslateX,NotAFlag"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", "5"),
+        std::optional<std::string>("TranslateX,Scale"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", "1"),
+        std::optional<std::string>("TranslateX"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", "0"),
+        std::optional<std::string>("None"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", "9"),
+        std::optional<std::string>("TranslateX,0x00000008"));
+}
+
 TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {
     // A reference-typed property (a Brush, a Transform, another control) has
     // no meaningful flat string value to show, and its serialized value is

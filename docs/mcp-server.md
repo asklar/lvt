@@ -226,9 +226,14 @@ For xamlOM properties, the descriptor's declared `propertyType` comes from
 `PropertyChainValue.Type` and drives editor selection and `CreateInstance`; the
 evaluated value's `ValueType` is reported only as live `runtimeType` and never
 trusted for mutation. Each persistent XAML connection also fetches its runtime
-enum catalog once. Enum descriptors expose provider-owned choices, aliases, and
-flags metadata; numeric readback is canonicalized only when the runtime type
-supports it. System XAML and WinUI catalogs stay isolated with their owning
+enum catalog once. Enum descriptors expose ordered provider-owned choices and
+aliases. Flags values
+accept comma-separated member names with surrounding whitespace normalized;
+every token must exist in the runtime catalog, after which `CreateInstance`
+remains the final validity check. Composite numeric readback is rendered in
+stable catalog order, with unknown residual bits retained as hexadecimal
+instead of silently discarded. Ordinary enum values are never decomposed as
+flags. System XAML and WinUI catalogs stay isolated with their owning
 connections. External plugin ABI support is not part of this contract.
 
 Tree reads and all three property operations share the session's existing

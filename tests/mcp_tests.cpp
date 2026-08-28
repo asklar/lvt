@@ -39,26 +39,29 @@ std::string read_text_file(const std::string& path) {
     return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 }
 
-int count_tap_log_lines(const char* text) {
+int count_tap_log_lines(const char* text, DWORD pid) {
     wchar_t tempPath[MAX_PATH];
     if (GetTempPathW(MAX_PATH, tempPath) == 0)
         return 0;
     std::ifstream log(std::wstring(tempPath) + L"lvt_tap.log", std::ios::binary);
     int count = 0;
     std::string line;
+    const auto processMarker =
+        "][" + std::to_string(pid) + "][";
     while (std::getline(log, line)) {
-        if (line.find(text) != std::string::npos)
+        if (line.find(processMarker) != std::string::npos &&
+            line.find(text) != std::string::npos)
             ++count;
     }
     return count;
 }
 
-int count_tap_set_site_calls() {
-    return count_tap_log_lines("SetSite called");
+int count_tap_set_site_calls(DWORD pid) {
+    return count_tap_log_lines("SetSite called", pid);
 }
 
-int count_tap_get_enums_calls() {
-    return count_tap_log_lines("GetEnums called once");
+int count_tap_get_enums_calls(DWORD pid) {
+    return count_tap_log_lines("GetEnums called once", pid);
 }
 
 // A live MCP conversation with `lvt mcp` over anonymous pipes.
@@ -764,6 +767,10 @@ protected:
         snprintf(buf, sizeof(buf), "0x%llX",
                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_hwnd)));
         return buf;
+    }
+
+    static DWORD process_id() {
+        return s_process ? GetProcessId(s_process.get()) : 0;
     }
 
     // Connect and return the session id, failing the test if it does not work.
@@ -1775,8 +1782,9 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
     const auto schemas = output_schemas(client);
     const auto session = connect(client);
     ASSERT_FALSE(session.empty());
-    const int setSiteBefore = count_tap_set_site_calls();
-    const int getEnumsBefore = count_tap_get_enums_calls();
+    const auto targetPid = process_id();
+    const int setSiteBefore = count_tap_set_site_calls(targetPid);
+    const int getEnumsBefore = count_tap_get_enums_calls(targetPid);
 
     auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
     ASSERT_TRUE(visual.contains("root")) << visual.dump(2);
@@ -1938,6 +1946,74 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         &isError);
     ASSERT_FALSE(isError) << restoreAlignment.dump(2);
 
+    const auto* manipulationMode =
+        find_property_descriptor(statusProperties, "ManipulationMode");
+    ASSERT_NE(manipulationMode, nullptr)
+        << "StatusText did not report ManipulationMode";
+    EXPECT_EQ(manipulationMode->value("kind", ""), "enum");
+    const auto manipulationDescriptorId =
+        manipulationMode->value("descriptorId", "");
+    ASSERT_FALSE(manipulationDescriptorId.empty());
+    const auto manipulationChoices =
+        manipulationMode->value("choices", json::array());
+    bool hasTranslateX = false;
+    bool hasScale = false;
+    for (const auto& choice : manipulationChoices) {
+        hasTranslateX =
+            hasTranslateX || choice.value("value", "") == "TranslateX";
+        hasScale = hasScale || choice.value("value", "") == "Scale";
+    }
+    ASSERT_TRUE(hasTranslateX) << manipulationChoices.dump(2);
+    ASSERT_TRUE(hasScale) << manipulationChoices.dump(2);
+    const auto originalManipulationMode =
+        typed_property_value(statusProperties, "ManipulationMode");
+    ASSERT_FALSE(originalManipulationMode.empty());
+
+    auto setManipulationMode = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", manipulationDescriptorId},
+             {"value", " TranslateX , Scale "}},
+        &isError);
+    ASSERT_FALSE(isError) << setManipulationMode.dump(2);
+    EXPECT_EQ(
+        setManipulationMode.value("value", ""),
+        "TranslateX,Scale");
+    auto compositeProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << compositeProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(compositeProperties, "ManipulationMode"),
+        "TranslateX,Scale");
+
+    auto invalidManipulationMode = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", manipulationDescriptorId},
+             {"value", "TranslateX,NotAFlag"}},
+        &isError);
+    EXPECT_TRUE(isError) << invalidManipulationMode.dump(2);
+    auto afterInvalidManipulation = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << afterInvalidManipulation.dump(2);
+    EXPECT_EQ(
+        typed_property_value(
+            afterInvalidManipulation, "ManipulationMode"),
+        "TranslateX,Scale");
+
+    auto restoreManipulationMode = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", manipulationDescriptorId},
+             {"value", originalManipulationMode}},
+        &isError);
+    ASSERT_FALSE(isError) << restoreManipulationMode.dump(2);
+
     auto unknown = client.call_tool(
         "set_property",
         json{{"session", session},
@@ -2070,10 +2146,10 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
     auto disconnected = client.call_tool(
         "disconnect", json{{"session", session}}, &isError);
     ASSERT_FALSE(isError) << disconnected.dump(2);
-    EXPECT_EQ(count_tap_set_site_calls() - setSiteBefore, 1)
+    EXPECT_EQ(count_tap_set_site_calls(targetPid) - setSiteBefore, 1)
         << "one MCP session must reuse one TAP injection across tree reads and "
            "get/set/clear property operations";
-    EXPECT_EQ(count_tap_get_enums_calls() - getEnumsBefore, 1)
+    EXPECT_EQ(count_tap_get_enums_calls(targetPid) - getEnumsBefore, 1)
         << "one persistent XAML connection must fetch its enum catalog once";
 }
 

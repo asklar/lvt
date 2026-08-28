@@ -23,7 +23,7 @@
         <!-- Gives interaction tests something observable to assert against:
              a click has no effect a UIA walk can see unless it changes state. -->
         <TextBlock x:Name="StatusText" Grid.Row="4" Text="clicks:0"
-                   TextAlignment="Left" />
+                   TextAlignment="Left" ManipulationMode="TranslateX" />
 
         <!-- The controls below exist so the interaction verbs have something to
              act on: a slider for RangeValue, a combo box for ExpandCollapse and

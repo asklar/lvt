@@ -27,6 +27,7 @@
 #include "xaml_property_filter.h"
 #include "bounded_event_queue.h"
 #include "xaml_enum_catalog.h"
+#include "../xaml_enum_util.h"
 
 // C++/WinRT projected types for XAML element inspection.
 // System XAML (Windows.UI.Xaml) headers are always available from the Windows SDK.
@@ -71,7 +72,9 @@ static void LogMsg(const char* fmt, ...) {
         logFile = _wfopen(tmp, L"a");
         if (!logFile) return;
     }
-    fprintf(logFile, "[%llu][%lu] ", GetTickCount64(), GetCurrentThreadId());
+    fprintf(
+        logFile, "[%llu][%lu][%lu] ", GetTickCount64(),
+        GetCurrentProcessId(), GetCurrentThreadId());
     va_list ap;
     va_start(ap, fmt);
     vfprintf(logFile, fmt, ap);
@@ -720,18 +723,17 @@ public:
             }
 
             if (const auto* enumType = FindEnumType(property->propertyType)) {
-                const bool valid = std::any_of(
-                    enumType->members.begin(), enumType->members.end(),
-                    [&](const lvt::tap::EnumMember& member) {
-                        return member.name == command.value;
-                    });
-                if (!valid) {
+                const auto canonical =
+                    lvt::detail::canonicalize_enum_member_list(
+                        command.value, enumType->members);
+                if (!canonical) {
                     command.hresult = E_INVALIDARG;
                     command.error =
-                        L"The value is not a named member of enum type '" +
+                        L"The value contains a member not present in enum type '" +
                         property->propertyType + L"'";
                     return;
                 }
+                command.value = *canonical;
             }
 
             wil::unique_bstr type(SysAllocStringLen(
