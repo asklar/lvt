@@ -1,342 +1,458 @@
 #include "comctl_provider.h"
+
+#include "native_message.h"
+#include "native_property_connection.h"
+
 #include <CommCtrl.h>
-#include <wil/resource.h>
+#include <optional>
 #include <vector>
 
 namespace lvt {
+namespace {
 
-// Timeout in ms for cross-process SendMessage calls
-static constexpr UINT kSendMsgTimeout = 1000;
-
-// Safe cross-process SendMessage with timeout to avoid hanging on unresponsive windows
-static LRESULT SafeSendMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    DWORD_PTR result = 0;
-    LRESULT lr = SendMessageTimeoutW(hwnd, msg, wParam, lParam,
-        SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, kSendMsgTimeout, &result);
-    if (lr == 0) return 0; // timeout or error
-    return static_cast<LRESULT>(result);
+std::optional<LRESULT> send(
+    const NativeWindowIdentity& identity, UINT message,
+    WPARAM wParam = 0, LPARAM lParam = 0) {
+    auto result =
+        send_native_message(identity, message, wParam, lParam);
+    if (!result.ok)
+        return std::nullopt;
+    return result.value;
 }
 
-static std::string wstr_to_str(const wchar_t* ws, int len = -1) {
-    if (!ws || (len == 0)) return {};
-    if (len < 0) len = static_cast<int>(wcslen(ws));
-    int sz = WideCharToMultiByte(CP_UTF8, 0, ws, len, nullptr, 0, nullptr, nullptr);
-    std::string s(sz, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws, len, s.data(), sz, nullptr, nullptr);
-    return s;
+bool identity_for(HWND hwnd, NativeWindowIdentity& identity) {
+    return capture_native_window_identity(hwnd, 0, identity).ok;
 }
 
-// RAII wrapper for memory allocated in a remote process via VirtualAllocEx.
-struct RemoteBuffer {
-    HANDLE process = nullptr;
-    void* ptr = nullptr;
-    SIZE_T size = 0;
+template <typename T>
+bool read_remote(const RemoteBuffer& remote, T& value) {
+    NativeMessageResult result;
+    return remote.read(&value, sizeof(value), result);
+}
 
-    RemoteBuffer() = default;
-    RemoteBuffer(HANDLE proc, SIZE_T sz)
-        : process(proc)
-        , ptr(VirtualAllocEx(proc, nullptr, sz, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))
-        , size(sz) {}
-    ~RemoteBuffer() { if (ptr) VirtualFreeEx(process, ptr, 0, MEM_RELEASE); }
-    RemoteBuffer(const RemoteBuffer&) = delete;
-    RemoteBuffer& operator=(const RemoteBuffer&) = delete;
-
-    explicit operator bool() const { return ptr != nullptr; }
-
-    bool write(const void* data, SIZE_T len) const {
-        return WriteProcessMemory(process, ptr, data, len, nullptr) != FALSE;
+bool read_remote_text(
+    const RemoteBuffer& remote, size_t offset, size_t charCount,
+    std::string& text) {
+    std::vector<wchar_t> buffer(charCount, L'\0');
+    NativeMessageResult result;
+    if (!remote.read(
+            buffer.data(), buffer.size() * sizeof(wchar_t), result, offset)) {
+        return false;
     }
-    bool read(void* data, SIZE_T len) const {
-        return ReadProcessMemory(process, ptr, data, len, nullptr) != FALSE;
+    const size_t length = wcsnlen_s(buffer.data(), buffer.size());
+    text = native_utf16_to_utf8(
+        std::wstring_view(buffer.data(), length));
+    return true;
+}
+
+bool initialize_remote(
+    const NativeWindowIdentity& identity, size_t size,
+    RemoteBuffer& remote) {
+    NativeMessageResult result;
+    remote = RemoteBuffer::allocate(identity, size, result);
+    return static_cast<bool>(remote);
+}
+
+void enrich_tree_item(
+    Element& parent, const NativeWindowIdentity& identity,
+    HTREEITEM itemHandle, NativePropertyConnection* properties,
+    RemoteBuffer& remote, int& added) {
+    if (!itemHandle || added >= 100)
+        return;
+
+    constexpr size_t itemSize = sizeof(TVITEMW);
+    constexpr size_t textChars = 512;
+    Element item;
+    item.type = "TreeViewItem";
+    item.framework = "comctl";
+    if (properties) {
+        item.providerHandle = properties->register_treeview_item(
+            identity.hwnd, itemHandle);
     }
-};
 
-// Open the process that owns the given HWND.
-static wil::unique_handle open_hwnd_process(HWND hwnd) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (!pid) return {};
-    return wil::unique_handle(OpenProcess(
-        PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, pid));
+    TVITEMW value{};
+    value.mask = TVIF_TEXT | TVIF_STATE | TVIF_CHILDREN;
+    value.hItem = itemHandle;
+    value.stateMask = TVIS_SELECTED | TVIS_EXPANDED;
+    value.pszText = reinterpret_cast<wchar_t*>(
+        static_cast<std::byte*>(remote.address()) + itemSize);
+    value.cchTextMax = static_cast<int>(textChars);
+    NativeMessageResult native;
+    if (remote.write(&value, sizeof(value), native)) {
+        auto got = send(
+            identity, TVM_GETITEMW, 0,
+            reinterpret_cast<LPARAM>(remote.address()));
+        TVITEMW returned{};
+        if (got && *got && read_remote(remote, returned)) {
+            read_remote_text(remote, itemSize, textChars, item.text);
+            if (returned.state & TVIS_SELECTED)
+                item.properties["selected"] = "true";
+            if (returned.state & TVIS_EXPANDED)
+                item.properties["expanded"] = "true";
+            if (returned.cChildren > 0)
+                item.properties["hasChildren"] = "true";
+        }
+    }
+    ++added;
+
+    auto child = send(
+        identity, TVM_GETNEXTITEM, TVGN_CHILD,
+        reinterpret_cast<LPARAM>(itemHandle));
+    HTREEITEM currentChild = child
+        ? reinterpret_cast<HTREEITEM>(*child)
+        : nullptr;
+    while (currentChild && added < 100) {
+        enrich_tree_item(
+            item, identity, currentChild, properties, remote, added);
+        auto next = send(
+            identity, TVM_GETNEXTITEM, TVGN_NEXT,
+            reinterpret_cast<LPARAM>(currentChild));
+        currentChild =
+            next ? reinterpret_cast<HTREEITEM>(*next) : nullptr;
+    }
+    parent.children.push_back(std::move(item));
 }
 
-void ComCtlProvider::enrich(Element& root) {
-    enrich_recursive(root);
+} // namespace
+
+void ComCtlProvider::enrich(
+    Element& root, NativePropertyConnection* properties) {
+    enrich_recursive(root, properties);
 }
 
-void ComCtlProvider::enrich_recursive(Element& el) {
+void ComCtlProvider::enrich_recursive(
+    Element& el, NativePropertyConnection* properties) {
     HWND hwnd = reinterpret_cast<HWND>(el.nativeHandle);
-    if (!hwnd) return;
+    if (!hwnd)
+        return;
 
     if (el.className == "SysListView32") {
-        enrich_listview(el, hwnd);
+        enrich_listview(el, hwnd, properties);
     } else if (el.className == "SysTreeView32") {
-        enrich_treeview(el, hwnd);
+        enrich_treeview(el, hwnd, properties);
     } else if (el.className == "ToolbarWindow32") {
-        enrich_toolbar(el, hwnd);
+        enrich_toolbar(el, hwnd, properties);
     } else if (el.className == "msctls_statusbar32") {
-        enrich_statusbar(el, hwnd);
+        enrich_statusbar(el, hwnd, properties);
     } else if (el.className == "SysTabControl32") {
-        enrich_tabcontrol(el, hwnd);
+        enrich_tabcontrol(el, hwnd, properties);
     }
 
-    for (auto& child : el.children) {
-        enrich_recursive(child);
-    }
+    for (auto& child : el.children)
+        enrich_recursive(child, properties);
 }
 
-void ComCtlProvider::enrich_listview(Element& el, HWND hwnd) {
+void ComCtlProvider::enrich_listview(
+    Element& el, HWND hwnd, NativePropertyConnection* properties) {
+    NativeWindowIdentity identity;
+    if (!identity_for(hwnd, identity))
+        return;
+
     el.type = "ListView";
     el.framework = "comctl";
+    if (properties)
+        el.providerHandle = properties->register_hwnd(hwnd);
 
-    // These messages don't use pointers — safe cross-process
-    int count = static_cast<int>(SafeSendMessage(hwnd, LVM_GETITEMCOUNT, 0, 0));
+    const auto countResult = send(identity, LVM_GETITEMCOUNT);
+    const int count =
+        countResult ? static_cast<int>(*countResult) : 0;
     el.properties["itemCount"] = std::to_string(count);
 
-    DWORD viewMode = static_cast<DWORD>(SafeSendMessage(hwnd, LVM_GETVIEW, 0, 0));
-    switch (viewMode) {
-    case LV_VIEW_ICON:      el.properties["viewMode"] = "icon"; break;
-    case LV_VIEW_DETAILS:   el.properties["viewMode"] = "details"; break;
-    case LV_VIEW_SMALLICON: el.properties["viewMode"] = "smallicon"; break;
-    case LV_VIEW_LIST:      el.properties["viewMode"] = "list"; break;
-    case LV_VIEW_TILE:      el.properties["viewMode"] = "tile"; break;
+    const auto viewMode = send(identity, LVM_GETVIEW);
+    if (viewMode) {
+        switch (*viewMode) {
+        case LV_VIEW_ICON: el.properties["viewMode"] = "icon"; break;
+        case LV_VIEW_DETAILS: el.properties["viewMode"] = "details"; break;
+        case LV_VIEW_SMALLICON:
+            el.properties["viewMode"] = "smallicon";
+            break;
+        case LV_VIEW_LIST: el.properties["viewMode"] = "list"; break;
+        case LV_VIEW_TILE: el.properties["viewMode"] = "tile"; break;
+        }
     }
 
-    HWND header = reinterpret_cast<HWND>(SafeSendMessage(hwnd, LVM_GETHEADER, 0, 0));
-    if (header) {
-        int colCount = static_cast<int>(SafeSendMessage(header, HDM_GETITEMCOUNT, 0, 0));
-        el.properties["columnCount"] = std::to_string(colCount);
+    const bool pointerAllowed =
+        !properties || properties->pointer_operations_allowed();
+    if (pointerAllowed) {
+        const auto headerValue = send(identity, LVM_GETHEADER);
+        HWND header =
+            headerValue ? reinterpret_cast<HWND>(*headerValue) : nullptr;
+        NativeWindowIdentity headerIdentity;
+        if (header && identity_for(header, headerIdentity)) {
+            const auto columns =
+                send(headerIdentity, HDM_GETITEMCOUNT);
+            if (columns)
+                el.properties["columnCount"] = std::to_string(*columns);
+        }
+    }
+    if (!pointerAllowed)
+        return;
+
+    constexpr size_t itemSize = sizeof(LVITEMW);
+    constexpr size_t textChars = 512;
+    RemoteBuffer remote;
+    if (!initialize_remote(
+            identity, itemSize + textChars * sizeof(wchar_t), remote)) {
+        return;
     }
 
-    // Cross-process: allocate buffers in target process
-    auto proc = open_hwnd_process(hwnd);
-    if (!proc) return;
-
-    constexpr int kTextBufSize = 512;
-    constexpr SIZE_T kRemoteSize = sizeof(LVITEMW) + kTextBufSize * sizeof(wchar_t);
-    RemoteBuffer remote(proc.get(), kRemoteSize);
-    if (!remote) return;
-
-    auto* remoteItem = reinterpret_cast<LVITEMW*>(remote.ptr);
-    auto* remoteText = reinterpret_cast<wchar_t*>(
-        static_cast<char*>(remote.ptr) + sizeof(LVITEMW));
-
-    int maxItems = (count < 50) ? count : 50;
-    for (int i = 0; i < maxItems; i++) {
+    const int maxItems = (std::min)(count, 50);
+    for (int index = 0; index < maxItems; ++index) {
         Element item;
         item.type = "ListViewItem";
         item.framework = "comctl";
-        item.properties["index"] = std::to_string(i);
-
-        LVITEMW lvi{};
-        lvi.mask = LVIF_TEXT | LVIF_STATE;
-        lvi.iItem = i;
-        lvi.stateMask = LVIS_SELECTED;
-        lvi.pszText = remoteText;  // pointer valid in target process
-        lvi.cchTextMax = kTextBufSize;
-
-        if (remote.write(&lvi, sizeof(lvi))) {
-            SafeSendMessage(hwnd, LVM_GETITEMW, 0, reinterpret_cast<LPARAM>(remoteItem));
-
-            LVITEMW result{};
-            remote.read(&result, sizeof(result));
-            wchar_t textBuf[kTextBufSize]{};
-            remote.read(textBuf, sizeof(textBuf));
-            item.text = wstr_to_str(textBuf);
-
-            if (result.state & LVIS_SELECTED)
-                item.properties["selected"] = "true";
+        item.properties["index"] = std::to_string(index);
+        if (properties) {
+            item.providerHandle =
+                properties->register_listview_item(hwnd, index);
         }
 
+        LVITEMW value{};
+        value.mask = LVIF_TEXT | LVIF_STATE;
+        value.iItem = index;
+        value.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+        value.pszText = reinterpret_cast<wchar_t*>(
+            static_cast<std::byte*>(remote.address()) + itemSize);
+        value.cchTextMax = static_cast<int>(textChars);
+
+        NativeMessageResult native;
+        if (remote.write(&value, sizeof(value), native)) {
+            const auto got = send(
+                identity, LVM_GETITEMW, 0,
+                reinterpret_cast<LPARAM>(remote.address()));
+            LVITEMW returned{};
+            if (got && *got && read_remote(remote, returned)) {
+                read_remote_text(
+                    remote, itemSize, textChars, item.text);
+                if (returned.state & LVIS_SELECTED)
+                    item.properties["selected"] = "true";
+                if (returned.state & LVIS_FOCUSED)
+                    item.properties["focused"] = "true";
+            }
+        }
         el.children.push_back(std::move(item));
     }
-    if (count > 50) {
+    if (count > maxItems)
         el.properties["truncated"] = "true";
-    }
 }
 
-void ComCtlProvider::enrich_treeview(Element& el, HWND hwnd) {
+void ComCtlProvider::enrich_treeview(
+    Element& el, HWND hwnd, NativePropertyConnection* properties) {
+    NativeWindowIdentity identity;
+    if (!identity_for(hwnd, identity))
+        return;
+
     el.type = "TreeView";
     el.framework = "comctl";
+    if (properties)
+        el.providerHandle = properties->register_hwnd(hwnd);
 
-    int count = static_cast<int>(SafeSendMessage(hwnd, TVM_GETCOUNT, 0, 0));
-    el.properties["itemCount"] = std::to_string(count);
+    const auto count = send(identity, TVM_GETCOUNT);
+    el.properties["itemCount"] =
+        std::to_string(count ? *count : 0);
 
-    // TVM_GETNEXTITEM/TVM_GETROOT don't use pointers — safe
-    HTREEITEM hItem = reinterpret_cast<HTREEITEM>(
-        SafeSendMessage(hwnd, TVM_GETNEXTITEM, TVGN_ROOT, 0));
+    if (properties && !properties->pointer_operations_allowed())
+        return;
 
-    auto proc = open_hwnd_process(hwnd);
-    if (!proc || !hItem) return;
-
-    constexpr int kTextBufSize = 512;
-    constexpr SIZE_T kRemoteSize = sizeof(TVITEMW) + kTextBufSize * sizeof(wchar_t);
-    RemoteBuffer remote(proc.get(), kRemoteSize);
-    if (!remote) return;
-
-    auto* remoteItem = reinterpret_cast<TVITEMW*>(remote.ptr);
-    auto* remoteText = reinterpret_cast<wchar_t*>(
-        static_cast<char*>(remote.ptr) + sizeof(TVITEMW));
-
-    int added = 0;
-    while (hItem && added < 100) {
-        Element item;
-        item.type = "TreeViewItem";
-        item.framework = "comctl";
-
-        TVITEMW tvi{};
-        tvi.mask = TVIF_TEXT | TVIF_STATE | TVIF_CHILDREN;
-        tvi.hItem = hItem;
-        tvi.stateMask = TVIS_SELECTED | TVIS_EXPANDED;
-        tvi.pszText = remoteText;
-        tvi.cchTextMax = kTextBufSize;
-
-        if (remote.write(&tvi, sizeof(tvi))) {
-            SafeSendMessage(hwnd, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(remoteItem));
-
-            TVITEMW result{};
-            remote.read(&result, sizeof(result));
-            wchar_t textBuf[kTextBufSize]{};
-            remote.read(textBuf, sizeof(textBuf));
-            item.text = wstr_to_str(textBuf);
-
-            if (result.state & TVIS_SELECTED)
-                item.properties["selected"] = "true";
-            if (result.state & TVIS_EXPANDED)
-                item.properties["expanded"] = "true";
-            if (result.cChildren > 0)
-                item.properties["hasChildren"] = "true";
-        }
-
-        el.children.push_back(std::move(item));
-        hItem = reinterpret_cast<HTREEITEM>(
-            SafeSendMessage(hwnd, TVM_GETNEXTITEM, TVGN_NEXT,
-                            reinterpret_cast<LPARAM>(hItem)));
-        added++;
+    constexpr size_t itemSize = sizeof(TVITEMW);
+    constexpr size_t textChars = 512;
+    RemoteBuffer remote;
+    if (!initialize_remote(
+            identity, itemSize + textChars * sizeof(wchar_t), remote)) {
+        return;
     }
+
+    const auto rootValue =
+        send(identity, TVM_GETNEXTITEM, TVGN_ROOT, 0);
+    HTREEITEM item =
+        rootValue ? reinterpret_cast<HTREEITEM>(*rootValue) : nullptr;
+    int added = 0;
+    while (item && added < 100) {
+        enrich_tree_item(
+            el, identity, item, properties, remote, added);
+        const auto next = send(
+            identity, TVM_GETNEXTITEM, TVGN_NEXT,
+            reinterpret_cast<LPARAM>(item));
+        item = next ? reinterpret_cast<HTREEITEM>(*next) : nullptr;
+    }
+    if (count && *count > added)
+        el.properties["truncated"] = "true";
 }
 
-void ComCtlProvider::enrich_toolbar(Element& el, HWND hwnd) {
+void ComCtlProvider::enrich_toolbar(
+    Element& el, HWND hwnd, NativePropertyConnection* properties) {
+    NativeWindowIdentity identity;
+    if (!identity_for(hwnd, identity))
+        return;
+
     el.type = "Toolbar";
     el.framework = "comctl";
+    if (properties)
+        el.providerHandle = properties->register_hwnd(hwnd);
 
-    int count = static_cast<int>(SafeSendMessage(hwnd, TB_BUTTONCOUNT, 0, 0));
+    const auto countResult = send(identity, TB_BUTTONCOUNT);
+    const int count =
+        countResult ? static_cast<int>(*countResult) : 0;
     el.properties["buttonCount"] = std::to_string(count);
 
-    auto proc = open_hwnd_process(hwnd);
-    if (!proc) return;
+    if (properties && !properties->pointer_operations_allowed())
+        return;
 
-    // TB_GETBUTTON needs a remote TBBUTTON struct
-    RemoteBuffer remoteBtnBuf(proc.get(), sizeof(TBBUTTON));
-    if (!remoteBtnBuf) return;
+    RemoteBuffer buttonBuffer;
+    RemoteBuffer textBuffer;
+    constexpr size_t textChars = 256;
+    if (!initialize_remote(identity, sizeof(TBBUTTON), buttonBuffer) ||
+        !initialize_remote(
+            identity, textChars * sizeof(wchar_t), textBuffer)) {
+        return;
+    }
 
-    constexpr int kTextBufSize = 256;
-    RemoteBuffer remoteTextBuf(proc.get(), kTextBufSize * sizeof(wchar_t));
-    if (!remoteTextBuf) return;
-
-    for (int i = 0; i < count && i < 50; i++) {
-        SafeSendMessage(hwnd, TB_GETBUTTON, i, reinterpret_cast<LPARAM>(remoteBtnBuf.ptr));
-
-        TBBUTTON btn{};
-        remoteBtnBuf.read(&btn, sizeof(btn));
+    for (int index = 0; index < count && index < 50; ++index) {
+        const auto got = send(
+            identity, TB_GETBUTTON, index,
+            reinterpret_cast<LPARAM>(buttonBuffer.address()));
+        TBBUTTON button{};
+        if (!got || !*got || !read_remote(buttonBuffer, button))
+            continue;
 
         Element item;
-        item.type = "ToolbarButton";
+        item.type =
+            (button.fsStyle & BTNS_SEP)
+                ? "ToolbarSeparator"
+                : "ToolbarButton";
         item.framework = "comctl";
-        item.properties["index"] = std::to_string(i);
-        item.properties["commandId"] = std::to_string(btn.idCommand);
-
-        if (btn.fsStyle & BTNS_SEP) {
-            item.type = "ToolbarSeparator";
-        } else {
-            SafeSendMessage(hwnd, TB_GETBUTTONTEXTW, btn.idCommand,
-                         reinterpret_cast<LPARAM>(remoteTextBuf.ptr));
-            wchar_t textBuf[kTextBufSize]{};
-            remoteTextBuf.read(textBuf, sizeof(textBuf));
-            item.text = wstr_to_str(textBuf);
+        item.properties["index"] = std::to_string(index);
+        item.properties["commandId"] =
+            std::to_string(button.idCommand);
+        if (properties && !(button.fsStyle & BTNS_SEP)) {
+            item.providerHandle = properties->register_toolbar_button(
+                hwnd, index, button.idCommand);
         }
 
-        if (btn.fsState & TBSTATE_CHECKED)
+        if (!(button.fsStyle & BTNS_SEP)) {
+            const auto length = send(
+                identity, TB_GETBUTTONTEXTW, button.idCommand,
+                reinterpret_cast<LPARAM>(textBuffer.address()));
+            if (length && *length >= 0) {
+                read_remote_text(
+                    textBuffer, 0, textChars, item.text);
+            }
+        }
+        if (button.fsState & TBSTATE_CHECKED)
             item.properties["checked"] = "true";
-        if (!(btn.fsState & TBSTATE_ENABLED))
+        if (!(button.fsState & TBSTATE_ENABLED))
             item.properties["enabled"] = "false";
-
         el.children.push_back(std::move(item));
     }
 }
 
-void ComCtlProvider::enrich_statusbar(Element& el, HWND hwnd) {
+void ComCtlProvider::enrich_statusbar(
+    Element& el, HWND hwnd, NativePropertyConnection* properties) {
+    NativeWindowIdentity identity;
+    if (!identity_for(hwnd, identity))
+        return;
+
     el.type = "StatusBar";
     el.framework = "comctl";
+    if (properties)
+        el.providerHandle = properties->register_hwnd(hwnd);
 
-    int parts = static_cast<int>(SafeSendMessage(hwnd, SB_GETPARTS, 0, 0));
+    const auto partsResult = send(identity, SB_GETPARTS);
+    const int parts =
+        partsResult ? static_cast<int>(*partsResult) : 0;
     el.properties["partCount"] = std::to_string(parts);
 
-    auto proc = open_hwnd_process(hwnd);
-    if (!proc) return;
+    if (properties && !properties->pointer_operations_allowed())
+        return;
 
-    constexpr int kTextBufSize = 512;
-    RemoteBuffer remoteTextBuf(proc.get(), kTextBufSize * sizeof(wchar_t));
-    if (!remoteTextBuf) return;
-
-    for (int i = 0; i < parts; i++) {
+    for (int index = 0; index < parts; ++index) {
         Element item;
         item.type = "StatusBarPart";
         item.framework = "comctl";
-        item.properties["index"] = std::to_string(i);
+        item.properties["index"] = std::to_string(index);
+        if (properties) {
+            item.providerHandle =
+                properties->register_statusbar_part(hwnd, index);
+        }
 
-        // SB_GETTEXTW with a remote buffer
-        SafeSendMessage(hwnd, SB_GETTEXTW, i, reinterpret_cast<LPARAM>(remoteTextBuf.ptr));
-        wchar_t textBuf[kTextBufSize]{};
-        remoteTextBuf.read(textBuf, sizeof(textBuf));
-        item.text = wstr_to_str(textBuf);
-
+        const auto length =
+            send(identity, SB_GETTEXTLENGTHW, index);
+        if (length) {
+            const size_t chars =
+                static_cast<size_t>(LOWORD(*length)) + 1;
+            RemoteBuffer textBuffer;
+            if (initialize_remote(
+                    identity, chars * sizeof(wchar_t), textBuffer)) {
+                const auto got = send(
+                    identity, SB_GETTEXTW, index,
+                    reinterpret_cast<LPARAM>(textBuffer.address()));
+                if (got) {
+                    read_remote_text(
+                        textBuffer, 0, chars, item.text);
+                }
+            }
+        }
         el.children.push_back(std::move(item));
     }
 }
 
-void ComCtlProvider::enrich_tabcontrol(Element& el, HWND hwnd) {
+void ComCtlProvider::enrich_tabcontrol(
+    Element& el, HWND hwnd, NativePropertyConnection* properties) {
+    NativeWindowIdentity identity;
+    if (!identity_for(hwnd, identity))
+        return;
+
     el.type = "TabControl";
     el.framework = "comctl";
+    if (properties)
+        el.providerHandle = properties->register_hwnd(hwnd);
 
-    int count = static_cast<int>(SafeSendMessage(hwnd, TCM_GETITEMCOUNT, 0, 0));
-    int selected = static_cast<int>(SafeSendMessage(hwnd, TCM_GETCURSEL, 0, 0));
+    const auto countResult = send(identity, TCM_GETITEMCOUNT);
+    const auto selectedResult = send(identity, TCM_GETCURSEL);
+    const int count =
+        countResult ? static_cast<int>(*countResult) : 0;
+    const int selected =
+        selectedResult ? static_cast<int>(*selectedResult) : -1;
     el.properties["tabCount"] = std::to_string(count);
     el.properties["selectedIndex"] = std::to_string(selected);
 
-    auto proc = open_hwnd_process(hwnd);
-    if (!proc) return;
+    if (properties && !properties->pointer_operations_allowed())
+        return;
 
-    constexpr int kTextBufSize = 256;
-    constexpr SIZE_T kRemoteSize = sizeof(TCITEMW) + kTextBufSize * sizeof(wchar_t);
-    RemoteBuffer remote(proc.get(), kRemoteSize);
-    if (!remote) return;
+    constexpr size_t itemSize = sizeof(TCITEMW);
+    constexpr size_t textChars = 256;
+    RemoteBuffer remote;
+    if (!initialize_remote(
+            identity, itemSize + textChars * sizeof(wchar_t), remote)) {
+        return;
+    }
 
-    auto* remoteItem = reinterpret_cast<TCITEMW*>(remote.ptr);
-    auto* remoteText = reinterpret_cast<wchar_t*>(
-        static_cast<char*>(remote.ptr) + sizeof(TCITEMW));
-
-    for (int i = 0; i < count; i++) {
+    for (int index = 0; index < count; ++index) {
         Element item;
         item.type = "Tab";
         item.framework = "comctl";
-        item.properties["index"] = std::to_string(i);
-        if (i == selected)
+        item.properties["index"] = std::to_string(index);
+        if (index == selected)
             item.properties["selected"] = "true";
+        if (properties)
+            item.providerHandle =
+                properties->register_tab_item(hwnd, index);
 
-        TCITEMW tci{};
-        tci.mask = TCIF_TEXT;
-        tci.pszText = remoteText;
-        tci.cchTextMax = kTextBufSize;
-
-        if (remote.write(&tci, sizeof(tci))) {
-            SafeSendMessage(hwnd, TCM_GETITEMW, i, reinterpret_cast<LPARAM>(remoteItem));
-
-            wchar_t textBuf[kTextBufSize]{};
-            remote.read(textBuf, sizeof(textBuf));
-            item.text = wstr_to_str(textBuf);
+        TCITEMW value{};
+        value.mask = TCIF_TEXT;
+        value.pszText = reinterpret_cast<wchar_t*>(
+            static_cast<std::byte*>(remote.address()) + itemSize);
+        value.cchTextMax = static_cast<int>(textChars);
+        NativeMessageResult native;
+        if (remote.write(&value, sizeof(value), native)) {
+            const auto got = send(
+                identity, TCM_GETITEMW, index,
+                reinterpret_cast<LPARAM>(remote.address()));
+            if (got && *got) {
+                read_remote_text(
+                    remote, itemSize, textChars, item.text);
+            }
         }
-
         el.children.push_back(std::move(item));
     }
 }

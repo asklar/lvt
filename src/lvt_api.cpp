@@ -12,6 +12,7 @@
 #include "tree_builder.h"
 #include "watch_diff.h"
 #include "providers/connection_registry.h"
+#include "providers/native_property_connection.h"
 
 #ifdef LVT_ENABLE_UIA
 #include "providers/uia_actions.h"
@@ -193,25 +194,38 @@ bool session_is_active(const std::string& id) {
 std::mutex g_connectionsMutex;
 std::map<std::string, std::vector<std::pair<std::string, lvt::ConnectionHandle>>> g_sessionConnections;
 
+std::string native_connection_registry_key(
+    const char* provider, HWND hwnd) {
+    char value[64]{};
+    snprintf(
+        value, sizeof(value), "%s@0x%llX", provider,
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(hwnd)));
+    return value;
+}
+
 // Builds a ConnectionLookup for build_tree, lazily acquiring (once per
-// session, on whichever call first needs it) a persistent connection for
-// each injectable framework this session's target actually has. Returns an
-// empty (falsy) ConnectionLookup when the target has none, so build_tree
-// falls back to its normal one-shot-per-call path with no behavior change.
+// session, on whichever call first needs it) persistent native property
+// adapters plus any diagnostics connections the target needs.
 lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
                                                     const std::vector<lvt::FrameworkInfo>& frameworks) {
     if (!session_is_active(session.id))
         return {};
 
-    bool hasXaml = false, hasWinUI3 = false, hasWpf = false, hasWinForms = false;
+    bool hasXaml = false, hasWinUI3 = false;
+    bool hasWpf = false, hasWinForms = false;
+    bool hasComCtl = false;
+    std::string comCtlVersion;
     for (auto& fi : frameworks) {
         if (fi.type == lvt::Framework::Xaml) hasXaml = true;
         if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
         if (fi.type == lvt::Framework::Wpf) hasWpf = true;
         if (fi.type == lvt::Framework::WinForms) hasWinForms = true;
+        if (fi.type == lvt::Framework::ComCtl) {
+            hasComCtl = true;
+            comCtlVersion = fi.version;
+        }
     }
-    if (!hasXaml && !hasWinUI3 && !hasWpf && !hasWinForms)
-        return {};
 
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
     if (!session_is_active(session.id))
@@ -249,7 +263,36 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
     const bool needWinUI3 = hasWinUI3 && !has_label("winui3");
     const bool needWpf = hasWpf && !has_label("wpf");
     const bool needWinForms = hasWinForms && !has_label("winforms");
-    if (needXaml || needWinUI3 || needWpf || needWinForms) {
+    const bool needWin32 = !has_label("win32");
+    const bool needComCtl = hasComCtl && !has_label("comctl");
+    if (needWin32 || needComCtl || needXaml || needWinUI3 ||
+        needWpf || needWinForms) {
+        if (needWin32) {
+            const auto registryKey =
+                native_connection_registry_key("win32", session.hwnd);
+            auto handle = lvt::ConnectionRegistry::instance().acquire(
+                session.pid, session.hwnd, registryKey,
+                [](HWND hwnd, DWORD pid)
+                    -> std::shared_ptr<lvt::IFrameworkConnection> {
+                    return lvt::NativePropertyConnection::connect(
+                        hwnd, pid, "win32");
+                });
+            if (handle)
+                entry.emplace_back("win32", std::move(handle));
+        }
+        if (needComCtl) {
+            const auto registryKey =
+                native_connection_registry_key("comctl", session.hwnd);
+            auto handle = lvt::ConnectionRegistry::instance().acquire(
+                session.pid, session.hwnd, registryKey,
+                [comCtlVersion](HWND hwnd, DWORD pid)
+                    -> std::shared_ptr<lvt::IFrameworkConnection> {
+                    return lvt::NativePropertyConnection::connect(
+                        hwnd, pid, "comctl", comCtlVersion);
+                });
+            if (handle)
+                entry.emplace_back("comctl", std::move(handle));
+        }
         // A full, untrimmed probe tree, needed only to resolve which
         // process/DLL a connection should target (XamlProvider needs to
         // locate the CoreWindow) - discarded once that resolution is done. A
@@ -262,11 +305,10 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         // for XAML injection. Do not run the detected framework providers
         // here: that would perform a complete one-shot XAML collection
         // immediately before opening the persistent connection.
-        lvt::Element probeTree;
-        if (needXaml)
-            probeTree = lvt::build_tree(session.hwnd, session.pid, {});
 #if LVT_ENABLE_XAML
         if (needXaml) {
+            lvt::Element probeTree =
+                lvt::build_tree(session.hwnd, session.pid, {});
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "xaml",
                 [&probeTree](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -826,8 +868,16 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
 #endif
     }
 
+    auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
+    const bool nativeOnly = std::all_of(
+        frameworks.begin(), frameworks.end(),
+        [](const lvt::FrameworkInfo& framework) {
+            return framework.type == lvt::Framework::Win32 ||
+                   framework.type == lvt::Framework::ComCtl;
+        });
     const auto hostArch = lvt::get_host_architecture();
-    if (session.architecture != lvt::Architecture::unknown &&
+    if (!nativeOnly &&
+        session.architecture != lvt::Architecture::unknown &&
         hostArch != lvt::Architecture::unknown &&
         session.architecture != hostArch) {
         error = std::string("the visual tree cannot be read across architectures: this lvt is ") +
@@ -837,7 +887,6 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         return false;
     }
 
-    auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
     const bool fastProperties = get_bool(params, "fast", false);
     for (int attempt = 0; attempt < 3; ++attempt) {
         auto connectionLookup = connection_lookup_for_session(session, frameworks);
@@ -965,11 +1014,20 @@ json method_connect(const json& params) {
         throw std::runtime_error("mode must be 'uia' or 'visual', not '" + mode + "'");
     const bool visualMode = mode == "visual";
 
-    // Driving by geometry means injecting into the target, which needs the same
-    // architecture as lvt — the visual tree is built by injecting too.
+    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+    const bool nativeOnly = std::all_of(
+        frameworks.begin(), frameworks.end(),
+        [](const lvt::FrameworkInfo& framework) {
+            return framework.type == lvt::Framework::Win32 ||
+                   framework.type == lvt::Framework::ComCtl;
+        });
+
+    // Injected framework trees need matching architecture. Native-only visual
+    // sessions use HWND enumeration and retain their safe scalar operations.
     if (visualMode) {
         const auto hostArch = lvt::get_host_architecture();
-        if (target.architecture != lvt::Architecture::unknown &&
+        if (!nativeOnly &&
+            target.architecture != lvt::Architecture::unknown &&
             hostArch != lvt::Architecture::unknown && target.architecture != hostArch) {
             throw std::runtime_error(
                 std::string("visual mode needs lvt and the target to share an architecture: this "
@@ -984,7 +1042,6 @@ json method_connect(const json& params) {
     char hwndText2[32];
     snprintf(hwndText2, sizeof(hwndText2), "0x%p", static_cast<void*>(target.hwnd));
 
-    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
     json names = json::array();
     for (const auto& fi : frameworks) {
         auto display = lvt::framework_display_name(fi);
@@ -1321,7 +1378,10 @@ PropertyTarget require_property_target(
 lvt::IFrameworkConnection* typed_property_connection(
     const Session& session, const PropertyTarget& target) {
     const auto hostArch = lvt::get_host_architecture();
-    if (session.architecture != lvt::Architecture::unknown &&
+    const bool nativeProvider =
+        target.provider == "win32" || target.provider == "comctl";
+    if (!nativeProvider &&
+        session.architecture != lvt::Architecture::unknown &&
         hostArch != lvt::Architecture::unknown &&
         session.architecture != hostArch) {
         throw std::runtime_error(

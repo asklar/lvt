@@ -12,6 +12,7 @@
 #include <string>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <set>
 #include <vector>
@@ -34,6 +35,11 @@
 #include "tree_builder.h"
 
 #include "apps/NativeControlsFixture/native_controls_fixture_ids.h"
+#include "element_key.h"
+#include "framework_detector.h"
+#include "providers/native_message.h"
+#include "providers/native_property_connection.h"
+#include "tree_builder.h"
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -2660,6 +2666,60 @@ TEST_F(ComCtlWindowFixture, DurableKeysCoverFullStaticTreeAndQueryRoundTrips) {
 
 // ---- Standalone native Win32/Common Controls fixture ----
 
+static lvt::Element* find_native_element_by_hwnd(
+    lvt::Element& element, HWND hwnd) {
+    if (element.nativeHandle == reinterpret_cast<uintptr_t>(hwnd))
+        return &element;
+    for (auto& child : element.children) {
+        if (auto* found = find_native_element_by_hwnd(child, hwnd))
+            return found;
+    }
+    return nullptr;
+}
+
+static lvt::Element* find_native_element_by_text(
+    lvt::Element& element, const std::string& type,
+    const std::string& text) {
+    if (element.type == type && element.text == text)
+        return &element;
+    for (auto& child : element.children) {
+        if (auto* found =
+                find_native_element_by_text(child, type, text)) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+static const lvt::PropertyDescriptor* native_descriptor(
+    const lvt::PropertySnapshotResult& snapshot,
+    const std::string& name) {
+    if (!snapshot.schema)
+        return nullptr;
+    for (const auto& descriptor : snapshot.schema->descriptors) {
+        if (descriptor.name == name)
+            return &descriptor;
+    }
+    return nullptr;
+}
+
+static const lvt::PropertyValue* native_value(
+    const lvt::PropertySnapshotResult& snapshot,
+    const std::string& name) {
+    const auto* descriptor = native_descriptor(snapshot, name);
+    if (!descriptor)
+        return nullptr;
+    for (const auto& value : snapshot.values) {
+        if (value.descriptorId == descriptor->descriptorId)
+            return &value;
+    }
+    return nullptr;
+}
+
+static std::string utf8(const char8_t* value) {
+    return reinterpret_cast<const char*>(value);
+}
+
 class NativeControlsFixture : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
@@ -2758,6 +2818,94 @@ protected:
         auto tree = json::parse(output, nullptr, false);
         EXPECT_FALSE(tree.is_discarded()) << "Output is not valid JSON:\n" << output;
         return tree;
+    }
+
+    struct NativeTree {
+        std::shared_ptr<lvt::NativePropertyConnection> win32;
+        std::shared_ptr<lvt::NativePropertyConnection> comctl;
+        lvt::Element root;
+    };
+
+    static NativeTree native_tree() {
+        NativeTree result;
+        result.win32 = lvt::NativePropertyConnection::connect(
+            s_hwnd, s_pid, "win32");
+        std::string comctlVersion;
+        const auto frameworks = lvt::detect_frameworks(s_hwnd, s_pid);
+        for (const auto& framework : frameworks) {
+            if (framework.type == lvt::Framework::ComCtl)
+                comctlVersion = framework.version;
+        }
+        result.comctl = lvt::NativePropertyConnection::connect(
+            s_hwnd, s_pid, "comctl", comctlVersion);
+        auto lookup =
+            [&result](const std::string& provider)
+                -> lvt::IFrameworkConnection* {
+            if (provider == "win32")
+                return result.win32.get();
+            if (provider == "comctl")
+                return result.comctl.get();
+            return nullptr;
+        };
+        result.root = lvt::build_tree(
+            s_hwnd, s_pid, frameworks, -1, {}, false, lookup);
+        lvt::assign_element_ids(result.root);
+        lvt::assign_element_keys(result.root);
+        return result;
+    }
+
+    static lvt::PropertySnapshotResult snapshot(
+        NativeTree& tree, lvt::Element& element) {
+        auto* connection = element.framework == "comctl"
+            ? static_cast<lvt::IFrameworkConnection*>(tree.comctl.get())
+            : static_cast<lvt::IFrameworkConnection*>(tree.win32.get());
+        return connection->get_property_snapshot(element.providerHandle);
+    }
+
+    static lvt::PropertyMutationResult set(
+        NativeTree& tree, lvt::Element& element,
+        const lvt::PropertySnapshotResult& properties,
+        const std::string& name, const std::string& value) {
+        const auto* descriptor = native_descriptor(properties, name);
+        if (!descriptor)
+            return {};
+        auto* connection = element.framework == "comctl"
+            ? static_cast<lvt::IFrameworkConnection*>(tree.comctl.get())
+            : static_cast<lvt::IFrameworkConnection*>(tree.win32.get());
+        return connection->set_property(
+            element.providerHandle, descriptor->descriptorId, value);
+    }
+
+    static lvt::PropertyMutationResult clear(
+        NativeTree& tree, lvt::Element& element,
+        const lvt::PropertySnapshotResult& properties,
+        const std::string& name) {
+        const auto* descriptor = native_descriptor(properties, name);
+        if (!descriptor)
+            return {};
+        auto* connection = element.framework == "comctl"
+            ? static_cast<lvt::IFrameworkConnection*>(tree.comctl.get())
+            : static_cast<lvt::IFrameworkConnection*>(tree.win32.get());
+        return connection->clear_property(
+            element.providerHandle, descriptor->descriptorId);
+    }
+
+    static std::string state_summary() {
+        DWORD_PTR protocolVersion = 0;
+        EXPECT_NE(
+            SendMessageTimeoutW(
+                s_hwnd, native_fixture::kRefreshSummaryMessage, 0, 0,
+                SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+                &protocolVersion),
+            0);
+        EXPECT_EQ(
+            protocolVersion,
+            static_cast<DWORD_PTR>(
+                native_fixture::kSummaryProtocolVersion));
+        auto tree = dump_tree();
+        const json* summary = find_element_by_hwnd(
+            tree["root"], control(native_fixture::kStateSummaryId));
+        return summary ? summary->value("text", "") : std::string();
     }
 
     static wil::unique_handle s_process;
@@ -2943,7 +3091,7 @@ TEST_F(NativeControlsFixture, ReadOnlySummaryReportsCompleteNativeState) {
     ASSERT_NE(summary, nullptr);
     EXPECT_EQ(summary->value("className", ""), "Static");
     const std::string text = summary->value("text", "");
-    EXPECT_NE(text.find("protocol=1"), std::string::npos);
+    EXPECT_NE(text.find("protocol=2"), std::string::npos);
     EXPECT_NE(text.find("checkbox(id=1001)=2"), std::string::npos);
     EXPECT_NE(text.find("radio(id=1002)=1"), std::string::npos);
     EXPECT_NE(text.find("button(id=1003)=Fixture action"), std::string::npos);
@@ -2958,22 +3106,521 @@ TEST_F(NativeControlsFixture, ReadOnlySummaryReportsCompleteNativeState) {
     EXPECT_NE(text.find("scrollbar(id=1008)=10,110,10,42"), std::string::npos);
     EXPECT_NE(
         text.find(
-            "listview(id=1009)=1:Beta row;items=Alpha row|Beta row|Gamma row"),
+            "listview(id=1009)=1:Beta row;focus=-1;items=Alpha row|Beta row|Gamma row"),
         std::string::npos);
     EXPECT_NE(
         text.find(
-            "tree(id=1010)=Fixture Root[expanded]/Fixture Child[expanded]/"
+            "tree(id=1010)=selected:Fixture Child;Fixture Root[expanded]/"
+            "Fixture Child[expanded]/"
             "Fixture Grandchild"),
         std::string::npos);
     EXPECT_NE(
         text.find(
-            "toolbar(id=1011)=2001:enabled,2002:enabled+checked,2003:disabled"),
+            "toolbar(id=1011)=2001:Apply:enabled,2002:Pinned:enabled+checked,"
+            "2003:Disabled:disabled"),
         std::string::npos);
     EXPECT_NE(text.find("status(id=1012)=Ready|3 items|Idle"), std::string::npos);
     EXPECT_NE(
         text.find("tab(id=1013)=1:Details;items=Overview|Details|Advanced"),
         std::string::npos);
     EXPECT_NE(text.find("generic(id=1014)=Generic child seed"), std::string::npos);
+}
+
+TEST_F(NativeControlsFixture, Win32TypedPropertiesRoundTripAndValidate) {
+    auto native = native_tree();
+    ASSERT_NE(native.win32, nullptr);
+    ASSERT_NE(native.comctl, nullptr);
+
+    auto* generic = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kGenericTextId));
+    ASSERT_NE(generic, nullptr);
+    EXPECT_EQ(generic->framework, "win32");
+    EXPECT_NE(generic->providerHandle, 0u);
+    EXPECT_EQ(generic->key.rfind("win32:0x", 0), 0u);
+
+    auto genericProperties = snapshot(native, *generic);
+    ASSERT_TRUE(genericProperties.ok) << genericProperties.error;
+    const auto* textDescriptor =
+        native_descriptor(genericProperties, "Text");
+    const auto* enabledDescriptor =
+        native_descriptor(genericProperties, "Enabled");
+    ASSERT_NE(textDescriptor, nullptr);
+    ASSERT_NE(enabledDescriptor, nullptr);
+    EXPECT_EQ(textDescriptor->kind, lvt::PropertyEditorKind::string);
+    EXPECT_EQ(enabledDescriptor->kind, lvt::PropertyEditorKind::boolean);
+    EXPECT_TRUE(textDescriptor->writable);
+    EXPECT_TRUE(enabledDescriptor->writable);
+
+    auto changedText = set(
+        native, *generic, genericProperties, "Text",
+        utf8(u8"Unicode ✓ 東京"));
+    ASSERT_TRUE(changedText.ok) << changedText.error;
+    EXPECT_EQ(changedText.value, utf8(u8"Unicode ✓ 東京"));
+    auto emptyText =
+        set(native, *generic, genericProperties, "Text", "");
+    ASSERT_TRUE(emptyText.ok) << emptyText.error;
+    auto restoredText = set(
+        native, *generic, genericProperties, "Text",
+        "Generic child seed");
+    ASSERT_TRUE(restoredText.ok) << restoredText.error;
+
+    auto disabled =
+        set(native, *generic, genericProperties, "Enabled", "false");
+    ASSERT_TRUE(disabled.ok) << disabled.error;
+    EXPECT_FALSE(IsWindowEnabled(
+        control(native_fixture::kGenericTextId)));
+    auto enabled =
+        set(native, *generic, genericProperties, "Enabled", "true");
+    ASSERT_TRUE(enabled.ok) << enabled.error;
+    EXPECT_TRUE(IsWindowEnabled(
+        control(native_fixture::kGenericTextId)));
+
+    auto* checkbox = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kCheckboxId));
+    auto* pushButton = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kButtonId));
+    ASSERT_NE(checkbox, nullptr);
+    ASSERT_NE(pushButton, nullptr);
+    auto checkboxProperties = snapshot(native, *checkbox);
+    ASSERT_TRUE(checkboxProperties.ok) << checkboxProperties.error;
+    const auto* checkState =
+        native_descriptor(checkboxProperties, "CheckState");
+    ASSERT_NE(checkState, nullptr);
+    EXPECT_TRUE(checkState->writable);
+    EXPECT_EQ(checkState->choices.size(), 3u);
+    for (const auto& value :
+         {"unchecked", "checked", "indeterminate"}) {
+        auto changed =
+            set(native, *checkbox, checkboxProperties, "CheckState", value);
+        ASSERT_TRUE(changed.ok) << value << ": " << changed.error;
+        EXPECT_EQ(changed.value, value);
+    }
+    auto pushProperties = snapshot(native, *pushButton);
+    ASSERT_TRUE(pushProperties.ok) << pushProperties.error;
+    const auto* pushState =
+        native_descriptor(pushProperties, "CheckState");
+    ASSERT_NE(pushState, nullptr);
+    EXPECT_FALSE(pushState->writable);
+    const auto* pushStateValue =
+        native_value(pushProperties, "CheckState");
+    ASSERT_NE(pushStateValue, nullptr);
+    EXPECT_NE(
+        pushStateValue->readOnlyReason.find("not a checkbox"),
+        std::string::npos);
+
+    auto* edit = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kEditId));
+    ASSERT_NE(edit, nullptr);
+    auto editProperties = snapshot(native, *edit);
+    ASSERT_TRUE(editProperties.ok) << editProperties.error;
+    for (const char* property :
+         {"Text", "SelectionStart", "SelectionEnd", "ReadOnly"}) {
+        const auto* descriptor =
+            native_descriptor(editProperties, property);
+        ASSERT_NE(descriptor, nullptr) << property;
+        EXPECT_TRUE(descriptor->writable) << property;
+    }
+    ASSERT_TRUE(set(
+        native, *edit, editProperties, "Text",
+        utf8(u8"Grüße 東京")).ok);
+    ASSERT_TRUE(set(
+        native, *edit, editProperties, "SelectionEnd", "8").ok);
+    ASSERT_TRUE(set(
+        native, *edit, editProperties, "SelectionStart", "2").ok);
+    ASSERT_TRUE(set(
+        native, *edit, editProperties, "ReadOnly", "true").ok);
+    auto invalidSelection = set(
+        native, *edit, editProperties, "SelectionStart", "9");
+    EXPECT_FALSE(invalidSelection.ok);
+    EXPECT_EQ(invalidSelection.hresult, E_INVALIDARG);
+    ASSERT_TRUE(set(
+        native, *edit, editProperties, "ReadOnly", "false").ok);
+    ASSERT_TRUE(set(
+        native, *edit, editProperties, "SelectionStart", "0").ok);
+    ASSERT_TRUE(set(
+        native, *edit, editProperties, "SelectionEnd", "0").ok);
+    ASSERT_TRUE(set(
+        native, *edit, editProperties, "Text", "Editable seed").ok);
+
+    auto* combo = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kComboBoxId));
+    auto* listBox = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kListBoxId));
+    ASSERT_NE(combo, nullptr);
+    ASSERT_NE(listBox, nullptr);
+    auto comboProperties = snapshot(native, *combo);
+    auto listProperties = snapshot(native, *listBox);
+    ASSERT_TRUE(comboProperties.ok) << comboProperties.error;
+    ASSERT_TRUE(listProperties.ok) << listProperties.error;
+    EXPECT_TRUE(
+        native_descriptor(comboProperties, "SelectedIndex")
+            ->supportsClear);
+    EXPECT_TRUE(
+        native_descriptor(listProperties, "SelectedIndex")
+            ->supportsClear);
+    ASSERT_TRUE(set(
+        native, *combo, comboProperties, "SelectedIndex", "2").ok);
+    auto clearedCombo =
+        clear(native, *combo, comboProperties, "SelectedIndex");
+    ASSERT_TRUE(clearedCombo.ok) << clearedCombo.error;
+    EXPECT_TRUE(clearedCombo.cleared);
+    ASSERT_TRUE(set(
+        native, *combo, comboProperties, "SelectedIndex", "1").ok);
+    auto invalidCombo = set(
+        native, *combo, comboProperties, "SelectedIndex", "3");
+    EXPECT_FALSE(invalidCombo.ok);
+    ASSERT_TRUE(set(
+        native, *listBox, listProperties, "SelectedIndex", "0").ok);
+    ASSERT_TRUE(clear(
+        native, *listBox, listProperties, "SelectedIndex").ok);
+    ASSERT_TRUE(set(
+        native, *listBox, listProperties, "SelectedIndex", "2").ok);
+
+    auto* scrollBar = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kScrollBarId));
+    ASSERT_NE(scrollBar, nullptr);
+    auto scrollProperties = snapshot(native, *scrollBar);
+    ASSERT_TRUE(scrollProperties.ok) << scrollProperties.error;
+    EXPECT_TRUE(
+        native_descriptor(scrollProperties, "Minimum")->writable);
+    EXPECT_TRUE(
+        native_descriptor(scrollProperties, "Maximum")->writable);
+    EXPECT_TRUE(
+        native_descriptor(scrollProperties, "Position")->writable);
+    EXPECT_FALSE(
+        native_descriptor(scrollProperties, "PageSize")->writable);
+    ASSERT_TRUE(set(
+        native, *scrollBar, scrollProperties, "Position", "80").ok);
+    ASSERT_TRUE(set(
+        native, *scrollBar, scrollProperties, "Minimum", "5").ok);
+    ASSERT_TRUE(set(
+        native, *scrollBar, scrollProperties, "Maximum", "120").ok);
+    auto invalidRange = set(
+        native, *scrollBar, scrollProperties, "Maximum", "40");
+    EXPECT_FALSE(invalidRange.ok);
+    EXPECT_EQ(invalidRange.hresult, E_INVALIDARG);
+    ASSERT_TRUE(set(
+        native, *scrollBar, scrollProperties, "Minimum", "10").ok);
+    ASSERT_TRUE(set(
+        native, *scrollBar, scrollProperties, "Maximum", "110").ok);
+    ASSERT_TRUE(set(
+        native, *scrollBar, scrollProperties, "Position", "42").ok);
+
+    const auto summary = state_summary();
+    EXPECT_NE(
+        summary.find("checkbox(id=1001)=2"), std::string::npos);
+    EXPECT_NE(
+        summary.find(
+            "edit(id=1004)=Editable seed;selection=0,0;readonly=0"),
+        std::string::npos);
+    EXPECT_NE(
+        summary.find("combo(id=1006)=1:Green"),
+        std::string::npos);
+    EXPECT_NE(
+        summary.find("listbox(id=1007)=2:Gamma"),
+        std::string::npos);
+    EXPECT_NE(
+        summary.find("scrollbar(id=1008)=10,110,10,42"),
+        std::string::npos);
+}
+
+TEST_F(NativeControlsFixture, ComCtlTypedPropertiesRoundTripAndRejectStaleItems) {
+    auto native = native_tree();
+    ASSERT_NE(native.comctl, nullptr);
+
+    auto* listView = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kListViewId));
+    ASSERT_NE(listView, nullptr);
+    EXPECT_EQ(listView->key.rfind("comctl:0x", 0), 0u);
+    auto listViewProperties = snapshot(native, *listView);
+    ASSERT_TRUE(listViewProperties.ok) << listViewProperties.error;
+    ASSERT_TRUE(set(
+        native, *listView, listViewProperties, "ViewMode", "list").ok);
+    ASSERT_TRUE(set(
+        native, *listView, listViewProperties, "ViewMode", "details").ok);
+
+    auto* beta = find_native_element_by_text(
+        *listView, "ListViewItem", "Beta row");
+    auto* alpha = find_native_element_by_text(
+        *listView, "ListViewItem", "Alpha row");
+    ASSERT_NE(beta, nullptr);
+    ASSERT_NE(alpha, nullptr);
+    auto betaProperties = snapshot(native, *beta);
+    ASSERT_TRUE(betaProperties.ok) << betaProperties.error;
+    for (const char* property : {"Selected", "Focused", "Text"}) {
+        ASSERT_TRUE(native_descriptor(betaProperties, property)->writable)
+            << property;
+    }
+    ASSERT_TRUE(set(
+        native, *beta, betaProperties, "Selected", "false").ok);
+    ASSERT_TRUE(set(
+        native, *beta, betaProperties, "Focused", "true").ok);
+    ASSERT_TRUE(set(
+        native, *beta, betaProperties, "Text",
+        utf8(u8"Beta ✓ 東京")).ok);
+    ASSERT_TRUE(set(
+        native, *beta, betaProperties, "Text", "").ok);
+    ASSERT_TRUE(set(
+        native, *beta, betaProperties, "Text", "Beta row").ok);
+    auto duplicateText = set(
+        native, *beta, betaProperties, "Text", "Alpha row");
+    EXPECT_FALSE(duplicateText.ok);
+    EXPECT_NE(
+        duplicateText.error.find("ambiguous"), std::string::npos);
+    ASSERT_TRUE(set(
+        native, *beta, betaProperties, "Focused", "false").ok);
+    ASSERT_TRUE(set(
+        native, *beta, betaProperties, "Selected", "true").ok);
+
+    auto alphaProperties = snapshot(native, *alpha);
+    ASSERT_TRUE(alphaProperties.ok) << alphaProperties.error;
+    DWORD_PTR changed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kMutateListViewIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
+    auto stale = set(
+        native, *alpha, alphaProperties, "Selected", "true");
+    EXPECT_FALSE(stale.ok);
+    EXPECT_NE(
+        stale.error.find("changed since"), std::string::npos);
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreListViewIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
+
+    auto* treeView = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kTreeViewId));
+    ASSERT_NE(treeView, nullptr);
+    auto* child = find_native_element_by_text(
+        *treeView, "TreeViewItem", "Fixture Child");
+    auto* grandchild = find_native_element_by_text(
+        *treeView, "TreeViewItem", "Fixture Grandchild");
+    ASSERT_NE(child, nullptr);
+    ASSERT_NE(grandchild, nullptr)
+        << "tree provider must preserve nested item identity";
+    auto childProperties = snapshot(native, *child);
+    auto grandchildProperties = snapshot(native, *grandchild);
+    ASSERT_TRUE(childProperties.ok) << childProperties.error;
+    ASSERT_TRUE(grandchildProperties.ok) << grandchildProperties.error;
+    ASSERT_TRUE(set(
+        native, *child, childProperties, "Selected", "false").ok);
+    ASSERT_TRUE(set(
+        native, *child, childProperties, "Selected", "true").ok);
+    ASSERT_TRUE(set(
+        native, *child, childProperties, "Expanded", "false").ok);
+    ASSERT_TRUE(set(
+        native, *child, childProperties, "Expanded", "true").ok);
+    ASSERT_TRUE(set(
+        native, *grandchild, grandchildProperties, "Selected", "true").ok);
+    ASSERT_TRUE(set(
+        native, *grandchild, grandchildProperties, "Text",
+        utf8(u8"Grandchild ✓")).ok);
+    ASSERT_TRUE(set(
+        native, *grandchild, grandchildProperties, "Text", "").ok);
+    ASSERT_TRUE(set(
+        native, *grandchild, grandchildProperties, "Text",
+        "Fixture Grandchild").ok);
+    ASSERT_TRUE(set(
+        native, *child, childProperties, "Selected", "true").ok);
+
+    auto* toolbar = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kToolbarId));
+    ASSERT_NE(toolbar, nullptr);
+    auto* apply = find_native_element_by_text(
+        *toolbar, "ToolbarButton", "Apply");
+    auto* pin = find_native_element_by_text(
+        *toolbar, "ToolbarButton", "Pinned");
+    auto* disabled = find_native_element_by_text(
+        *toolbar, "ToolbarButton", "Disabled");
+    ASSERT_NE(apply, nullptr);
+    ASSERT_NE(pin, nullptr);
+    ASSERT_NE(disabled, nullptr);
+    auto applyProperties = snapshot(native, *apply);
+    auto pinProperties = snapshot(native, *pin);
+    auto disabledProperties = snapshot(native, *disabled);
+    ASSERT_TRUE(applyProperties.ok) << applyProperties.error;
+    ASSERT_TRUE(pinProperties.ok) << pinProperties.error;
+    ASSERT_TRUE(disabledProperties.ok) << disabledProperties.error;
+    EXPECT_FALSE(
+        native_descriptor(applyProperties, "Checked")->writable);
+    EXPECT_TRUE(
+        native_descriptor(pinProperties, "Checked")->writable);
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kMutateToolbarIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
+    auto staleCommand = set(
+        native, *apply, applyProperties, "Text", "wrong command");
+    EXPECT_FALSE(staleCommand.ok);
+    EXPECT_NE(
+        staleCommand.error.find("different command"),
+        std::string::npos);
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreToolbarIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &changed),
+        0);
+    ASSERT_TRUE(set(
+        native, *pin, pinProperties, "Checked", "false").ok);
+    ASSERT_TRUE(set(
+        native, *pin, pinProperties, "Checked", "true").ok);
+    ASSERT_TRUE(set(
+        native, *disabled, disabledProperties, "Enabled", "true").ok);
+    ASSERT_TRUE(set(
+        native, *disabled, disabledProperties, "Enabled", "false").ok);
+    ASSERT_TRUE(set(
+        native, *apply, applyProperties, "Text",
+        utf8(u8"Apply ✓")).ok);
+    ASSERT_TRUE(set(
+        native, *apply, applyProperties, "Text", "").ok);
+    ASSERT_TRUE(set(
+        native, *apply, applyProperties, "Text", "Apply").ok);
+
+    auto* status = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kStatusBarId));
+    ASSERT_NE(status, nullptr);
+    ASSERT_GE(status->children.size(), 2u);
+    auto firstPartProperties = snapshot(native, status->children[0]);
+    const auto schemasAfterFirstPart =
+        native.comctl->cached_schema_count_for_testing();
+    auto secondPartProperties = snapshot(native, status->children[1]);
+    ASSERT_TRUE(firstPartProperties.ok) << firstPartProperties.error;
+    ASSERT_TRUE(secondPartProperties.ok) << secondPartProperties.error;
+    EXPECT_EQ(
+        firstPartProperties.schema->schemaId,
+        secondPartProperties.schema->schemaId);
+    EXPECT_EQ(
+        native.comctl->cached_schema_count_for_testing(),
+        schemasAfterFirstPart)
+        << "schemas are shared by class/style/capability rather than HWND item";
+    ASSERT_TRUE(set(
+        native, status->children[1], secondPartProperties, "Text",
+        utf8(u8"三 items ✓")).ok);
+    ASSERT_TRUE(set(
+        native, status->children[1], secondPartProperties, "Text", "").ok);
+    ASSERT_TRUE(set(
+        native, status->children[1], secondPartProperties, "Text",
+        "3 items").ok);
+
+    auto* tabs = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kTabControlId));
+    ASSERT_NE(tabs, nullptr);
+    auto tabProperties = snapshot(native, *tabs);
+    ASSERT_TRUE(tabProperties.ok) << tabProperties.error;
+    ASSERT_TRUE(set(
+        native, *tabs, tabProperties, "SelectedIndex", "-1").ok);
+    ASSERT_TRUE(set(
+        native, *tabs, tabProperties, "SelectedIndex", "2").ok);
+    auto invalidTab = set(
+        native, *tabs, tabProperties, "SelectedIndex", "3");
+    EXPECT_FALSE(invalidTab.ok);
+    ASSERT_TRUE(set(
+        native, *tabs, tabProperties, "SelectedIndex", "1").ok);
+    ASSERT_GE(tabs->children.size(), 1u);
+    auto tabItemProperties = snapshot(native, tabs->children[0]);
+    ASSERT_TRUE(tabItemProperties.ok) << tabItemProperties.error;
+    ASSERT_TRUE(set(
+        native, tabs->children[0], tabItemProperties, "Text",
+        utf8(u8"Overview ✓")).ok);
+    ASSERT_TRUE(set(
+        native, tabs->children[0], tabItemProperties, "Text", "").ok);
+    ASSERT_TRUE(set(
+        native, tabs->children[0], tabItemProperties, "Text",
+        "Overview").ok);
+
+    const auto summary = state_summary();
+    EXPECT_NE(
+        summary.find(
+            "listview(id=1009)=1:Beta row;focus=-1;"
+            "items=Alpha row|Beta row|Gamma row"),
+        std::string::npos);
+    EXPECT_NE(
+        summary.find(
+            "tree(id=1010)=selected:Fixture Child;"
+            "Fixture Root[expanded]/Fixture Child[expanded]/"
+            "Fixture Grandchild"),
+        std::string::npos);
+    EXPECT_NE(
+        summary.find(
+            "toolbar(id=1011)=2001:Apply:enabled,"
+            "2002:Pinned:enabled+checked,2003:Disabled:disabled"),
+        std::string::npos);
+    EXPECT_NE(
+        summary.find("status(id=1012)=Ready|3 items|Idle"),
+        std::string::npos);
+    EXPECT_NE(
+        summary.find(
+            "tab(id=1013)=1:Details;items=Overview|Details|Advanced"),
+        std::string::npos);
+}
+
+TEST_F(NativeControlsFixture, NativePropertySafetyRejectsHungClosedAndOwnerDataTargets) {
+    auto native = native_tree();
+    ASSERT_NE(native.win32, nullptr);
+
+    DWORD_PTR ignored = 0;
+    ASSERT_TRUE(PostMessageW(
+        s_hwnd, native_fixture::kHangMessage, 0, 0));
+    Sleep(100);
+    const auto started = std::chrono::steady_clock::now();
+    auto hung = native.win32->get_property_snapshot(
+        native.root.providerHandle);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_FALSE(hung.ok);
+    EXPECT_EQ(hung.hresult, HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    EXPECT_NE(hung.error.find("timeout"), std::string::npos);
+    EXPECT_LT(
+        elapsed, std::chrono::seconds(2))
+        << "SendMessageTimeoutW must bound an unresponsive target";
+    Sleep(1600);
+
+    HWND local = CreateWindowExW(
+        0, WC_STATICW, L"closed", WS_OVERLAPPED,
+        0, 0, 10, 10, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    ASSERT_NE(local, nullptr);
+    auto closedConnection = lvt::NativePropertyConnection::connect(
+        local, GetCurrentProcessId(), "win32");
+    ASSERT_NE(closedConnection, nullptr);
+    const auto closedHandle = closedConnection->register_hwnd(local);
+    DestroyWindow(local);
+    auto closed = closedConnection->get_property_snapshot(closedHandle);
+    EXPECT_FALSE(closed.ok);
+    EXPECT_EQ(
+        closed.hresult,
+        HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE));
+
+    HWND owner = CreateWindowExW(
+        0, WC_STATICW, L"owner", WS_OVERLAPPED,
+        0, 0, 100, 100, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    ASSERT_NE(owner, nullptr);
+    HWND ownerData = CreateWindowExW(
+        0, WC_LISTVIEWW, L"", WS_CHILD | LVS_REPORT | LVS_OWNERDATA,
+        0, 0, 100, 100, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    ASSERT_NE(ownerData, nullptr);
+    SendMessageW(ownerData, LVM_SETITEMCOUNT, 1, 0);
+    auto ownerDataConnection = lvt::NativePropertyConnection::connect(
+        owner, GetCurrentProcessId(), "comctl", "test");
+    ASSERT_NE(ownerDataConnection, nullptr);
+    const auto ownerDataHandle =
+        ownerDataConnection->register_listview_item(ownerData, 0);
+    auto ownerDataProperties =
+        ownerDataConnection->get_property_snapshot(ownerDataHandle);
+    ASSERT_TRUE(ownerDataProperties.ok) << ownerDataProperties.error;
+    for (const auto& descriptor :
+         ownerDataProperties.schema->descriptors) {
+        EXPECT_FALSE(descriptor.writable);
+        const auto* value =
+            native_value(ownerDataProperties, descriptor.name);
+        ASSERT_NE(value, nullptr);
+        EXPECT_NE(
+            value->readOnlyReason.find("Owner-data"),
+            std::string::npos);
+    }
+    DestroyWindow(owner);
 }
 
 // ---- Framework-specific bounds (WinUI3/XAML) ----

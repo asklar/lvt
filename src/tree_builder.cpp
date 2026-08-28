@@ -7,6 +7,7 @@
 #include "providers/provider.h"
 #include "providers/win32_provider.h"
 #include "providers/comctl_provider.h"
+#include "providers/native_property_connection.h"
 #if LVT_ENABLE_XAML
 #include "providers/xaml_provider.h"
 #endif
@@ -210,14 +211,21 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
                    const ConnectionLookup& connectionLookup) {
     // Start with the Win32 provider as the base — it always applies
     Win32Provider win32;
-    Element root = win32.build(hwnd, maxDepth);
+    auto* win32Properties = connectionLookup
+        ? dynamic_cast<NativePropertyConnection*>(connectionLookup("win32"))
+        : nullptr;
+    Element root = win32.build(hwnd, maxDepth, win32Properties);
 
     // Layer on framework-specific providers
     for (auto& fi : frameworks) {
         switch (fi.type) {
         case Framework::ComCtl: {
             ComCtlProvider comctl;
-            comctl.enrich(root);
+            auto* comctlProperties = connectionLookup
+                ? dynamic_cast<NativePropertyConnection*>(
+                      connectionLookup("comctl"))
+                : nullptr;
+            comctl.enrich(root, comctlProperties);
             break;
         }
         case Framework::Xaml: {

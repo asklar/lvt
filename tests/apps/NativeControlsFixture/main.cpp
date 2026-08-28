@@ -90,6 +90,14 @@ std::wstring toolbar_state(HWND hwnd, int commandId) {
     return result;
 }
 
+std::wstring toolbar_text(HWND hwnd, int commandId) {
+    wchar_t buffer[128]{};
+    const LRESULT length = SendMessageW(
+        hwnd, TB_GETBUTTONTEXTW, commandId,
+        reinterpret_cast<LPARAM>(buffer));
+    return length < 0 ? L"<error>" : std::wstring(buffer);
+}
+
 std::wstring statusbar_text(HWND hwnd, int part) {
     const LRESULT info = SendMessageW(hwnd, SB_GETTEXTLENGTHW, part, 0);
     const int length = LOWORD(info);
@@ -121,7 +129,24 @@ void refresh_state_summary() {
         static_cast<int>(SendMessageW(g_controls.listBox, LB_GETCURSEL, 0, 0));
     const int listViewSelection =
         ListView_GetNextItem(g_controls.listView, -1, LVNI_SELECTED);
+    const int listViewFocus =
+        ListView_GetNextItem(g_controls.listView, -1, LVNI_FOCUSED);
     const int tabSelection = TabCtrl_GetCurSel(g_controls.tabControl);
+    const HTREEITEM treeSelection =
+        TreeView_GetSelection(g_controls.treeView);
+
+    DWORD editSelectionStart = 0;
+    DWORD editSelectionEnd = 0;
+    SendMessageW(
+        g_controls.edit, EM_GETSEL,
+        reinterpret_cast<WPARAM>(&editSelectionStart),
+        reinterpret_cast<LPARAM>(&editSelectionEnd));
+    DWORD readOnlySelectionStart = 0;
+    DWORD readOnlySelectionEnd = 0;
+    SendMessageW(
+        g_controls.readOnlyEdit, EM_GETSEL,
+        reinterpret_cast<WPARAM>(&readOnlySelectionStart),
+        reinterpret_cast<LPARAM>(&readOnlySelectionEnd));
 
     SCROLLINFO scrollInfo{sizeof(scrollInfo), SIF_RANGE | SIF_PAGE | SIF_POS};
     GetScrollInfo(g_controls.scrollBar, SB_CTL, &scrollInfo);
@@ -135,14 +160,24 @@ void refresh_state_summary() {
 
     std::wostringstream summary;
     summary
-        << L"protocol=1\n"
+        << L"protocol=" << fixture::kSummaryProtocolVersion << L"\n"
         << L"checkbox(id=1001)="
         << SendMessageW(g_controls.checkbox, BM_GETCHECK, 0, 0) << L"\n"
         << L"radio(id=1002)="
         << SendMessageW(g_controls.radio, BM_GETCHECK, 0, 0) << L"\n"
         << L"button(id=1003)=" << window_text(g_controls.button) << L"\n"
-        << L"edit(id=1004)=" << window_text(g_controls.edit) << L"\n"
-        << L"readonly(id=1005)=" << window_text(g_controls.readOnlyEdit) << L"\n"
+        << L"edit(id=1004)=" << window_text(g_controls.edit)
+        << L";selection=" << editSelectionStart << L"," << editSelectionEnd
+        << L";readonly="
+        << ((GetWindowLongPtrW(g_controls.edit, GWL_STYLE) & ES_READONLY) ? 1 : 0)
+        << L"\n"
+        << L"readonly(id=1005)=" << window_text(g_controls.readOnlyEdit)
+        << L";selection=" << readOnlySelectionStart << L","
+        << readOnlySelectionEnd << L";readonly="
+        << ((GetWindowLongPtrW(g_controls.readOnlyEdit, GWL_STYLE) & ES_READONLY)
+                ? 1
+                : 0)
+        << L"\n"
         << L"combo(id=1006)=" << comboSelection << L":"
         << combo_item_text(g_controls.comboBox, comboSelection)
         << L";items=" << combo_item_text(g_controls.comboBox, 0) << L"|"
@@ -158,18 +193,26 @@ void refresh_state_summary() {
         << L"," << scrollInfo.nPage << L"," << scrollInfo.nPos << L"\n"
         << L"listview(id=1009)=" << listViewSelection << L":"
         << listview_item_text(g_controls.listView, listViewSelection)
+        << L";focus=" << listViewFocus
         << L";items=" << listview_item_text(g_controls.listView, 0) << L"|"
         << listview_item_text(g_controls.listView, 1) << L"|"
         << listview_item_text(g_controls.listView, 2) << L"\n"
-        << L"tree(id=1010)=" << tree_item_text(g_controls.treeView, g_controls.treeRoot)
+        << L"tree(id=1010)=selected:"
+        << tree_item_text(g_controls.treeView, treeSelection) << L";"
+        << tree_item_text(g_controls.treeView, g_controls.treeRoot)
         << L"[" << (rootExpanded ? L"expanded" : L"collapsed") << L"]/"
         << tree_item_text(g_controls.treeView, g_controls.treeChild)
         << L"[" << (childExpanded ? L"expanded" : L"collapsed") << L"]/"
         << tree_item_text(g_controls.treeView, g_controls.treeGrandchild) << L"\n"
-        << L"toolbar(id=1011)=2001:" << toolbar_state(
-               g_controls.toolbar, fixture::kToolbarApplyCommand)
-        << L",2002:" << toolbar_state(g_controls.toolbar, fixture::kToolbarPinCommand)
-        << L",2003:" << toolbar_state(
+        << L"toolbar(id=1011)=2001:"
+        << toolbar_text(g_controls.toolbar, fixture::kToolbarApplyCommand)
+        << L":" << toolbar_state(g_controls.toolbar, fixture::kToolbarApplyCommand)
+        << L",2002:"
+        << toolbar_text(g_controls.toolbar, fixture::kToolbarPinCommand)
+        << L":" << toolbar_state(g_controls.toolbar, fixture::kToolbarPinCommand)
+        << L",2003:"
+        << toolbar_text(g_controls.toolbar, fixture::kToolbarDisabledCommand)
+        << L":" << toolbar_state(
                g_controls.toolbar, fixture::kToolbarDisabledCommand)
         << L"\n"
         << L"status(id=1012)=" << statusbar_text(g_controls.statusBar, 0) << L"|"
@@ -180,7 +223,8 @@ void refresh_state_summary() {
         << L";items=" << tab_text(g_controls.tabControl, 0) << L"|"
         << tab_text(g_controls.tabControl, 1) << L"|"
         << tab_text(g_controls.tabControl, 2) << L"\n"
-        << L"generic(id=1014)=" << window_text(g_controls.genericText);
+        << L"generic(id=1014)=" << window_text(g_controls.genericText)
+        << L";enabled=" << (IsWindowEnabled(g_controls.genericText) ? 1 : 0);
 
     SetWindowTextW(g_controls.stateSummary, summary.str().c_str());
 }
@@ -427,6 +471,38 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case fixture::kRefreshSummaryMessage:
         refresh_state_summary();
         return fixture::kSummaryProtocolVersion;
+    case fixture::kMutateListViewIdentityMessage:
+        ListView_SetItemText(
+            g_controls.listView, 0, 0,
+            const_cast<LPWSTR>(L"External replacement"));
+        refresh_state_summary();
+        return TRUE;
+    case fixture::kRestoreListViewIdentityMessage:
+        ListView_SetItemText(
+            g_controls.listView, 0, 0,
+            const_cast<LPWSTR>(L"Alpha row"));
+        refresh_state_summary();
+        return TRUE;
+    case fixture::kMutateToolbarIdentityMessage: {
+        TBBUTTONINFOW info{sizeof(info)};
+        info.dwMask = TBIF_COMMAND;
+        info.idCommand = 2999;
+        return SendMessageW(
+            g_controls.toolbar, TB_SETBUTTONINFOW,
+            fixture::kToolbarApplyCommand,
+            reinterpret_cast<LPARAM>(&info));
+    }
+    case fixture::kRestoreToolbarIdentityMessage: {
+        TBBUTTONINFOW info{sizeof(info)};
+        info.dwMask = TBIF_COMMAND;
+        info.idCommand = fixture::kToolbarApplyCommand;
+        return SendMessageW(
+            g_controls.toolbar, TB_SETBUTTONINFOW, 2999,
+            reinterpret_cast<LPARAM>(&info));
+    }
+    case fixture::kHangMessage:
+        Sleep(2500);
+        return TRUE;
     case fixture::kCloseMessage:
     case WM_CLOSE:
         DestroyWindow(hwnd);

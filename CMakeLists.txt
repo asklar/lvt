@@ -136,6 +136,8 @@ set(LVT_CORE_SOURCES
     src/wil_diagnostics.cpp
     src/providers/win32_provider.cpp
     src/providers/comctl_provider.cpp
+    src/providers/native_message.cpp
+    src/providers/native_property_connection.cpp
     src/providers/connection_registry.cpp
     src/providers/property_contract.cpp
 )
@@ -1126,8 +1128,6 @@ endif()
 add_dependencies(lvt_integration_tests ${LVT_INTEGRATION_DEPS})
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
 
-# Chromium plugin tests — DOM JSON format and native messaging protocol
-if(LVT_ENABLE_CHROMIUM)
 # --- MCP server tests ------------------------------------------------------
 # A separate binary because it needs a live JSON-RPC conversation over pipes
 # rather than the one-shot commands the other integration tests run, and
@@ -1140,13 +1140,14 @@ if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
         WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
         WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
         WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
+        "NATIVE_CONTROLS_FIXTURE_EXE_PATH=\"$<TARGET_FILE:lvt_native_controls_fixture>\""
     )
     target_link_libraries(lvt_mcp_tests PRIVATE
         GTest::gtest GTest::gtest_main
         WIL::WIL
         nlohmann_json::nlohmann_json
     )
-    add_dependencies(lvt_mcp_tests lvt)
+    add_dependencies(lvt_mcp_tests lvt lvt_native_controls_fixture)
     if(TARGET lvt_tap)
         add_dependencies(lvt_mcp_tests lvt_tap)
     endif()
@@ -1162,6 +1163,8 @@ if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
     add_test(NAME mcp_tests COMMAND lvt_mcp_tests)
 endif()
 
+# Chromium plugin tests — DOM JSON format and native messaging protocol
+if(LVT_ENABLE_CHROMIUM)
 add_executable(lvt_chromium_tests    tests/chromium_tests.cpp
     src/element_key.cpp
 )

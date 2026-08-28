@@ -21,8 +21,11 @@
 #include <thread>
 #include <vector>
 
+#include "apps/NativeControlsFixture/native_controls_fixture_ids.h"
+
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+namespace native_fixture = lvt::native_fixture;
 
 namespace {
 
@@ -796,6 +799,112 @@ protected:
 wil::unique_process_handle McpSampleFixture::s_process;
 wil::unique_handle McpSampleFixture::s_thread;
 HWND McpSampleFixture::s_hwnd = nullptr;
+
+class NativeMcpFixture : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        const fs::path exe = NATIVE_CONTROLS_FIXTURE_EXE_PATH;
+        ASSERT_TRUE(fs::exists(exe));
+
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        std::wstring command = L"\"" + exe.wstring() + L"\"";
+        ASSERT_TRUE(CreateProcessW(
+            nullptr, command.data(), nullptr, nullptr, FALSE, 0,
+            nullptr, nullptr, &startup, &process));
+        s_process.reset(process.hProcess);
+        s_thread.reset(process.hThread);
+        s_pid = process.dwProcessId;
+        WaitForInputIdle(s_process.get(), 5000);
+
+        for (int attempt = 0; attempt < 50 && !s_hwnd; ++attempt) {
+            EnumWindows(
+                [](HWND hwnd, LPARAM parameter) -> BOOL {
+                    DWORD pid = 0;
+                    GetWindowThreadProcessId(hwnd, &pid);
+                    if (pid != s_pid)
+                        return TRUE;
+                    wchar_t className[128]{};
+                    GetClassNameW(
+                        hwnd, className,
+                        static_cast<int>(_countof(className)));
+                    if (wcscmp(
+                            className,
+                            native_fixture::kWindowClass) == 0) {
+                        *reinterpret_cast<HWND*>(parameter) = hwnd;
+                        return FALSE;
+                    }
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(&s_hwnd));
+            if (!s_hwnd)
+                Sleep(100);
+        }
+        ASSERT_NE(s_hwnd, nullptr);
+    }
+
+    static void TearDownTestSuite() {
+        if (s_hwnd && IsWindow(s_hwnd))
+            PostMessageW(s_hwnd, native_fixture::kCloseMessage, 0, 0);
+        if (s_process)
+            WaitForSingleObject(s_process.get(), 5000);
+        s_process.reset();
+        s_thread.reset();
+        s_hwnd = nullptr;
+        s_pid = 0;
+    }
+
+    static std::string hwnd_string() {
+        char value[32]{};
+        snprintf(
+            value, sizeof(value), "0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(s_hwnd)));
+        return value;
+    }
+
+    static std::string connect(McpClient& client) {
+        auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+        return connected.value("session", "");
+    }
+
+    static const json* find_by_class(
+        const json& tree, const std::string& className) {
+        std::vector<const json*> elements;
+        collect_json_elements(tree, elements);
+        for (const auto* element : elements) {
+            if (element->value("className", "") == className)
+                return element;
+        }
+        return nullptr;
+    }
+
+    static const json* find_child(
+        const json& parent, const std::string& type,
+        const std::string& text) {
+        std::vector<const json*> elements;
+        collect_json_elements(parent, elements);
+        for (const auto* element : elements) {
+            if (element->value("type", "") == type &&
+                element->value("text", "") == text) {
+                return element;
+            }
+        }
+        return nullptr;
+    }
+
+    static wil::unique_process_handle s_process;
+    static wil::unique_handle s_thread;
+    static DWORD s_pid;
+    static HWND s_hwnd;
+};
+
+wil::unique_process_handle NativeMcpFixture::s_process;
+wil::unique_handle NativeMcpFixture::s_thread;
+DWORD NativeMcpFixture::s_pid = 0;
+HWND NativeMcpFixture::s_hwnd = nullptr;
 
 } // namespace
 
@@ -2227,6 +2336,194 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
            "get/set/clear property operations";
     EXPECT_EQ(count_tap_get_enums_calls(targetPid) - getEnumsBefore, 1)
         << "one persistent XAML connection must fetch its enum catalog once";
+}
+
+TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
+    McpClient readOnly(false);
+    ASSERT_TRUE(readOnly.started());
+    ASSERT_TRUE(readOnly.handshake());
+    const auto readOnlySession = connect(readOnly);
+    ASSERT_FALSE(readOnlySession.empty());
+
+    auto readOnlyTree = readOnly.call_tool(
+        "get_visual_tree", json{{"session", readOnlySession}});
+    ASSERT_TRUE(readOnlyTree.contains("root")) << readOnlyTree.dump(2);
+    const auto* readOnlyGeneric = find_by_class(
+        readOnlyTree["root"], "LvtNativePropertyFixtureText");
+    ASSERT_NE(readOnlyGeneric, nullptr);
+    const auto readOnlyKey = readOnlyGeneric->value("key", "");
+    ASSERT_EQ(readOnlyKey.rfind("win32:0x", 0), 0u);
+
+    bool isError = false;
+    auto readOnlyProperties = readOnly.call_tool(
+        "get_editable_properties",
+        json{{"session", readOnlySession}, {"element", readOnlyKey}},
+        &isError);
+    ASSERT_FALSE(isError) << readOnlyProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(readOnlyProperties, "Text"),
+        "Generic child seed");
+
+    auto refused = readOnly.call_tool(
+        "set_property",
+        json{{"session", readOnlySession},
+             {"element", readOnlyKey},
+             {"descriptorId",
+              find_property_descriptor(readOnlyProperties, "Text")
+                  ->value("descriptorId", "")},
+             {"value", "must not be written"}},
+        &isError);
+    EXPECT_TRUE(isError) << refused.dump(2);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto schemas = output_schemas(client);
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto* generic =
+        find_by_class(tree["root"], "LvtNativePropertyFixtureText");
+    const auto* combo =
+        find_by_class(tree["root"], "ComboBox");
+    const auto* status =
+        find_by_class(tree["root"], "msctls_statusbar32");
+    ASSERT_NE(generic, nullptr);
+    ASSERT_NE(combo, nullptr);
+    ASSERT_NE(status, nullptr);
+
+    const auto genericKey = generic->value("key", "");
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    std::string schemaError;
+    EXPECT_TRUE(schema_allows(
+        schemas.at("get_editable_properties"), properties, schemaError))
+        << schemaError;
+    const auto* text = find_property_descriptor(properties, "Text");
+    const auto* enabled = find_property_descriptor(properties, "Enabled");
+    ASSERT_NE(text, nullptr);
+    ASSERT_NE(enabled, nullptr);
+    EXPECT_EQ(text->value("kind", ""), "string");
+    EXPECT_EQ(enabled->value("kind", ""), "boolean");
+    EXPECT_TRUE(text->value("writable", false));
+    EXPECT_FALSE(text->contains("message"));
+    EXPECT_FALSE(text->contains("wParam"));
+    EXPECT_FALSE(text->contains("lParam"));
+
+    auto repeated = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << repeated.dump(2);
+    EXPECT_EQ(
+        repeated.value("schemaId", ""),
+        properties.value("schemaId", ""));
+    EXPECT_EQ(
+        find_property_descriptor(repeated, "Text")
+            ->value("descriptorId", ""),
+        text->value("descriptorId", ""));
+
+    const auto changedText =
+        std::string(reinterpret_cast<const char*>(u8"MCP ✓ 東京"));
+    auto changed = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", genericKey},
+             {"descriptorId", text->value("descriptorId", "")},
+             {"value", changedText}},
+        &isError);
+    ASSERT_FALSE(isError) << changed.dump(2);
+    EXPECT_EQ(changed.value("value", ""), changedText);
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("set_property"), changed, schemaError))
+        << schemaError;
+
+    auto changedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << changedProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(changedProperties, "Text"), changedText);
+
+    for (const std::string value : {"", "Generic child seed"}) {
+        auto setText = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", genericKey},
+                 {"descriptorId", text->value("descriptorId", "")},
+                 {"value", value}},
+            &isError);
+        ASSERT_FALSE(isError) << setText.dump(2);
+        EXPECT_EQ(setText.value("value", ""), value);
+    }
+
+    auto unknown = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", genericKey},
+             {"descriptorId", "native-v1:not-a-descriptor"},
+             {"value", "value"}},
+        &isError);
+    EXPECT_TRUE(isError) << unknown.dump(2);
+
+    const auto comboKey = combo->value("key", "");
+    auto comboProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", comboKey}},
+        &isError);
+    ASSERT_FALSE(isError) << comboProperties.dump(2);
+    const auto* selected =
+        find_property_descriptor(comboProperties, "SelectedIndex");
+    ASSERT_NE(selected, nullptr);
+    EXPECT_TRUE(selected->value("supportsClear", false));
+    auto cleared = client.call_tool(
+        "clear_property",
+        json{{"session", session},
+             {"element", comboKey},
+             {"descriptorId", selected->value("descriptorId", "")}},
+        &isError);
+    ASSERT_FALSE(isError) << cleared.dump(2);
+    EXPECT_TRUE(cleared.value("cleared", false));
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("clear_property"), cleared, schemaError))
+        << schemaError;
+    auto restored = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", comboKey},
+             {"descriptorId", selected->value("descriptorId", "")},
+             {"value", "1"}},
+        &isError);
+    ASSERT_FALSE(isError) << restored.dump(2);
+
+    ASSERT_GE(status->value("children", json::array()).size(), 2u);
+    const auto firstPartKey =
+        (*status)["children"][0].value("key", "");
+    const auto secondPartKey =
+        (*status)["children"][1].value("key", "");
+    auto firstPart = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", firstPartKey}},
+        &isError);
+    ASSERT_FALSE(isError) << firstPart.dump(2);
+    auto secondPart = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", secondPartKey}},
+        &isError);
+    ASSERT_FALSE(isError) << secondPart.dump(2);
+    EXPECT_EQ(
+        firstPart.value("schemaId", ""),
+        secondPart.value("schemaId", ""))
+        << "status parts should reuse one cached native schema";
 }
 
 TEST_F(McpSampleFixture, ResourcesMatchEachSessionsFixedTreeMode) {

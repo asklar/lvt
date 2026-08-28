@@ -10,13 +10,12 @@
 
 namespace lvt {
 
-// Looks up an already-established, reusable connection for a given
-// framework label ("xaml"/"winui3"/"wpf"/"winforms"), instead of build_tree re-injecting a
-// fresh one-shot connection every call. Returns nullptr (or is left unset
-// entirely) to keep today's one-shot-per-call behavior - this is how a
-// one-shot CLI command (dump/query/screenshot) still works unchanged; only
-// a caller that holds a connection across many build_tree calls (watch's
-// loop, an MCP session - see connection_registry.h) supplies one.
+// Looks up an already-established, reusable connection for a provider label
+// ("win32", "comctl", "xaml", "winui3", "wpf", "winforms", or a plugin
+// name). Diagnostics providers avoid reinjection; native providers use the
+// connection for typed-property identities and schema caches. Returning
+// nullptr (or leaving the lookup unset) keeps one-shot dump/query/screenshot
+// behavior unchanged.
 //
 // Returns a raw pointer, not a shared_ptr: the callback is only ever used
 // synchronously within one build_tree call, and the caller supplying it

@@ -119,9 +119,10 @@ of architecture, and its elements are the ones a `uia` session acts on.
 shows HWNDs, XAML types, WPF elements and Chromium DOM nodes — implementation
 structure the UIA tree deliberately hides. Its elements can be driven too, but
 only from a session connected with `mode: "visual"`, which acts by aiming real
-input at where an element is. Because it works by injecting into the target it
-needs lvt and the target to share an architecture; when they do not, it says so
-and names the right binary.
+input at where an element is. Injected XAML/WPF/WinForms/plugin visual trees
+need lvt and the target to share an architecture. A native-only Win32/ComCtl
+tree can still be read across architectures; ABI-sensitive item detail and
+property operations become read-only while scalar operations remain available.
 
 On a rich XAML/WinUI3 tree, `get_visual_tree` walks every element's entire
 property inheritance chain by default (`IVisualTreeService::
@@ -208,43 +209,66 @@ opaque descriptor id and owns conversion:
 {"name":"clear_property","arguments":{"session":"s1","element":"winui3:0x123","descriptorId":"winui3-1:p7"}}
 ```
 
-Setting and clearing require `lvt mcp --allow-input`. Clearing removes the
-local/provider value, allowing inherited, style, or default resolution to
-resume. Unknown, stale, element-mismatched, and read-only descriptor ids are
+Setting and clearing require `lvt mcp --allow-input`. Clearing has
+provider-defined semantics: XAML removes a local value, while the curated
+ComboBox/ListBox descriptors clear selection to the documented no-selection
+state. Unknown, stale, element-mismatched, and read-only descriptor ids are
 rejected. Successful mutations include provider readback of the effective
 `value`, `runtimeType`, `source`, `overridden`, and `canClear` state. The
 returned value is never the caller's input echoed back; a failed readback is
 reported as an explicit mutation failure.
 
-The provider-neutral contract is implemented by XAML/WinUI3, WPF, and WinForms.
-Each schema cache is connection-scoped and contains metadata only, never live
-values. WPF exposes writable scalar dependency properties and preserves local
-value precedence through `SetValue`/`ClearValue`. WinForms uses
-`TypeDescriptor`, including custom descriptors, but admits only a conservative
-scalar/converter allowlist and uses `ResetValue` only when reset is supported.
-For xamlOM properties, the descriptor's declared `propertyType` comes from
-`PropertyChainValue.Type` and drives editor selection and `CreateInstance`; the
-evaluated value's `ValueType` is reported only as live `runtimeType` and never
-trusted for mutation. Each persistent XAML connection also fetches its runtime
-enum catalog once. Enum descriptors expose ordered provider-owned choices and
-aliases. Flags values
-accept comma-separated member names only when the provider has explicitly
-confirmed `System.FlagsAttribute` through WinRT metadata; surrounding
-whitespace is normalized and every token must exist in the runtime catalog,
-after which `CreateInstance` remains the final validity check. Composite
-numeric flags readback is rendered in stable catalog order, with unknown
-residual bits retained as hexadecimal instead of silently discarded.
-Unmatched numeric values and comma-separated input for confirmed ordinary
-enums are never fabricated into combinations. Unresolved/custom enum metadata
-is explicit: validated comma syntax is deferred to `CreateInstance`, but
-numeric values are preserved unchanged because flags semantics are unknown.
-System XAML and WinUI catalogs stay isolated with their owning connections.
-Other built-in provider adapters can implement the same contract without
-adding framework catalogs to clients. External plugin ABI support is not part
-of this contract.
+The provider-neutral contract is implemented by XAML/WinUI3, WPF, WinForms,
+and curated Win32/Common Controls adapters. WPF exposes writable scalar
+dependency properties and preserves local value precedence through
+`SetValue`/`ClearValue`. WinForms uses `TypeDescriptor`, including custom
+descriptors, but admits only a conservative scalar/converter allowlist and
+uses `ResetValue` only when reset is supported. Native support deliberately
+exposes semantic properties rather than styles or messages:
+
+| Native target | Typed properties |
+|---|---|
+| Any supported HWND | Text and enabled state |
+| Button | Check state when the button style is checkable |
+| Edit | Text, selection start/end, and read-only state |
+| ComboBox / single-select ListBox | Selected index; clear removes selection |
+| ScrollBar | Minimum, maximum, position; page size is read-only |
+| SysListView32 | View mode; item selected/focused/text when item identity is verified and it is not owner-data |
+| SysTreeView32 | Item selected, expanded, and text |
+| ToolbarWindow32 | Button checked/enabled/text after command-id revalidation |
+| Status bar | Part text |
+| Tab control | Selected index and tab text |
+
+When a native operation is not safe for a particular class/style, owner-data
+control, stale item, or architecture combination, the descriptor/value is
+read-only with an explicit reason. Native descriptors never contain styles,
+message ids, `wParam`/`lParam`, or caller-controlled pointers.
+
+Schema caches are connection-scoped and contain metadata only, never live
+values. Native schemas are keyed by normalized class, common-control version,
+capability style bits, item kind, and host/target architecture. XAML schemas
+use the provider's declared property metadata. For xamlOM properties, the
+descriptor's declared `propertyType` comes from `PropertyChainValue.Type` and
+drives editor selection and `CreateInstance`; the evaluated value's
+`ValueType` is reported only as live `runtimeType` and never trusted for
+mutation. Each persistent XAML connection fetches its runtime enum catalog
+once. Flags values accept comma-separated members only when WinRT metadata
+confirms `System.FlagsAttribute`; ordinary and unresolved enum numerics are
+never fabricated into flag combinations. External plugin ABI support is not
+part of this contract.
+
+Native messaging is bounded with `SendMessageTimeoutW` using
+`SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT`. Pointer-bearing common-control
+structures and strings use target-process buffers opened with only VM
+read/write/operation rights. Before every write lvt revalidates the HWND,
+owner PID, class, item index/identity or toolbar command, and value range, then
+reads the property back before reporting success. ABI-sensitive pointer
+operations are read-only across process architectures; tested scalar message
+operations remain available.
 
 Tree reads and all three property operations share the session's existing
-persistent connection: there is no second injection or side protocol.
+persistent provider adapter: there is no second injection or caller-specified
+native message side protocol.
 
 ## Addressing elements
 

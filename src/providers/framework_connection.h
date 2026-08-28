@@ -105,11 +105,11 @@ struct PropertyMutationResult {
 // thread and can occasionally make a whole tick's collection take far
 // longer than expected.
 //
-// A provider that does NOT support this (e.g. Win32Provider/ComCtlProvider,
-// which just re-enumerate cheap native HWNDs, or any plugin that hasn't
-// implemented the optional plugin ABI v2 connection functions) is simply
-// never asked for one — callers fall back to their existing one-shot
-// enrich()-per-call path unchanged. See connection_registry.h for how a
+// Native Win32/ComCtl adapters also implement this interface for their
+// provider-owned typed-property schemas and opaque item identities; their
+// get_tree() remains a no-op because HWND enumeration itself is cheap. A
+// provider that does not support connections is never asked for one and keeps
+// its one-shot enrich()-per-call path. See connection_registry.h for how a
 // caller (watch's loop, an MCP session) acquires/reuses/releases these.
 class IFrameworkConnection {
 public:
@@ -148,9 +148,9 @@ public:
         return true;
     }
 
-    // Optional provider-neutral typed property operations. XAML, WinUI3, WPF
-    // and WinForms implement these over their persistent diagnostics
-    // connections. Other built-in providers retain explicit unsupported
+    // Optional provider-neutral typed property operations. XAML, WinUI3, WPF,
+    // and WinForms use persistent diagnostics connections; Win32 and ComCtl
+    // use curated native adapters. Other providers retain explicit unsupported
     // defaults until their provider-owned schema adapters are implemented.
     virtual PropertySnapshotResult get_property_snapshot(uint64_t) {
         return {};

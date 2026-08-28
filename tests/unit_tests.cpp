@@ -15,6 +15,8 @@
 #include "providers/connection_registry.h"
 #include "providers/framework_connection.h"
 #include "providers/managed_connection.h"
+#include "providers/native_message.h"
+#include "providers/native_property_connection.h"
 #include "providers/overlapped_io.h"
 #include "providers/xaml_enum_catalog.h"
 #include "providers/uia_props.h"
@@ -633,6 +635,26 @@ TEST(ElementKeys, WinFormsManagedIdentitySurvivesHwndRecreation) {
     reusedHwnd.nativeHandle = 0x100;
     assign_element_keys(reusedHwnd);
     EXPECT_NE(reusedHwnd.key, original.key);
+}
+
+TEST(ElementKeys, NativePropertyHandlesUseCompactProviderKeys) {
+    Element root;
+    root.type = "Window";
+    root.className = "FixtureWindow";
+    root.framework = "win32";
+    root.nativeHandle = 0x1234;
+    root.providerHandle = UINT64_C(0x1234);
+
+    Element item;
+    item.type = "ListViewItem";
+    item.framework = "comctl";
+    item.providerHandle = UINT64_C(0x8000000000000042);
+    root.children.push_back(std::move(item));
+
+    assign_element_keys(root);
+
+    EXPECT_EQ(root.key, "win32:0x1234");
+    EXPECT_EQ(root.children[0].key, "comctl:0x8000000000000042");
 }
 
 TEST(ElementKeys, ParsesOnlyCompactXamlInstanceKeys) {
@@ -2631,6 +2653,51 @@ TEST(XamlEnumCatalog, UnresolvedTypesDeferCompositeInputWithoutDecomposition) {
     EXPECT_EQ(
         catalog.canonical_value("Contoso.CustomEnum", "3"),
         std::optional<std::string>("3"));
+}
+
+TEST(NativeTypedPropertyContract, ParsesOnlyCanonicalScalarShapes) {
+    EXPECT_EQ(
+        normalize_native_class_name("SysListView32"),
+        "syslistview32");
+
+    bool boolean = false;
+    EXPECT_TRUE(native_property_detail::parse_boolean("true", boolean));
+    EXPECT_TRUE(boolean);
+    EXPECT_TRUE(native_property_detail::parse_boolean("FALSE", boolean));
+    EXPECT_FALSE(boolean);
+    EXPECT_FALSE(native_property_detail::parse_boolean("1", boolean));
+    EXPECT_FALSE(native_property_detail::parse_boolean(" true", boolean));
+
+    int integer = 0;
+    EXPECT_TRUE(native_property_detail::parse_integer("-1", integer));
+    EXPECT_EQ(integer, -1);
+    EXPECT_TRUE(native_property_detail::parse_integer("2147483647", integer));
+    EXPECT_EQ(integer, 2147483647);
+    EXPECT_FALSE(native_property_detail::parse_integer("", integer));
+    EXPECT_FALSE(native_property_detail::parse_integer("1.0", integer));
+    EXPECT_FALSE(native_property_detail::parse_integer(" 1", integer));
+    EXPECT_FALSE(native_property_detail::parse_integer("2147483648", integer));
+}
+
+TEST(NativeTypedPropertyContract, ComputesEffectiveScrollRange) {
+    EXPECT_EQ(native_property_detail::effective_scroll_max(10, 110, 0), 110);
+    EXPECT_EQ(native_property_detail::effective_scroll_max(10, 110, 1), 110);
+    EXPECT_EQ(native_property_detail::effective_scroll_max(10, 110, 10), 101);
+    EXPECT_EQ(native_property_detail::effective_scroll_max(10, 15, 20), 10);
+    EXPECT_EQ(native_property_detail::effective_scroll_max(20, 10, 0), 20);
+}
+
+TEST(NativeTypedPropertyContract, PointerOperationsRequireMatchingArchitecture) {
+    EXPECT_TRUE(native_pointer_operations_allowed(
+        Architecture::x64, Architecture::x64));
+    EXPECT_TRUE(native_pointer_operations_allowed(
+        Architecture::x86, Architecture::x86));
+    EXPECT_FALSE(native_pointer_operations_allowed(
+        Architecture::x64, Architecture::x86));
+    EXPECT_FALSE(native_pointer_operations_allowed(
+        Architecture::x86, Architecture::x64));
+    EXPECT_FALSE(native_pointer_operations_allowed(
+        Architecture::unknown, Architecture::x64));
 }
 
 TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {

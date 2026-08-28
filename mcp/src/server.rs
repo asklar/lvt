@@ -1716,8 +1716,9 @@ impl LvtServer {
     }
 
     #[tool(
-        description = "Clear one typed property's provider-local override using the opaque \
-                       descriptor id returned by get_editable_properties.",
+        description = "Apply one typed property's provider-defined clear behavior using the \
+                       opaque descriptor id returned by get_editable_properties. This may remove \
+                       a local override or move a native control to its documented no-value state.",
         output_schema = crate::schema::property_mutation(),
         annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]

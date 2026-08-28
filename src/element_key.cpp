@@ -101,7 +101,8 @@ bool has_process_wide_provider_identity(const Element& el) {
 static std::string compact_instance_key(const Element& el) {
     if (el.providerHandle == 0 ||
         (el.framework != "xaml" && el.framework != "winui3" &&
-         el.framework != "wpf" && el.framework != "winforms"))
+         el.framework != "wpf" && el.framework != "winforms" &&
+         el.framework != "win32" && el.framework != "comctl"))
         return {};
 
     std::ostringstream out;

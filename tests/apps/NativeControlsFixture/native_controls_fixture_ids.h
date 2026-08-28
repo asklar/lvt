@@ -32,6 +32,11 @@ inline constexpr int kToolbarDisabledCommand = 2003;
 // the real control state and returns the summary protocol version.
 inline constexpr UINT kRefreshSummaryMessage = WM_APP + 0x100;
 inline constexpr UINT kCloseMessage = WM_APP + 0x101;
-inline constexpr LRESULT kSummaryProtocolVersion = 1;
+inline constexpr UINT kMutateListViewIdentityMessage = WM_APP + 0x102;
+inline constexpr UINT kRestoreListViewIdentityMessage = WM_APP + 0x103;
+inline constexpr UINT kHangMessage = WM_APP + 0x104;
+inline constexpr UINT kMutateToolbarIdentityMessage = WM_APP + 0x105;
+inline constexpr UINT kRestoreToolbarIdentityMessage = WM_APP + 0x106;
+inline constexpr LRESULT kSummaryProtocolVersion = 2;
 
 } // namespace lvt::native_fixture

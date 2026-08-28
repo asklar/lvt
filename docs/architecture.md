@@ -71,7 +71,38 @@ flowchart BT
 
 Injecting the TAP DLL and calling `AdviseVisualTreeChange` is meant to happen **once** per debugging session, not on every tree refresh — see `docs/tap-dll-design.md`'s connection lifecycle section. `IFrameworkConnection` is the generic interface a provider can implement to expose that as "connect once, `get_tree()` many times"; `ConnectionRegistry` is a per-process, refcounted registry (keyed by `pid` + framework label) that lets a long-running consumer — `watch`'s tick loop, an MCP session — acquire one via a move-only `ConnectionHandle` and reuse it for its own lifetime, instead of each tree refresh re-injecting from scratch. `tree_builder.h`'s `build_tree` takes an optional `ConnectionLookup` callback for this; a caller that doesn't supply one (a one-shot `dump`/`query`/`screenshot`) sees no behavior change — providers fall back to their original one-shot `enrich()`.
 
-XamlProvider, WinUI3Provider, WpfProvider and WinFormsProvider implement this today. One-shot WPF/WinForms operations use the same path as long-running sessions — open connection, `GET_TREE`, `DISCONNECT` — so injection and teardown have one implementation. Plugins can adopt the interface without changing how callers acquire or use them.
+XamlProvider, WinUI3Provider, WpfProvider, and WinFormsProvider use persistent
+diagnostics connections. One-shot WPF/WinForms operations use the same path as
+long-running sessions — open connection, `GET_TREE`, `DISCONNECT` — so
+injection and teardown have one implementation. Win32Provider and
+ComCtlProvider use lightweight per-session connections, not for tree
+collection, but to register opaque native element identities and cache
+provider-owned typed-property schemas. Plugins can adopt the interface without
+changing how callers acquire or use them.
+
+### Native typed-property safety (`native_message.*`,
+`native_property_connection.*`)
+
+The Win32/Common Controls property adapter is intentionally curated. Its
+descriptor ids map to internal semantic operations such as `Text`,
+`SelectedIndex`, or `Expanded`; they cannot encode a message id or native
+pointer.
+
+All cross-process messages go through one `SendMessageTimeoutW` wrapper with
+`SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT`. Common-control messages at or above
+`WM_USER` do not marshal caller pointers, so structures and strings for those
+messages live in RAII `VirtualAllocEx` buffers. The owning process handle uses
+only `PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE`. System
+messages such as `WM_GETTEXT` and `EM_GETSEL` use User32's documented
+marshalling but remain disabled across architectures in the conservative
+first implementation.
+
+Every mutation validates that the HWND still exists and has the same PID and
+class. Item operations additionally revalidate the current index and identity
+(or toolbar command id), range-constrained values are checked against live
+state, and every successful write is read back. Owner-data or ambiguous
+list-view items and ABI-sensitive cross-bitness operations remain visible but
+read-only with a reason.
 
 ### Element ID assignment
 
@@ -111,7 +142,7 @@ Differences that matter:
 | | Visual tree | UIA tree |
 |---|---|---|
 | Mechanism | Native APIs + DLL injection | `IUIAutomation` client, no injection |
-| Architecture | Must match the target | Cross-architecture |
+| Architecture | Must match for injected providers; native-only cross-architecture is scalar/partial | Cross-architecture |
 | Identity | Class names, x:Name | `AutomationId`, `RuntimeId` |
 | Actionability | none | `SupportedPatterns` + pattern state |
 

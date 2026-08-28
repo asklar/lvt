@@ -57,10 +57,12 @@ private:
 // Per-process (i.e. per lvt_core instance - a one-shot CLI command links
 // this fresh each run, while lvt_core stays loaded for the whole life of an
 // `lvt watch` process or an `lvt mcp` server process) registry of live
-// IFrameworkConnections, keyed by (pid, framework label, e.g. "xaml" /
-// "winui3"). Refcounted: multiple acquirers within the SAME process share
-// one underlying connection; it is only torn down once the last holder
-// releases (or lets its ConnectionHandle go out of scope).
+// IFrameworkConnections, keyed by (pid, connection key). Diagnostics
+// providers use framework labels such as "xaml"; native property adapters
+// include their root HWND so two windows in one process do not share item
+// identity maps. Refcounted: multiple acquirers with the same key share one
+// underlying connection; it is only torn down once the last holder releases
+// (or lets its ConnectionHandle go out of scope).
 //
 // Deliberately per-process only - a connection acquired by one lvt.exe
 // invocation is not visible to another separately-running lvt.exe process

@@ -107,7 +107,9 @@ All editing uses tools on the same MCP session:
 Schemas are cached by `schemaId` while values are refreshed for the selected
 element, so controls sharing a schema reuse editor presentation. UIA's existing
 Toggle/Value rows remain temporary legacy templates until its provider exposes
-the same descriptor contract. Elements are addressed by durable keys.
+the same descriptor contract. The same generic editors render XAML/WinUI3 and
+the curated Win32/Common Controls descriptors; no framework-specific Viewer
+template is required. Elements are addressed by durable keys.
 
 ## Crosshair targeting
 
