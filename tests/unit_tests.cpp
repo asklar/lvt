@@ -897,6 +897,42 @@ TEST(WatchDiff, ProcessWideProviderHandleReparentsFromLaterToEarlierParent) {
     EXPECT_EQ(events[0].fields["path"].newValue, "0.0.0");
 }
 
+TEST(WatchDiff, SamePathDifferentParentEmitsExplicitRelocation) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "OldPanel"));
+    before.children[0].children.push_back(diff_provider_el(
+        "winui3", "Button", "Microsoft.UI.Xaml.Controls.Button", 0xB02, "Move"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "NewPanel"));
+    after.children[0].children.push_back(diff_provider_el(
+        "winui3", "Button", "Microsoft.UI.Xaml.Controls.Button", 0xB02, "Move"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 3u);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Added);
+    EXPECT_EQ(events[0].path, "0.0");
+    EXPECT_EQ(events[1].type, ChangeEvent::Type::Changed);
+    EXPECT_EQ(events[1].key, "winui3:0xB02");
+    EXPECT_EQ(events[1].path, "0.0.0");
+    EXPECT_FALSE(events[1].fields.count("path"));
+    ASSERT_TRUE(events[1].fields.count("parentKey"));
+    EXPECT_EQ(events[1].fields.at("parentKey").oldValue,
+              "win32|Root/win32|OldPanel");
+    EXPECT_EQ(events[1].fields.at("parentKey").newValue,
+              "win32|Root/win32|NewPanel");
+    EXPECT_EQ(events[2].type, ChangeEvent::Type::Removed);
+    EXPECT_EQ(events[2].path, "0.0");
+
+    auto serialized = json::parse(serialize_change_event(events[1]));
+    EXPECT_EQ(serialized["path"], "0.0.0");
+    EXPECT_EQ(serialized["fields"]["parentKey"]["old"],
+              "win32|Root/win32|OldPanel");
+    EXPECT_EQ(serialized["fields"]["parentKey"]["new"],
+              "win32|Root/win32|NewPanel");
+}
+
 TEST(WatchDiff, ReparentedProviderSubtreeIsReconciledExactlyOnce) {
     auto makeSubtree = [] {
         auto root = diff_provider_el(

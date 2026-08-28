@@ -144,6 +144,11 @@ previous tree per MCP session. The first call returns the current tree as flat
 view/property options or the visual `fast` setting starts a fresh snapshot,
 because those choices intentionally describe different trees.
 
+Changed events carry per-field `{ "old", "new" }` values. A `path` field moves
+an existing key to a new absolute tree path; `parentKey` is an explicit
+relocation signal for the rarer case where the parent object changed while the
+child's absolute path stayed the same.
+
 Every connected session exposes exactly one standards-compliant subscribable
 MCP resource, matching the session's fixed mode:
 

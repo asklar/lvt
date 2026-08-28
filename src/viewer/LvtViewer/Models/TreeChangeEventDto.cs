@@ -6,8 +6,10 @@ namespace LvtViewer.Models;
 /// One element-change event in an MCP tree-resource patch. The shape is
 /// produced by watch_diff.cpp/serialize_change_event: "added" and "removed"
 /// carry the full element; "changed" carries only differing fields keyed by
-/// field name ("type", "framework", "className", "text", "bounds", or
-/// "properties.&lt;Name&gt;").
+/// field name ("path", "type", "framework", "className", "text", "bounds",
+/// or "properties.&lt;Name&gt;"). "parentKey" is an explicit relocation
+/// signal for a provider object whose parent changed even if its absolute path
+/// did not.
 /// </summary>
 public sealed class TreeChangeEventDto
 {
@@ -23,4 +25,3 @@ public sealed class FieldChangeDto
     public string Old { get; set; } = "";
     public string New { get; set; } = "";
 }
-

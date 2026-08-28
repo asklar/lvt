@@ -56,6 +56,9 @@ jobs:
       - name: Build managed WinForms TAP assembly
         run: dotnet build src/tap_winforms/LvtWinFormsTap.csproj -c Release
 
+      - name: Viewer LiveTree regression tests
+        run: dotnet run --project tests/viewer_live_tree_tests/ViewerLiveTreeTests.csproj -c Release
+
       - name: Build
         run: cmake --build build
 

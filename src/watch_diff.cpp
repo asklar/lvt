@@ -87,45 +87,51 @@ struct GlobalReconciliation {
     std::unordered_map<const Element*, const Element*> currToPrev;
     std::unordered_map<const Element*, std::string> prevPaths;
     std::unordered_map<const Element*, std::string> currPaths;
+    std::unordered_map<const Element*, const Element*> prevParents;
+    std::unordered_map<const Element*, const Element*> currParents;
     std::unordered_set<const Element*> processedCurr;
 };
 
 void collect_prev_candidates(
-    const Element& el, const std::string& path,
+    const Element& el, const Element* parent, const std::string& path,
     std::map<ProcessWideProviderIdentity, GlobalCandidate<const Element*>>& candidates,
-    std::unordered_map<const Element*, std::string>& paths) {
-    paths.emplace(&el, path);
+    GlobalReconciliation& result) {
+    result.prevParents.emplace(&el, parent);
+    result.prevPaths.emplace(&el, path);
     if (has_process_wide_provider_identity(el)) {
         auto& candidate = candidates[{el.framework, el.providerHandle}];
         candidate.element = &el;
         candidate.count++;
     }
     for (size_t i = 0; i < el.children.size(); ++i)
-        collect_prev_candidates(el.children[i], path + "." + std::to_string(i),
-                                candidates, paths);
+        collect_prev_candidates(el.children[i], &el,
+                                path + "." + std::to_string(i),
+                                candidates, result);
 }
 
 void collect_curr_candidates(
-    Element& el, const std::string& path,
+    Element& el, Element* parent, const std::string& path,
     std::map<ProcessWideProviderIdentity, GlobalCandidate<Element*>>& candidates,
-    std::unordered_map<const Element*, std::string>& paths) {
-    paths.emplace(&el, path);
+    GlobalReconciliation& result) {
+    result.currParents.emplace(&el, parent);
+    result.currPaths.emplace(&el, path);
     if (has_process_wide_provider_identity(el)) {
         auto& candidate = candidates[{el.framework, el.providerHandle}];
         candidate.element = &el;
         candidate.count++;
     }
     for (size_t i = 0; i < el.children.size(); ++i)
-        collect_curr_candidates(el.children[i], path + "." + std::to_string(i),
-                                candidates, paths);
+        collect_curr_candidates(el.children[i], &el,
+                                path + "." + std::to_string(i),
+                                candidates, result);
 }
 
 GlobalReconciliation build_global_reconciliation(Element& before, Element& after) {
     std::map<ProcessWideProviderIdentity, GlobalCandidate<const Element*>> prevCandidates;
     std::map<ProcessWideProviderIdentity, GlobalCandidate<Element*>> currCandidates;
     GlobalReconciliation result;
-    collect_prev_candidates(before, "0", prevCandidates, result.prevPaths);
-    collect_curr_candidates(after, "0", currCandidates, result.currPaths);
+    collect_prev_candidates(before, nullptr, "0", prevCandidates, result);
+    collect_curr_candidates(after, nullptr, "0", currCandidates, result);
 
     for (const auto& [identity, prevCandidate] : prevCandidates) {
         auto currIt = currCandidates.find(identity);
@@ -435,6 +441,7 @@ namespace {
 
 void reconcile_and_collect(const Element& prev, Element& curr,
                            const std::string& prevPath, const std::string& currPath,
+                           bool parentChanged,
                            GlobalReconciliation& global,
                            std::vector<ChangeEvent>& events);
 
@@ -449,6 +456,7 @@ void collect_added_events(Element& node, const std::string& path,
         if (global.processedCurr.insert(&node).second) {
             reconcile_and_collect(*globalIt->second, node,
                                   global.prevPaths.at(globalIt->second), path,
+                                  /*parentChanged=*/true,
                                   global, events);
         }
         return;
@@ -495,12 +503,21 @@ void collect_removed_events(const Element& node, const std::string& path,
 // survive an ancestor's own position among its siblings shifting.
 void reconcile_and_collect(const Element& prev, Element& curr,
                            const std::string& prevPath, const std::string& currPath,
+                           bool parentChanged,
                            GlobalReconciliation& global,
                            std::vector<ChangeEvent>& events) {
     global.processedCurr.insert(&curr);
     curr.key = prev.key;
 
     auto fields = diff_element_fields(prev, prevPath, curr, currPath);
+    if (parentChanged) {
+        const auto* prevParent = global.prevParents.at(&prev);
+        const auto* currParent = global.currParents.at(&curr);
+        fields["parentKey"] = {
+            prevParent == nullptr ? std::string() : prevParent->key,
+            currParent == nullptr ? std::string() : currParent->key,
+        };
+    }
     if (!fields.empty()) {
         ChangeEvent event;
         event.type = ChangeEvent::Type::Changed;
@@ -519,13 +536,15 @@ void reconcile_and_collect(const Element& prev, Element& curr,
     for (auto& [pi, ci] : matched)
         reconcile_and_collect(prev.children[pi], curr.children[ci],
                               prevPath + "." + std::to_string(pi),
-                              currPath + "." + std::to_string(ci), global, events);
+                              currPath + "." + std::to_string(ci),
+                              /*parentChanged=*/false, global, events);
     for (auto& [movedPrev, movedCurr] : movedIn) {
         if (!global.processedCurr.insert(movedCurr).second)
             continue;
         reconcile_and_collect(*movedPrev, *movedCurr,
                               global.prevPaths.at(movedPrev),
-                              global.currPaths.at(movedCurr), global, events);
+                              global.currPaths.at(movedCurr),
+                              /*parentChanged=*/true, global, events);
     }
     for (auto ci : added)
         collect_added_events(curr.children[ci], currPath + "." + std::to_string(ci),
@@ -553,7 +572,8 @@ std::vector<ChangeEvent> diff_trees(Element& before, Element& after) {
     global.processedCurr.insert(&after);
 
     std::vector<ChangeEvent> events;
-    reconcile_and_collect(before, after, "0", "0", global, events);
+    reconcile_and_collect(before, after, "0", "0",
+                          /*parentChanged=*/false, global, events);
     return events;
 }
 

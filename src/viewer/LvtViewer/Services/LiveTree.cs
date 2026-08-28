@@ -110,17 +110,22 @@ public sealed class LiveTree
         if (!_byKey.TryGetValue(evt.Key, out var node) || evt.Fields == null)
             return;
 
+        var relocate = false;
+        var newPath = node.Path;
         foreach (var (fieldName, change) in evt.Fields)
         {
             if (fieldName == "path")
             {
-                // A reorder/reparent: move exactly this one node from
-                // wherever it currently sits to wherever it belongs now —
-                // never a reason to touch any other node.
-                Logger.Log("tree", $"changed key={evt.Key} path {node.Path} -> {change.New}");
-                DetachFromParent(node);
-                node.Path = change.New;
-                AttachToParent(node);
+                relocate = true;
+                newPath = change.New;
+            }
+            else if (fieldName == "parentKey")
+            {
+                // A process-wide provider object can move between two parent
+                // objects that occupy the same path. Presence of parentKey is
+                // therefore an explicit relocation signal even when the path
+                // text itself did not change.
+                relocate = true;
             }
             else if (fieldName == "bounds")
             {
@@ -134,6 +139,18 @@ public sealed class LiveTree
             {
                 node.SetScalarField(fieldName, change.New);
             }
+        }
+
+        if (relocate)
+        {
+            // Move exactly this one node from wherever it currently sits to
+            // wherever the patch's path now resolves. The new parent may have
+            // replaced the old parent at that identical path earlier in this
+            // same patch.
+            Logger.Log("tree", $"relocate key={evt.Key} path {node.Path} -> {newPath}");
+            DetachFromParent(node);
+            node.Path = newPath;
+            AttachToParent(node);
         }
     }
 
@@ -210,7 +227,12 @@ public sealed class LiveTree
     {
         if (_attachedKeys.Remove(node.Key))
         {
-            _byPath.Remove(node.Path);
+            // A newly-added replacement can already own this same absolute
+            // path. Removing the obsolete node must not erase the replacement
+            // mapping that later children use to attach.
+            if (_byPath.TryGetValue(node.Path, out var mapped) &&
+                ReferenceEquals(mapped, node))
+                _byPath.Remove(node.Path);
             if (node.Parent != null)
             {
                 node.Parent.Children.Remove(node);
