@@ -178,6 +178,15 @@ TEST(JsonSerializer, ChildElements) {
     EXPECT_EQ(child["text"], "OK");
 }
 
+TEST(JsonSerializer, NativeHandleIsPreservedAsHex) {
+    auto root = make_test_tree();
+    root.nativeHandle = 0x1234ABCD;
+    auto result = serialize_to_json(root, (HWND)0x1234, 42, "test.exe", {"win32"});
+    auto j = json::parse(result);
+
+    EXPECT_EQ(j["root"]["nativeHandle"], "0x1234ABCD");
+}
+
 TEST(JsonSerializer, ControlCharsSanitized) {
     Element root;
     root.type = "Win\x01" "dow";  // embedded control char
@@ -527,6 +536,29 @@ TEST(ElementKeys, ProcessWideProviderIdentityIsExplicitOptIn) {
     EXPECT_FALSE(has_process_wide_provider_identity(xaml));
 }
 
+TEST(ElementKeys, ManagedFrameworkHandlesUseCompactSessionKeys) {
+    Element root = key_el("Window");
+
+    Element wpfButton;
+    wpfButton.type = "Button";
+    wpfButton.className = "System.Windows.Controls.Button";
+    wpfButton.framework = "wpf";
+    wpfButton.providerHandle = 0x1234;
+
+    Element winFormsButton;
+    winFormsButton.type = "Button";
+    winFormsButton.className = "System.Windows.Forms.Button";
+    winFormsButton.framework = "winforms";
+    winFormsButton.providerHandle = 0x5678;
+
+    root.children.push_back(std::move(wpfButton));
+    root.children.push_back(std::move(winFormsButton));
+    assign_element_keys(root);
+
+    EXPECT_EQ(root.children[0].key, "wpf:0x1234");
+    EXPECT_EQ(root.children[1].key, "winforms:0x5678");
+}
+
 TEST(ElementKeys, ParsesOnlyCompactXamlInstanceKeys) {
     CompactXamlKey key;
     std::string error;
@@ -646,6 +678,26 @@ TEST(WinFormsEnrichment, InvalidJsonDoesNotModifyTree) {
     EXPECT_EQ(root.type, "Window");
 }
 
+TEST(WinFormsEnrichment, PreservesManagedIdentityForControlsWithoutHwnd) {
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+    root.nativeHandle = 0x100;
+
+    ASSERT_TRUE(apply_winforms_control_json(
+        root,
+        R"([{"hwnd":"100","managedHandle":1,"type":"System.Windows.Forms.Form","children":[)"
+        R"({"managedHandle":2,"type":"System.Windows.Forms.Control","name":"windowless"})"
+        R"(]}])"));
+
+    ASSERT_EQ(root.children.size(), 1u);
+    const auto& child = root.children[0];
+    EXPECT_EQ(child.framework, "winforms");
+    EXPECT_EQ(child.nativeHandle, 2u);
+    EXPECT_EQ(child.properties.at("managedHandle"), "0x2");
+    EXPECT_EQ(child.properties.at("handleKind"), "managed");
+}
+
 TEST(WpfTreeJson, ZeroSizeIsMarkedRatherThanSilentlyOmitted) {
     // Before the fix, w<=0 || h<=0 meant no width/height/offset/zeroSize at
     // all: indistinguishable from PresentationSource throwing or the element
@@ -658,6 +710,16 @@ TEST(WpfTreeJson, ZeroSizeIsMarkedRatherThanSilentlyOmitted) {
     EXPECT_EQ((*roots)[0].properties["zeroSize"], "true");
     EXPECT_EQ((*roots)[0].bounds.width, 0);
     EXPECT_EQ((*roots)[0].bounds.height, 0);
+}
+
+TEST(WpfTreeJson, PreservesManagedIdentity) {
+    auto roots = lvt::wpf_parse_tree_json(
+        R"([{"managedHandle":42,"type":"System.Windows.Controls.Button"}])", "wpf");
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].nativeHandle, 42u);
+    EXPECT_EQ((*roots)[0].properties.at("managedHandle"), "0x2A");
+    EXPECT_EQ((*roots)[0].properties.at("handleKind"), "managed");
 }
 
 TEST(WpfTreeJson, NonZeroBoundsAreGraftedNormally) {

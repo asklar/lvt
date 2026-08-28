@@ -241,14 +241,24 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         case Framework::Wpf: {
 #if LVT_ENABLE_WPF
             WpfProvider wpf;
-            wpf.enrich(root, hwnd, pid);
+            auto connection = connectionLookup ? connectionLookup("wpf") : nullptr;
+            if (connection && connection->is_alive()) {
+                wpf.enrich_with_connection(root, *connection);
+            } else if (!connectionLookup) {
+                wpf.enrich(root, hwnd, pid);
+            }
 #endif
             break;
         }
         case Framework::WinForms: {
 #if LVT_ENABLE_WINFORMS
             WinFormsProvider winforms;
-            winforms.enrich(root, hwnd, pid);
+            auto connection = connectionLookup ? connectionLookup("winforms") : nullptr;
+            if (connection && connection->is_alive()) {
+                winforms.enrich_with_connection(root, *connection);
+            } else if (!connectionLookup) {
+                winforms.enrich(root, hwnd, pid);
+            }
 #endif
             break;
         }

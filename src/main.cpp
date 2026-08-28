@@ -19,6 +19,12 @@
 #if LVT_ENABLE_WINUI3
 #include "providers/winui3_provider.h"
 #endif
+#if LVT_ENABLE_WPF
+#include "providers/wpf_provider.h"
+#endif
+#if LVT_ENABLE_WINFORMS
+#include "providers/winforms_provider.h"
+#endif
 
 #include "element_key.h"
 #include <cstdio>
@@ -658,9 +664,7 @@ static void collect_frameworks_present(const lvt::Element& el, std::set<std::str
         collect_frameworks_present(child, out);
 }
 
-// True if `previous` had real content in an *injected* framework (xaml or
-// winui3 — the ones that require InitializeXamlDiagnosticsEx and can fail;
-// win32/comctl never inject and are not what this guards against) that
+// True if `previous` had real content in an injected framework that
 // `current` has none of at all. The target window itself being confirmed
 // still open (see run_watch_loop's IsWindow check, which always runs
 // before this) makes "the whole XAML tree just vanished" a symptom, not
@@ -676,15 +680,16 @@ static bool lost_injected_framework_content(const lvt::Element& previous, const 
     collect_frameworks_present(previous, prevFrameworks);
     collect_frameworks_present(current, currFrameworks);
     for (const auto& fw : prevFrameworks) {
-        if ((fw == "xaml" || fw == "winui3") && !currFrameworks.count(fw))
+        if ((fw == "xaml" || fw == "winui3" || fw == "wpf" || fw == "winforms") &&
+            !currFrameworks.count(fw))
             return true;
     }
     return false;
 }
 
 // Acquires the persistent connections a watch session can reuse across ticks.
-// For visual-tree sessions that means one connection per injectable framework
-// (xaml/winui3); for --uia it means one reusable UI Automation client. Held
+// For visual-tree sessions that means one connection per injectable framework;
+// for --uia it means one reusable UI Automation client. Held
 // for the whole watch session; released automatically when run_watch_loop
 // returns.
 //
@@ -712,12 +717,14 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
 #endif
 
     auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
-    bool hasXaml = false, hasWinUI3 = false;
+    bool hasXaml = false, hasWinUI3 = false, hasWpf = false, hasWinForms = false;
     for (auto& fi : frameworks) {
         if (fi.type == lvt::Framework::Xaml) hasXaml = true;
         if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
+        if (fi.type == lvt::Framework::Wpf) hasWpf = true;
+        if (fi.type == lvt::Framework::WinForms) hasWinForms = true;
     }
-    if (!hasXaml && !hasWinUI3)
+    if (!hasXaml && !hasWinUI3 && !hasWpf && !hasWinForms)
         return connections;
 
     // XamlProvider::open_connection only needs the CoreWindow HWND from the
@@ -730,7 +737,9 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
     // against Microsoft Store. An empty framework list still builds the
     // untrimmed Win32 base tree (build_tree always starts with Win32), which
     // contains the CoreWindow and is all this probe actually needs.
-    lvt::Element probeTree = lvt::build_tree(target.hwnd, target.pid, {});
+    lvt::Element probeTree;
+    if (hasXaml)
+        probeTree = lvt::build_tree(target.hwnd, target.pid, {});
 
 #if LVT_ENABLE_XAML
     if (hasXaml) {
@@ -767,6 +776,28 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
             });
         // See the matching comment in the Xaml case above.
         connections.emplace_back("winui3", std::move(handle));
+    }
+#endif
+#if LVT_ENABLE_WPF
+    if (hasWpf) {
+        auto handle = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, "wpf",
+            [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                lvt::WpfProvider wpf;
+                return wpf.open_connection(hwnd, pid);
+            });
+        connections.emplace_back("wpf", std::move(handle));
+    }
+#endif
+#if LVT_ENABLE_WINFORMS
+    if (hasWinForms) {
+        auto handle = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, "winforms",
+            [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                lvt::WinFormsProvider winforms;
+                return winforms.open_connection(hwnd, pid);
+            });
+        connections.emplace_back("winforms", std::move(handle));
     }
 #endif
     return connections;
@@ -964,7 +995,7 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
         if (lost_injected_framework_content(previous, current)) {
             for (int extra = 0; extra < 2 && lost_injected_framework_content(previous, current); extra++) {
                 if (lvt::g_debug)
-                    fprintf(stderr, "lvt: XAML/WinUI3 content vanished this tick; retrying (attempt %d)\n", extra + 1);
+                    fprintf(stderr, "lvt: injected framework content vanished this tick; retrying (attempt %d)\n", extra + 1);
                 Sleep(1000);
                 lvt::Element retryTree;
                 if (build_output_tree(target, args, retryTree, lookup))

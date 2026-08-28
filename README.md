@@ -497,7 +497,8 @@ Framework providers:
 - **ComCtlProvider** — enriches ComCtl32 controls (ListView items, TreeView nodes, etc.)
 - **XamlProvider** — injects TAP DLL to walk Windows XAML visual trees
 - **WinUI3Provider** — injects TAP DLL to walk WinUI 3 visual trees
-- **WpfProvider** — walks WPF visual trees via managed DLL injection
+- **WpfProvider** — persistent managed connection; walks WPF visual/logical trees on the Application dispatcher
+- **WinFormsProvider** — persistent managed connection; enriches HWND controls and identifies handle-less controls without forcing handle creation
 - **Plugins** — extensible framework support (e.g. [Avalonia](avalonia-plugin.md)) via C ABI plugin interface
 
 See [docs/architecture.md](docs/architecture.md) for details.

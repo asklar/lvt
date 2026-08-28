@@ -93,16 +93,15 @@ bool has_process_wide_provider_identity(const Element& el) {
            (el.framework == "xaml" || el.framework == "winui3");
 }
 
-// XAML diagnostics InstanceHandles are already process-wide object
-// identities. Unlike a sibling index/name path, they do not change when an
-// element is reparented and do not need every ancestor repeated in every
-// descendant's key. They have also been observed stable across independent
-// diagnostics connections to the same live target, which the WinUI
-// integration test guards by dumping twice and querying in a third process.
-// Keep the structural algorithm as the fallback for providers/elements that
-// do not expose such an identity.
+// Framework-native handles are already object identities. XAML/WinUI handles
+// are runtime InstanceHandles; WPF/WinForms handles come from their persistent
+// managed object registries. Only XAML/WinUI opt into process-wide reparent
+// reconciliation; managed handles are session-scoped. HWNDs remain separately
+// available as nativeHandle.
 static std::string compact_instance_key(const Element& el) {
-    if (!has_process_wide_provider_identity(el))
+    if (el.providerHandle == 0 ||
+        (el.framework != "xaml" && el.framework != "winui3" &&
+         el.framework != "wpf" && el.framework != "winforms"))
         return {};
 
     std::ostringstream out;

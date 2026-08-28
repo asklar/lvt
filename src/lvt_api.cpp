@@ -24,6 +24,12 @@
 #if LVT_ENABLE_WINUI3
 #include "providers/winui3_provider.h"
 #endif
+#if LVT_ENABLE_WPF
+#include "providers/wpf_provider.h"
+#endif
+#if LVT_ENABLE_WINFORMS
+#include "providers/winforms_provider.h"
+#endif
 
 #include <wil/resource.h>
 #include <wil/result.h>
@@ -189,17 +195,19 @@ std::map<std::string, std::vector<std::pair<std::string, lvt::ConnectionHandle>>
 
 // Builds a ConnectionLookup for build_tree, lazily acquiring (once per
 // session, on whichever call first needs it) a persistent connection for
-// each xaml/winui3 framework this session's target actually has. Returns an
-// empty (falsy) ConnectionLookup when the target has neither, so build_tree
+// each injectable framework this session's target actually has. Returns an
+// empty (falsy) ConnectionLookup when the target has none, so build_tree
 // falls back to its normal one-shot-per-call path with no behavior change.
 lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
                                                     const std::vector<lvt::FrameworkInfo>& frameworks) {
-    bool hasXaml = false, hasWinUI3 = false;
+    bool hasXaml = false, hasWinUI3 = false, hasWpf = false, hasWinForms = false;
     for (auto& fi : frameworks) {
         if (fi.type == lvt::Framework::Xaml) hasXaml = true;
         if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
+        if (fi.type == lvt::Framework::Wpf) hasWpf = true;
+        if (fi.type == lvt::Framework::WinForms) hasWinForms = true;
     }
-    if (!hasXaml && !hasWinUI3)
+    if (!hasXaml && !hasWinUI3 && !hasWpf && !hasWinForms)
         return {};
 
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
@@ -233,7 +241,9 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 
     const bool needXaml = hasXaml && !has_label("xaml");
     const bool needWinUI3 = hasWinUI3 && !has_label("winui3");
-    if (needXaml || needWinUI3) {
+    const bool needWpf = hasWpf && !has_label("wpf");
+    const bool needWinForms = hasWinForms && !has_label("winforms");
+    if (needXaml || needWinUI3 || needWpf || needWinForms) {
         // A full, untrimmed probe tree, needed only to resolve which
         // process/DLL a connection should target (XamlProvider needs to
         // locate the CoreWindow) - discarded once that resolution is done. A
@@ -246,7 +256,9 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         // for XAML injection. Do not run the detected framework providers
         // here: that would perform a complete one-shot XAML collection
         // immediately before opening the persistent connection.
-        lvt::Element probeTree = lvt::build_tree(session.hwnd, session.pid, {});
+        lvt::Element probeTree;
+        if (needXaml)
+            probeTree = lvt::build_tree(session.hwnd, session.pid, {});
 #if LVT_ENABLE_XAML
         if (needXaml) {
             auto handle = lvt::ConnectionRegistry::instance().acquire(
@@ -269,6 +281,30 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
                 });
             if (handle)
                 entry.emplace_back("winui3", std::move(handle));
+        }
+#endif
+#if LVT_ENABLE_WPF
+        if (needWpf) {
+            auto handle = lvt::ConnectionRegistry::instance().acquire(
+                session.pid, session.hwnd, "wpf",
+                [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                    lvt::WpfProvider wpf;
+                    return wpf.open_connection(hwnd, pid);
+                });
+            if (handle)
+                entry.emplace_back("wpf", std::move(handle));
+        }
+#endif
+#if LVT_ENABLE_WINFORMS
+        if (needWinForms) {
+            auto handle = lvt::ConnectionRegistry::instance().acquire(
+                session.pid, session.hwnd, "winforms",
+                [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                    lvt::WinFormsProvider winforms;
+                    return winforms.open_connection(hwnd, pid);
+                });
+            if (handle)
+                entry.emplace_back("winforms", std::move(handle));
         }
 #endif
     }
@@ -502,7 +538,8 @@ ParsedRef parse_ref(const std::string& ref) {
     // not.
     if (ref.rfind("uia|", 0) == 0)
         return {RefTree::uia, ref};
-    if (ref.rfind("xaml:0x", 0) == 0 || ref.rfind("winui3:0x", 0) == 0)
+    if (ref.rfind("xaml:0x", 0) == 0 || ref.rfind("winui3:0x", 0) == 0 ||
+        ref.rfind("wpf:0x", 0) == 0 || ref.rfind("winforms:0x", 0) == 0)
         return {RefTree::visual, ref};
     if (ref.find('|') != std::string::npos)
         return {RefTree::visual, ref};

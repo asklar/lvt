@@ -51,10 +51,12 @@ flowchart BT
     ComCtl["ComCtlProvider\n<small>(enrich controls)</small>"]
     XAML["XamlProvider\n<small>(inject TAP DLL)</small>"]
     WinUI3["WinUI3Provider\n<small>(inject TAP DLL)</small>"]
+    WPF["WpfProvider\n<small>(persistent managed TAP)</small>"]
+    WinForms["WinFormsProvider\n<small>(persistent managed TAP)</small>"]
     Tree["Unified Element Tree"]
 
-    Win32 --> ComCtl & XAML & WinUI3
-    ComCtl & XAML & WinUI3 --> Tree
+    Win32 --> ComCtl & XAML & WinUI3 & WPF & WinForms
+    ComCtl & XAML & WinUI3 & WPF & WinForms --> Tree
 ```
 
 1. **Win32Provider** builds the base tree by recursively enumerating child windows (`EnumChildWindows`). Each HWND becomes an `Element` with class name, text, bounds, styles.
@@ -63,11 +65,13 @@ flowchart BT
 
 3. **XamlProvider / WinUI3Provider** inject the TAP DLL into the target process, receive the XAML visual tree as JSON over a persistent named pipe, and graft XAML subtrees into matching `DesktopChildSiteBridge` elements in the Win32 tree.
 
+4. **WpfProvider / WinFormsProvider** inject architecture-matched native CLR hosts once per session. The managed tree walker connects one duplex pipe, sends `READY`, and serves correlated `GET_TREE` commands until `DISCONNECT` or target/pipe failure. WPF walks on `Application.Dispatcher`; WinForms uses `Control.BeginInvoke`. Managed object IDs are weakly assigned and the per-connection reverse map is rebuilt on every snapshot, so refreshes preserve identity without retaining dead controls. See [Managed TAP connections](managed-tap-connections.md).
+
 ### Reusable connections (`providers/framework_connection.h`, `connection_registry.h`)
 
 Injecting the TAP DLL and calling `AdviseVisualTreeChange` is meant to happen **once** per debugging session, not on every tree refresh — see `docs/tap-dll-design.md`'s connection lifecycle section. `IFrameworkConnection` is the generic interface a provider can implement to expose that as "connect once, `get_tree()` many times"; `ConnectionRegistry` is a per-process, refcounted registry (keyed by `pid` + framework label) that lets a long-running consumer — `watch`'s tick loop, an MCP session — acquire one via a move-only `ConnectionHandle` and reuse it for its own lifetime, instead of each tree refresh re-injecting from scratch. `tree_builder.h`'s `build_tree` takes an optional `ConnectionLookup` callback for this; a caller that doesn't supply one (a one-shot `dump`/`query`/`screenshot`) sees no behavior change — providers fall back to their original one-shot `enrich()`.
 
-Only XamlProvider and WinUI3Provider implement this today (they are the only frameworks with a real `AdviseVisualTreeChange`-equivalent API); other providers/plugins can adopt the same interface later without changing how callers acquire or use it.
+XamlProvider, WinUI3Provider, WpfProvider and WinFormsProvider implement this today. One-shot WPF/WinForms operations use the same path as long-running sessions — open connection, `GET_TREE`, `DISCONNECT` — so injection and teardown have one implementation. Plugins can adopt the interface without changing how callers acquire or use them.
 
 ### Element ID assignment
 
@@ -75,6 +79,8 @@ After the full tree is built, `assign_element_ids()` walks the tree in depth-fir
 - Stable within a single invocation
 - Deterministic (same tree structure → same IDs)
 - Used by `--element` for subtree scoping and by screenshot annotations
+
+Durable `key` identity is separate. XAML/WinUI instance handles and managed WPF/WinForms handles use compact framework-qualified keys (`wpf:0x…`, `winforms:0x…`, and so on), remaining stable across refreshes on the same live target.
 
 ### Bridge-to-XAML matching
 

@@ -15,6 +15,18 @@
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
+#include "element_key.h"
+#include "lvt_config.h"
+#if LVT_ENABLE_WPF || LVT_ENABLE_WINFORMS
+#include "providers/managed_connection.h"
+#endif
+#if LVT_ENABLE_WINFORMS
+#include "providers/winforms_provider.h"
+#endif
+#if LVT_ENABLE_WPF
+#include "providers/wpf_provider.h"
+#endif
+#include "tree_builder.h"
 
 #include "apps/NativeControlsFixture/native_controls_fixture_ids.h"
 
@@ -608,6 +620,7 @@ static std::string query_prop_until(const std::string& lvt, const std::string& p
 struct VisibleWindowSearch {
     DWORD pid;
     bool found;
+    HWND hwnd;
 };
 
 static BOOL CALLBACK find_visible_window_for_pid(HWND hwnd, LPARAM lParam) {
@@ -616,16 +629,37 @@ static BOOL CALLBACK find_visible_window_for_pid(HWND hwnd, LPARAM lParam) {
     GetWindowThreadProcessId(hwnd, &windowPid);
     if (windowPid == search->pid && IsWindowVisible(hwnd)) {
         search->found = true;
+        search->hwnd = hwnd;
         return FALSE;
     }
     return TRUE;
 }
 
 static bool has_visible_window_for_pid(DWORD pid) {
-    VisibleWindowSearch search{pid, false};
+    VisibleWindowSearch search{pid, false, nullptr};
     EnumWindows(find_visible_window_for_pid, reinterpret_cast<LPARAM>(&search));
     return search.found;
 }
+
+static HWND visible_window_for_pid(DWORD pid) {
+    VisibleWindowSearch search{pid, false, nullptr};
+    EnumWindows(find_visible_window_for_pid, reinterpret_cast<LPARAM>(&search));
+    return search.hwnd;
+}
+
+#if LVT_ENABLE_WPF || LVT_ENABLE_WINFORMS
+static const lvt::Element* find_named_element(
+    const lvt::Element& element, const std::string& name) {
+    auto found = element.properties.find("name");
+    if (found != element.properties.end() && found->second == name)
+        return &element;
+    for (const auto& child : element.children) {
+        if (const auto* match = find_named_element(child, name))
+            return match;
+    }
+    return nullptr;
+}
+#endif
 
 static bool deploy_plugins(const fs::path& source, const fs::path& dest, std::string& error) {
     std::error_code ec;
@@ -977,6 +1011,69 @@ TEST_F(WinFormsSampleFixture, DurableKeyContract) {
     EXPECT_EQ(queriedType, "System.Windows.Forms.Button");
 }
 
+#if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED
+TEST_F(WinFormsSampleFixture, PersistentConnectionReusesServerAndStableIdentity) {
+    SkipIfNotReady();
+    HWND hwnd = visible_window_for_pid(s_pid);
+    ASSERT_NE(hwnd, nullptr);
+
+    lvt::WinFormsProvider provider;
+    auto connection = provider.open_connection(hwnd, s_pid);
+    ASSERT_NE(connection, nullptr);
+    auto capabilities = lvt::managed_connection_capabilities(*connection);
+    ASSERT_TRUE(capabilities.has_value());
+    EXPECT_NE(std::find(capabilities->commands.begin(), capabilities->commands.end(), "GET_TREE"),
+              capabilities->commands.end());
+    EXPECT_NE(std::find(capabilities->commands.begin(), capabilities->commands.end(), "DISCONNECT"),
+              capabilities->commands.end());
+
+    auto started = std::chrono::steady_clock::now();
+    auto first = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(connection->get_tree(first, false));
+    lvt::assign_element_ids(first);
+    lvt::assign_element_keys(first);
+    auto second = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(connection->get_tree(second, false));
+    lvt::assign_element_ids(second);
+    lvt::assign_element_keys(second);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(20));
+
+    const auto* firstButton = find_named_element(first, "okButton");
+    const auto* secondButton = find_named_element(second, "okButton");
+    ASSERT_NE(firstButton, nullptr);
+    ASSERT_NE(secondButton, nullptr);
+    EXPECT_NE(firstButton->nativeHandle, 0u);
+    EXPECT_EQ(firstButton->nativeHandle, secondButton->nativeHandle);
+    EXPECT_EQ(firstButton->key, secondButton->key);
+
+    auto afterReads = lvt::managed_connection_capabilities(*connection);
+    ASSERT_TRUE(afterReads.has_value());
+    EXPECT_EQ(afterReads->connectionId, capabilities->connectionId);
+    EXPECT_EQ(afterReads->serverStartCount, capabilities->serverStartCount);
+
+    const auto assemblyInstance = capabilities->assemblyInstanceId;
+    const auto previousStartCount = capabilities->serverStartCount;
+    connection.reset();
+
+    auto reconnected = provider.open_connection(hwnd, s_pid);
+    ASSERT_NE(reconnected, nullptr);
+    auto reconnectedCapabilities = lvt::managed_connection_capabilities(*reconnected);
+    ASSERT_TRUE(reconnectedCapabilities.has_value());
+    EXPECT_NE(reconnectedCapabilities->connectionId, capabilities->connectionId);
+    EXPECT_EQ(reconnectedCapabilities->assemblyInstanceId, assemblyInstance);
+    EXPECT_EQ(reconnectedCapabilities->serverStartCount, previousStartCount + 1);
+
+    auto refreshed = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(reconnected->get_tree(refreshed, false));
+    lvt::assign_element_ids(refreshed);
+    lvt::assign_element_keys(refreshed);
+    const auto* refreshedButton = find_named_element(refreshed, "okButton");
+    ASSERT_NE(refreshedButton, nullptr);
+    EXPECT_EQ(refreshedButton->nativeHandle, firstButton->nativeHandle);
+    EXPECT_EQ(refreshedButton->key, firstButton->key);
+}
+#endif
+
 class WpfSampleFixture : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
@@ -1170,6 +1267,135 @@ TEST_F(WpfSampleFixture, DurableKeyContract) {
     EXPECT_EQ(queried.value("framework", ""), "wpf");
     EXPECT_EQ(queried.value("name", ""), "OkButton");
 }
+
+#if LVT_ENABLE_WPF && LVT_WITH_MANAGED
+TEST_F(WpfSampleFixture, PersistentConnectionReusesServerAndStableIdentity) {
+    SkipIfNotReady();
+    HWND hwnd = visible_window_for_pid(s_pid);
+    ASSERT_NE(hwnd, nullptr);
+
+    lvt::WpfProvider provider;
+    auto connection = provider.open_connection(hwnd, s_pid);
+    ASSERT_NE(connection, nullptr);
+    auto capabilities = lvt::managed_connection_capabilities(*connection);
+    ASSERT_TRUE(capabilities.has_value());
+
+    auto started = std::chrono::steady_clock::now();
+    auto first = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(connection->get_tree(first, false));
+    lvt::assign_element_ids(first);
+    lvt::assign_element_keys(first);
+    auto second = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(connection->get_tree(second, false));
+    lvt::assign_element_ids(second);
+    lvt::assign_element_keys(second);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(20));
+
+    const auto* firstButton = find_named_element(first, "OkButton");
+    const auto* secondButton = find_named_element(second, "OkButton");
+    ASSERT_NE(firstButton, nullptr);
+    ASSERT_NE(secondButton, nullptr);
+    EXPECT_NE(firstButton->nativeHandle, 0u);
+    EXPECT_EQ(firstButton->nativeHandle, secondButton->nativeHandle);
+    EXPECT_EQ(firstButton->key, secondButton->key);
+
+    auto afterReads = lvt::managed_connection_capabilities(*connection);
+    ASSERT_TRUE(afterReads.has_value());
+    EXPECT_EQ(afterReads->connectionId, capabilities->connectionId);
+    EXPECT_EQ(afterReads->serverStartCount, capabilities->serverStartCount);
+
+    const auto assemblyInstance = capabilities->assemblyInstanceId;
+    const auto previousStartCount = capabilities->serverStartCount;
+    connection.reset();
+
+    auto reconnected = provider.open_connection(hwnd, s_pid);
+    ASSERT_NE(reconnected, nullptr);
+    auto reconnectedCapabilities = lvt::managed_connection_capabilities(*reconnected);
+    ASSERT_TRUE(reconnectedCapabilities.has_value());
+    EXPECT_NE(reconnectedCapabilities->connectionId, capabilities->connectionId);
+    EXPECT_EQ(reconnectedCapabilities->assemblyInstanceId, assemblyInstance);
+    EXPECT_EQ(reconnectedCapabilities->serverStartCount, previousStartCount + 1);
+
+    auto refreshed = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(reconnected->get_tree(refreshed, false));
+    lvt::assign_element_ids(refreshed);
+    lvt::assign_element_keys(refreshed);
+    const auto* refreshedButton = find_named_element(refreshed, "OkButton");
+    ASSERT_NE(refreshedButton, nullptr);
+    EXPECT_EQ(refreshedButton->nativeHandle, firstButton->nativeHandle);
+    EXPECT_EQ(refreshedButton->key, firstButton->key);
+}
+#endif
+
+#if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED
+TEST(ManagedWinFormsConnection, TargetExitBreaksConnectionWithoutBlocking) {
+    STARTUPINFOA startup{sizeof(startup)};
+    PROCESS_INFORMATION processInfo{};
+    std::string command = std::string("\"") + WINFORMS_SAMPLE_EXE_PATH + "\"";
+    const auto workingDirectory = fs::path(WINFORMS_SAMPLE_EXE_PATH).parent_path().string();
+    ASSERT_TRUE(CreateProcessA(
+        nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+        workingDirectory.c_str(), &startup, &processInfo));
+    wil::unique_handle process(processInfo.hProcess);
+    wil::unique_handle thread(processInfo.hThread);
+    WaitForInputIdle(process.get(), 5000);
+
+    HWND hwnd = nullptr;
+    for (int attempt = 0; attempt < 20 && !hwnd; ++attempt) {
+        hwnd = visible_window_for_pid(processInfo.dwProcessId);
+        if (!hwnd)
+            Sleep(100);
+    }
+    ASSERT_NE(hwnd, nullptr);
+
+    lvt::WinFormsProvider provider;
+    auto connection = provider.open_connection(hwnd, processInfo.dwProcessId);
+    ASSERT_NE(connection, nullptr);
+    ASSERT_TRUE(TerminateProcess(process.get(), 0));
+    ASSERT_EQ(WaitForSingleObject(process.get(), 5000), WAIT_OBJECT_0);
+
+    auto started = std::chrono::steady_clock::now();
+    EXPECT_FALSE(connection->is_alive());
+    lvt::Element root;
+    EXPECT_FALSE(connection->get_tree(root, false));
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(2));
+}
+#endif
+
+#if LVT_ENABLE_WPF && LVT_WITH_MANAGED
+TEST(ManagedWpfConnection, TargetExitBreaksConnectionWithoutBlocking) {
+    STARTUPINFOA startup{sizeof(startup)};
+    PROCESS_INFORMATION processInfo{};
+    std::string command = std::string("\"") + WPF_SAMPLE_EXE_PATH + "\"";
+    const auto workingDirectory = fs::path(WPF_SAMPLE_EXE_PATH).parent_path().string();
+    ASSERT_TRUE(CreateProcessA(
+        nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+        workingDirectory.c_str(), &startup, &processInfo));
+    wil::unique_handle process(processInfo.hProcess);
+    wil::unique_handle thread(processInfo.hThread);
+    WaitForInputIdle(process.get(), 5000);
+
+    HWND hwnd = nullptr;
+    for (int attempt = 0; attempt < 20 && !hwnd; ++attempt) {
+        hwnd = visible_window_for_pid(processInfo.dwProcessId);
+        if (!hwnd)
+            Sleep(100);
+    }
+    ASSERT_NE(hwnd, nullptr);
+
+    lvt::WpfProvider provider;
+    auto connection = provider.open_connection(hwnd, processInfo.dwProcessId);
+    ASSERT_NE(connection, nullptr);
+    ASSERT_TRUE(TerminateProcess(process.get(), 0));
+    ASSERT_EQ(WaitForSingleObject(process.get(), 5000), WAIT_OBJECT_0);
+
+    auto started = std::chrono::steady_clock::now();
+    EXPECT_FALSE(connection->is_alive());
+    lvt::Element root;
+    EXPECT_FALSE(connection->get_tree(root, false));
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(2));
+}
+#endif
 
 class WinUI3SampleFixture : public ::testing::Test {
 protected:

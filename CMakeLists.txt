@@ -149,6 +149,9 @@ endif()
 if(LVT_ENABLE_WINUI3)
     list(APPEND LVT_CORE_SOURCES src/providers/winui3_provider.cpp)
 endif()
+if(LVT_ENABLE_WPF OR LVT_ENABLE_WINFORMS)
+    list(APPEND LVT_CORE_SOURCES src/providers/managed_connection.cpp)
+endif()
 if(LVT_ENABLE_WPF)
     list(APPEND LVT_CORE_SOURCES src/providers/wpf_provider.cpp src/providers/wpf_inject.cpp)
 endif()
@@ -588,9 +591,10 @@ if(LVT_ENABLE_WPF)
 add_library(lvt_wpf_tap SHARED
     src/tap_wpf/wpf_tap_native.cpp
     src/tap_wpf/wpf_tap_native.def
+    src/tap_managed/managed_tap_host.cpp
 )
 target_compile_definitions(lvt_wpf_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(lvt_wpf_tap PRIVATE src)
+target_include_directories(lvt_wpf_tap PRIVATE src src/tap_managed)
 target_link_libraries(lvt_wpf_tap PRIVATE WIL::WIL ole32)
 set_property(TARGET lvt_wpf_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
@@ -602,13 +606,26 @@ lvt_add_version_resource(lvt_wpf_tap
     "lvt WPF TAP DLL (injected diagnostics helper)"
     "lvt_wpf_tap" "lvt_wpf_tap_${TAP_ARCH_SUFFIX}.dll" VFT_DLL)
 
-# Build managed WPF tree walker assembly and copy to output
-# Pre-build with: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release
 # The managed DLL is AnyCPU so the same binary works for all architectures.
 if(LVT_BUILD_MANAGED)
+set(LVT_WPF_MANAGED_DLL "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/Release/LvtWpfTap.dll")
+add_custom_command(
+    OUTPUT "${LVT_WPF_MANAGED_DLL}"
+    COMMAND dotnet build "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.csproj" -c Release --nologo
+    DEPENDS
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.csproj"
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/WpfTreeWalker.cs"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building managed WPF tree walker assembly"
+    VERBATIM
+)
+add_custom_target(lvt_wpf_managed ALL
+    DEPENDS "${LVT_WPF_MANAGED_DLL}"
+)
+add_dependencies(lvt_wpf_tap lvt_wpf_managed)
 add_custom_command(TARGET lvt_wpf_tap POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/Release/LvtWpfTap.dll"
+        "${LVT_WPF_MANAGED_DLL}"
         "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.dll"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.runtimeconfig.json"
@@ -623,9 +640,10 @@ if(LVT_ENABLE_WINFORMS)
 add_library(lvt_winforms_tap SHARED
     src/tap_winforms/winforms_tap_native.cpp
     src/tap_winforms/winforms_tap_native.def
+    src/tap_managed/managed_tap_host.cpp
 )
 target_compile_definitions(lvt_winforms_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(lvt_winforms_tap PRIVATE src)
+target_include_directories(lvt_winforms_tap PRIVATE src src/tap_managed)
 target_link_libraries(lvt_winforms_tap PRIVATE WIL::WIL ole32)
 set_property(TARGET lvt_winforms_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
@@ -965,6 +983,7 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
 )
 target_link_libraries(lvt_integration_tests PRIVATE
+    lvt_core
     GTest::gtest GTest::gtest_main
     WIL::WIL nlohmann_json::nlohmann_json
     comctl32
@@ -977,6 +996,9 @@ set(LVT_INTEGRATION_DEPS
 )
 if(LVT_BUILD_TOOL)
     list(APPEND LVT_INTEGRATION_DEPS lvt)
+endif()
+if(LVT_ENABLE_WPF)
+    list(APPEND LVT_INTEGRATION_DEPS lvt_wpf_tap)
 endif()
 if(LVT_ENABLE_WINFORMS)
     list(APPEND LVT_INTEGRATION_DEPS lvt_winforms_tap winforms_sample_app)
@@ -998,10 +1020,12 @@ if(LVT_ENABLE_CHROMIUM)
 # because it only exists when the MCP server was built.
 if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
     add_executable(lvt_mcp_tests tests/mcp_tests.cpp)
-    target_include_directories(lvt_mcp_tests PRIVATE src)
+    target_include_directories(lvt_mcp_tests PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/include/lvt")
     target_compile_definitions(lvt_mcp_tests PRIVATE
         WIN32_LEAN_AND_MEAN NOMINMAX
         WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
+        WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
+        WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
     )
     target_link_libraries(lvt_mcp_tests PRIVATE
         GTest::gtest GTest::gtest_main
@@ -1014,6 +1038,12 @@ if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
     endif()
     if(TARGET winui3_sample_app)
         add_dependencies(lvt_mcp_tests winui3_sample_app)
+    endif()
+    if(TARGET lvt_wpf_tap)
+        add_dependencies(lvt_mcp_tests lvt_wpf_tap wpf_sample_app)
+    endif()
+    if(TARGET lvt_winforms_tap)
+        add_dependencies(lvt_mcp_tests lvt_winforms_tap winforms_sample_app)
     endif()
     add_test(NAME mcp_tests COMMAND lvt_mcp_tests)
 endif()

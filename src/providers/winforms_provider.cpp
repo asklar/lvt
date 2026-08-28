@@ -15,7 +15,20 @@ static void label_winforms_like_windows(Element& el) {
 
 void WinFormsProvider::enrich(Element& root, HWND hwnd, DWORD pid) {
     label_winforms_like_windows(root);
-    inject_and_collect_winforms_tree(root, hwnd, pid);
+    auto connection = open_connection(hwnd, pid);
+    if (connection)
+        connection->get_tree(root, false);
+}
+
+std::shared_ptr<IFrameworkConnection> WinFormsProvider::open_connection(
+    HWND hwnd, DWORD pid) {
+    return open_winforms_connection(hwnd, pid);
+}
+
+void WinFormsProvider::enrich_with_connection(
+    Element& root, IFrameworkConnection& connection) {
+    label_winforms_like_windows(root);
+    connection.get_tree(root, false);
 }
 
 } // namespace lvt

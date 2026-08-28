@@ -11,7 +11,7 @@
 namespace lvt {
 
 // Looks up an already-established, reusable connection for a given
-// framework label ("xaml"/"winui3"), instead of build_tree re-injecting a
+// framework label ("xaml"/"winui3"/"wpf"/"winforms"), instead of build_tree re-injecting a
 // fresh one-shot connection every call. Returns nullptr (or is left unset
 // entirely) to keep today's one-shot-per-call behavior - this is how a
 // one-shot CLI command (dump/query/screenshot) still works unchanged; only

@@ -1,20 +1,91 @@
 using System;
+using System.Collections.Generic;
 using System.IO.Pipes;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace LvtWinFormsTap
 {
     public static class WinFormsTreeWalker
     {
-        public delegate int CollectTreeDelegate(IntPtr pipeNamePtr, int pipeNameLength);
+        public delegate int RunServerDelegate(IntPtr pipeNamePtr, int pipeNameLength);
 
-        public static int CollectTree(IntPtr pipeNamePtr, int pipeNameLength)
+        private const int UiTimeoutMilliseconds = 10000;
+        private static readonly string AssemblyInstanceId = Guid.NewGuid().ToString("N");
+        private static readonly ConditionalWeakTable<Control, Identity> Identities =
+            new ConditionalWeakTable<Control, Identity>();
+        private static long nextIdentity;
+        private static int serverStartCount;
+
+        private delegate bool EnumWindowsCallback(IntPtr hwnd, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(
+            EnumWindowsCallback callback, IntPtr parameter);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(
+            IntPtr hwnd, out uint processId);
+
+        private sealed class Identity
+        {
+            public Identity(long value)
+            {
+                Value = value;
+            }
+
+            public long Value { get; private set; }
+        }
+
+        private sealed class ObjectRegistry
+        {
+            private Dictionary<long, WeakReference> objects =
+                new Dictionary<long, WeakReference>();
+
+            public Dictionary<long, WeakReference> CreateSnapshot()
+            {
+                return new Dictionary<long, WeakReference>();
+            }
+
+            public long Track(Control value, Dictionary<long, WeakReference> snapshot)
+            {
+                Identity identity = Identities.GetValue(
+                    value, ignored => new Identity(Interlocked.Increment(ref nextIdentity)));
+                snapshot[identity.Value] = new WeakReference(value);
+                return identity.Value;
+            }
+
+            public void Commit(Dictionary<long, WeakReference> snapshot)
+            {
+                objects = snapshot;
+            }
+
+            public bool TryGet(long handle, out Control value)
+            {
+                WeakReference reference;
+                value = null;
+                if (!objects.TryGetValue(handle, out reference))
+                    return false;
+                value = reference.Target as Control;
+                return value != null;
+            }
+
+            public void Clear()
+            {
+                objects.Clear();
+            }
+        }
+
+        public static int RunServer(IntPtr pipeNamePtr, int pipeNameLength)
         {
             try
             {
-                string pipeName = System.Runtime.InteropServices.Marshal.PtrToStringUni(pipeNamePtr);
-                return CollectTreeImpl(pipeName);
+                string pipeName = Marshal.PtrToStringUni(pipeNamePtr);
+                return RunServerImpl(pipeName);
             }
             catch
             {
@@ -22,96 +93,207 @@ namespace LvtWinFormsTap
             }
         }
 
-        public static int CollectTree(string pipeName)
+        public static int RunServer(string pipeName)
         {
-            return CollectTreeImpl(pipeName);
+            return RunServerImpl(pipeName);
         }
 
-        private static int CollectTreeImpl(string pipeName)
+        private static int RunServerImpl(string pipeName)
         {
+            if (string.IsNullOrEmpty(pipeName))
+                return 1;
+
+            string shortName = pipeName;
+            const string pipePrefix = @"\\.\pipe\";
+            if (shortName.StartsWith(pipePrefix, StringComparison.OrdinalIgnoreCase))
+                shortName = shortName.Substring(pipePrefix.Length);
+
+            var registry = new ObjectRegistry();
             try
             {
-                string json = null;
-                if (Application.OpenForms.Count > 0 && Application.OpenForms[0].IsHandleCreated)
-                {
-                    var first = Application.OpenForms[0];
-                    first.BeginInvoke(new MethodInvoker(() => json = WalkAllForms()));
-
-                    var deadline = DateTime.UtcNow.AddSeconds(5);
-                    while (json == null && DateTime.UtcNow < deadline)
-                        System.Threading.Thread.Sleep(10);
-                }
-
-                if (json == null)
-                    json = WalkAllForms();
-
-                string shortName = pipeName;
-                const string pipePrefix = @"\\.\pipe\";
-                if (shortName.StartsWith(pipePrefix))
-                    shortName = shortName.Substring(pipePrefix.Length);
-
-                using (var client = new NamedPipeClientStream(".", shortName, PipeDirection.Out))
+                using (var client = new NamedPipeClientStream(
+                    ".", shortName, PipeDirection.InOut, PipeOptions.None))
                 {
                     client.Connect(5000);
-                    byte[] data = Encoding.UTF8.GetBytes(json);
-                    client.Write(data, 0, data.Length);
-                    client.Flush();
-                }
+                    using (var reader = new System.IO.StreamReader(
+                        client, new UTF8Encoding(false), false, 4096, true))
+                    using (var writer = new System.IO.StreamWriter(
+                        client, new UTF8Encoding(false), 4096, true))
+                    {
+                        writer.AutoFlush = true;
+                        int startCount = Interlocked.Increment(ref serverStartCount);
+                        string connectionId = Guid.NewGuid().ToString("N");
+                        writer.WriteLine(
+                            "READY\t{\"protocol\":1,\"connectionId\":\"" + connectionId +
+                            "\",\"assemblyInstanceId\":\"" + AssemblyInstanceId +
+                            "\",\"serverStartCount\":" + startCount +
+                            ",\"commands\":[\"GET_TREE\",\"DISCONNECT\"]}");
 
+                        for (;;)
+                        {
+                            string line = reader.ReadLine();
+                            if (line == null)
+                                break;
+
+                            string[] parts = line.Split(new[] { '\t' }, 4);
+                            if (parts.Length < 3 || parts[0] != "REQUEST")
+                                continue;
+
+                            string commandId = parts[1];
+                            string command = parts[2];
+                            if (command == "GET_TREE")
+                            {
+                                try
+                                {
+                                    string tree = CollectTreeOnUiThread(registry);
+                                    WriteResponse(writer, commandId, "OK", tree);
+                                }
+                                catch (Exception error)
+                                {
+                                    WriteResponse(
+                                        writer, commandId, "ERROR",
+                                        "{\"message\":\"" + EscapeJson(error.Message) + "\"}");
+                                }
+                            }
+                            else if (command == "DISCONNECT")
+                            {
+                                WriteResponse(writer, commandId, "OK", "{}");
+                                break;
+                            }
+                            else
+                            {
+                                WriteResponse(
+                                    writer, commandId, "ERROR",
+                                    "{\"message\":\"unsupported command\"}");
+                            }
+                        }
+                    }
+                }
                 return 0;
             }
             catch
             {
                 return -1;
             }
+            finally
+            {
+                registry.Clear();
+            }
         }
 
-        private static string WalkAllForms()
+        private static void WriteResponse(
+            System.IO.StreamWriter writer, string commandId, string status, string payload)
         {
-            var sb = new StringBuilder();
-            sb.Append('[');
+            writer.WriteLine("RESPONSE\t" + commandId + "\t" + status + "\t" + payload);
+        }
+
+        private static string CollectTreeOnUiThread(ObjectRegistry registry)
+        {
+            Control marshalControl = FindMarshalControl();
+            if (marshalControl == null)
+                throw new InvalidOperationException(
+                    "No WinForms UI control with a created handle is available");
+
+            Dictionary<long, WeakReference> snapshot = registry.CreateSnapshot();
+            var completion = new TaskCompletionSource<string>();
+            marshalControl.BeginInvoke(new MethodInvoker(() =>
+            {
+                try
+                {
+                    completion.SetResult(WalkAllForms(registry, snapshot));
+                }
+                catch (Exception error)
+                {
+                    completion.SetException(error);
+                }
+            }));
+
+            if (!completion.Task.Wait(UiTimeoutMilliseconds))
+                throw new TimeoutException("WinForms UI thread did not complete the tree walk");
+            string tree = completion.Task.GetAwaiter().GetResult();
+            registry.Commit(snapshot);
+            return tree;
+        }
+
+        private static Control FindMarshalControl()
+        {
+            Control result = null;
+            uint currentProcessId = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+            EnumWindows((hwnd, parameter) =>
+            {
+                uint windowProcessId;
+                GetWindowThreadProcessId(hwnd, out windowProcessId);
+                if (windowProcessId != currentProcessId)
+                    return true;
+
+                Control control = Control.FromHandle(hwnd);
+                if (control == null)
+                    return true;
+                result = control;
+                return false;
+            }, IntPtr.Zero);
+            return result;
+        }
+
+        private static string WalkAllForms(
+            ObjectRegistry registry, Dictionary<long, WeakReference> snapshot)
+        {
+            var builder = new StringBuilder();
+            builder.Append('[');
             bool first = true;
             foreach (Form form in Application.OpenForms)
             {
-                if (!first) sb.Append(',');
+                if (form == null)
+                    continue;
+                if (!first)
+                    builder.Append(',');
                 first = false;
-                SerializeControl(sb, form);
+                SerializeControl(builder, form, registry, snapshot);
             }
-            sb.Append(']');
-            return sb.ToString();
+            builder.Append(']');
+            return builder.ToString();
         }
 
-        private static void SerializeControl(StringBuilder sb, Control control)
+        private static void SerializeControl(
+            StringBuilder builder, Control control, ObjectRegistry registry,
+            Dictionary<long, WeakReference> snapshot)
         {
-            sb.Append('{');
-            sb.Append("\"hwnd\":\"").Append(((long)control.Handle).ToString("X")).Append('"');
-            sb.Append(",\"type\":\"").Append(EscapeJson(control.GetType().FullName ?? control.GetType().Name)).Append('"');
+            long managedHandle = registry.Track(control, snapshot);
+            builder.Append('{');
+            builder.Append("\"managedHandle\":").Append(managedHandle);
+            if (control.IsHandleCreated)
+            {
+                builder.Append(",\"hwnd\":\"").Append(
+                    control.Handle.ToInt64().ToString("X")).Append('"');
+            }
+            builder.Append(",\"type\":\"").Append(
+                EscapeJson(control.GetType().FullName ?? control.GetType().Name)).Append('"');
 
             if (!string.IsNullOrEmpty(control.Name))
-                sb.Append(",\"name\":\"").Append(EscapeJson(control.Name)).Append('"');
+                builder.Append(",\"name\":\"").Append(EscapeJson(control.Name)).Append('"');
             if (!string.IsNullOrEmpty(control.Text))
-                sb.Append(",\"text\":\"").Append(EscapeJson(Trim(control.Text))).Append('"');
+                builder.Append(",\"text\":\"").Append(EscapeJson(Trim(control.Text))).Append('"');
             if (!control.Visible)
-                sb.Append(",\"visible\":false");
+                builder.Append(",\"visible\":false");
             if (!control.Enabled)
-                sb.Append(",\"enabled\":false");
+                builder.Append(",\"enabled\":false");
             if (control is TextBoxBase textBox)
-                sb.Append(",\"readOnly\":").Append(textBox.ReadOnly ? "true" : "false");
+                builder.Append(",\"readOnly\":").Append(textBox.ReadOnly ? "true" : "false");
             if (control is ButtonBase button)
-                sb.Append(",\"autoSize\":").Append(button.AutoSize ? "true" : "false");
+                builder.Append(",\"autoSize\":").Append(button.AutoSize ? "true" : "false");
 
             if (control.Controls.Count > 0)
             {
-                sb.Append(",\"children\":[");
-                for (int i = 0; i < control.Controls.Count; i++)
+                builder.Append(",\"children\":[");
+                for (int index = 0; index < control.Controls.Count; index++)
                 {
-                    if (i > 0) sb.Append(',');
-                    SerializeControl(sb, control.Controls[i]);
+                    if (index > 0)
+                        builder.Append(',');
+                    SerializeControl(builder, control.Controls[index], registry, snapshot);
                 }
-                sb.Append(']');
+                builder.Append(']');
             }
-
-            sb.Append('}');
+            builder.Append('}');
         }
 
         private static string Trim(string value)
@@ -119,28 +301,29 @@ namespace LvtWinFormsTap
             return value.Length > 200 ? value.Substring(0, 200) : value;
         }
 
-        private static string EscapeJson(string s)
+        private static string EscapeJson(string value)
         {
-            if (s == null) return "";
-            var sb = new StringBuilder(s.Length);
-            foreach (char c in s)
+            if (value == null)
+                return "";
+            var builder = new StringBuilder(value.Length);
+            foreach (char character in value)
             {
-                switch (c)
+                switch (character)
                 {
-                    case '"': sb.Append("\\\""); break;
-                    case '\\': sb.Append("\\\\"); break;
-                    case '\n': sb.Append("\\n"); break;
-                    case '\r': sb.Append("\\r"); break;
-                    case '\t': sb.Append("\\t"); break;
+                    case '"': builder.Append("\\\""); break;
+                    case '\\': builder.Append("\\\\"); break;
+                    case '\n': builder.Append("\\n"); break;
+                    case '\r': builder.Append("\\r"); break;
+                    case '\t': builder.Append("\\t"); break;
                     default:
-                        if (c < 0x20)
-                            sb.AppendFormat("\\u{0:X4}", (int)c);
+                        if (character < 0x20)
+                            builder.AppendFormat("\\u{0:X4}", (int)character);
                         else
-                            sb.Append(c);
+                            builder.Append(character);
                         break;
                 }
             }
-            return sb.ToString();
+            return builder.ToString();
         }
     }
 }

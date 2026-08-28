@@ -4,6 +4,8 @@
 
 The TAP DLL (`lvt_tap.dll`) is a COM in-process server that gets injected into the target process to walk XAML visual trees. It uses the same diagnostic infrastructure that Visual Studio's Live Visual Tree uses. ("TAP" comes from the `wszTAPDllName` parameter of `InitializeXamlDiagnosticsEx`.)
 
+WPF and WinForms use separate native CLR-host TAP DLLs and managed walkers. They now follow the same persistent connection lifetime but not the XAML COM/message-window implementation described below. Their protocol, UI-thread marshaling, weak identity registry and unload sequence are documented in [Managed TAP connections](managed-tap-connections.md).
+
 `InitializeXamlDiagnosticsEx` and `AdviseVisualTreeChange` are a subscribe-and-react API: they are meant to be called **once** per debugging session, with `OnVisualTreeChange` then incrementally reporting Add/Remove mutations for as long as the subscription stays alive. The TAP DLL is built around that model — connect once, serve many tree refreshes over a persistent pipe, disconnect once when the session ends — not around reconnecting from scratch on every refresh. An earlier version of this file did the latter (calling `InitializeXamlDiagnosticsEx` fresh every `watch` tick); that caused a confirmed, unbounded resource leak (one message-only window created and never destroyed per tick) and was the root cause of a "tree refreshes/resets" bug reported against Microsoft Store. See `src/providers/framework_connection.h` and `connection_registry.h` for the caller-side half of this design.
 
 ## Connection lifecycle

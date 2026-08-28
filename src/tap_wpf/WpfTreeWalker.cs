@@ -1,29 +1,100 @@
-// WpfTreeWalker.cs — Managed assembly injected into WPF target process.
-// Walks the WPF visual tree via VisualTreeHelper and serializes to JSON
-// over a named pipe, matching the schema used by the XAML TAP DLL.
-
 using System;
-using System.IO;
+using System.Collections;
+using System.Collections.Generic;
 using System.IO.Pipes;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Threading;
 
 namespace LvtWpfTap
 {
     public static class WpfTreeWalker
     {
-        // Delegate type for .NET Core hosting interop
-        public delegate int CollectTreeDelegate(IntPtr pipeNamePtr, int pipeNameLength);
+        public delegate int RunServerDelegate(IntPtr pipeNamePtr, int pipeNameLength);
 
-        // Entry point for .NET Core hosting (load_assembly_and_get_function_pointer).
-        // Takes IntPtr + length matching the component entry point convention.
-        public static int CollectTree(IntPtr pipeNamePtr, int pipeNameLength)
+        private const int UiTimeoutMilliseconds = 10000;
+        private static readonly string AssemblyInstanceId = Guid.NewGuid().ToString("N");
+        private static readonly ConditionalWeakTable<DependencyObject, Identity> Identities =
+            new ConditionalWeakTable<DependencyObject, Identity>();
+        private static long nextIdentity;
+        private static int serverStartCount;
+
+        private sealed class Identity
+        {
+            public Identity(long value)
+            {
+                Value = value;
+            }
+
+            public long Value { get; private set; }
+        }
+
+        private sealed class ObjectRegistry
+        {
+            private Dictionary<long, WeakReference> objects =
+                new Dictionary<long, WeakReference>();
+
+            public Dictionary<long, WeakReference> CreateSnapshot()
+            {
+                return new Dictionary<long, WeakReference>();
+            }
+
+            public long Track(
+                DependencyObject value, Dictionary<long, WeakReference> snapshot)
+            {
+                Identity identity = Identities.GetValue(
+                    value, ignored => new Identity(Interlocked.Increment(ref nextIdentity)));
+                snapshot[identity.Value] = new WeakReference(value);
+                return identity.Value;
+            }
+
+            public void Commit(Dictionary<long, WeakReference> snapshot)
+            {
+                objects = snapshot;
+            }
+
+            public bool TryGet(long handle, out DependencyObject value)
+            {
+                WeakReference reference;
+                value = null;
+                if (!objects.TryGetValue(handle, out reference))
+                    return false;
+                value = reference.Target as DependencyObject;
+                return value != null;
+            }
+
+            public void Clear()
+            {
+                objects.Clear();
+            }
+        }
+
+        private sealed class ReferenceComparer : IEqualityComparer<DependencyObject>
+        {
+            public static readonly ReferenceComparer Instance = new ReferenceComparer();
+
+            public bool Equals(DependencyObject left, DependencyObject right)
+            {
+                return ReferenceEquals(left, right);
+            }
+
+            public int GetHashCode(DependencyObject value)
+            {
+                return RuntimeHelpers.GetHashCode(value);
+            }
+        }
+
+        public static int RunServer(IntPtr pipeNamePtr, int pipeNameLength)
         {
             try
             {
-                string pipeName = System.Runtime.InteropServices.Marshal.PtrToStringUni(pipeNamePtr);
-                return CollectTreeImpl(pipeName);
+                string pipeName = Marshal.PtrToStringUni(pipeNamePtr);
+                return RunServerImpl(pipeName);
             }
             catch
             {
@@ -31,257 +102,362 @@ namespace LvtWpfTap
             }
         }
 
-        // Entry point for .NET Framework hosting (ExecuteInDefaultAppDomain).
-        // Takes a string parameter directly.
-        public static int CollectTree(string pipeName)
+        public static int RunServer(string pipeName)
         {
-            return CollectTreeImpl(pipeName);
+            return RunServerImpl(pipeName);
         }
 
-        private static int CollectTreeImpl(string pipeName)
+        private static int RunServerImpl(string pipeName)
         {
+            if (string.IsNullOrEmpty(pipeName))
+                return 1;
+
+            string shortName = pipeName;
+            const string pipePrefix = @"\\.\pipe\";
+            if (shortName.StartsWith(pipePrefix, StringComparison.OrdinalIgnoreCase))
+                shortName = shortName.Substring(pipePrefix.Length);
+
+            var registry = new ObjectRegistry();
             try
             {
-                // Must run on the WPF Dispatcher thread
-                var app = Application.Current;
-                if (app == null) return 1;
-
-                string json = null;
-                app.Dispatcher.Invoke(() =>
-                {
-                    json = WalkAllWindows();
-                });
-
-                if (json == null) return 2;
-
-                // Extract just the pipe name portion for NamedPipeClientStream
-                // Input: "\\.\pipe\lvt_XXXX" -> "lvt_XXXX"
-                string shortName = pipeName;
-                const string pipePrefix = @"\\.\pipe\";
-                if (shortName.StartsWith(pipePrefix))
-                    shortName = shortName.Substring(pipePrefix.Length);
-
-                using (var client = new NamedPipeClientStream(".", shortName,
-                    PipeDirection.Out))
+                using (var client = new NamedPipeClientStream(
+                    ".", shortName, PipeDirection.InOut, PipeOptions.None))
                 {
                     client.Connect(5000);
-                    byte[] data = Encoding.UTF8.GetBytes(json);
-                    client.Write(data, 0, data.Length);
-                    client.Flush();
-                }
+                    using (var reader = new System.IO.StreamReader(
+                        client, new UTF8Encoding(false), false, 4096, true))
+                    using (var writer = new System.IO.StreamWriter(
+                        client, new UTF8Encoding(false), 4096, true))
+                    {
+                        writer.AutoFlush = true;
+                        int startCount = Interlocked.Increment(ref serverStartCount);
+                        string connectionId = Guid.NewGuid().ToString("N");
+                        writer.WriteLine(
+                            "READY\t{\"protocol\":1,\"connectionId\":\"" + connectionId +
+                            "\",\"assemblyInstanceId\":\"" + AssemblyInstanceId +
+                            "\",\"serverStartCount\":" + startCount +
+                            ",\"commands\":[\"GET_TREE\",\"DISCONNECT\"]}");
 
+                        for (;;)
+                        {
+                            string line = reader.ReadLine();
+                            if (line == null)
+                                break;
+
+                            string[] parts = line.Split(new[] { '\t' }, 4);
+                            if (parts.Length < 3 || parts[0] != "REQUEST")
+                                continue;
+
+                            string commandId = parts[1];
+                            string command = parts[2];
+                            if (command == "GET_TREE")
+                            {
+                                try
+                                {
+                                    string tree = CollectTreeOnDispatcher(registry);
+                                    WriteResponse(writer, commandId, "OK", tree);
+                                }
+                                catch (Exception error)
+                                {
+                                    WriteResponse(
+                                        writer, commandId, "ERROR",
+                                        "{\"message\":\"" + EscapeJson(error.Message) + "\"}");
+                                }
+                            }
+                            else if (command == "DISCONNECT")
+                            {
+                                WriteResponse(writer, commandId, "OK", "{}");
+                                break;
+                            }
+                            else
+                            {
+                                WriteResponse(
+                                    writer, commandId, "ERROR",
+                                    "{\"message\":\"unsupported command\"}");
+                            }
+                        }
+                    }
+                }
                 return 0;
             }
             catch
             {
                 return -1;
             }
+            finally
+            {
+                registry.Clear();
+            }
         }
 
-        private static string WalkAllWindows()
+        private static void WriteResponse(
+            System.IO.StreamWriter writer, string commandId, string status, string payload)
         {
-            var sb = new StringBuilder();
-            sb.Append('[');
+            writer.WriteLine("RESPONSE\t" + commandId + "\t" + status + "\t" + payload);
+        }
 
-            var windows = Application.Current.Windows;
-            bool first = true;
-            for (int i = 0; i < windows.Count; i++)
+        private static string CollectTreeOnDispatcher(ObjectRegistry registry)
+        {
+            Application application = Application.Current;
+            if (application == null || application.Dispatcher == null)
+                throw new InvalidOperationException("WPF Application dispatcher is unavailable");
+            Dispatcher dispatcher = application.Dispatcher;
+            if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+                throw new InvalidOperationException("WPF Application dispatcher is shutting down");
+
+            Dictionary<long, WeakReference> snapshot = registry.CreateSnapshot();
+            DispatcherOperation<string> operation = dispatcher.InvokeAsync(
+                () => WalkAllWindows(registry, snapshot), DispatcherPriority.Send);
+            if (!operation.Task.Wait(UiTimeoutMilliseconds))
             {
-                var window = windows[i];
-                if (!first) sb.Append(',');
+                operation.Abort();
+                throw new TimeoutException("WPF UI thread did not complete the tree walk");
+            }
+            string tree = operation.Task.GetAwaiter().GetResult();
+            registry.Commit(snapshot);
+            return tree;
+        }
+
+        private static string WalkAllWindows(
+            ObjectRegistry registry, Dictionary<long, WeakReference> snapshot)
+        {
+            var builder = new StringBuilder();
+            var visited = new HashSet<DependencyObject>(ReferenceComparer.Instance);
+            builder.Append('[');
+
+            bool first = true;
+            WindowCollection windows = Application.Current.Windows;
+            for (int index = 0; index < windows.Count; index++)
+            {
+                Window window = windows[index];
+                if (window == null || visited.Contains(window))
+                    continue;
+                if (!first)
+                    builder.Append(',');
                 first = false;
-                SerializeElement(sb, window);
+                SerializeElement(builder, window, registry, snapshot, visited);
             }
 
-            sb.Append(']');
-            return sb.ToString();
+            builder.Append(']');
+            return builder.ToString();
         }
 
-        private static void SerializeElement(StringBuilder sb, DependencyObject element)
+        private static void SerializeElement(
+            StringBuilder builder, DependencyObject element, ObjectRegistry registry,
+            Dictionary<long, WeakReference> snapshot,
+            HashSet<DependencyObject> visited)
         {
-            sb.Append('{');
+            visited.Add(element);
+            long managedHandle = registry.Track(element, snapshot);
+            builder.Append('{');
+            builder.Append("\"managedHandle\":").Append(managedHandle);
 
             string typeName = element.GetType().FullName ?? element.GetType().Name;
-            sb.Append("\"type\":\"").Append(EscapeJson(typeName)).Append('"');
+            builder.Append(",\"type\":\"").Append(EscapeJson(typeName)).Append('"');
 
-            // Name (x:Name)
-            if (element is FrameworkElement fe)
+            if (element is Window window)
             {
-                if (!string.IsNullOrEmpty(fe.Name))
-                    sb.Append(",\"name\":\"").Append(EscapeJson(fe.Name)).Append('"');
+                HwndSource source = PresentationSource.FromVisual(window) as HwndSource;
+                if (source != null && source.Handle != IntPtr.Zero)
+                    builder.Append(",\"hwnd\":\"").Append(
+                        source.Handle.ToInt64().ToString("X")).Append('"');
+            }
 
-                // Bounds
-                double w = fe.ActualWidth;
-                double h = fe.ActualHeight;
-                if (w > 0 && h > 0)
+            FrameworkElement frameworkElement = element as FrameworkElement;
+            if (frameworkElement != null)
+            {
+                if (!string.IsNullOrEmpty(frameworkElement.Name))
+                    builder.Append(",\"name\":\"").Append(
+                        EscapeJson(frameworkElement.Name)).Append('"');
+
+                double width = frameworkElement.ActualWidth;
+                double height = frameworkElement.ActualHeight;
+                if (width > 0 && height > 0)
                 {
-                    sb.AppendFormat(",\"width\":{0:F1},\"height\":{1:F1}", w, h);
-
-                    // Screen position
+                    builder.AppendFormat(
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        ",\"width\":{0:F1},\"height\":{1:F1}", width, height);
                     try
                     {
-                        var source = PresentationSource.FromVisual(fe);
-                        if (source != null)
+                        PresentationSource source =
+                            PresentationSource.FromVisual(frameworkElement);
+                        if (source != null && source.CompositionTarget != null)
                         {
-                            // PointToScreen returns *device* pixels, while
-                            // ActualWidth/Height above are device-independent
-                            // units. Reporting one of each leaves the origin
-                            // scaled by the DPI factor and the size not, so at
-                            // 150% an element 613 units across the window is
-                            // reported at 920 — outside the window rect lvt
-                            // reads, which puts every annotation in the wrong
-                            // place and makes the bounds useless to a caller.
-                            //
-                            // TransformFromDevice converts back to the same
-                            // units as the size, which is also the space lvt
-                            // works in: it is DPI-unaware, so the window rect
-                            // and the UIA bounds it reads are already scaled.
-                            // On a DPI-unaware WPF app the transform is
-                            // identity, so this is a no-op there.
-                            Point screenPos = fe.PointToScreen(new Point(0, 0));
-                            var fromDevice = source.CompositionTarget.TransformFromDevice;
-                            screenPos = fromDevice.Transform(screenPos);
-                            sb.AppendFormat(",\"offsetX\":{0:F1},\"offsetY\":{1:F1}",
-                                screenPos.X, screenPos.Y);
+                            Point screenPosition =
+                                frameworkElement.PointToScreen(new Point(0, 0));
+                            screenPosition =
+                                source.CompositionTarget.TransformFromDevice.Transform(
+                                    screenPosition);
+                            builder.AppendFormat(
+                                System.Globalization.CultureInfo.InvariantCulture,
+                                ",\"offsetX\":{0:F1},\"offsetY\":{1:F1}",
+                                screenPosition.X, screenPosition.Y);
                         }
                     }
-                    catch { /* PointToScreen can fail for non-rendered elements */ }
+                    catch
+                    {
+                    }
                 }
                 else
                 {
-                    // w<=0 or h<=0 used to mean total silence here: no width,
-                    // no height, no offset, indistinguishable from an element
-                    // that was never laid out at all or whose PresentationSource
-                    // lookup threw. zeroSize says explicitly "lvt read
-                    // ActualWidth/ActualHeight and they really are zero (or
-                    // negative before layout)", which is exactly the case a
-                    // user investigating a missing/invisible element needs to
-                    // be able to tell apart from a different failure.
-                    sb.Append(",\"zeroSize\":true");
+                    builder.Append(",\"zeroSize\":true");
                 }
 
-                // Text content for common controls. hasTextProperty distinguishes
-                // "no Text/Content/Header string property exists on this type"
-                // (key omitted) from "the property exists and is an empty
-                // string" (key emitted as ""), which GetTextContent's caller
-                // must be able to tell apart — collapsing them the way a plain
-                // IsNullOrEmpty check does means an empty TextBox is
-                // unrecoverably identical to a Border with no text at all.
-                string text = GetTextContent(fe, out bool hasTextProperty);
+                bool hasTextProperty;
+                string text = GetTextContent(frameworkElement, out hasTextProperty);
                 if (hasTextProperty)
-                    sb.Append(",\"text\":\"").Append(EscapeJson(text ?? "")).Append('"');
+                    builder.Append(",\"text\":\"").Append(EscapeJson(text ?? "")).Append('"');
 
-                // Visibility/enabled.
-                //
-                // "visible":false / absent is kept exactly as before: lvt's
-                // generic click-safety check (see lvt_api.cpp centreOf) reads
-                // this boolean across every provider, so its shape cannot
-                // change here without touching every other provider too.
-                //
-                // "wpf.visibility" is new and additive, named like
-                // "winforms.visible" is for WinForms: WPF has three
-                // visibilities, and collapsing Hidden and Collapsed into the
-                // same boolean loses the answer to the single most common
-                // WPF layout question there is — Hidden still reserves its
-                // layout space and Collapsed does not, so "why is there a gap
-                // where nothing is showing" has opposite answers depending on
-                // which one this was.
-                if (fe.Visibility != Visibility.Visible)
+                if (frameworkElement.Visibility != Visibility.Visible)
                 {
-                    sb.Append(",\"visible\":false");
-                    sb.Append(",\"wpf.visibility\":\"").Append(fe.Visibility.ToString()).Append('"');
+                    builder.Append(",\"visible\":false");
+                    builder.Append(",\"wpf.visibility\":\"").Append(
+                        frameworkElement.Visibility.ToString()).Append('"');
                 }
-                if (!fe.IsEnabled)
-                    sb.Append(",\"enabled\":false");
+                if (!frameworkElement.IsEnabled)
+                    builder.Append(",\"enabled\":false");
             }
-
-            // Children
-            int childCount = VisualTreeHelper.GetChildrenCount(element);
-            if (childCount > 0)
+            else
             {
-                sb.Append(",\"children\":[");
-                for (int i = 0; i < childCount; i++)
-                {
-                    if (i > 0) sb.Append(',');
-                    SerializeElement(sb, VisualTreeHelper.GetChild(element, i));
-                }
-                sb.Append(']');
+                FrameworkContentElement contentElement =
+                    element as FrameworkContentElement;
+                if (contentElement != null && !string.IsNullOrEmpty(contentElement.Name))
+                    builder.Append(",\"name\":\"").Append(
+                        EscapeJson(contentElement.Name)).Append('"');
             }
 
-            sb.Append('}');
+            List<DependencyObject> children = GetChildren(element);
+            bool wroteChildren = false;
+            foreach (DependencyObject child in children)
+            {
+                if (child == null || visited.Contains(child))
+                    continue;
+                if (!wroteChildren)
+                {
+                    builder.Append(",\"children\":[");
+                    wroteChildren = true;
+                }
+                else
+                {
+                    builder.Append(',');
+                }
+                SerializeElement(builder, child, registry, snapshot, visited);
+            }
+            if (wroteChildren)
+                builder.Append(']');
+            builder.Append('}');
         }
 
-        private static string GetTextContent(FrameworkElement fe, out bool hasTextProperty)
+        private static List<DependencyObject> GetChildren(DependencyObject element)
         {
-            // Use reflection to get common text properties without hard type deps.
-            //
-            // hasTextProperty distinguishes "this element has no string-valued
-            // Text/Content/Header at all" from "it has one and it happens to be
-            // empty" - SerializeElement needs that to decide whether to omit the
-            // "text" key entirely or emit it as "". Content/Header are declared
-            // as `object`, so an empty string there is still a real answer;
-            // null or a non-string object is not, and we fall through to the
-            // next candidate rather than reporting a false "has no text".
+            var children = new List<DependencyObject>();
             try
             {
-                var textProp = fe.GetType().GetProperty("Text");
-                if (textProp != null && textProp.PropertyType == typeof(string))
+                int visualCount = VisualTreeHelper.GetChildrenCount(element);
+                for (int index = 0; index < visualCount; index++)
                 {
-                    var val = textProp.GetValue(fe) as string ?? "";
+                    DependencyObject child = VisualTreeHelper.GetChild(element, index);
+                    if (child != null)
+                        children.Add(child);
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                IEnumerable logicalChildren = LogicalTreeHelper.GetChildren(element);
+                foreach (object value in logicalChildren)
+                {
+                    DependencyObject child = value as DependencyObject;
+                    if (child != null && !ContainsReference(children, child))
+                        children.Add(child);
+                }
+            }
+            catch
+            {
+            }
+            return children;
+        }
+
+        private static bool ContainsReference(
+            List<DependencyObject> values, DependencyObject candidate)
+        {
+            foreach (DependencyObject value in values)
+            {
+                if (ReferenceEquals(value, candidate))
+                    return true;
+            }
+            return false;
+        }
+
+        private static string GetTextContent(
+            FrameworkElement element, out bool hasTextProperty)
+        {
+            try
+            {
+                var textProperty = element.GetType().GetProperty("Text");
+                if (textProperty != null && textProperty.PropertyType == typeof(string))
+                {
+                    string value = textProperty.GetValue(element) as string ?? "";
                     hasTextProperty = true;
-                    return val.Length > 200 ? val.Substring(0, 200) : val;
+                    return value.Length > 200 ? value.Substring(0, 200) : value;
                 }
 
-                var contentProp = fe.GetType().GetProperty("Content");
-                if (contentProp != null)
+                var contentProperty = element.GetType().GetProperty("Content");
+                if (contentProperty != null)
                 {
-                    var val = contentProp.GetValue(fe);
-                    if (val is string s)
+                    string value = contentProperty.GetValue(element) as string;
+                    if (value != null)
                     {
                         hasTextProperty = true;
-                        return s.Length > 200 ? s.Substring(0, 200) : s;
+                        return value.Length > 200 ? value.Substring(0, 200) : value;
                     }
                 }
 
-                var headerProp = fe.GetType().GetProperty("Header");
-                if (headerProp != null)
+                var headerProperty = element.GetType().GetProperty("Header");
+                if (headerProperty != null)
                 {
-                    var val = headerProp.GetValue(fe);
-                    if (val is string s)
+                    string value = headerProperty.GetValue(element) as string;
+                    if (value != null)
                     {
                         hasTextProperty = true;
-                        return s.Length > 200 ? s.Substring(0, 200) : s;
+                        return value.Length > 200 ? value.Substring(0, 200) : value;
                     }
                 }
             }
-            catch { }
+            catch
+            {
+            }
 
             hasTextProperty = false;
             return null;
         }
 
-        private static string EscapeJson(string s)
+        private static string EscapeJson(string value)
         {
-            if (s == null) return "";
-            var sb = new StringBuilder(s.Length);
-            foreach (char c in s)
+            if (value == null)
+                return "";
+            var builder = new StringBuilder(value.Length);
+            foreach (char character in value)
             {
-                switch (c)
+                switch (character)
                 {
-                    case '"': sb.Append("\\\""); break;
-                    case '\\': sb.Append("\\\\"); break;
-                    case '\n': sb.Append("\\n"); break;
-                    case '\r': sb.Append("\\r"); break;
-                    case '\t': sb.Append("\\t"); break;
+                    case '"': builder.Append("\\\""); break;
+                    case '\\': builder.Append("\\\\"); break;
+                    case '\n': builder.Append("\\n"); break;
+                    case '\r': builder.Append("\\r"); break;
+                    case '\t': builder.Append("\\t"); break;
                     default:
-                        if (c < 0x20)
-                            sb.AppendFormat("\\u{0:X4}", (int)c);
+                        if (character < 0x20)
+                            builder.AppendFormat("\\u{0:X4}", (int)character);
                         else
-                            sb.Append(c);
+                            builder.Append(character);
                         break;
                 }
             }
-            return sb.ToString();
+            return builder.ToString();
         }
     }
 }

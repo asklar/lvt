@@ -10,6 +10,7 @@
 #include <wil/resource.h>
 
 #include <windows.h>
+#include "lvt_config.h"
 
 #include <algorithm>
 #include <atomic>
@@ -133,6 +134,16 @@ public:
         if (process_)
             GetExitCodeProcess(process_.get(), &code);
         return code;
+    }
+
+    void terminate_server() {
+        if (!started_)
+            return;
+        if (process_) {
+            TerminateProcess(process_.get(), 1);
+            WaitForSingleObject(process_.get(), 5000);
+        }
+        shutdown();
     }
 
     void notify(const std::string& method, const json& params = json()) {
@@ -463,6 +474,179 @@ bool has_tool(const std::vector<std::string>& names, const std::string& name) {
     return std::find(names.begin(), names.end(), name) != names.end();
 }
 
+class ManagedSampleProcess {
+public:
+    bool start(const fs::path& executable) {
+        if (!fs::exists(executable))
+            return false;
+        STARTUPINFOA startup{sizeof(startup)};
+        PROCESS_INFORMATION processInfo{};
+        std::string command = "\"" + executable.string() + "\"";
+        if (!CreateProcessA(
+                nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                executable.parent_path().string().c_str(), &startup, &processInfo)) {
+            return false;
+        }
+        process_.reset(processInfo.hProcess);
+        thread_.reset(processInfo.hThread);
+        pid_ = processInfo.dwProcessId;
+        WaitForInputIdle(process_.get(), 5000);
+
+        for (int attempt = 0; attempt < 30 && !hwnd_; ++attempt) {
+            EnumWindows([](HWND hwnd, LPARAM parameter) -> BOOL {
+                auto* self = reinterpret_cast<ManagedSampleProcess*>(parameter);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(hwnd, &owner);
+                if (owner == self->pid_ && IsWindowVisible(hwnd)) {
+                    self->hwnd_ = hwnd;
+                    return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(this));
+            if (!hwnd_)
+                Sleep(100);
+        }
+        return hwnd_ != nullptr;
+    }
+
+    ~ManagedSampleProcess() {
+        if (process_)
+            TerminateProcess(process_.get(), 0);
+    }
+
+    DWORD pid() const { return pid_; }
+
+    std::string hwnd_string() const {
+        char buffer[32];
+        snprintf(
+            buffer, sizeof(buffer), "0x%llX",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(hwnd_)));
+        return buffer;
+    }
+
+private:
+    wil::unique_process_handle process_;
+    wil::unique_handle thread_;
+    DWORD pid_ = 0;
+    HWND hwnd_ = nullptr;
+};
+
+int count_managed_tap_starts(const wchar_t* logName, DWORD pid) {
+    wchar_t tempPath[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tempPath) == 0)
+        return 0;
+    std::ifstream log(std::wstring(tempPath) + logName, std::ios::binary);
+    const std::string pidMarker = "[pid=" + std::to_string(pid) + " ";
+    int count = 0;
+    std::string line;
+    while (std::getline(log, line)) {
+        if (line.find(pidMarker) != std::string::npos &&
+            line.find("Persistent managed TAP worker starting") != std::string::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+const json* find_managed_named_element(const json& root, const std::string& name) {
+    std::vector<const json*> elements;
+    collect_json_elements(root, elements);
+    for (const auto* element : elements) {
+        if (element->value("properties", json::object()).value("name", "") == name)
+            return element;
+    }
+    return nullptr;
+}
+
+void verify_managed_mcp_connection(
+    const fs::path& executable, const std::string& elementName,
+    const std::string& keyPrefix, const wchar_t* logName) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(executable));
+    const int startsBefore = count_managed_tap_starts(logName, sample.pid());
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    auto connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    auto first = client.call_tool("get_visual_tree", json{{"session", session}});
+    auto second = client.call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(first.contains("root")) << first.dump(2);
+    ASSERT_TRUE(second.contains("root")) << second.dump(2);
+    const json* firstElement = find_managed_named_element(first["root"], elementName);
+    const json* secondElement = find_managed_named_element(second["root"], elementName);
+    ASSERT_NE(firstElement, nullptr);
+    ASSERT_NE(secondElement, nullptr);
+    const std::string firstKey = firstElement->value("key", "");
+    const std::string firstHandle =
+        firstElement->value("properties", json::object()).value("managedHandle", "");
+    EXPECT_EQ(firstKey.rfind(keyPrefix, 0), 0u);
+    EXPECT_FALSE(firstHandle.empty());
+    EXPECT_EQ(secondElement->value("key", ""), firstKey);
+    EXPECT_EQ(secondElement->value("properties", json::object()).value("managedHandle", ""),
+              firstHandle);
+
+    bool isError = false;
+    auto disconnected =
+        client.call_tool("disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << disconnected.dump(2);
+    EXPECT_EQ(count_managed_tap_starts(logName, sample.pid()) - startsBefore, 1)
+        << "two MCP tree reads must reuse exactly one managed TAP injection";
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string reconnectedSession = connected.value("session", "");
+    ASSERT_FALSE(reconnectedSession.empty()) << connected.dump(2);
+    auto third =
+        client.call_tool("get_visual_tree", json{{"session", reconnectedSession}});
+    ASSERT_TRUE(third.contains("root")) << third.dump(2);
+    const json* thirdElement = find_managed_named_element(third["root"], elementName);
+    ASSERT_NE(thirdElement, nullptr);
+    EXPECT_EQ(thirdElement->value("key", ""), firstKey);
+    EXPECT_EQ(thirdElement->value("properties", json::object()).value("managedHandle", ""),
+              firstHandle);
+    client.call_tool("disconnect", json{{"session", reconnectedSession}}, &isError);
+    ASSERT_FALSE(isError);
+    EXPECT_EQ(count_managed_tap_starts(logName, sample.pid()) - startsBefore, 2)
+        << "disconnect must tear down cleanly so a new MCP session can reconnect";
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string brokenPipeSession = connected.value("session", "");
+    ASSERT_FALSE(brokenPipeSession.empty()) << connected.dump(2);
+    auto beforeBreak =
+        client.call_tool("get_visual_tree", json{{"session", brokenPipeSession}});
+    ASSERT_TRUE(beforeBreak.contains("root")) << beforeBreak.dump(2);
+    client.terminate_server();
+
+    McpClient recovered(false);
+    ASSERT_TRUE(recovered.started());
+    ASSERT_TRUE(recovered.handshake());
+    connected = recovered.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string recoveredSession = connected.value("session", "");
+    ASSERT_FALSE(recoveredSession.empty()) << connected.dump(2);
+    auto afterBreak =
+        recovered.call_tool("get_visual_tree", json{{"session", recoveredSession}});
+    ASSERT_TRUE(afterBreak.contains("root")) << afterBreak.dump(2);
+    const json* recoveredElement =
+        find_managed_named_element(afterBreak["root"], elementName);
+    ASSERT_NE(recoveredElement, nullptr);
+    EXPECT_EQ(recoveredElement->value("key", ""), firstKey);
+    EXPECT_EQ(
+        recoveredElement->value("properties", json::object()).value("managedHandle", ""),
+        firstHandle);
+    recovered.call_tool("disconnect", json{{"session", recoveredSession}}, &isError);
+    ASSERT_FALSE(isError);
+    EXPECT_EQ(count_managed_tap_starts(logName, sample.pid()) - startsBefore, 4)
+        << "a broken MCP transport must let the managed server exit and reconnect";
+}
+
 // The sample app is the target for anything that needs known AutomationIds.
 class McpSampleFixture : public ::testing::Test {
 protected:
@@ -602,6 +786,7 @@ TEST(McpServer, ReadOnlyByDefaultAndInputOnlyWithTheFlag) {
         EXPECT_TRUE(has_tool(names, "connect"));
         EXPECT_TRUE(has_tool(names, "screenshot"));
     }
+
     {
         McpClient full(true);
         ASSERT_TRUE(full.started());
@@ -611,6 +796,21 @@ TEST(McpServer, ReadOnlyByDefaultAndInputOnlyWithTheFlag) {
             EXPECT_TRUE(has_tool(names, tool)) << tool << " should be exposed with --allow-input";
     }
 }
+
+#if LVT_ENABLE_WPF && LVT_WITH_MANAGED
+TEST(McpManagedFrameworks, WpfConnectionPersistsAcrossTreeReads) {
+    verify_managed_mcp_connection(
+        WPF_SAMPLE_EXE_PATH, "OkButton", "wpf:0x", L"lvt_wpf_tap.log");
+}
+#endif
+
+#if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED
+TEST(McpManagedFrameworks, WinFormsConnectionPersistsAcrossTreeReads) {
+    verify_managed_mcp_connection(
+        WINFORMS_SAMPLE_EXE_PATH, "okButton", "winforms:0x",
+        L"lvt_winforms_tap.log");
+}
+#endif
 
 TEST(McpServer, CallingAWithheldToolIsRejectedRatherThanSilentlyIgnored) {
     McpClient client(false);
