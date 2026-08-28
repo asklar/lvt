@@ -1041,35 +1041,6 @@ impl ResourceRegistry {
         }
     }
 
-    async fn fail_watcher(&self, resource: &SessionResource, epoch: u64, generation: u64) {
-        let uri = resource.uri();
-        let cancel = {
-            let mut inner = self.inner.lock().await;
-            if *inner.session_epochs.get(&resource.session).unwrap_or(&0) != epoch
-                || inner
-                    .entries
-                    .get(&uri)
-                    .and_then(|entry| entry.watcher.as_ref())
-                    .map(|watcher| watcher.generation)
-                    != Some(generation)
-            {
-                return;
-            }
-            *inner
-                .session_epochs
-                .entry(resource.session.clone())
-                .or_default() += 1;
-            inner.legacy_ids.remove(&uri);
-            inner
-                .entries
-                .remove(&uri)
-                .and_then(|entry| entry.watcher.map(|watcher| watcher.cancel))
-        };
-        if let Some(cancel) = cancel {
-            let _ = cancel.send(true);
-        }
-    }
-
     async fn clear_session(&self, session: &str) {
         let mut cancellations = Vec::new();
         {
@@ -1140,12 +1111,11 @@ async fn run_resource_watcher(
             _ = interval.tick() => {
                 let patch = match get_tree_patch(&resource, false).await {
                     Ok(patch) => patch,
-                    Err(_) => {
-                        registry
-                            .fail_watcher(&resource, epoch, generation)
-                            .await;
-                        break;
-                    }
+                    // Preserve the subscription across a transient target
+                    // read failure. lvt_core keeps the previous diff baseline
+                    // in that case, so the next successful pass remains
+                    // coherent instead of requiring a resubscribe.
+                    Err(_) => continue,
                 };
                 match registry
                     .cache_from_watcher(&resource, epoch, generation, patch)
@@ -1159,12 +1129,7 @@ async fn run_resource_watcher(
                     CacheResult::NeedsSnapshot => {
                         let snapshot = match get_tree_patch(&resource, true).await {
                             Ok(snapshot) => snapshot,
-                            Err(_) => {
-                                registry
-                                    .fail_watcher(&resource, epoch, generation)
-                                    .await;
-                                break;
-                            }
+                            Err(_) => continue,
                         };
                         match registry
                             .cache_from_watcher(&resource, epoch, generation, snapshot)

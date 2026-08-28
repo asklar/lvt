@@ -425,11 +425,12 @@ cmake --build build
 .\build\viewer\LvtViewer.exe
 ```
 
-It's a separate WPF (.NET) app that drives `lvt.exe` as a subprocess (`watch`
-for live updates, `toggle`/`set-value` for editing) rather than linking
-`lvt_core`. See **[src/viewer/README.md](src/viewer/README.md)** for the
-architecture, why `watch` was chosen over MCP for live updates, and how to
-build/run it.
+It's a separate WPF (.NET) app that launches `lvt mcp --allow-input` and uses
+subscribed MCP tree resources for live snapshot/diff updates. UIA actions and
+typed XAML/WinUI property edits use tools on that same persistent session; the
+viewer never links `lvt_core`. See
+**[src/viewer/README.md](src/viewer/README.md)** for the architecture and
+build/run details.
 
 ## Output format
 

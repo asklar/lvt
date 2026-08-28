@@ -10,7 +10,7 @@ namespace LvtViewer.ViewModels;
 /// <summary>
 /// One node of the live element tree shown in the TreeView, and the source
 /// of the property panel when selected. Instances are long-lived: the same
-/// object is reused across watch ticks (keyed by lvt's durable "key"), so
+/// object is reused across MCP resource patches (keyed by lvt's durable "key"), so
 /// updating its bound properties in place is what makes the TreeView/property
 /// panel refresh live without losing selection or expansion state.
 /// </summary>
@@ -153,7 +153,12 @@ public sealed class ElementNodeViewModel : ObservableObject
         }
     }
 
-    public ObservableCollection<PropertyRowViewModel> PropertyRows { get; } = new();
+    private ObservableCollection<PropertyRowViewModel> _propertyRows = new();
+    public ObservableCollection<PropertyRowViewModel> PropertyRows
+    {
+        get => _propertyRows;
+        private set => SetField(ref _propertyRows, value);
+    }
 
     public ObservableCollection<ElementNodeViewModel> Children { get; } = new();
 
@@ -251,6 +256,16 @@ public sealed class ElementNodeViewModel : ObservableObject
             return;
         }
 
+        if (row.IsVisualProperty)
+        {
+            // Tree patches can carry the same property already represented
+            // by a richer xamlOM descriptor. Refresh its value without
+            // replacing/removing the metadata-backed row.
+            row.Value = value;
+            NotifyIfIdentifyingProperty(name);
+            return;
+        }
+
         if (value.Length == 0 && !row.IsEditable)
         {
             PropertyRows.Remove(row);
@@ -259,6 +274,30 @@ public sealed class ElementNodeViewModel : ObservableObject
         }
         row.Value = value;
         NotifyIfIdentifyingProperty(name);
+    }
+
+    public void ReplaceVisualPropertyRows(IEnumerable<PropertyRowViewModel> rows)
+    {
+        var merged = PropertyRows.Where(row => !row.IsVisualProperty).ToList();
+        foreach (var row in rows)
+        {
+            var treeRow = merged.FirstOrDefault(existing => existing.Name == row.Name);
+            if (treeRow != null)
+                merged.Remove(treeRow);
+            merged.Add(row);
+        }
+        // One collection replacement produces one ItemsControl refresh.
+        // Clearing/adding hundreds of dependency properties individually
+        // made selecting a node look frozen while WPF repeatedly remeasured
+        // the property panel.
+        PropertyRows = new ObservableCollection<PropertyRowViewModel>(merged);
+        OnPropertyChanged(nameof(DisplayName));
+    }
+
+    public void ReplacePropertyRows(IEnumerable<PropertyRowViewModel> rows)
+    {
+        PropertyRows = new ObservableCollection<PropertyRowViewModel>(rows);
+        OnPropertyChanged(nameof(DisplayName));
     }
 
     /// <summary>

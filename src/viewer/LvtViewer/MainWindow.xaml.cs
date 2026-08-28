@@ -48,7 +48,7 @@ public partial class MainWindow : Window
         _viewModel.PropertyChanged += (_, e) =>
         {
             // HighlightSelected: the user toggled the checkbox. SelectedElement:
-            // covers MainViewModel clearing it itself (e.g. on watch.Exited,
+            // covers MainViewModel clearing it itself (e.g. if the MCP server exits,
             // when the target process crashed or closed — see MainViewModel's
             // constructor) as well as the TreeView.SelectedItemChanged case
             // already handled above; without this, a programmatic clear would
@@ -274,7 +274,7 @@ public partial class MainWindow : Window
 
     private void OnHighlightedNodeBoundsChanged(object? sender, PropertyChangedEventArgs e)
     {
-        // A live watch tick can move/resize the selected element (e.g. the
+        // A live MCP patch can move/resize the selected element (e.g. the
         // target window was resized); keep the overlay in sync rather than
         // leaving it pointing at a stale rectangle.
         if (e.PropertyName is nameof(ElementNodeViewModel.BoundsX) or nameof(ElementNodeViewModel.BoundsY)

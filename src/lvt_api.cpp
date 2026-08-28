@@ -611,6 +611,41 @@ lvt::UiaOptions uia_options_from(const json& params) {
 }
 #endif
 
+struct InjectedFrameworkShape {
+    bool xamlHost = false;
+    bool xamlContent = false;
+    bool winui3Host = false;
+    bool winui3Content = false;
+};
+
+void inspect_injected_framework_shape(
+    const lvt::Element& element, InjectedFrameworkShape& shape) {
+    if (element.className == "Windows.UI.Core.CoreWindow" ||
+        element.className == "Windows.UI.Composition.DesktopWindowContentBridge")
+        shape.xamlHost = true;
+    if (element.className == "Microsoft.UI.Content.DesktopChildSiteBridge" ||
+        element.className == "WinUIDesktopWin32WindowClass")
+        shape.winui3Host = true;
+
+    const bool isXamlRuntimeType =
+        element.className.rfind("Windows.UI.Xaml.", 0) == 0 ||
+        element.className.rfind("Microsoft.UI.Xaml.", 0) == 0;
+    if (isXamlRuntimeType && element.framework == "xaml")
+        shape.xamlContent = true;
+    if (isXamlRuntimeType && element.framework == "winui3")
+        shape.winui3Content = true;
+
+    for (const auto& child : element.children)
+        inspect_injected_framework_shape(child, shape);
+}
+
+bool missing_injected_framework_content(const lvt::Element& tree) {
+    InjectedFrameworkShape shape;
+    inspect_injected_framework_shape(tree, shape);
+    return (shape.xamlHost && !shape.xamlContent) ||
+           (shape.winui3Host && !shape.winui3Content);
+}
+
 // Build the tree a request asked for. `uia` selects the view; the visual tree
 // still needs an architecture match because it injects.
 //
@@ -702,9 +737,27 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
 
     auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
     const bool fastProperties = get_bool(params, "fast", false);
-    auto connectionLookup = connection_lookup_for_session(session, frameworks);
-    tree = lvt::build_tree(session.hwnd, session.pid, frameworks, -1, {}, fastProperties, connectionLookup);
-    return true;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        auto connectionLookup = connection_lookup_for_session(session, frameworks);
+        tree = lvt::build_tree(
+            session.hwnd, session.pid, frameworks, -1, {}, fastProperties, connectionLookup);
+        if (!missing_injected_framework_content(tree))
+            return true;
+
+        // A failed persistent refresh still yields a valid Win32 host
+        // skeleton. Treating that as the new truth makes diff consumers
+        // remove the entire live XAML subtree, only to add it back after
+        // reconnection. Retry so the lookup can prune/reacquire the dead
+        // connection, and never advance an MCP snapshot to this transient
+        // host-only state.
+        if (attempt < 2)
+            Sleep(500);
+    }
+
+    error =
+        "the XAML/WinUI host is still present but its framework tree is temporarily "
+        "unavailable; the previous MCP snapshot was preserved";
+    return false;
 }
 
 // --- methods ------------------------------------------------------------

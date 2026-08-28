@@ -158,6 +158,7 @@
             <Grid Grid.Column="2">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
 
@@ -191,13 +192,29 @@
                     </Grid>
                     <Separator Margin="0,8,0,4"/>
                     <TextBlock Text="Properties" FontWeight="Bold"/>
-                    <TextBlock Text="Switch on &quot;UI Automation tree&quot; above to edit Toggle/Value properties — the visual tree is read-only."
+                    <TextBlock Text="Writable scalar XAML/WinUI properties can be edited below; Clear restores the inherited or default value."
                                Foreground="#FF808080" FontStyle="Italic" TextWrapping="Wrap" Margin="0,2,0,0"
                                Visibility="{Binding DataContext.UseUia, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource InverseBoolToVisibility}}"/>
                 </StackPanel>
 
-                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="10,0,10,10">
-                    <ItemsControl ItemsSource="{Binding SelectedElement.PropertyRows}">
+                <Grid Grid.Row="1" Margin="10,2,10,6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="Filter properties:" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox Grid.Column="1"
+                             Text="{Binding PropertySearchQuery, UpdateSourceTrigger=PropertyChanged}"
+                             ToolTip="Filter property names and values"/>
+                    <ProgressBar Grid.Column="2" Width="80" Height="5" Margin="10,0,0,0"
+                                 VerticalAlignment="Center" IsIndeterminate="True"
+                                 Visibility="{Binding IsPropertyPanelLoading, Converter={StaticResource BoolToVisibility}}"
+                                 ToolTip="Loading properties from the target"/>
+                </Grid>
+
+                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" Margin="10,0,10,10">
+                    <ItemsControl ItemsSource="{Binding SelectedPropertyRows}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>
                                 <Grid Margin="0,2,0,2">
@@ -223,6 +240,25 @@
                                             <Button Content="Set" Padding="10,1"
                                                     Command="{Binding DataContext.SetValueCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                                     CommandParameter="{Binding}"/>
+                                        </StackPanel>
+                                        <StackPanel Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=VisualValue}">
+                                            <TextBlock Foreground="#FF707070" FontSize="11" Margin="0,0,0,2">
+                                                <Run Text="{Binding ValueType, Mode=OneWay}"/>
+                                                <Run Text=" · "/>
+                                                <Run Text="{Binding Source, Mode=OneWay}"/>
+                                            </TextBlock>
+                                            <StackPanel Orientation="Horizontal">
+                                                <TextBox Text="{Binding EditText, UpdateSourceTrigger=PropertyChanged}"
+                                                         Width="180" Margin="0,0,8,0"/>
+                                                <Button Content="Set" Padding="10,1" Margin="0,0,6,0"
+                                                        Command="{Binding DataContext.SetVisualPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        CommandParameter="{Binding}"/>
+                                                <Button Content="Clear" Padding="10,1"
+                                                        IsEnabled="{Binding CanClear}"
+                                                        ToolTip="Restore the inherited, styled, or default value"
+                                                        Command="{Binding DataContext.ClearVisualPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        CommandParameter="{Binding}"/>
+                                            </StackPanel>
                                         </StackPanel>
                                     </StackPanel>
                                 </Grid>
