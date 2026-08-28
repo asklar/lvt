@@ -3,6 +3,7 @@
 #include "../debug.h"
 #include "../module_util.h"
 #include "../target.h"
+#include "overlapped_io.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -312,13 +313,6 @@ IoWaitResult wait_for_io(HANDLE event, HANDLE process, DWORD timeoutMs) {
     return IoWaitResult::failed;
 }
 
-void cancel_and_drain(HANDLE pipe, OVERLAPPED& overlapped) {
-    CancelIoEx(pipe, &overlapped);
-    WaitForSingleObject(overlapped.hEvent, 1000);
-    DWORD ignored = 0;
-    GetOverlappedResult(pipe, &overlapped, &ignored, FALSE);
-}
-
 class DuplexPipeLineIo {
 public:
     DuplexPipeLineIo(HANDLE pipe, HANDLE process)
@@ -365,7 +359,7 @@ public:
                     return false;
                 const auto wait = wait_for_io(m_readEvent.get(), m_process, remaining);
                 if (wait != IoWaitResult::completed) {
-                    cancel_and_drain(m_pipe, overlapped);
+                    detail::cancel_and_complete_overlapped(m_pipe, overlapped);
                     return false;
                 }
                 if (!GetOverlappedResult(m_pipe, &overlapped, &bytesRead, FALSE))
@@ -403,7 +397,7 @@ public:
                     return false;
                 const auto wait = wait_for_io(m_writeEvent.get(), m_process, remaining);
                 if (wait != IoWaitResult::completed) {
-                    cancel_and_drain(m_pipe, overlapped);
+                    detail::cancel_and_complete_overlapped(m_pipe, overlapped);
                     return false;
                 }
                 if (!GetOverlappedResult(m_pipe, &overlapped, &bytesWritten, FALSE))
@@ -434,7 +428,7 @@ bool wait_for_pipe_connection(
 
     const auto wait = wait_for_io(overlapped.hEvent, process, timeoutMs);
     if (wait != IoWaitResult::completed) {
-        cancel_and_drain(pipe, overlapped);
+        detail::cancel_and_complete_overlapped(pipe, overlapped);
         return false;
     }
 
@@ -593,7 +587,10 @@ public:
             connectedSynchronously ? ERROR_SUCCESS : GetLastError();
 
         if (!inject_dll(pid, tapPath, options.frameworkLabel)) {
-            cancel_and_drain(pipe.get(), connectOverlapped);
+            if (connectError == ERROR_IO_PENDING) {
+                detail::cancel_and_complete_overlapped(
+                    pipe.get(), connectOverlapped);
+            }
             DeleteFileW(sidecar.c_str());
             return nullptr;
         }
@@ -711,6 +708,24 @@ public:
         auto response = send_command_locked(
             "GET_PROPERTIES", std::to_string(handle),
             m_options.commandTimeoutMs);
+        if (response.completed && !response.success) {
+            PropertySnapshotResult firstFailure;
+            set_command_error(response.payload, firstFailure);
+            if (firstFailure.hresult ==
+                HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
+                // A new persistent connection has an empty reverse identity
+                // map until its first tree walk. Hydrate it once and retry the
+                // stable provider handle; a genuinely stale/new-assembly
+                // handle remains rejected by the second response.
+                auto hydration = send_command_locked(
+                    "GET_TREE", "{}", m_options.commandTimeoutMs);
+                if (hydration.completed && hydration.success) {
+                    response = send_command_locked(
+                        "GET_PROPERTIES", std::to_string(handle),
+                        m_options.commandTimeoutMs);
+                }
+            }
+        }
         if (!response.completed) {
             set_transport_error(result);
             return result;

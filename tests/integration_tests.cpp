@@ -5,8 +5,10 @@
 #include <sstream>
 #include <Windows.h>
 #include <CommCtrl.h>
+#include <TlHelp32.h>
 #include <wil/resource.h>
 #include <cstdio>
+#include <cwctype>
 #include <string>
 #include <array>
 #include <atomic>
@@ -726,6 +728,109 @@ static HWND visible_window_for_pid(DWORD pid) {
 }
 
 #if LVT_ENABLE_WPF || LVT_ENABLE_WINFORMS
+class ScopedSampleProcess {
+public:
+    bool start(const fs::path& executable) {
+        STARTUPINFOA startup{sizeof(startup)};
+        PROCESS_INFORMATION info{};
+        std::string command = "\"" + executable.string() + "\"";
+        if (!CreateProcessA(
+                nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                executable.parent_path().string().c_str(), &startup, &info))
+            return false;
+        process_.reset(info.hProcess);
+        thread_.reset(info.hThread);
+        pid_ = info.dwProcessId;
+        WaitForInputIdle(process_.get(), 5000);
+        for (int attempt = 0; attempt < 30 && !hwnd_; ++attempt) {
+            hwnd_ = visible_window_for_pid(pid_);
+            if (!hwnd_)
+                Sleep(100);
+        }
+        return hwnd_ != nullptr;
+    }
+
+    ~ScopedSampleProcess() {
+        if (process_ && WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT)
+            TerminateProcess(process_.get(), 0);
+    }
+
+    DWORD pid() const { return pid_; }
+    HWND hwnd() const { return hwnd_; }
+
+private:
+    wil::unique_handle process_;
+    wil::unique_handle thread_;
+    DWORD pid_ = 0;
+    HWND hwnd_ = nullptr;
+};
+
+class ScopedUiBlock {
+public:
+    bool enter(const wchar_t* framework, DWORD pid) {
+        const std::wstring prefix =
+            L"Local\\Lvt" + std::wstring(framework) +
+            L"SampleUiBlock_" + std::to_wstring(pid);
+        trigger_.reset(OpenEventW(
+            EVENT_MODIFY_STATE, FALSE, (prefix + L"_trigger").c_str()));
+        entered_.reset(OpenEventW(
+            SYNCHRONIZE, FALSE, (prefix + L"_entered").c_str()));
+        release_.reset(OpenEventW(
+            EVENT_MODIFY_STATE, FALSE, (prefix + L"_release").c_str()));
+        if (!trigger_ || !entered_ || !release_)
+            return false;
+        if (!SetEvent(trigger_.get()))
+            return false;
+        active_ =
+            WaitForSingleObject(entered_.get(), 5000) == WAIT_OBJECT_0;
+        return active_;
+    }
+
+    void release() {
+        if (active_) {
+            SetEvent(release_.get());
+            active_ = false;
+        }
+    }
+
+    ~ScopedUiBlock() {
+        release();
+    }
+
+private:
+    wil::unique_handle trigger_;
+    wil::unique_handle entered_;
+    wil::unique_handle release_;
+    bool active_ = false;
+};
+
+static std::wstring loaded_module_path(DWORD pid, const wchar_t* moduleName) {
+    const HANDLE raw = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (raw == INVALID_HANDLE_VALUE)
+        return {};
+    wil::unique_handle snapshot(raw);
+    MODULEENTRY32W module{sizeof(module)};
+    if (!Module32FirstW(snapshot.get(), &module))
+        return {};
+    do {
+        if (_wcsicmp(module.szModule, moduleName) == 0)
+            return module.szExePath;
+    } while (Module32NextW(snapshot.get(), &module));
+    return {};
+}
+
+static std::wstring loaded_module_path_until(
+    DWORD pid, const wchar_t* moduleName, int attempts = 20) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        auto path = loaded_module_path(pid, moduleName);
+        if (!path.empty())
+            return path;
+        Sleep(100);
+    }
+    return {};
+}
+
 static const lvt::Element* find_named_element(
     const lvt::Element& element, const std::string& name) {
     auto found = element.properties.find("name");
@@ -745,6 +850,16 @@ static const lvt::PropertyDescriptor* find_property_descriptor(
     for (const auto& descriptor : snapshot.schema->descriptors) {
         if (descriptor.name == name)
             return &descriptor;
+    }
+    return nullptr;
+}
+
+static const lvt::PropertyValue* find_property_value(
+    const lvt::PropertySnapshotResult& snapshot,
+    const std::string& descriptorId) {
+    for (const auto& value : snapshot.values) {
+        if (value.descriptorId == descriptorId)
+            return &value;
     }
     return nullptr;
 }
@@ -1252,6 +1367,51 @@ TEST_F(WinFormsSampleFixture, X86HostfxrAbiRunsTreeAndProperties) {
     ASSERT_TRUE(clear.ok) << clear.error;
     EXPECT_EQ(clear.value, "Default text");
 }
+
+TEST_F(WinFormsSampleFixture, QueuedClearTimeoutCannotMutateLater) {
+    SkipIfNotReady();
+    HWND hwnd = visible_window_for_pid(s_pid);
+    ASSERT_NE(hwnd, nullptr);
+    lvt::WinFormsProvider provider;
+    auto connection = provider.open_connection(hwnd, s_pid);
+    ASSERT_NE(connection, nullptr);
+
+    auto tree = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(connection->get_tree(tree, false));
+    const auto* form = find_named_element(tree, "MainForm");
+    ASSERT_NE(form, nullptr);
+    auto snapshot =
+        connection->get_property_snapshot(form->providerHandle);
+    ASSERT_TRUE(snapshot.ok) << snapshot.error;
+    const auto* property =
+        find_property_descriptor(snapshot, "EditableText");
+    ASSERT_NE(property, nullptr);
+    auto set = connection->set_property(
+        form->providerHandle, property->descriptorId, "blocked clear");
+    ASSERT_TRUE(set.ok) << set.error;
+
+    ScopedUiBlock block;
+    ASSERT_TRUE(block.enter(L"WinForms", s_pid));
+    auto clear = connection->clear_property(
+        form->providerHandle, property->descriptorId);
+    EXPECT_FALSE(clear.ok);
+    EXPECT_NE(clear.error.find("before execution"), std::string::npos)
+        << clear.error;
+    block.release();
+
+    auto after =
+        connection->get_property_snapshot(form->providerHandle);
+    ASSERT_TRUE(after.ok) << after.error;
+    const auto* value =
+        find_property_value(after, property->descriptorId);
+    ASSERT_NE(value, nullptr);
+    EXPECT_EQ(value->value, "blocked clear");
+    EXPECT_TRUE(value->canClear);
+
+    auto cleanup = connection->clear_property(
+        form->providerHandle, property->descriptorId);
+    ASSERT_TRUE(cleanup.ok) << cleanup.error;
+}
 #endif
 
 class WpfSampleFixture : public ::testing::Test {
@@ -1552,6 +1712,44 @@ TEST_F(WpfSampleFixture, X86HostfxrAbiRunsTreeAndProperties) {
     ASSERT_TRUE(clear.ok) << clear.error;
     EXPECT_NEAR(std::stod(clear.value), 0.75, 0.001);
 }
+
+TEST_F(WpfSampleFixture, QueuedSetTimeoutCannotMutateLater) {
+    SkipIfNotReady();
+    HWND hwnd = visible_window_for_pid(s_pid);
+    ASSERT_NE(hwnd, nullptr);
+    lvt::WpfProvider provider;
+    auto connection = provider.open_connection(hwnd, s_pid);
+    ASSERT_NE(connection, nullptr);
+
+    auto tree = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(connection->get_tree(tree, false));
+    const auto* button = find_named_element(tree, "OkButton");
+    ASSERT_NE(button, nullptr);
+    auto snapshot =
+        connection->get_property_snapshot(button->providerHandle);
+    ASSERT_TRUE(snapshot.ok) << snapshot.error;
+    const auto* property =
+        find_property_descriptor(snapshot, "Opacity");
+    ASSERT_NE(property, nullptr);
+
+    ScopedUiBlock block;
+    ASSERT_TRUE(block.enter(L"Wpf", s_pid));
+    auto set = connection->set_property(
+        button->providerHandle, property->descriptorId, "0.4");
+    EXPECT_FALSE(set.ok);
+    EXPECT_NE(set.error.find("before execution"), std::string::npos)
+        << set.error;
+    block.release();
+
+    auto after =
+        connection->get_property_snapshot(button->providerHandle);
+    ASSERT_TRUE(after.ok) << after.error;
+    const auto* value =
+        find_property_value(after, property->descriptorId);
+    ASSERT_NE(value, nullptr);
+    EXPECT_NEAR(std::stod(value->value), 0.75, 0.001);
+    EXPECT_FALSE(value->canClear);
+}
 #endif
 
 #if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED
@@ -1637,6 +1835,135 @@ TEST(ManagedWpfConnection, TargetExitBreaksConnectionWithoutBlocking) {
     EXPECT_FALSE(properties.ok);
     EXPECT_FALSE(properties.error.empty());
     EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(2));
+}
+#endif
+
+#if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED
+TEST(ManagedCoreClrFloor, Net6WinFormsTreeAndProperties) {
+    ScopedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_NET6_SAMPLE_EXE_PATH));
+    auto coreClr = loaded_module_path_until(sample.pid(), L"coreclr.dll");
+    ASSERT_FALSE(coreClr.empty());
+    std::transform(
+        coreClr.begin(), coreClr.end(), coreClr.begin(),
+        [](wchar_t value) { return static_cast<wchar_t>(towlower(value)); });
+    EXPECT_NE(coreClr.find(L"\\6.0."), std::wstring::npos)
+        << "the compatibility fixture must actually run on CoreCLR 6: "
+        << fs::path(coreClr).string();
+
+    lvt::WinFormsProvider provider;
+    auto connection = provider.open_connection(sample.hwnd(), sample.pid());
+    ASSERT_NE(connection, nullptr);
+    auto tree = lvt::build_tree(sample.hwnd(), sample.pid(), {});
+    ASSERT_TRUE(connection->get_tree(tree, false));
+    const auto* form = find_named_element(tree, "MainForm");
+    ASSERT_NE(form, nullptr);
+    auto snapshot =
+        connection->get_property_snapshot(form->providerHandle);
+    ASSERT_TRUE(snapshot.ok) << snapshot.error;
+    EXPECT_NE(find_property_descriptor(snapshot, "EditableText"), nullptr);
+}
+#endif
+
+#if LVT_ENABLE_WPF && LVT_WITH_MANAGED
+TEST(ManagedCoreClrFloor, Net6WpfTreeAndProperties) {
+    ScopedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WPF_NET6_SAMPLE_EXE_PATH));
+    auto coreClr = loaded_module_path_until(sample.pid(), L"coreclr.dll");
+    ASSERT_FALSE(coreClr.empty());
+    std::transform(
+        coreClr.begin(), coreClr.end(), coreClr.begin(),
+        [](wchar_t value) { return static_cast<wchar_t>(towlower(value)); });
+    EXPECT_NE(coreClr.find(L"\\6.0."), std::wstring::npos)
+        << "the compatibility fixture must actually run on CoreCLR 6: "
+        << fs::path(coreClr).string();
+
+    lvt::WpfProvider provider;
+    auto connection = provider.open_connection(sample.hwnd(), sample.pid());
+    ASSERT_NE(connection, nullptr);
+    auto tree = lvt::build_tree(sample.hwnd(), sample.pid(), {});
+    ASSERT_TRUE(connection->get_tree(tree, false));
+    const auto* button = find_named_element(tree, "OkButton");
+    ASSERT_NE(button, nullptr);
+    auto snapshot =
+        connection->get_property_snapshot(button->providerHandle);
+    ASSERT_TRUE(snapshot.ok) << snapshot.error;
+    EXPECT_NE(find_property_descriptor(snapshot, "Opacity"), nullptr);
+}
+#endif
+
+#if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED
+TEST(ManagedClrCompatibility, Net48WinFormsTreeAndProperties) {
+    ScopedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_NET48_SAMPLE_EXE_PATH));
+    EXPECT_FALSE(loaded_module_path_until(sample.pid(), L"clr.dll").empty());
+    EXPECT_TRUE(loaded_module_path(sample.pid(), L"coreclr.dll").empty());
+
+    lvt::WinFormsProvider provider;
+    auto connection = provider.open_connection(sample.hwnd(), sample.pid());
+    ASSERT_NE(connection, nullptr);
+    auto tree = lvt::build_tree(sample.hwnd(), sample.pid(), {});
+    ASSERT_TRUE(connection->get_tree(tree, false));
+    const auto* form = find_named_element(tree, "MainForm");
+    ASSERT_NE(form, nullptr);
+    auto snapshot =
+        connection->get_property_snapshot(form->providerHandle);
+    ASSERT_TRUE(snapshot.ok) << snapshot.error;
+    EXPECT_NE(find_property_descriptor(snapshot, "EditableText"), nullptr);
+}
+#endif
+
+#if LVT_ENABLE_WPF && LVT_WITH_MANAGED
+TEST(ManagedClrCompatibility, Net48WpfTreeAndProperties) {
+    ScopedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WPF_NET48_SAMPLE_EXE_PATH));
+    EXPECT_FALSE(loaded_module_path_until(sample.pid(), L"clr.dll").empty());
+    EXPECT_TRUE(loaded_module_path(sample.pid(), L"coreclr.dll").empty());
+
+    lvt::WpfProvider provider;
+    auto connection = provider.open_connection(sample.hwnd(), sample.pid());
+    ASSERT_NE(connection, nullptr);
+    auto tree = lvt::build_tree(sample.hwnd(), sample.pid(), {});
+    ASSERT_TRUE(connection->get_tree(tree, false));
+    const auto* button = find_named_element(tree, "OkButton");
+    ASSERT_NE(button, nullptr);
+    auto snapshot =
+        connection->get_property_snapshot(button->providerHandle);
+    ASSERT_TRUE(snapshot.ok) << snapshot.error;
+    EXPECT_NE(find_property_descriptor(snapshot, "Opacity"), nullptr);
+}
+#endif
+
+#if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED
+TEST(ManagedIdentity, NewProcessRejectsPriorAssemblyHandle) {
+    uint64_t oldHandle = 0;
+    {
+        ScopedSampleProcess first;
+        ASSERT_TRUE(first.start(WINFORMS_SAMPLE_EXE_PATH));
+        lvt::WinFormsProvider provider;
+        auto connection = provider.open_connection(first.hwnd(), first.pid());
+        ASSERT_NE(connection, nullptr);
+        auto tree = lvt::build_tree(first.hwnd(), first.pid(), {});
+        ASSERT_TRUE(connection->get_tree(tree, false));
+        const auto* form = find_named_element(tree, "MainForm");
+        ASSERT_NE(form, nullptr);
+        oldHandle = form->providerHandle;
+        ASSERT_NE(oldHandle, 0u);
+    }
+
+    ScopedSampleProcess second;
+    ASSERT_TRUE(second.start(WINFORMS_SAMPLE_EXE_PATH));
+    lvt::WinFormsProvider provider;
+    auto connection = provider.open_connection(second.hwnd(), second.pid());
+    ASSERT_NE(connection, nullptr);
+    auto tree = lvt::build_tree(second.hwnd(), second.pid(), {});
+    ASSERT_TRUE(connection->get_tree(tree, false));
+    const auto* form = find_named_element(tree, "MainForm");
+    ASSERT_NE(form, nullptr);
+    EXPECT_NE(form->providerHandle, oldHandle);
+    auto stale = connection->get_property_snapshot(oldHandle);
+    EXPECT_FALSE(stale.ok);
+    EXPECT_NE(stale.error.find("stale"), std::string::npos);
 }
 #endif
 

@@ -200,6 +200,9 @@ std::map<std::string, std::vector<std::pair<std::string, lvt::ConnectionHandle>>
 // falls back to its normal one-shot-per-call path with no behavior change.
 lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
                                                     const std::vector<lvt::FrameworkInfo>& frameworks) {
+    if (!session_is_active(session.id))
+        return {};
+
     bool hasXaml = false, hasWinUI3 = false, hasWpf = false, hasWinForms = false;
     for (auto& fi : frameworks) {
         if (fi.type == lvt::Framework::Xaml) hasXaml = true;
@@ -211,7 +214,10 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         return {};
 
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
-    auto& entry = g_sessionConnections[session.id];
+    if (!session_is_active(session.id))
+        return {};
+    auto [entryIt, _] = g_sessionConnections.try_emplace(session.id);
+    auto& entry = entryIt->second;
 
     // A connection can die mid-session (a transient timeout against an
     // unusually large/busy tree, or the target recycling something XAML
@@ -1430,10 +1436,17 @@ json method_get_editable_properties(const json& params) {
     const auto session = require_session(params);
     const auto target = require_property_target(session, params);
     TargetGuard guard(session.hwnd);
+    if (!session_is_active(session.id))
+        throw std::runtime_error(
+            "this session was disconnected while the property request was waiting");
     auto* connection = typed_property_connection(session, target);
-    return property_snapshot_result(
-        get_string(params, "element"),
-        connection->get_property_snapshot(target.handle));
+    auto result = connection->get_property_snapshot(target.handle);
+    if (!result.ok && !connection->is_alive() &&
+        session_is_active(session.id)) {
+        connection = typed_property_connection(session, target);
+        result = connection->get_property_snapshot(target.handle);
+    }
+    return property_snapshot_result(get_string(params, "element"), result);
 }
 
 json method_set_property(const json& params, bool allowInput) {
@@ -1457,6 +1470,9 @@ json method_set_property(const json& params, bool allowInput) {
     const auto value = valueIt->get<std::string>();
 
     TargetGuard guard(session.hwnd);
+    if (!session_is_active(session.id))
+        throw std::runtime_error(
+            "this session was disconnected while the property mutation was waiting");
     auto* connection = typed_property_connection(session, target);
     return property_mutation_result(
         get_string(params, "element"), descriptorId,
@@ -1480,6 +1496,9 @@ json method_clear_property(const json& params, bool allowInput) {
         throw std::runtime_error("'descriptorId' must be a non-empty string");
 
     TargetGuard guard(session.hwnd);
+    if (!session_is_active(session.id))
+        throw std::runtime_error(
+            "this session was disconnected while the property mutation was waiting");
     auto* connection = typed_property_connection(session, target);
     return property_mutation_result(
         get_string(params, "element"), descriptorId,

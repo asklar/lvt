@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>WpfSample</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <EnableDefaultItems>false</EnableDefaultItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ApplicationDefinition Include="..\WpfSample\App.xaml" Link="App.xaml" />
+    <Page Include="..\WpfSample\MainWindow.xaml" Link="MainWindow.xaml" />
+    <Compile Include="..\WpfSample\App.xaml.cs" Link="App.xaml.cs" />
+    <Compile Include="..\WpfSample\MainWindow.xaml.cs" Link="MainWindow.xaml.cs" />
+  </ItemGroup>
+</Project>

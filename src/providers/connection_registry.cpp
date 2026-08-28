@@ -6,8 +6,10 @@
 namespace lvt {
 
 ConnectionHandle::ConnectionHandle(DWORD pid, std::string frameworkLabel,
+                                   uint64_t generation,
                                    std::shared_ptr<IFrameworkConnection> connection)
-    : m_pid(pid), m_frameworkLabel(std::move(frameworkLabel)), m_connection(std::move(connection)) {
+    : m_pid(pid), m_frameworkLabel(std::move(frameworkLabel)),
+      m_generation(generation), m_connection(std::move(connection)) {
 }
 
 ConnectionHandle::~ConnectionHandle() {
@@ -17,8 +19,10 @@ ConnectionHandle::~ConnectionHandle() {
 ConnectionHandle::ConnectionHandle(ConnectionHandle&& other) noexcept
     : m_pid(other.m_pid),
       m_frameworkLabel(std::move(other.m_frameworkLabel)),
+      m_generation(other.m_generation),
       m_connection(std::move(other.m_connection)) {
     other.m_connection.reset();
+    other.m_generation = 0;
 }
 
 ConnectionHandle& ConnectionHandle::operator=(ConnectionHandle&& other) noexcept {
@@ -26,8 +30,10 @@ ConnectionHandle& ConnectionHandle::operator=(ConnectionHandle&& other) noexcept
         release_if_held();
         m_pid = other.m_pid;
         m_frameworkLabel = std::move(other.m_frameworkLabel);
+        m_generation = other.m_generation;
         m_connection = std::move(other.m_connection);
         other.m_connection.reset();
+        other.m_generation = 0;
     }
     return *this;
 }
@@ -39,7 +45,8 @@ void ConnectionHandle::reset() {
 
 void ConnectionHandle::release_if_held() {
     if (m_connection) {
-        ConnectionRegistry::instance().release(m_pid, m_frameworkLabel);
+        ConnectionRegistry::instance().release(
+            m_pid, m_frameworkLabel, m_generation, m_connection.get());
     }
 }
 
@@ -55,7 +62,9 @@ ConnectionHandle ConnectionRegistry::acquire(DWORD pid, HWND hwnd, const std::st
     auto it = m_entries.find(key);
     if (it != m_entries.end() && it->second.connection && it->second.connection->is_alive()) {
         it->second.refCount++;
-        return ConnectionHandle(pid, frameworkLabel, it->second.connection);
+        return ConnectionHandle(
+            pid, frameworkLabel, it->second.generation,
+            it->second.connection);
     }
 
     // No live entry (or a stale one whose connection died) - (re)create it.
@@ -72,15 +81,22 @@ ConnectionHandle ConnectionRegistry::acquire(DWORD pid, HWND hwnd, const std::st
     Entry entry;
     entry.connection = connection;
     entry.refCount = 1;
+    entry.generation = m_nextGeneration++;
     m_entries[key] = entry;
-    return ConnectionHandle(pid, frameworkLabel, connection);
+    return ConnectionHandle(
+        pid, frameworkLabel, entry.generation, connection);
 }
 
-void ConnectionRegistry::release(DWORD pid, const std::string& frameworkLabel) {
+void ConnectionRegistry::release(
+    DWORD pid, const std::string& frameworkLabel, uint64_t generation,
+    const IFrameworkConnection* connection) {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto key = std::make_pair(pid, frameworkLabel);
     auto it = m_entries.find(key);
     if (it == m_entries.end())
+        return;
+    if (it->second.generation != generation ||
+        it->second.connection.get() != connection)
         return;
     if (--it->second.refCount <= 0) {
         // Dropping the shared_ptr here runs the connection's destructor,

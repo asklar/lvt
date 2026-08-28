@@ -595,7 +595,7 @@ add_library(lvt_wpf_tap SHARED
 )
 target_compile_definitions(lvt_wpf_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(lvt_wpf_tap PRIVATE src src/tap_managed)
-target_link_libraries(lvt_wpf_tap PRIVATE WIL::WIL ole32)
+target_link_libraries(lvt_wpf_tap PRIVATE WIL::WIL ole32 version)
 set_property(TARGET lvt_wpf_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set_target_properties(lvt_wpf_tap PROPERTIES
@@ -654,7 +654,7 @@ add_library(lvt_winforms_tap SHARED
 )
 target_compile_definitions(lvt_winforms_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(lvt_winforms_tap PRIVATE src src/tap_managed)
-target_link_libraries(lvt_winforms_tap PRIVATE WIL::WIL ole32)
+target_link_libraries(lvt_winforms_tap PRIVATE WIL::WIL ole32 version)
 set_property(TARGET lvt_winforms_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set_target_properties(lvt_winforms_tap PROPERTIES
@@ -936,6 +936,36 @@ add_custom_target(wpf_sample_app ALL
 file(TO_NATIVE_PATH "${WPF_SAMPLE_OUTPUT_DIR}/WpfSample.exe" WPF_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" WPF_SAMPLE_EXE_ESCAPED "${WPF_SAMPLE_EXE_NATIVE}")
 
+set(WPF_NET6_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WpfSampleNet6/WpfSampleNet6.csproj")
+set(WPF_NET6_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WpfSampleNet6")
+add_custom_target(wpf_net6_sample_app ALL
+    COMMAND dotnet publish "${WPF_NET6_SAMPLE_PROJECT}" -c Release
+        -p:CheckEolTargetFramework=false
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WPF_NET6_SAMPLE_OUTPUT_DIR}"
+    BYPRODUCTS "${WPF_NET6_SAMPLE_OUTPUT_DIR}/WpfSample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building .NET 6 WPF sample app"
+)
+file(TO_NATIVE_PATH "${WPF_NET6_SAMPLE_OUTPUT_DIR}/WpfSample.exe" WPF_NET6_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WPF_NET6_SAMPLE_EXE_ESCAPED "${WPF_NET6_SAMPLE_EXE_NATIVE}")
+
+set(WPF_NET48_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WpfSampleNet48/WpfSampleNet48.csproj")
+set(WPF_NET48_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WpfSampleNet48")
+add_custom_target(wpf_net48_sample_app ALL
+    COMMAND dotnet build "${WPF_NET48_SAMPLE_PROJECT}" -c Release
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WPF_NET48_SAMPLE_OUTPUT_DIR}"
+    BYPRODUCTS "${WPF_NET48_SAMPLE_OUTPUT_DIR}/WpfSample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building .NET Framework 4.8 WPF sample app"
+)
+file(TO_NATIVE_PATH "${WPF_NET48_SAMPLE_OUTPUT_DIR}/WpfSample.exe" WPF_NET48_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WPF_NET48_SAMPLE_EXE_ESCAPED "${WPF_NET48_SAMPLE_EXE_NATIVE}")
+
 # WinUI3 sample app used by integration tests
 set(WINUI3_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/WinUI3Sample.csproj")
 set(WINUI3_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinUI3Sample")
@@ -990,6 +1020,36 @@ add_custom_target(winforms_sample_app ALL
 file(TO_NATIVE_PATH "${WINFORMS_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe" WINFORMS_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" WINFORMS_SAMPLE_EXE_ESCAPED "${WINFORMS_SAMPLE_EXE_NATIVE}")
 
+set(WINFORMS_NET6_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinFormsSampleNet6/WinFormsSampleNet6.csproj")
+set(WINFORMS_NET6_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinFormsSampleNet6")
+add_custom_target(winforms_net6_sample_app ALL
+    COMMAND dotnet publish "${WINFORMS_NET6_SAMPLE_PROJECT}" -c Release
+        -p:CheckEolTargetFramework=false
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WINFORMS_NET6_SAMPLE_OUTPUT_DIR}" --nologo
+    BYPRODUCTS "${WINFORMS_NET6_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building .NET 6 WinForms sample app"
+)
+file(TO_NATIVE_PATH "${WINFORMS_NET6_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe" WINFORMS_NET6_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WINFORMS_NET6_SAMPLE_EXE_ESCAPED "${WINFORMS_NET6_SAMPLE_EXE_NATIVE}")
+
+set(WINFORMS_NET48_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinFormsSampleNet48/WinFormsSampleNet48.csproj")
+set(WINFORMS_NET48_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinFormsSampleNet48")
+add_custom_target(winforms_net48_sample_app ALL
+    COMMAND dotnet build "${WINFORMS_NET48_SAMPLE_PROJECT}" -c Release
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WINFORMS_NET48_SAMPLE_OUTPUT_DIR}" --nologo
+    BYPRODUCTS "${WINFORMS_NET48_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building .NET Framework 4.8 WinForms sample app"
+)
+file(TO_NATIVE_PATH "${WINFORMS_NET48_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe" WINFORMS_NET48_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WINFORMS_NET48_SAMPLE_EXE_ESCAPED "${WINFORMS_NET48_SAMPLE_EXE_NATIVE}")
+
 # Native Win32/Common Controls sample app used by integration tests and future
 # property-editing coverage. It deliberately builds for the active CMake
 # architecture, so the same fixture source is usable in x64 and x86 test builds.
@@ -1016,9 +1076,13 @@ target_include_directories(lvt_integration_tests PRIVATE src)
 target_compile_definitions(lvt_integration_tests PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN UNICODE _UNICODE
     WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
+    WPF_NET6_SAMPLE_EXE_PATH="${WPF_NET6_SAMPLE_EXE_ESCAPED}"
+    WPF_NET48_SAMPLE_EXE_PATH="${WPF_NET48_SAMPLE_EXE_ESCAPED}"
     WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
     AVALONIA_SAMPLE_EXE_PATH="${AVALONIA_SAMPLE_EXE_ESCAPED}"
     WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
+    WINFORMS_NET6_SAMPLE_EXE_PATH="${WINFORMS_NET6_SAMPLE_EXE_ESCAPED}"
+    WINFORMS_NET48_SAMPLE_EXE_PATH="${WINFORMS_NET48_SAMPLE_EXE_ESCAPED}"
     "NATIVE_CONTROLS_FIXTURE_EXE_PATH=\"$<TARGET_FILE:lvt_native_controls_fixture>\""
     "MANAGED_PIPE_SPOOF_EXE_PATH=\"$<TARGET_FILE:lvt_managed_pipe_spoof>\""
     # Lets tests assert on repository files, e.g. that the packaged skill has
@@ -1034,9 +1098,13 @@ target_link_libraries(lvt_integration_tests PRIVATE
 target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
 set(LVT_INTEGRATION_DEPS
     wpf_sample_app
+    wpf_net6_sample_app
+    wpf_net48_sample_app
     winui3_sample_app
     lvt_native_controls_fixture
     lvt_managed_pipe_spoof
+    winforms_net6_sample_app
+    winforms_net48_sample_app
 )
 if(LVT_BUILD_TOOL)
     list(APPEND LVT_INTEGRATION_DEPS lvt)

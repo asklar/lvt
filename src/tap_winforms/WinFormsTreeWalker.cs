@@ -21,7 +21,14 @@ namespace LvtWinFormsTap
         public delegate int RunServerDelegate(IntPtr pipeNamePtr, int pipeNameLength);
 
         private const int UiTimeoutMilliseconds = 10000;
-        private static readonly string AssemblyInstanceId = Guid.NewGuid().ToString("N");
+        private static readonly Guid AssemblyInstanceGuid = Guid.NewGuid();
+        private static readonly string AssemblyInstanceId =
+            AssemblyInstanceGuid.ToString("N");
+        private static readonly long AssemblyIdentityPrefix =
+            Math.Max(
+                1,
+                BitConverter.ToUInt32(AssemblyInstanceGuid.ToByteArray(), 0) &
+                0x7FFFFFFF);
         private static readonly ConditionalWeakTable<Control, Identity> Identities =
             new ConditionalWeakTable<Control, Identity>();
         private static long nextIdentity;
@@ -68,13 +75,19 @@ namespace LvtWinFormsTap
                 Dictionary<long, ObjectEntry> snapshot)
             {
                 Identity identity = Identities.GetValue(
-                    value, ignored => new Identity(Interlocked.Increment(ref nextIdentity)));
+                    value, ignored => new Identity(NextIdentity()));
                 snapshot[identity.Value] = new ObjectEntry
                 {
                     Target = new WeakReference(value),
                     MarshalControl = new WeakReference(marshalControl),
                 };
                 return identity.Value;
+            }
+
+            private static long NextIdentity()
+            {
+                uint local = unchecked((uint)Interlocked.Increment(ref nextIdentity));
+                return (AssemblyIdentityPrefix << 32) | local;
             }
 
             public void Commit(Dictionary<long, ObjectEntry> snapshot)
@@ -475,7 +488,7 @@ namespace LvtWinFormsTap
             Control target;
             Control marshalControl;
             ResolveTarget(registry, handle, out target, out marshalControl);
-            return InvokeOnControl(
+            return InvokeMutationOnControl(
                 marshalControl,
                 () =>
                 {
@@ -502,7 +515,7 @@ namespace LvtWinFormsTap
             Control target;
             Control marshalControl;
             ResolveTarget(registry, handle, out target, out marshalControl);
-            return InvokeOnControl(
+            return InvokeMutationOnControl(
                 marshalControl,
                 () =>
                 {
@@ -784,6 +797,59 @@ namespace LvtWinFormsTap
                 throw new CommandException(
                     "WinForms UI thread did not complete the managed operation",
                     ManagedProtocol.InvalidState);
+            }
+            return completion.Task.GetAwaiter().GetResult();
+        }
+
+        private static T InvokeMutationOnControl<T>(
+            Control marshalControl, Func<T> action)
+        {
+            var completion = new TaskCompletionSource<T>();
+            var gate = new MutationGate();
+            try
+            {
+                marshalControl.BeginInvoke(new MethodInvoker(() =>
+                {
+                    if (!gate.TryBegin())
+                    {
+                        completion.TrySetCanceled();
+                        return;
+                    }
+                    try
+                    {
+                        completion.TrySetResult(action());
+                    }
+                    catch (Exception error)
+                    {
+                        completion.TrySetException(error);
+                    }
+                    finally
+                    {
+                        gate.Complete();
+                    }
+                }));
+            }
+            catch (Exception error)
+            {
+                throw new CommandException(
+                    "Could not dispatch to the WinForms UI thread: " +
+                    ManagedProtocol.Unwrap(error).Message,
+                    ManagedProtocol.InvalidState);
+            }
+
+            if (!completion.Task.Wait(UiTimeoutMilliseconds))
+            {
+                if (gate.CancelBeforeStart())
+                {
+                    throw new CommandException(
+                        "WinForms mutation timed out and was cancelled before execution",
+                        ManagedProtocol.InvalidState);
+                }
+                if (completion.Task.IsCompleted || gate.IsCompleted)
+                    return completion.Task.GetAwaiter().GetResult();
+                throw new CommandException(
+                    "WinForms mutation timed out after execution began; its outcome is indeterminate",
+                    ManagedProtocol.EPending);
             }
             return completion.Task.GetAwaiter().GetResult();
         }

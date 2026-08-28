@@ -84,6 +84,10 @@ Framework support is per-provider, so you can drop pieces you don't need. Win32 
 
 `LVT_BUILD_MANAGED` is the only thing that requires the .NET SDK. WPF, WinForms and Avalonia each have a native half that hosts the CLR plus a managed tree-walker assembly; only the latter needs `dotnet`. With `-DLVT_BUILD_MANAGED=OFF` the whole native build still works, including those TAP DLLs — you just lose managed enrichment for those three frameworks. XAML and WinUI 3 are pure C++ either way.
 
+The built-in WPF/WinForms managed TAP supports .NET Framework 4.8 targets and
+CoreCLR WindowsDesktop 6.0 or newer. Active CoreCLR 3.1/5 runtimes are rejected
+rather than loading an incompatible component.
+
 #### C++/WinRT projection
 
 The XAML and WinUI 3 providers need C++/WinRT headers. These come from two places:

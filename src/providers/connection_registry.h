@@ -22,6 +22,7 @@ class ConnectionHandle {
 public:
     ConnectionHandle() = default;
     ConnectionHandle(DWORD pid, std::string frameworkLabel,
+                      uint64_t generation,
                       std::shared_ptr<IFrameworkConnection> connection);
     ~ConnectionHandle();
 
@@ -49,6 +50,7 @@ private:
 
     DWORD m_pid = 0;
     std::string m_frameworkLabel;
+    uint64_t m_generation = 0;
     std::shared_ptr<IFrameworkConnection> m_connection;
 };
 
@@ -82,15 +84,19 @@ public:
 
 private:
     friend class ConnectionHandle;
-    void release(DWORD pid, const std::string& frameworkLabel);
+    void release(
+        DWORD pid, const std::string& frameworkLabel, uint64_t generation,
+        const IFrameworkConnection* connection);
 
     struct Entry {
         std::shared_ptr<IFrameworkConnection> connection;
         int refCount = 0;
+        uint64_t generation = 0;
     };
 
     std::mutex m_mutex;
     std::map<std::pair<DWORD, std::string>, Entry> m_entries;
+    uint64_t m_nextGeneration = 1;
 };
 
 } // namespace lvt

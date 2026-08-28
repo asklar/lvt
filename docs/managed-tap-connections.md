@@ -55,6 +55,9 @@ sequenceDiagram
 ```
 
 The pipe also ends the command loop when lvt exits unexpectedly. Native reads and writes wait on both their overlapped-I/O event and the target process handle, so a target exit fails promptly instead of leaving a blocked thread. Before reconnecting, lvt verifies that the previous native TAP module has completed its safe worker-thread unload.
+Timed-out overlapped connect/read/write operations synchronously observe their
+`CancelIoEx` completion before stack-owned `OVERLAPPED`, event, or buffer
+storage is released.
 
 Connection bootstrap is serialized across lvt processes by a named mutex keyed
 by target PID and framework. The mutex covers module inspection, sidecar
@@ -86,10 +89,20 @@ Tabs above represent literal tab characters. Request IDs make responses unambigu
 ## Identity and object lifetime
 
 Each managed assembly assigns controls/objects IDs through a `ConditionalWeakTable`. The table does not keep controls alive. Every connection maintains a reverse weak map containing only objects visited by the latest successful tree snapshot; it replaces that map on refresh and clears it on disconnect.
+The high 31 bits of each 64-bit handle identify the loaded managed assembly
+instance and the low 32 bits are its weak object sequence. Native DLL reconnects
+inside the same target reuse the already-loaded managed assembly and therefore
+preserve handles. A genuinely new assembly instance cannot accidentally resolve
+an old key.
 
 - WPF emits a managed handle for every visual or logical `DependencyObject`.
 - WinForms emits both the managed handle and an HWND when the control already owns one. Reading the tree never creates a handle merely to obtain identity.
 - Native `Element::providerHandle`, `properties.managedHandle`, and compact durable keys preserve managed identity across refreshes. WinForms keeps any existing HWND separately as `nativeHandle`; property routing always uses the 64-bit provider handle.
+
+On a fresh native reconnect the reverse map is initially empty. A property
+snapshot that receives an unknown handle performs one bounded `GET_TREE`
+hydration and retries once. Handles from the same live target/assembly resolve;
+stale or different-assembly handles remain explicit errors.
 
 ## Typed property policies
 
@@ -117,9 +130,29 @@ The pipe thread never reads framework objects directly.
 - WinForms records each control's owning top-level control/Form during the tree walk and queues property work through that owner's `BeginInvoke`; there is no direct off-thread fallback.
 
 A timeout returns a correlated command error while leaving the transport available for a later retry. Broken transport or target exit marks the native connection dead so the registry can replace it.
+Mutation dispatch uses an atomic queued/running/cancelled gate. A timeout that
+wins before the UI callback starts is definitive and the later callback cannot
+mutate. If execution already began, the result explicitly reports an
+indeterminate/in-progress outcome instead of claiming the mutation failed.
 
 If a WPF or WinForms `GET_TREE` fails after native HWND labeling, the provider
 marks the result as an incomplete framework refresh. Watch retries and retains
 its previous snapshot rather than emitting false subtree removals. MCP visual
 reads and resources likewise retry and refuse to advance their baseline to the
 host-only tree.
+
+## Runtime support
+
+- .NET Framework targets require **.NET Framework 4.8**, matching the managed
+  TAP assemblies' `net48` target.
+- CoreCLR WPF/WinForms targets require **Microsoft.WindowsDesktop.App 6.0 or
+  newer**. The component runtime configs request 6.0 with `LatestMajor`; the
+  same `net48` component assembly is API-compatible with the tested .NET 6 and
+  .NET 10 WindowsDesktop runtimes.
+- Active CoreCLR 3.1 and 5 are rejected explicitly rather than attempting to
+  load an incompatible component. .NET 7 is covered by the 6+ policy, although
+  the regression matrix pins the supported floor at .NET 6 LTS.
+
+Connection registry handles also carry a generation and exact connection
+identity, so releasing holders from a dead generation cannot decrement a
+replacement entry.

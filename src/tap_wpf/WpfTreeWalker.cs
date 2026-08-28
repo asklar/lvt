@@ -23,7 +23,14 @@ namespace LvtWpfTap
         public delegate int RunServerDelegate(IntPtr pipeNamePtr, int pipeNameLength);
 
         private const int UiTimeoutMilliseconds = 10000;
-        private static readonly string AssemblyInstanceId = Guid.NewGuid().ToString("N");
+        private static readonly Guid AssemblyInstanceGuid = Guid.NewGuid();
+        private static readonly string AssemblyInstanceId =
+            AssemblyInstanceGuid.ToString("N");
+        private static readonly long AssemblyIdentityPrefix =
+            Math.Max(
+                1,
+                BitConverter.ToUInt32(AssemblyInstanceGuid.ToByteArray(), 0) &
+                0x7FFFFFFF);
         private static readonly ConditionalWeakTable<DependencyObject, Identity> Identities =
             new ConditionalWeakTable<DependencyObject, Identity>();
         private static long nextIdentity;
@@ -53,9 +60,15 @@ namespace LvtWpfTap
                 DependencyObject value, Dictionary<long, WeakReference> snapshot)
             {
                 Identity identity = Identities.GetValue(
-                    value, ignored => new Identity(Interlocked.Increment(ref nextIdentity)));
+                    value, ignored => new Identity(NextIdentity()));
                 snapshot[identity.Value] = new WeakReference(value);
                 return identity.Value;
+            }
+
+            private static long NextIdentity()
+            {
+                uint local = unchecked((uint)Interlocked.Increment(ref nextIdentity));
+                return (AssemblyIdentityPrefix << 32) | local;
             }
 
             public void Commit(Dictionary<long, WeakReference> snapshot)
@@ -364,7 +377,7 @@ namespace LvtWpfTap
             string descriptorId = ManagedProtocol.DecodeHex(parts[1]);
             string value = ManagedProtocol.DecodeHex(parts[2]);
             DependencyObject target = ResolveTarget(registry, handle);
-            return InvokeOnDispatcher(() =>
+            return InvokeMutationOnDispatcher(() =>
             {
                 WpfPropertyMetadata property =
                     ResolveProperty(target, catalog, descriptorId);
@@ -383,7 +396,7 @@ namespace LvtWpfTap
             ulong handle = ParseHandle(parts[0]);
             string descriptorId = ManagedProtocol.DecodeHex(parts[1]);
             DependencyObject target = ResolveTarget(registry, handle);
-            return InvokeOnDispatcher(() =>
+            return InvokeMutationOnDispatcher(() =>
             {
                 WpfPropertyMetadata property =
                     ResolveProperty(target, catalog, descriptorId);
@@ -632,6 +645,59 @@ namespace LvtWpfTap
                 throw new CommandException(
                     "WPF UI thread did not complete the managed operation",
                     ManagedProtocol.InvalidState);
+            }
+            return operation.Task.GetAwaiter().GetResult();
+        }
+
+        private static T InvokeMutationOnDispatcher<T>(Func<T> action)
+        {
+            Application application = Application.Current;
+            if (application == null || application.Dispatcher == null)
+            {
+                throw new CommandException(
+                    "WPF Application dispatcher is unavailable",
+                    ManagedProtocol.InvalidState);
+            }
+            Dispatcher dispatcher = application.Dispatcher;
+            if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+            {
+                throw new CommandException(
+                    "WPF Application dispatcher is shutting down",
+                    ManagedProtocol.InvalidState);
+            }
+
+            var gate = new MutationGate();
+            DispatcherOperation<T> operation = dispatcher.InvokeAsync(() =>
+            {
+                if (!gate.TryBegin())
+                    throw new OperationCanceledException();
+                try
+                {
+                    return action();
+                }
+                finally
+                {
+                    gate.Complete();
+                }
+            }, DispatcherPriority.Send);
+
+            if (!operation.Task.Wait(UiTimeoutMilliseconds))
+            {
+                bool cancelled = gate.CancelBeforeStart();
+                bool aborted = operation.Abort();
+                if (cancelled)
+                {
+                    throw new CommandException(
+                        aborted
+                            ? "WPF mutation timed out and its queued dispatcher operation was aborted before execution"
+                            : "WPF mutation timed out and its cancellation gate prevented execution",
+                        ManagedProtocol.InvalidState);
+                }
+                if (operation.Task.IsCompleted || gate.IsCompleted)
+                    return operation.Task.GetAwaiter().GetResult();
+                throw new CommandException(
+                    "WPF mutation timed out after execution began; its outcome is indeterminate",
+                    ManagedProtocol.EPending);
             }
             return operation.Task.GetAwaiter().GetResult();
         }

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <string>
 #include <tuple>
+#include <vector>
 
 namespace {
 
@@ -170,6 +171,31 @@ HMODULE LoadHostFxr() {
     return hostFxrPath.empty() ? nullptr : LoadLibraryW(hostFxrPath.c_str());
 }
 
+int LoadedCoreClrMajorVersion() {
+    HMODULE coreClr = GetModuleHandleW(L"coreclr.dll");
+    if (!coreClr)
+        return 0;
+
+    wchar_t path[MAX_PATH];
+    if (GetModuleFileNameW(coreClr, path, MAX_PATH) == 0)
+        return 0;
+    DWORD ignored = 0;
+    const DWORD bytes = GetFileVersionInfoSizeW(path, &ignored);
+    if (bytes == 0)
+        return 0;
+    std::vector<unsigned char> version(bytes);
+    if (!GetFileVersionInfoW(path, 0, bytes, version.data()))
+        return 0;
+    VS_FIXEDFILEINFO* fixed = nullptr;
+    UINT fixedBytes = 0;
+    if (!VerQueryValueW(
+            version.data(), L"\\", reinterpret_cast<void**>(&fixed),
+            &fixedBytes) ||
+        !fixed || fixedBytes < sizeof(VS_FIXEDFILEINFO))
+        return 0;
+    return HIWORD(fixed->dwProductVersionMS);
+}
+
 bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pipeName) {
     using namespace lvt::managed_host_abi;
 
@@ -254,8 +280,18 @@ DWORD WINAPI WorkerThread(LPVOID) {
             GetModuleHandleW(L"mscorwks.dll") != nullptr;
         bool hosted = false;
         if (hasCoreClr) {
-            LogMsg("Hosting through the loaded CoreCLR");
-            hosted = TryNetCore(assemblyPath, pipeName);
+            const int coreClrMajor = LoadedCoreClrMajorVersion();
+            if (coreClrMajor > 0 && coreClrMajor < 6) {
+                LogMsg(
+                    "CoreCLR %d is unsupported; managed TAP requires .NET 6 or newer",
+                    coreClrMajor);
+            } else {
+                if (coreClrMajor > 0)
+                    LogMsg("Hosting through the loaded CoreCLR %d", coreClrMajor);
+                else
+                    LogMsg("Hosting through the loaded CoreCLR");
+                hosted = TryNetCore(assemblyPath, pipeName);
+            }
         } else if (hasFrameworkClr) {
             LogMsg("Hosting through the loaded .NET Framework CLR");
             hosted = TryNetFramework(assemblyPath, pipeName);

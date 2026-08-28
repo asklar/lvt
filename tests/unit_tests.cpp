@@ -402,6 +402,17 @@ private:
     std::shared_ptr<int> destroyed_;
 };
 
+class ReplaceableConnection final : public IFrameworkConnection {
+public:
+    bool get_tree(Element&, bool, const std::string& = {}) override {
+        return true;
+    }
+    std::vector<ConnectionEvent> poll_events() override { return {}; }
+    bool is_alive() const override { return alive; }
+
+    bool alive = true;
+};
+
 } // namespace
 
 TEST(ConnectionHandle, SharedSnapshotOutlivesRegistryHandle) {
@@ -419,6 +430,49 @@ TEST(ConnectionHandle, SharedSnapshotOutlivesRegistryHandle) {
 
     snapshot.reset();
     EXPECT_EQ(*destroyed, 1);
+}
+
+TEST(ConnectionHandle, StaleGenerationCannotReleaseReplacement) {
+    const DWORD pid = GetCurrentProcessId();
+    const std::string label = "unit-registry-generation";
+    auto oldConnection = std::make_shared<ReplaceableConnection>();
+    auto oldFirst = ConnectionRegistry::instance().acquire(
+        pid, nullptr, label,
+        [oldConnection](HWND, DWORD) { return oldConnection; });
+    auto oldSecond = ConnectionRegistry::instance().acquire(
+        pid, nullptr, label,
+        [](HWND, DWORD) -> std::shared_ptr<IFrameworkConnection> {
+            ADD_FAILURE() << "the second old holder should reuse the entry";
+            return nullptr;
+        });
+    ASSERT_TRUE(oldFirst);
+    ASSERT_TRUE(oldSecond);
+
+    oldConnection->alive = false;
+    auto replacement = std::make_shared<ReplaceableConnection>();
+    auto fresh = ConnectionRegistry::instance().acquire(
+        pid, nullptr, label,
+        [replacement](HWND, DWORD) { return replacement; });
+    ASSERT_TRUE(fresh);
+    ASSERT_EQ(fresh.get(), replacement.get());
+
+    oldFirst.reset();
+    oldSecond.reset();
+
+    int replacementFactories = 0;
+    auto freshSecond = ConnectionRegistry::instance().acquire(
+        pid, nullptr, label,
+        [&replacementFactories](HWND, DWORD)
+            -> std::shared_ptr<IFrameworkConnection> {
+            ++replacementFactories;
+            return std::make_shared<ReplaceableConnection>();
+        });
+    ASSERT_TRUE(freshSecond);
+    EXPECT_EQ(replacementFactories, 0);
+    EXPECT_EQ(freshSecond.get(), replacement.get());
+
+    fresh.reset();
+    freshSecond.reset();
 }
 
 // ---- Durable element keys and lookup ----
@@ -1406,6 +1460,73 @@ TEST(OverlappedIo, CancellationCompletesBeforeStackStorageIsReleased) {
     SetLastError(ERROR_SUCCESS);
     EXPECT_FALSE(GetOverlappedResult(
         server.get(), &readOv, &bytesRead, FALSE));
+    EXPECT_EQ(GetLastError(), ERROR_OPERATION_ABORTED);
+}
+
+TEST(OverlappedIo, PendingConnectCancellationIsDrained) {
+    const auto pipeName =
+        std::wstring(L"\\\\.\\pipe\\lvt_connect_cancel_") +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64());
+    wil::unique_hfile pipe(CreateNamedPipeW(
+        pipeName.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 64, 64, 0, nullptr));
+    ASSERT_TRUE(pipe);
+    wil::unique_event event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.get();
+    ASSERT_FALSE(ConnectNamedPipe(pipe.get(), &overlapped));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    detail::cancel_and_complete_overlapped(pipe.get(), overlapped);
+
+    DWORD transferred = 0;
+    EXPECT_FALSE(GetOverlappedResult(
+        pipe.get(), &overlapped, &transferred, FALSE));
+    EXPECT_EQ(GetLastError(), ERROR_OPERATION_ABORTED);
+}
+
+TEST(OverlappedIo, PendingWriteCancellationIsDrained) {
+    const auto pipeName =
+        std::wstring(L"\\\\.\\pipe\\lvt_write_cancel_") +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64());
+    wil::unique_hfile server(CreateNamedPipeW(
+        pipeName.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 1, 1, 0, nullptr));
+    ASSERT_TRUE(server);
+    wil::unique_event connectEvent(
+        CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    OVERLAPPED connectOv{};
+    connectOv.hEvent = connectEvent.get();
+    ASSERT_FALSE(ConnectNamedPipe(server.get(), &connectOv));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+    wil::unique_hfile client(CreateFileW(
+        pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        OPEN_EXISTING, 0, nullptr));
+    ASSERT_TRUE(client);
+    ASSERT_EQ(WaitForSingleObject(connectEvent.get(), 5000), WAIT_OBJECT_0);
+    DWORD connected = 0;
+    ASSERT_TRUE(GetOverlappedResult(
+        server.get(), &connectOv, &connected, FALSE));
+
+    std::vector<char> payload(1024 * 1024, 'x');
+    wil::unique_event writeEvent(
+        CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    OVERLAPPED writeOv{};
+    writeOv.hEvent = writeEvent.get();
+    DWORD written = 0;
+    ASSERT_FALSE(WriteFile(
+        server.get(), payload.data(), static_cast<DWORD>(payload.size()),
+        &written, &writeOv));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    detail::cancel_and_complete_overlapped(server.get(), writeOv);
+
+    EXPECT_FALSE(GetOverlappedResult(
+        server.get(), &writeOv, &written, FALSE));
     EXPECT_EQ(GetLastError(), ERROR_OPERATION_ABORTED);
 }
 

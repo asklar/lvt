@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing;
 using System.Linq;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace WinFormsSample
@@ -31,6 +34,9 @@ namespace WinFormsSample
 
     internal sealed class SampleForm : Form
     {
+        private readonly EventWaitHandle blockTrigger;
+        private readonly EventWaitHandle blockEntered;
+        private readonly EventWaitHandle blockRelease;
         private string editableText = "Default text";
         private int retryCount = 5;
         private SampleMode mode = SampleMode.Basic;
@@ -80,6 +86,26 @@ namespace WinFormsSample
             Controls.Add(textBox);
             Controls.Add(button);
             Controls.Add(checkBox);
+
+            var prefix = $@"Local\LvtWinFormsSampleUiBlock_{Process.GetCurrentProcess().Id}";
+            blockTrigger = new EventWaitHandle(
+                false, EventResetMode.AutoReset, prefix + "_trigger");
+            blockEntered = new EventWaitHandle(
+                false, EventResetMode.ManualReset, prefix + "_entered");
+            blockRelease = new EventWaitHandle(
+                false, EventResetMode.AutoReset, prefix + "_release");
+            _ = Task.Run(() =>
+            {
+                while (blockTrigger.WaitOne())
+                {
+                    BeginInvoke(new MethodInvoker(() =>
+                    {
+                        blockEntered.Set();
+                        blockRelease.WaitOne();
+                        blockEntered.Reset();
+                    }));
+                }
+            });
         }
 
         [Browsable(true)]

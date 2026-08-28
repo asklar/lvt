@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 
 namespace LvtManagedTap
 {
@@ -46,6 +47,32 @@ namespace LvtManagedTap
         }
     }
 
+    internal sealed class MutationGate
+    {
+        // 0 = queued, 1 = running, 2 = cancelled before start, 3 = completed
+        private int state;
+
+        public bool TryBegin()
+        {
+            return Interlocked.CompareExchange(ref state, 1, 0) == 0;
+        }
+
+        public bool CancelBeforeStart()
+        {
+            return Interlocked.CompareExchange(ref state, 2, 0) == 0;
+        }
+
+        public bool IsCompleted
+        {
+            get { return Volatile.Read(ref state) == 3; }
+        }
+
+        public void Complete()
+        {
+            Volatile.Write(ref state, 3);
+        }
+    }
+
     internal static class ManagedProtocol
     {
         public const uint EFail = 0x80004005;
@@ -53,6 +80,7 @@ namespace LvtManagedTap
         public const uint EAccessDenied = 0x80070005;
         public const uint NotFound = 0x80070490;
         public const uint InvalidState = 0x8007139F;
+        public const uint EPending = 0x8000000A;
 
         public static bool TryParseRequest(string line, out ManagedRequest request)
         {

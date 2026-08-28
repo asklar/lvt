@@ -531,6 +531,45 @@ private:
     HWND hwnd_ = nullptr;
 };
 
+class ManagedSampleUiBlock {
+public:
+    bool enter(const wchar_t* framework, DWORD pid) {
+        const std::wstring prefix =
+            L"Local\\Lvt" + std::wstring(framework) +
+            L"SampleUiBlock_" + std::to_wstring(pid);
+        trigger_.reset(OpenEventW(
+            EVENT_MODIFY_STATE, FALSE, (prefix + L"_trigger").c_str()));
+        entered_.reset(OpenEventW(
+            SYNCHRONIZE, FALSE, (prefix + L"_entered").c_str()));
+        release_.reset(OpenEventW(
+            EVENT_MODIFY_STATE, FALSE, (prefix + L"_release").c_str()));
+        if (!trigger_ || !entered_ || !release_)
+            return false;
+        if (!SetEvent(trigger_.get()))
+            return false;
+        active_ =
+            WaitForSingleObject(entered_.get(), 5000) == WAIT_OBJECT_0;
+        return active_;
+    }
+
+    void release() {
+        if (active_) {
+            SetEvent(release_.get());
+            active_ = false;
+        }
+    }
+
+    ~ManagedSampleUiBlock() {
+        release();
+    }
+
+private:
+    wil::unique_handle trigger_;
+    wil::unique_handle entered_;
+    wil::unique_handle release_;
+    bool active_ = false;
+};
+
 int count_managed_tap_starts(const wchar_t* logName, DWORD pid) {
     wchar_t tempPath[MAX_PATH];
     if (GetTempPathW(MAX_PATH, tempPath) == 0)
@@ -631,6 +670,15 @@ void verify_managed_mcp_connection(
         "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
     const std::string recoveredSession = connected.value("session", "");
     ASSERT_FALSE(recoveredSession.empty()) << connected.dump(2);
+    bool recoveredPropertyError = false;
+    auto recoveredProperties = recovered.call_tool(
+        "get_editable_properties",
+        json{{"session", recoveredSession}, {"element", firstKey}},
+        &recoveredPropertyError);
+    ASSERT_FALSE(recoveredPropertyError) << recoveredProperties.dump(2);
+    EXPECT_FALSE(
+        recoveredProperties.value("descriptors", json::array()).empty())
+        << "a broken-pipe reconnect must hydrate the stable identity map once";
     auto afterBreak =
         recovered.call_tool("get_visual_tree", json{{"session", recoveredSession}});
     ASSERT_TRUE(afterBreak.contains("root")) << afterBreak.dump(2);
@@ -997,14 +1045,18 @@ TEST(McpManagedFrameworks, WpfTypedDependencyProperties) {
         "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
     const std::string reconnectedSession = connected.value("session", "");
     ASSERT_FALSE(reconnectedSession.empty()) << connected.dump(2);
-    tree = client.call_tool(
-        "get_visual_tree", json{{"session", reconnectedSession}});
-    button = find_managed_named_element(tree["root"], "OkButton");
-    ASSERT_NE(button, nullptr);
+    auto hydratedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", reconnectedSession}, {"element", buttonKey}},
+        &isError);
+    ASSERT_FALSE(isError) << hydratedProperties.dump(2);
+    EXPECT_NE(
+        hydratedProperties.value("schemaId", ""),
+        buttonProperties.value("schemaId", ""));
     auto staleDescriptor = client.call_tool(
         "set_property",
         json{{"session", reconnectedSession},
-             {"element", button->value("key", "")},
+             {"element", buttonKey},
              {"descriptorId", opacityId},
              {"value", "0.5"}},
         &isError);
@@ -1211,14 +1263,18 @@ TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
         "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
     const std::string reconnectedSession = connected.value("session", "");
     ASSERT_FALSE(reconnectedSession.empty()) << connected.dump(2);
-    tree = client.call_tool(
-        "get_visual_tree", json{{"session", reconnectedSession}});
-    form = find_managed_named_element(tree["root"], "MainForm");
-    ASSERT_NE(form, nullptr);
+    auto hydratedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", reconnectedSession}, {"element", formKey}},
+        &isError);
+    ASSERT_FALSE(isError) << hydratedProperties.dump(2);
+    EXPECT_NE(
+        hydratedProperties.value("schemaId", ""),
+        properties.value("schemaId", ""));
     auto staleDescriptor = client.call_tool(
         "set_property",
         json{{"session", reconnectedSession},
-             {"element", form->value("key", "")},
+             {"element", formKey},
              {"descriptorId", textId},
              {"value", "stale"}},
         &isError);
@@ -1278,6 +1334,107 @@ TEST(McpManagedFrameworks, FailedWinFormsRefreshDoesNotAdvanceSnapshot) {
     observer.call_tool(
         "disconnect", json{{"session", observerSession}}, &isError);
     ASSERT_FALSE(isError);
+}
+
+TEST(McpManagedFrameworks, DisconnectWinsQueuedPropertyRequests) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_SAMPLE_EXE_PATH));
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    const json* form = find_managed_named_element(tree["root"], "MainForm");
+    ASSERT_NE(form, nullptr);
+    const std::string formKey = form->value("key", "");
+    bool isError = false;
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* text = find_property_descriptor(properties, "EditableText");
+    ASSERT_NE(text, nullptr);
+    const std::string textId = text->value("descriptorId", "");
+
+    ManagedSampleUiBlock block;
+    ASSERT_TRUE(block.enter(L"WinForms", sample.pid()));
+    const int slowTreeId = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    Sleep(150);
+    const int setId = client.send_request(
+        "tools/call",
+        json{{"name", "set_property"},
+             {"arguments",
+              json{{"session", session},
+                   {"element", formKey},
+                   {"descriptorId", textId},
+                   {"value", "must not land"}}}});
+    const int disconnectId = client.send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+    Sleep(150);
+    block.release();
+
+    auto slowTreeResponse = client.await_response(slowTreeId);
+    auto setResponse = client.await_response(setId);
+    auto disconnectResponse = client.await_response(disconnectId);
+    ASSERT_TRUE(slowTreeResponse.contains("result")) << slowTreeResponse.dump(2);
+    ASSERT_TRUE(setResponse.contains("result")) << setResponse.dump(2);
+    EXPECT_TRUE(setResponse["result"].value("isError", false))
+        << "a property mutation queued behind disconnect must be refused";
+    ASSERT_TRUE(disconnectResponse.contains("result"))
+        << disconnectResponse.dump(2);
+    EXPECT_FALSE(disconnectResponse["result"].value("isError", false));
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    EXPECT_EQ(typed_property_value(properties, "EditableText"), "Default text")
+        << "disconnect must prevent the queued mutation and connection-map leak";
+    text = find_property_descriptor(properties, "EditableText");
+    ASSERT_NE(text, nullptr);
+
+    ASSERT_TRUE(block.enter(L"WinForms", sample.pid()));
+    const int secondSlowTreeId = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    Sleep(150);
+    const int getId = client.send_request(
+        "tools/call",
+        json{{"name", "get_editable_properties"},
+             {"arguments",
+              json{{"session", session}, {"element", formKey}}}});
+    const int secondDisconnectId = client.send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+    Sleep(150);
+    block.release();
+
+    (void)client.await_response(secondSlowTreeId);
+    auto getResponse = client.await_response(getId);
+    auto secondDisconnectResponse =
+        client.await_response(secondDisconnectId);
+    ASSERT_TRUE(getResponse.contains("result")) << getResponse.dump(2);
+    EXPECT_TRUE(getResponse["result"].value("isError", false))
+        << "a property read queued behind disconnect must be refused";
+    ASSERT_TRUE(secondDisconnectResponse.contains("result"))
+        << secondDisconnectResponse.dump(2);
+    EXPECT_FALSE(secondDisconnectResponse["result"].value("isError", false));
 }
 #endif
 
