@@ -7,6 +7,8 @@
 #include <vector>
 #include <Windows.h>
 
+struct IUIAutomation;
+
 namespace lvt {
 
 enum class ActionKind {
@@ -69,6 +71,17 @@ struct ActionResult {
     bool hasElement = false;
 };
 
+enum class UiaPropertyAction {
+    setValue,
+    setRangeValue,
+    setToggleState,
+    setExpandCollapseState,
+    replaceSelection,
+    addToSelection,
+    removeFromSelection,
+    scroll,
+};
+
 // Resolve the reference against a UIA walk of the target and perform the
 // action. When `connection` is supplied, the resolve/readback/wait walks reuse
 // that persistent client; the live-element action itself still runs on the
@@ -81,6 +94,15 @@ struct ActionResult {
 ActionResult perform_action(HWND hwnd, const UiaOptions& options,
                             const ActionRequest& request,
                             UiaConnection* connection = nullptr);
+
+// Provider-owned typed property mutation on a live UIA element. The caller
+// supplies the persistent session IUIAutomation object and invokes this on its
+// MTA, so descriptor actions neither create another client nor re-walk the
+// tree. `action` is selected from an opaque descriptor, never from client input.
+PropertyMutationResult perform_uia_property_action(
+    IUIAutomation* automation, HWND hwnd,
+    const std::vector<int>& runtimeId,
+    UiaPropertyAction action, const std::string& value);
 
 // Parse an action name as accepted on the command line.
 bool parse_action_kind(const std::string& name, ActionKind& out);

@@ -21,6 +21,7 @@
 #include "providers/overlapped_io.h"
 #include "providers/xaml_enum_catalog.h"
 #include "providers/uia_props.h"
+#include "providers/uia_property_adapter.h"
 #include "input.h"
 #include "providers/uia_actions.h"
 #include "tap/xaml_property_filter.h"
@@ -2789,6 +2790,186 @@ TEST(TypedPropertyContract, EditorKindWireNamesAreProviderNeutral) {
         property_editor_kind_name(PropertyEditorKind::number), "number");
     EXPECT_STREQ(
         property_editor_kind_name(PropertyEditorKind::enumeration), "enum");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::command), "command");
+}
+
+namespace {
+
+Element editable_uia_element(
+    const std::string& type, const std::string& patterns,
+    std::initializer_list<std::pair<const std::string, std::string>> properties) {
+    Element element;
+    element.type = type;
+    element.framework = "uia";
+    element.properties["SupportedPatterns"] = patterns;
+    element.properties["IsEnabled"] = "true";
+    for (const auto& [name, value] : properties)
+        element.properties[name] = value;
+    return element;
+}
+
+const PropertyDescriptor* descriptor_named(
+    const PropertySchema& schema, const std::string& name) {
+    for (const auto& descriptor : schema.descriptors) {
+        if (descriptor.name == name)
+            return &descriptor;
+    }
+    return nullptr;
+}
+
+const PropertyValue* value_for(
+    const PropertySnapshotResult& snapshot, const PropertyDescriptor& descriptor) {
+    for (const auto& value : snapshot.values) {
+        if (value.descriptorId == descriptor.descriptorId)
+            return &value;
+    }
+    return nullptr;
+}
+
+std::vector<std::string> choice_values(const PropertyDescriptor& descriptor) {
+    std::vector<std::string> result;
+    for (const auto& choice : descriptor.choices)
+        result.push_back(choice.value);
+    return result;
+}
+
+} // namespace
+
+TEST(UiaTypedProperties, ValueHonorsReadOnlyAndSchemaCacheDoesNotStoreValues) {
+    UiaPropertySchemaCache cache;
+    auto writable = editable_uia_element(
+        "Edit", "Value",
+        {{"Value.Value", "first"}, {"Value.IsReadOnly", "false"}});
+    auto first = make_uia_property_snapshot(
+        writable, UiaSelectionCapabilities{}, cache);
+    ASSERT_TRUE(first.ok);
+    const auto* descriptor = descriptor_named(*first.schema, "Value.Value");
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_EQ(descriptor->kind, PropertyEditorKind::string);
+    EXPECT_TRUE(descriptor->writable);
+    EXPECT_FALSE(descriptor->supportsClear);
+    const auto* firstValue = value_for(first, *descriptor);
+    ASSERT_NE(firstValue, nullptr);
+    EXPECT_EQ(firstValue->value, "first");
+
+    writable.properties["Value.Value"] = "second";
+    auto second = make_uia_property_snapshot(
+        writable, UiaSelectionCapabilities{}, cache);
+    EXPECT_EQ(first.schema.get(), second.schema.get());
+    EXPECT_EQ(first.schema->schemaId, second.schema->schemaId);
+    const auto* secondValue = value_for(second, *descriptor);
+    ASSERT_NE(secondValue, nullptr);
+    EXPECT_EQ(secondValue->value, "second");
+    EXPECT_EQ(cache.size(), 1u);
+
+    writable.properties["Value.IsReadOnly"] = "true";
+    auto readOnly = make_uia_property_snapshot(
+        writable, UiaSelectionCapabilities{}, cache);
+    const auto* readOnlyDescriptor =
+        descriptor_named(*readOnly.schema, "Value.Value");
+    ASSERT_NE(readOnlyDescriptor, nullptr);
+    EXPECT_EQ(readOnlyDescriptor->kind, PropertyEditorKind::readonly);
+    EXPECT_FALSE(readOnlyDescriptor->writable);
+    EXPECT_NE(readOnly.schema->schemaId, first.schema->schemaId);
+    EXPECT_EQ(cache.size(), 2u);
+}
+
+TEST(UiaTypedProperties, RangeValueSuppliesBoundsWithoutInventingStep) {
+    UiaPropertySchemaCache cache;
+    auto slider = editable_uia_element(
+        "Slider", "RangeValue",
+        {{"RangeValue.Value", "25"},
+         {"RangeValue.Minimum", "0"},
+         {"RangeValue.Maximum", "100"},
+         {"RangeValue.IsReadOnly", "false"}});
+    auto snapshot = make_uia_property_snapshot(
+        slider, UiaSelectionCapabilities{}, cache);
+    const auto* descriptor =
+        descriptor_named(*snapshot.schema, "RangeValue.Value");
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_EQ(descriptor->kind, PropertyEditorKind::number);
+    ASSERT_TRUE(descriptor->minimum.has_value());
+    ASSERT_TRUE(descriptor->maximum.has_value());
+    EXPECT_DOUBLE_EQ(*descriptor->minimum, 0);
+    EXPECT_DOUBLE_EQ(*descriptor->maximum, 100);
+    EXPECT_FALSE(descriptor->step.has_value());
+
+    slider.properties["RangeValue.IsReadOnly"] = "true";
+    auto readOnly = make_uia_property_snapshot(
+        slider, UiaSelectionCapabilities{}, cache);
+    const auto* readOnlyDescriptor =
+        descriptor_named(*readOnly.schema, "RangeValue.Value");
+    ASSERT_NE(readOnlyDescriptor, nullptr);
+    EXPECT_EQ(readOnlyDescriptor->kind, PropertyEditorKind::readonly);
+    EXPECT_FALSE(readOnlyDescriptor->writable);
+    EXPECT_EQ(readOnlyDescriptor->minimum, descriptor->minimum);
+    EXPECT_EQ(readOnlyDescriptor->maximum, descriptor->maximum);
+}
+
+TEST(UiaTypedProperties, ToggleAndExpandExposeOnlyDeterministicStates) {
+    UiaPropertySchemaCache cache;
+    auto element = editable_uia_element(
+        "CheckBox", "Toggle,ExpandCollapse",
+        {{"Toggle.ToggleState", "Indeterminate"},
+         {"ExpandCollapse.State", "PartiallyExpanded"}});
+    auto snapshot = make_uia_property_snapshot(
+        element, UiaSelectionCapabilities{}, cache);
+
+    const auto* toggle =
+        descriptor_named(*snapshot.schema, "Toggle.ToggleState");
+    ASSERT_NE(toggle, nullptr);
+    EXPECT_EQ(toggle->kind, PropertyEditorKind::enumeration);
+    EXPECT_EQ(choice_values(*toggle),
+              (std::vector<std::string>{"Off", "On"}));
+
+    const auto* expand =
+        descriptor_named(*snapshot.schema, "ExpandCollapse.State");
+    ASSERT_NE(expand, nullptr);
+    EXPECT_EQ(expand->kind, PropertyEditorKind::enumeration);
+    EXPECT_EQ(choice_values(*expand),
+              (std::vector<std::string>{"Expanded", "Collapsed"}));
+
+    element.properties["ExpandCollapse.State"] = "LeafNode";
+    auto leaf = make_uia_property_snapshot(
+        element, UiaSelectionCapabilities{}, cache);
+    const auto* leafExpand =
+        descriptor_named(*leaf.schema, "ExpandCollapse.State");
+    ASSERT_NE(leafExpand, nullptr);
+    EXPECT_EQ(leafExpand->kind, PropertyEditorKind::readonly);
+    EXPECT_FALSE(leafExpand->writable);
+}
+
+TEST(UiaTypedProperties, SelectionAndScrollCommandsFollowProviderCapabilities) {
+    UiaPropertySchemaCache cache;
+    UiaSelectionCapabilities selection{
+        .known = true,
+        .canSelectMultiple = true,
+        .isSelectionRequired = false,
+    };
+    auto item = editable_uia_element(
+        "ListItem", "SelectionItem,Scroll",
+        {{"SelectionItem.IsSelected", "false"},
+         {"Scroll.HorizontallyScrollable", "false"},
+         {"Scroll.VerticallyScrollable", "true"},
+         {"Scroll.VerticalPercent", "10"}});
+    auto snapshot = make_uia_property_snapshot(item, selection, cache);
+
+    const auto* selectionDescriptor =
+        descriptor_named(*snapshot.schema, "SelectionItem.Action");
+    ASSERT_NE(selectionDescriptor, nullptr);
+    EXPECT_EQ(selectionDescriptor->kind, PropertyEditorKind::command);
+    EXPECT_EQ(
+        choice_values(*selectionDescriptor),
+        (std::vector<std::string>{"select", "add", "remove"}));
+
+    const auto* scroll =
+        descriptor_named(*snapshot.schema, "Scroll.Action");
+    ASSERT_NE(scroll, nullptr);
+    EXPECT_EQ(scroll->kind, PropertyEditorKind::command);
+    EXPECT_EQ(
+        choice_values(*scroll),
+        (std::vector<std::string>{"up", "down"}));
 }
 
 TEST(XamlEnumParser, DeepCopiesAliasesAndSanitizesTypeNames) {

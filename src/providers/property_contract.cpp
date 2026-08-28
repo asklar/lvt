@@ -28,6 +28,7 @@ const char* property_editor_kind_name(PropertyEditorKind kind) {
     case PropertyEditorKind::integer: return "integer";
     case PropertyEditorKind::number: return "number";
     case PropertyEditorKind::enumeration: return "enum";
+    case PropertyEditorKind::command: return "command";
     }
     return "readonly";
 }

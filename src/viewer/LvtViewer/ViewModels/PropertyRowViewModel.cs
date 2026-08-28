@@ -22,7 +22,7 @@ public sealed class PropertyRowViewModel : ObservableObject
     public PropertyRowViewModel(string name, string value)
     {
         Name = name;
-        Kind = ClassifyLegacyUiaEditor(name);
+        Kind = PropertyEditorKind.ReadOnly;
         Value = value;
     }
 
@@ -133,6 +133,8 @@ public sealed class PropertyRowViewModel : ObservableObject
             : descriptor.Choices;
         Kind = descriptor.EditorKind;
         Value = value.Value;
+        if (Kind == PropertyEditorKind.Command && Choices.Count != 0)
+            EditText = Choices[0].Value;
         Validate();
 
         OnPropertyChanged(nameof(Name));
@@ -175,6 +177,13 @@ public sealed class PropertyRowViewModel : ObservableObject
             } else {
                 error = ValidateRange(number);
             }
+        } else if ((Kind == PropertyEditorKind.Enumeration ||
+                    Kind == PropertyEditorKind.Command) &&
+                   Choices.Count != 0 &&
+                   !Choices.Any(choice =>
+                       string.Equals(
+                           choice.Value, EditText, StringComparison.Ordinal))) {
+            error = "Choose a provider-supplied option.";
         }
         ValidationError = error;
     }
@@ -188,12 +197,4 @@ public sealed class PropertyRowViewModel : ObservableObject
         return "";
     }
 
-    private static PropertyEditorKind ClassifyLegacyUiaEditor(string name) =>
-        name switch
-        {
-            "Toggle.ToggleState" => PropertyEditorKind.LegacyToggle,
-            "Value.Value" => PropertyEditorKind.LegacyTextValue,
-            "RangeValue.Value" => PropertyEditorKind.LegacyTextValue,
-            _ => PropertyEditorKind.ReadOnly,
-        };
 }

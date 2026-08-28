@@ -324,6 +324,59 @@ PatternAttempt try_toggle(IUIAutomationElement* element, std::string& method) {
     return attempt;
 }
 
+bool parse_toggle_state(const std::string& text, ToggleState& out) {
+    if (text == "Off") {
+        out = ToggleState_Off;
+        return true;
+    }
+    if (text == "On") {
+        out = ToggleState_On;
+        return true;
+    }
+    if (text == "Indeterminate") {
+        out = ToggleState_Indeterminate;
+        return true;
+    }
+    return false;
+}
+
+PatternAttempt try_set_toggle_state(
+    IUIAutomationElement* element, const std::string& value,
+    std::string& method) {
+    wil::com_ptr<IUIAutomationTogglePattern> toggle;
+    if (FAILED(element->GetCurrentPatternAs(
+            UIA_TogglePatternId, IID_PPV_ARGS(&toggle))) || !toggle) {
+        return {};
+    }
+
+    ToggleState wanted = ToggleState_Off;
+    if (!parse_toggle_state(value, wanted))
+        return {true, E_INVALIDARG};
+
+    bool seen[3] = {};
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        ToggleState current = ToggleState_Off;
+        const HRESULT stateHr = toggle->get_CurrentToggleState(&current);
+        if (FAILED(stateHr))
+            return {true, stateHr};
+        if (current == wanted) {
+            method = "TogglePattern.SetState";
+            return {true, S_OK};
+        }
+
+        const auto index = static_cast<int>(current);
+        if (index < 0 || index >= static_cast<int>(std::size(seen)) || seen[index])
+            return {true, HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)};
+        seen[index] = true;
+
+        const HRESULT toggleHr = toggle->Toggle();
+        LOG_IF_FAILED(toggleHr);
+        if (FAILED(toggleHr))
+            return {true, toggleHr};
+    }
+    return {true, HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)};
+}
+
 PatternAttempt try_set_value(IUIAutomationElement* element, const std::string& text,
                              std::string& method) {
     wil::com_ptr<IUIAutomationValuePattern> value;
@@ -538,6 +591,103 @@ std::string describe_decline(const PatternAttempt& attempt, const char* patternN
 }
 
 } // namespace
+
+PropertyMutationResult perform_uia_property_action(
+    IUIAutomation* automation, HWND hwnd,
+    const std::vector<int>& runtimeId,
+    UiaPropertyAction action, const std::string& value) {
+    PropertyMutationResult result;
+    if (!automation) {
+        result.hresult = E_POINTER;
+        result.error = "The UI Automation session is no longer available";
+        return result;
+    }
+
+    wil::com_ptr<IUIAutomationElement> element;
+    const HRESULT findHr =
+        find_by_runtime_id(automation, hwnd, runtimeId, &element);
+    if (FAILED(findHr) || !element) {
+        result.hresult = FAILED(findHr)
+            ? findHr
+            : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        result.error =
+            "The UI Automation element changed or disappeared after its properties were read";
+        return result;
+    }
+
+    (void)realize_if_virtualized(element.get());
+
+    std::string method;
+    PatternAttempt attempt;
+    switch (action) {
+    case UiaPropertyAction::setValue:
+        attempt = try_set_value(element.get(), value, method);
+        break;
+    case UiaPropertyAction::setRangeValue:
+        attempt = try_set_range_value(element.get(), value, method);
+        break;
+    case UiaPropertyAction::setToggleState:
+        attempt = try_set_toggle_state(element.get(), value, method);
+        break;
+    case UiaPropertyAction::setExpandCollapseState:
+        if (value != "Expanded" && value != "Collapsed") {
+            attempt = {true, E_INVALIDARG};
+        } else {
+            attempt = try_expand_collapse(
+                element.get(), value == "Expanded", method);
+        }
+        break;
+    case UiaPropertyAction::replaceSelection:
+        attempt = try_select(element.get(), method);
+        break;
+    case UiaPropertyAction::addToSelection:
+        attempt = try_change_selection(element.get(), true, method);
+        break;
+    case UiaPropertyAction::removeFromSelection:
+        attempt = try_change_selection(element.get(), false, method);
+        break;
+    case UiaPropertyAction::scroll:
+        attempt = try_scroll(element.get(), value, 1, method);
+        break;
+    }
+
+    if (!attempt.succeeded()) {
+        result.hresult = attempt.supported ? attempt.hr : E_NOTIMPL;
+        if (!attempt.supported) {
+            result.error =
+                "The UI Automation pattern advertised by this descriptor is no longer available";
+        } else if (attempt.hr == E_INVALIDARG) {
+            result.error = "The selected value is not valid for this property descriptor";
+        } else if (attempt.hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
+            result.error =
+                "The UI Automation provider cannot intentionally set the selected state";
+        } else {
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "0x%08X",
+                     static_cast<unsigned>(attempt.hr));
+            result.error =
+                "The UI Automation provider rejected the property action (" +
+                std::string(buffer) + ")";
+        }
+        return result;
+    }
+
+    result.ok = true;
+    result.hresult = S_OK;
+    result.error.clear();
+    switch (action) {
+    case UiaPropertyAction::setValue:
+    case UiaPropertyAction::setRangeValue:
+    case UiaPropertyAction::setToggleState:
+    case UiaPropertyAction::setExpandCollapseState:
+        result.hasValue = true;
+        result.value = value;
+        break;
+    default:
+        break;
+    }
+    return result;
+}
 
 // The one place an ActionKind's textual name is defined. `parse_action_kind`
 // and `action_kind_name` are both generated from this, so a new kind cannot end

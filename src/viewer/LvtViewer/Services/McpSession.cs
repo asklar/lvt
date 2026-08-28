@@ -199,12 +199,6 @@ public sealed class McpSession : IAsyncDisposable, IDisposable
     public Task<McpToolResult> GetElementPropertiesAsync(string element) =>
         CallSessionToolAsync("get_element_properties", new { element });
 
-    public Task<McpToolResult> ToggleAsync(string element) =>
-        CallSessionToolAsync("toggle", new { element });
-
-    public Task<McpToolResult> SetValueAsync(string element, string text) =>
-        CallSessionToolAsync("set_value", new { element, text });
-
     public Task<McpToolResult> GetEditablePropertiesAsync(string element) =>
         CallSessionToolAsync("get_editable_properties", new { element });
 

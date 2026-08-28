@@ -65,6 +65,12 @@ public:
                   const std::string& providerOption = {}) override;
     bool get_tree_with_options(Element& root, const UiaOptions& options,
                                bool* truncated = nullptr);
+    PropertySnapshotResult get_property_snapshot(uint64_t handle) override;
+    PropertyMutationResult set_property(
+        uint64_t handle, const std::string& descriptorId,
+        const std::string& value) override;
+    PropertyMutationResult clear_property(
+        uint64_t handle, const std::string& descriptorId) override;
     std::vector<ConnectionEvent> poll_events() override;
     bool is_alive() const override;
 

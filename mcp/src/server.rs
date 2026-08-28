@@ -177,7 +177,7 @@ pub struct UiaTreeChangesArgs {
 pub struct EditablePropertiesArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference or durable key returned by the session's visual tree.
+    /// Element reference or durable key returned by this session's tree.
     pub element: String,
 }
 
@@ -1407,7 +1407,8 @@ impl LvtServer {
 
     #[tool(
         description = "Get provider-owned typed property descriptors and the current live values \
-                       for one visual element. Descriptors are framework-neutral and carry opaque \
+                       for one element in this session's UIA or visual tree. Descriptors are \
+                       framework-neutral and carry opaque \
                        ids, editor kinds, choices, writability, clear capability, and declared \
                        types; live values are returned separately.",
         output_schema = crate::schema::editable_properties(),
@@ -1694,9 +1695,10 @@ impl LvtServer {
     #[tool(
         description = "Set one writable typed property using the opaque descriptor id returned \
                        by get_editable_properties. The provider owns type conversion and rejects \
-                       unknown, stale, read-only, or element-mismatched descriptor ids.",
+                       unknown, stale, read-only, or element-mismatched descriptor ids. Command \
+                       descriptors use the same call to run one provider-supplied choice.",
         output_schema = crate::schema::property_mutation(),
-        annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
+        annotations(destructive_hint = true, open_world_hint = true)
     )]
     async fn set_property(
         &self,
@@ -1718,7 +1720,9 @@ impl LvtServer {
     #[tool(
         description = "Apply one typed property's provider-defined clear behavior using the \
                        opaque descriptor id returned by get_editable_properties. This may remove \
-                       a local override or move a native control to its documented no-value state.",
+                       a local override or move a native control to its documented no-value state. \
+                       Providers without a reset operation, including most UI Automation patterns, \
+                       return an explicit unsupported error.",
         output_schema = crate::schema::property_mutation(),
         annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]

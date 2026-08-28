@@ -55,7 +55,7 @@ work across them.
 | `get_uia_tree_changes` | Session-scoped UIA patches: a snapshot on first call, then added/removed/changed events |
 | `get_visual_tree` | The framework-native tree — Win32/XAML/WPF/WinForms/Avalonia/Chromium. Shows *how a UI is built*; drive it from a `visual`-mode session |
 | `get_visual_tree_changes` | Session-scoped visual-tree patches: a snapshot on first call, then added/removed/changed events |
-| `get_editable_properties` | Provider-owned typed property schema and live values for one visual element |
+| `get_editable_properties` | Provider-owned typed property schema and live values for one element in the session's UIA or visual tree |
 | `get_frameworks` | UI frameworks detected in the target, with versions |
 | `find_elements` | Match by AutomationId, name, control type or supported pattern |
 | `get_element_properties` | One element's properties, or a named subset |
@@ -72,7 +72,7 @@ work across them.
 | `toggle` | Flip a checkbox or toggle button |
 | `set_value` | Set a text or numeric value outright |
 | `set_property` | Set a writable typed property by opaque provider descriptor id |
-| `clear_property` | Clear a typed property's local/provider override |
+| `clear_property` | Clear/reset a typed property when its provider supports that operation |
 | `set_expanded` | Expand or collapse a tree item or combo box |
 | `select` | Select a list item or tab (`replace`, `add`, `remove`) |
 | `focus` | Give an element keyboard focus |
@@ -202,14 +202,17 @@ method or notification is introduced.
 
 ### Typed property schemas and mutation
 
-`get_editable_properties` takes an `element` reference or durable visual key.
+`get_editable_properties` takes an `element` reference or durable key from the
+session's own UIA or visual tree.
 It returns a provider-owned `schemaId`, immutable `descriptors`, and separate
 per-element live `values`. Descriptors include an opaque `descriptorId`,
 declared property type, provider/framework identity, editor kind
-(`readonly`, `string`, `boolean`, `integer`, `number`, or `enum`), choices,
-optional numeric limits, writability, and clear capability. Live values carry
-the current value, runtime value type, source, override state, and whether that
-specific value can currently be cleared.
+(`readonly`, `string`, `boolean`, `integer`, `number`, `enum`, or `command`),
+choices, optional numeric limits, writability, and clear capability. A command
+descriptor represents provider-supplied actions such as supported UIA scroll
+directions; clients render its choices without inferring behavior from the
+property name. Live values carry the current value, runtime value type, source,
+override state, and whether that specific value can currently be cleared.
 
 Clients never send a property index or type name. The provider resolves the
 opaque descriptor id and owns conversion:
@@ -222,14 +225,16 @@ opaque descriptor id and owns conversion:
 Setting and clearing require `lvt mcp --allow-input`. Clearing has
 provider-defined semantics: XAML removes a local value, while the curated
 ComboBox/ListBox descriptors clear selection to the documented no-selection
-state. Unknown, stale, element-mismatched, and read-only descriptor ids are
-rejected. Successful mutations include provider readback of the effective
+state. UI Automation patterns generally have no reset operation, so their
+descriptors report `supportsClear:false` and `clear_property` returns an
+explicit unsupported error. Unknown, stale, element-mismatched, and read-only
+descriptor ids are rejected. Successful mutations include provider readback of the effective
 `value`, `runtimeType`, `source`, `overridden`, and `canClear` state. The
 returned value is never the caller's input echoed back; a failed readback is
 reported as an explicit mutation failure.
 
-The provider-neutral contract is implemented by XAML/WinUI3, WPF, WinForms,
-and curated Win32/Common Controls adapters. WPF exposes writable scalar
+The provider-neutral contract is implemented by XAML/WinUI3, UI Automation,
+WPF, WinForms, and curated Win32/Common Controls adapters. WPF exposes writable scalar
 dependency properties and preserves local value precedence through
 `SetValue`/`ClearValue`. WinForms uses `TypeDescriptor`, including custom
 descriptors, but admits only a conservative scalar/converter allowlist and
@@ -264,8 +269,11 @@ drives editor selection and `CreateInstance`; the evaluated value's
 mutation. Each persistent XAML connection fetches its runtime enum catalog
 once. Flags values accept comma-separated members only when WinRT metadata
 confirms `System.FlagsAttribute`; ordinary and unresolved enum numerics are
-never fabricated into flag combinations. External plugin ABI support is not
-part of this contract.
+never fabricated into flag combinations. The UIA adapter derives editors and
+choices from cached supported patterns and capability properties:
+Value/RangeValue read-only state, RangeValue bounds, deterministic Toggle and
+ExpandCollapse states, Selection-container capabilities, and supported Scroll
+directions. External plugin ABI support is not part of this contract.
 
 Native messaging is bounded with `SendMessageTimeoutW` using
 `SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT`. Pointer-bearing common-control

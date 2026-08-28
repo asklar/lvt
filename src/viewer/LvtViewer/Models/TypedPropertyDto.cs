@@ -11,8 +11,7 @@ public enum PropertyEditorKind
     Integer,
     Number,
     Enumeration,
-    LegacyToggle,
-    LegacyTextValue,
+    Command,
 }
 
 public sealed class PropertyChoiceDto
@@ -51,6 +50,7 @@ public sealed class PropertyDescriptorDto
             "integer" => PropertyEditorKind.Integer,
             "number" => PropertyEditorKind.Number,
             "enum" => PropertyEditorKind.Enumeration,
+            "command" => PropertyEditorKind.Command,
             _ => PropertyEditorKind.ReadOnly,
         };
     }

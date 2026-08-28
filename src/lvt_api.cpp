@@ -1549,23 +1549,29 @@ PropertyTarget require_property_target(
         throw std::runtime_error("'element' must be a non-empty string");
 
     const auto parsedRef = parse_ref(elementRef);
-    if (parsedRef.tree == RefTree::uia) {
+    const bool uia = !session.visualMode;
+    if (uia && parsedRef.tree == RefTree::visual) {
         throw std::runtime_error(
             "'" + elementRef +
-            "' is a UI Automation reference, but typed visual properties need "
-            "an element from get_visual_tree");
+            "' is a visual-tree reference, but this session exposes UI Automation properties");
+    }
+    if (!uia && parsedRef.tree == RefTree::uia) {
+        throw std::runtime_error(
+            "'" + elementRef +
+            "' is a UI Automation reference, but this session exposes visual-tree properties");
     }
 
     PropertyTarget target;
-    if (parse_compact_property_target(parsedRef.ref, target))
+    if (!uia && parse_compact_property_target(parsedRef.ref, target))
         return target;
 
     json treeParams = params;
-    treeParams["fast"] = true;
+    if (!uia)
+        treeParams["fast"] = true;
     lvt::Element tree;
     std::string error;
     if (!build_tree_for(
-            session, treeParams, false, tree, error, nullptr,
+            session, treeParams, uia, tree, error, nullptr,
             targetAlreadyLocked))
         throw std::runtime_error(error);
     const auto* element = lvt::find_element_by_ref(tree, parsedRef.ref);
@@ -1576,6 +1582,11 @@ PropertyTarget require_property_target(
             "element '" + elementRef +
             "' has no provider-owned property identity");
     }
+    if (uia && element->framework != "uia") {
+        throw std::runtime_error(
+            "element '" + elementRef +
+            "' does not belong to this session's UI Automation tree");
+    }
     target.provider = element->framework;
     target.handle = element->providerHandle;
     return target;
@@ -1583,6 +1594,28 @@ PropertyTarget require_property_target(
 
 std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
     const Session& session, const PropertyTarget& target) {
+    if (target.provider == "uia") {
+#ifdef LVT_ENABLE_UIA
+        if (session.visualMode) {
+            throw std::runtime_error(
+                "UI Automation properties require a session connected in uia mode");
+        }
+        auto connection = uia_connection_for_session(session);
+        if (!connection || !connection->is_alive()) {
+            throw std::runtime_error(
+                "the UI Automation property connection is no longer available");
+        }
+        return connection.get();
+#else
+        throw std::runtime_error(
+            "this build has UI Automation support compiled out");
+#endif
+    }
+
+    if (!session.visualMode) {
+        throw std::runtime_error(
+            "visual typed properties require a session connected in visual mode");
+    }
     const auto hostArch = lvt::get_host_architecture();
     const bool nativeProvider =
         target.provider == "win32" || target.provider == "comctl";

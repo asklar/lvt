@@ -524,6 +524,14 @@ std::string typed_property_value(const json& snapshot, const std::string& name) 
     return value ? value->value("value", "") : std::string();
 }
 
+bool descriptor_has_choice(const json& descriptor, const std::string& value) {
+    for (const auto& choice : descriptor.value("choices", json::array())) {
+        if (choice.value("value", "") == value)
+            return true;
+    }
+    return false;
+}
+
 // A JSON Schema checker covering exactly the keywords lvt's output schemas use:
 // type, const, enum, required, properties, items, additionalProperties, anyOf.
 //
@@ -2441,7 +2449,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
     ASSERT_TRUE(client.started());
     ASSERT_TRUE(client.handshake());
     const auto schemas = output_schemas(client);
-    const auto session = connect(client);
+    const auto session = connect(client, "visual");
     ASSERT_FALSE(session.empty());
     const auto targetPid = process_id();
     const int setSiteBefore = count_tap_set_site_calls(targetPid);
@@ -2461,6 +2469,461 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         else if (name == "StatusText")
             status = element;
     }
+
+    const auto runUiaTypedProperties = [&] {
+        SCOPED_TRACE("UIA typed properties are provider-driven and deterministic");
+        SkipIfNotReady();
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto schemas = output_schemas(client);
+        const auto session = connect(client);
+        ASSERT_FALSE(session.empty());
+
+        bool isError = false;
+        auto input = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "InputBox"}});
+        ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
+        const auto inputRef = input["elements"][0].value("ref", "");
+        const auto inputKey = input["elements"][0].value("key", "");
+
+        auto inputProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", inputRef}}, &isError);
+        ASSERT_FALSE(isError) << inputProperties.dump(2);
+        std::string schemaError;
+        EXPECT_TRUE(schema_allows(
+            schemas.at("get_editable_properties"), inputProperties, schemaError))
+            << schemaError;
+        const auto* valueDescriptor =
+            find_property_descriptor(inputProperties, "Value.Value");
+        ASSERT_NE(valueDescriptor, nullptr) << inputProperties.dump(2);
+        EXPECT_EQ(valueDescriptor->value("kind", ""), "string");
+        EXPECT_TRUE(valueDescriptor->value("writable", false));
+        EXPECT_FALSE(valueDescriptor->value("supportsClear", true));
+        const auto valueDescriptorId = valueDescriptor->value("descriptorId", "");
+        const auto originalText =
+            typed_property_value(inputProperties, "Value.Value");
+
+        auto repeated = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", inputKey}}, &isError);
+        ASSERT_FALSE(isError) << repeated.dump(2);
+        EXPECT_EQ(
+            repeated.value("schemaId", ""),
+            inputProperties.value("schemaId", ""));
+        const auto* repeatedValue =
+            find_property_descriptor(repeated, "Value.Value");
+        ASSERT_NE(repeatedValue, nullptr);
+        EXPECT_EQ(
+            repeatedValue->value("descriptorId", ""), valueDescriptorId);
+
+        const auto changedText = "typed UIA value";
+        auto setValue = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", inputRef},
+                 {"descriptorId", valueDescriptorId},
+                 {"value", changedText}},
+            &isError);
+        ASSERT_FALSE(isError) << setValue.dump(2);
+        auto changedInput = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", inputKey}}, &isError);
+        ASSERT_FALSE(isError) << changedInput.dump(2);
+        EXPECT_EQ(typed_property_value(changedInput, "Value.Value"), changedText);
+
+        auto readOnly = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ReadOnlyBox"}});
+        ASSERT_EQ(readOnly["elements"].size(), 1u) << readOnly.dump(2);
+        auto readOnlyProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", readOnly["elements"][0].value("ref", "")}},
+            &isError);
+        ASSERT_FALSE(isError) << readOnlyProperties.dump(2);
+        const auto* readOnlyValue =
+            find_property_descriptor(readOnlyProperties, "Value.Value");
+        ASSERT_NE(readOnlyValue, nullptr);
+        EXPECT_EQ(readOnlyValue->value("kind", ""), "readonly");
+        EXPECT_FALSE(readOnlyValue->value("writable", true));
+
+        auto slider = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "LevelSlider"}});
+        ASSERT_EQ(slider["elements"].size(), 1u) << slider.dump(2);
+        const auto sliderRef = slider["elements"][0].value("ref", "");
+        const auto sliderKey = slider["elements"][0].value("key", "");
+        auto sliderProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", sliderKey}}, &isError);
+        ASSERT_FALSE(isError) << sliderProperties.dump(2);
+        const auto* range =
+            find_property_descriptor(sliderProperties, "RangeValue.Value");
+        ASSERT_NE(range, nullptr) << sliderProperties.dump(2);
+        EXPECT_EQ(range->value("kind", ""), "number");
+        EXPECT_DOUBLE_EQ(range->value("minimum", -1.0), 0.0);
+        EXPECT_DOUBLE_EQ(range->value("maximum", -1.0), 100.0);
+        EXPECT_FALSE(range->contains("step"));
+        const auto rangeDescriptorId = range->value("descriptorId", "");
+        const auto originalRange =
+            typed_property_value(sliderProperties, "RangeValue.Value");
+
+        auto readOnlyRange = client.call_tool(
+            "find_elements",
+            json{{"session", session}, {"automationId", "ReadOnlyRange"}});
+        ASSERT_EQ(readOnlyRange["elements"].size(), 1u) << readOnlyRange.dump(2);
+        auto readOnlyRangeProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", readOnlyRange["elements"][0].value("ref", "")}},
+            &isError);
+        ASSERT_FALSE(isError) << readOnlyRangeProperties.dump(2);
+        const auto* readOnlyRangeDescriptor =
+            find_property_descriptor(
+                readOnlyRangeProperties, "RangeValue.Value");
+        ASSERT_NE(readOnlyRangeDescriptor, nullptr)
+            << readOnlyRangeProperties.dump(2);
+        EXPECT_EQ(readOnlyRangeDescriptor->value("kind", ""), "readonly");
+        EXPECT_FALSE(readOnlyRangeDescriptor->value("writable", true));
+        EXPECT_DOUBLE_EQ(
+            readOnlyRangeDescriptor->value("minimum", -1.0), 0.0);
+        EXPECT_DOUBLE_EQ(
+            readOnlyRangeDescriptor->value("maximum", -1.0), 100.0);
+
+        auto setRange = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", sliderKey},
+                 {"descriptorId", rangeDescriptorId},
+                 {"value", "75"}},
+            &isError);
+        ASSERT_FALSE(isError) << setRange.dump(2);
+        auto rangeAfter = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", sliderKey}}, &isError);
+        ASSERT_FALSE(isError) << rangeAfter.dump(2);
+        EXPECT_EQ(typed_property_value(rangeAfter, "RangeValue.Value"), "75")
+            << rangeAfter.dump(2);
+
+        auto checkbox = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ReadyCheckBox"}});
+        ASSERT_EQ(checkbox["elements"].size(), 1u) << checkbox.dump(2);
+        const auto checkboxRef = checkbox["elements"][0].value("ref", "");
+        const auto checkboxKey = checkbox["elements"][0].value("key", "");
+        auto checkboxProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", checkboxKey}}, &isError);
+        ASSERT_FALSE(isError) << checkboxProperties.dump(2);
+        const auto* toggle =
+            find_property_descriptor(checkboxProperties, "Toggle.ToggleState");
+        ASSERT_NE(toggle, nullptr) << checkboxProperties.dump(2);
+        EXPECT_EQ(toggle->value("kind", ""), "enum");
+        EXPECT_TRUE(descriptor_has_choice(*toggle, "Off"));
+        EXPECT_TRUE(descriptor_has_choice(*toggle, "On"));
+        EXPECT_FALSE(descriptor_has_choice(*toggle, "Indeterminate"));
+        const auto toggleDescriptorId = toggle->value("descriptorId", "");
+        const auto originalToggle =
+            typed_property_value(checkboxProperties, "Toggle.ToggleState");
+        const auto wantedToggle = originalToggle == "On" ? "Off" : "On";
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto setToggle = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", checkboxKey},
+                     {"descriptorId", toggleDescriptorId},
+                     {"value", wantedToggle}},
+                &isError);
+            ASSERT_FALSE(isError) << setToggle.dump(2);
+        }
+        auto toggleAfter = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", checkboxKey}}, &isError);
+        ASSERT_FALSE(isError) << toggleAfter.dump(2);
+        EXPECT_EQ(
+            typed_property_value(toggleAfter, "Toggle.ToggleState"), wantedToggle)
+            << "setting the same toggle state twice must not cycle away from it\n"
+            << toggleAfter.dump(2);
+
+        auto combo = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ChoiceCombo"}});
+        ASSERT_EQ(combo["elements"].size(), 1u) << combo.dump(2);
+        auto comboProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", combo["elements"][0].value("ref", "")}},
+            &isError);
+        ASSERT_FALSE(isError) << comboProperties.dump(2);
+        const auto* expand =
+            find_property_descriptor(comboProperties, "ExpandCollapse.State");
+        ASSERT_NE(expand, nullptr) << comboProperties.dump(2);
+        EXPECT_TRUE(descriptor_has_choice(*expand, "Expanded"));
+        EXPECT_TRUE(descriptor_has_choice(*expand, "Collapsed"));
+        auto setExpanded = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", combo["elements"][0].value("ref", "")},
+                 {"descriptorId", expand->value("descriptorId", "")},
+                 {"value", "Expanded"}},
+            &isError);
+        ASSERT_FALSE(isError) << setExpanded.dump(2);
+        auto expandedCombo = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ChoiceCombo"}});
+        ASSERT_FALSE(expandedCombo["elements"].empty());
+        auto expandedProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", expandedCombo["elements"][0].value("ref", "")}},
+            &isError);
+        ASSERT_FALSE(isError) << expandedProperties.dump(2);
+        EXPECT_EQ(
+            typed_property_value(expandedProperties, "ExpandCollapse.State"),
+            "Expanded");
+        const auto* collapse =
+            find_property_descriptor(expandedProperties, "ExpandCollapse.State");
+        ASSERT_NE(collapse, nullptr);
+        auto setCollapsed = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", expandedCombo["elements"][0].value("ref", "")},
+                 {"descriptorId", collapse->value("descriptorId", "")},
+                 {"value", "Collapsed"}},
+            &isError);
+        ASSERT_FALSE(isError) << setCollapsed.dump(2);
+
+        auto item = client.call_tool(
+            "find_elements",
+            json{{"session", session}, {"name", "Item 000"}, {"type", "ListItem"}});
+        if (!item["elements"].empty()) {
+            const auto itemRef = item["elements"][0].value("ref", "");
+            auto itemProperties = client.call_tool(
+                "get_editable_properties",
+                json{{"session", session}, {"element", itemRef}}, &isError);
+            ASSERT_FALSE(isError) << itemProperties.dump(2);
+            const auto* selection =
+                find_property_descriptor(itemProperties, "SelectionItem.Action");
+            ASSERT_NE(selection, nullptr) << itemProperties.dump(2);
+            EXPECT_EQ(selection->value("kind", ""), "command");
+            EXPECT_TRUE(descriptor_has_choice(*selection, "select"));
+            EXPECT_TRUE(descriptor_has_choice(*selection, "add"));
+            EXPECT_TRUE(descriptor_has_choice(*selection, "remove"));
+            auto add = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", itemRef},
+                     {"descriptorId", selection->value("descriptorId", "")},
+                     {"value", "add"}},
+                &isError);
+            ASSERT_FALSE(isError) << add.dump(2);
+
+            auto currentItem = client.call_tool(
+                "find_elements",
+                json{{"session", session}, {"name", "Item 000"}, {"type", "ListItem"}});
+            ASSERT_FALSE(currentItem["elements"].empty());
+            auto selectedProperties = client.call_tool(
+                "get_editable_properties",
+                json{{"session", session},
+                     {"element", currentItem["elements"][0].value("ref", "")}},
+                &isError);
+            ASSERT_FALSE(isError) << selectedProperties.dump(2);
+            EXPECT_EQ(
+                typed_property_value(selectedProperties, "SelectionItem.Action"),
+                "Selected");
+            const auto* remove =
+                find_property_descriptor(selectedProperties, "SelectionItem.Action");
+            ASSERT_NE(remove, nullptr);
+            auto removed = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", currentItem["elements"][0].value("ref", "")},
+                     {"descriptorId", remove->value("descriptorId", "")},
+                     {"value", "remove"}},
+                &isError);
+            ASSERT_FALSE(isError) << removed.dump(2);
+
+            auto replacementItem = client.call_tool(
+                "find_elements",
+                json{{"session", session}, {"name", "Item 000"}, {"type", "ListItem"}});
+            ASSERT_FALSE(replacementItem["elements"].empty());
+            auto replacementProperties = client.call_tool(
+                "get_editable_properties",
+                json{{"session", session},
+                     {"element", replacementItem["elements"][0].value("ref", "")}},
+                &isError);
+            ASSERT_FALSE(isError) << replacementProperties.dump(2);
+            const auto* replace =
+                find_property_descriptor(replacementProperties, "SelectionItem.Action");
+            ASSERT_NE(replace, nullptr);
+            auto selected = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", replacementItem["elements"][0].value("ref", "")},
+                     {"descriptorId", replace->value("descriptorId", "")},
+                     {"value", "select"}},
+                &isError);
+            ASSERT_FALSE(isError) << selected.dump(2);
+
+            auto selectedItem = client.call_tool(
+                "find_elements",
+                json{{"session", session}, {"name", "Item 000"}, {"type", "ListItem"}});
+            ASSERT_FALSE(selectedItem["elements"].empty());
+            auto selectedSnapshot = client.call_tool(
+                "get_editable_properties",
+                json{{"session", session},
+                     {"element", selectedItem["elements"][0].value("ref", "")}},
+                &isError);
+            ASSERT_FALSE(isError) << selectedSnapshot.dump(2);
+            const auto* selectedDescriptor =
+                find_property_descriptor(selectedSnapshot, "SelectionItem.Action");
+            ASSERT_NE(selectedDescriptor, nullptr);
+            auto finalRemove = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", selectedItem["elements"][0].value("ref", "")},
+                     {"descriptorId", selectedDescriptor->value("descriptorId", "")},
+                     {"value", "remove"}},
+                &isError);
+            EXPECT_FALSE(isError) << finalRemove.dump(2);
+        }
+
+        auto list = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ItemsList"}});
+        ASSERT_EQ(list["elements"].size(), 1u) << list.dump(2);
+        const auto listRef = list["elements"][0].value("ref", "");
+        const auto listKey = list["elements"][0].value("key", "");
+        auto listProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", listKey}}, &isError);
+        ASSERT_FALSE(isError) << listProperties.dump(2);
+        const auto* scroll =
+            find_property_descriptor(listProperties, "Scroll.Action");
+        ASSERT_NE(scroll, nullptr) << listProperties.dump(2);
+        EXPECT_EQ(scroll->value("kind", ""), "command");
+        EXPECT_TRUE(descriptor_has_choice(*scroll, "up"));
+        EXPECT_TRUE(descriptor_has_choice(*scroll, "down"));
+        EXPECT_FALSE(descriptor_has_choice(*scroll, "left"));
+        EXPECT_FALSE(descriptor_has_choice(*scroll, "right"));
+        const auto beforeScroll = typed_property_value(listProperties, "Scroll.Action");
+        auto scrolled = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", listKey},
+                 {"descriptorId", scroll->value("descriptorId", "")},
+                 {"value", "down"}},
+            &isError);
+        ASSERT_FALSE(isError) << scrolled.dump(2);
+        auto afterScroll = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", listKey}}, &isError);
+        ASSERT_FALSE(isError) << afterScroll.dump(2);
+        EXPECT_NE(
+            typed_property_value(afterScroll, "Scroll.Action"), beforeScroll);
+
+        auto clear = client.call_tool(
+            "clear_property",
+            json{{"session", session},
+                 {"element", sliderKey},
+                 {"descriptorId", rangeDescriptorId}},
+            &isError);
+        EXPECT_TRUE(isError) << clear.dump(2);
+        EXPECT_NE(clear.dump().find("does not expose a generic clear"), std::string::npos)
+            << clear.dump(2);
+
+        auto restoreRange = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", sliderKey},
+                 {"descriptorId", rangeDescriptorId},
+                 {"value", originalRange}},
+            &isError);
+        EXPECT_FALSE(isError) << restoreRange.dump(2);
+        auto restoreToggle = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", checkboxKey},
+                 {"descriptorId", toggleDescriptorId},
+                 {"value", originalToggle}},
+            &isError);
+        EXPECT_FALSE(isError) << restoreToggle.dump(2);
+        auto restoreText = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", inputKey},
+                 {"descriptorId", valueDescriptorId},
+                 {"value", originalText}},
+            &isError);
+        EXPECT_FALSE(isError) << restoreText.dump(2);
+    };
+
+    const auto runUiaResourceRefresh = [&] {
+        SCOPED_TRACE("UIA typed property mutation refreshes subscribed resource");
+        SkipIfNotReady();
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto session = connect(client);
+        ASSERT_FALSE(session.empty());
+
+        auto input = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "InputBox"}});
+        ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
+        const auto inputRef = input["elements"][0].value("ref", "");
+        const auto inputKey = input["elements"][0].value("key", "");
+
+        bool isError = false;
+        auto properties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", inputRef}}, &isError);
+        ASSERT_FALSE(isError) << properties.dump(2);
+        const auto* value =
+            find_property_descriptor(properties, "Value.Value");
+        ASSERT_NE(value, nullptr);
+        const auto descriptorId = value->value("descriptorId", "");
+        const auto original = typed_property_value(properties, "Value.Value");
+
+        const auto uri = "lvt://session/" + session + "/uia-tree";
+        auto subscribed = client.request("resources/subscribe", json{{"uri", uri}});
+        ASSERT_TRUE(subscribed.contains("result")) << subscribed.dump(2);
+        auto initialRead = client.request("resources/read", json{{"uri", uri}});
+        ASSERT_TRUE(initialRead.contains("result")) << initialRead.dump(2);
+
+        auto changed = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", inputRef},
+                 {"descriptorId", descriptorId},
+                 {"value", "typed resource mutation"}},
+            &isError);
+        ASSERT_FALSE(isError) << changed.dump(2);
+
+        auto notification =
+            client.await_notification("notifications/resources/updated", 20);
+        ASSERT_FALSE(notification.is_null())
+            << "no resource update followed a generic UIA property mutation";
+        auto read = client.request("resources/read", json{{"uri", uri}});
+        ASSERT_TRUE(read.contains("result")) << read.dump(2);
+        const auto patch = json::parse(
+            read["result"]["contents"][0].value("text", ""), nullptr, false);
+        ASSERT_FALSE(patch.is_discarded()) << read.dump(2);
+        bool sawValueChange = false;
+        for (const auto& event : patch.value("events", json::array())) {
+            const auto fields = event.value("fields", json::object());
+            sawValueChange = sawValueChange ||
+                             (event.value("key", "") == inputKey &&
+                              fields.contains("properties.Value.Value"));
+        }
+        EXPECT_TRUE(sawValueChange) << patch.dump(2);
+
+        auto unsubscribed = client.request("resources/unsubscribe", json{{"uri", uri}});
+        EXPECT_TRUE(unsubscribed.contains("result")) << unsubscribed.dump(2);
+        auto restored = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", inputRef},
+                 {"descriptorId", descriptorId},
+                 {"value", original}},
+            &isError);
+        EXPECT_FALSE(isError) << restored.dump(2);
+    };
     ASSERT_NE(button, nullptr);
     ASSERT_NE(status, nullptr);
     const auto key = button->value("key", "");
@@ -2888,6 +3351,8 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
            "get/set/clear property operations";
     EXPECT_EQ(count_tap_get_enums_calls(targetPid) - getEnumsBefore, 1)
         << "one persistent XAML connection must fetch its enum catalog once";
+    runUiaTypedProperties();
+    runUiaResourceRefresh();
 }
 
 TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {

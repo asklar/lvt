@@ -286,7 +286,10 @@ cached!(editable_properties, {
                         "propertyType": { "type": "string" },
                         "kind": {
                             "type": "string",
-                            "enum": ["readonly", "string", "boolean", "integer", "number", "enum"]
+                            "enum": [
+                                "readonly", "string", "boolean", "integer",
+                                "number", "enum", "command"
+                            ]
                         },
                         "choices": {
                             "type": "array",

@@ -1,4 +1,6 @@
 #include "uia_provider.h"
+#include "uia_actions.h"
+#include "uia_property_adapter.h"
 #include "../debug.h"
 
 #include <wil/com.h>
@@ -10,11 +12,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace lvt {
@@ -558,7 +563,130 @@ struct UiaConnection::State {
     std::mutex mutex;
     wil::com_ptr<IUIAutomation> automation;
     CO_MTA_USAGE_COOKIE mtaCookie = nullptr;
+    uint64_t nextProviderHandle = 1;
+    std::unordered_map<std::string, uint64_t> handlesByRuntimeId;
+    std::unordered_map<uint64_t, std::string> runtimeIdsByHandle;
+    UiaPropertySchemaCache schemaCache;
 };
+
+namespace {
+
+void assign_uia_provider_handles(
+    Element& element,
+    uint64_t& nextHandle,
+    std::unordered_map<std::string, uint64_t>& handlesByRuntimeId,
+    std::unordered_map<uint64_t, std::string>& runtimeIdsByHandle) {
+    const auto runtime = element.properties.find("RuntimeId");
+    if (runtime != element.properties.end() && !runtime->second.empty()) {
+        auto found = handlesByRuntimeId.find(runtime->second);
+        if (found == handlesByRuntimeId.end()) {
+            const auto handle = nextHandle++;
+            handlesByRuntimeId.emplace(runtime->second, handle);
+            runtimeIdsByHandle.emplace(handle, runtime->second);
+            element.providerHandle = handle;
+        } else {
+            element.providerHandle = found->second;
+        }
+    }
+    for (auto& child : element.children) {
+        assign_uia_provider_handles(
+            child, nextHandle, handlesByRuntimeId, runtimeIdsByHandle);
+    }
+}
+
+bool has_supported_pattern(const Element& element, const char* wanted) {
+    const auto found = element.properties.find("SupportedPatterns");
+    if (found == element.properties.end())
+        return false;
+    size_t start = 0;
+    while (start < found->second.size()) {
+        const auto comma = found->second.find(',', start);
+        const auto token = found->second.substr(
+            start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (token == wanted)
+            return true;
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return false;
+}
+
+bool bool_property(const Element& element, const char* name, bool fallback) {
+    const auto found = element.properties.find(name);
+    if (found == element.properties.end())
+        return fallback;
+    return found->second == "true";
+}
+
+struct LocatedPropertyElement {
+    const Element* element = nullptr;
+    UiaSelectionCapabilities selection;
+};
+
+bool locate_property_element(
+    const Element& current, uint64_t handle,
+    UiaSelectionCapabilities inheritedSelection,
+    LocatedPropertyElement& result) {
+    if (has_supported_pattern(current, "Selection")) {
+        inheritedSelection.known = true;
+        inheritedSelection.canSelectMultiple =
+            bool_property(current, "Selection.CanSelectMultiple", false);
+        inheritedSelection.isSelectionRequired =
+            bool_property(current, "Selection.IsSelectionRequired", true);
+    }
+
+    if (current.providerHandle == handle) {
+        result.element = &current;
+        result.selection = inheritedSelection;
+        return true;
+    }
+    for (const auto& child : current.children) {
+        if (locate_property_element(
+                child, handle, inheritedSelection, result)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const PropertyDescriptor* find_descriptor(
+    const PropertySchema& schema, const std::string& descriptorId) {
+    for (const auto& descriptor : schema.descriptors) {
+        if (descriptor.descriptorId == descriptorId)
+            return &descriptor;
+    }
+    return nullptr;
+}
+
+bool is_choice(
+    const PropertyDescriptor& descriptor, const std::string& value) {
+    return std::any_of(
+        descriptor.choices.begin(), descriptor.choices.end(),
+        [&](const PropertyChoice& choice) { return choice.value == value; });
+}
+
+bool validate_number(
+    const PropertyDescriptor& descriptor, const std::string& text,
+    std::string& error) {
+    char* end = nullptr;
+    const double value = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || *end != '\0' || !std::isfinite(value)) {
+        error = "The property value must be a finite number";
+        return false;
+    }
+    if (descriptor.minimum && value < *descriptor.minimum) {
+        error = "The property value is below the provider-supplied minimum";
+        return false;
+    }
+    if (descriptor.maximum && value > *descriptor.maximum) {
+        error = "The property value is above the provider-supplied maximum";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
 
 UiaConnection::UiaConnection(HWND hwnd)
     : m_hwnd(hwnd), m_state(std::make_unique<State>()) {
@@ -656,6 +784,11 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
         apply_automation_timeouts(automation, options);
         return build_tree_with_automation(automation, hwnd, options, built, wasTruncated);
     });
+    if (SUCCEEDED(hr)) {
+        assign_uia_provider_handles(
+            built, m_state->nextProviderHandle,
+            m_state->handlesByRuntimeId, m_state->runtimeIdsByHandle);
+    }
     lock.unlock();
 
     if (truncated)
@@ -671,6 +804,163 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
     }
     root = std::move(built);
     return true;
+}
+
+PropertySnapshotResult UiaConnection::get_property_snapshot(uint64_t handle) {
+    Element tree;
+    bool refreshed = false;
+    for (int attempt = 0; attempt < 3 && !refreshed; ++attempt) {
+        if (attempt > 0)
+            Sleep(static_cast<DWORD>(120 * attempt));
+        refreshed = get_tree_with_options(tree, UiaOptions{});
+    }
+    if (!refreshed) {
+        PropertySnapshotResult result;
+        result.hresult = E_FAIL;
+        result.error = "Could not refresh the UI Automation tree";
+        return result;
+    }
+
+    LocatedPropertyElement located;
+    if (!locate_property_element(
+            tree, handle, UiaSelectionCapabilities{}, located) ||
+        !located.element) {
+        PropertySnapshotResult result;
+        result.hresult = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        result.error =
+            "The UI Automation element is stale or does not belong to this session";
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(m_state->mutex);
+    return make_uia_property_snapshot(
+        *located.element, located.selection, m_state->schemaCache);
+}
+
+PropertyMutationResult UiaConnection::set_property(
+    uint64_t handle, const std::string& descriptorId,
+    const std::string& value) {
+    const auto snapshot = get_property_snapshot(handle);
+    if (!snapshot.ok || !snapshot.schema) {
+        PropertyMutationResult result;
+        result.hresult = snapshot.hresult;
+        result.error = snapshot.error;
+        return result;
+    }
+
+    const auto* descriptor =
+        find_descriptor(*snapshot.schema, descriptorId);
+    if (!descriptor) {
+        PropertyMutationResult result;
+        result.hresult = E_INVALIDARG;
+        result.error =
+            "The property descriptor is unknown, stale, or belongs to a different UI Automation element";
+        return result;
+    }
+    if (!descriptor->writable) {
+        PropertyMutationResult result;
+        result.hresult = E_ACCESSDENIED;
+        result.error = "The UI Automation property descriptor is read-only";
+        return result;
+    }
+    if (!descriptor->choices.empty() && !is_choice(*descriptor, value)) {
+        PropertyMutationResult result;
+        result.hresult = E_INVALIDARG;
+        result.error =
+            "The selected value is not one of the provider-supplied choices";
+        return result;
+    }
+    if (descriptor->kind == PropertyEditorKind::number) {
+        std::string error;
+        if (!validate_number(*descriptor, value, error)) {
+            PropertyMutationResult result;
+            result.hresult = E_INVALIDARG;
+            result.error = std::move(error);
+            return result;
+        }
+    }
+
+    UiaPropertyAction action;
+    if (descriptor->name == "Value.Value") {
+        action = UiaPropertyAction::setValue;
+    } else if (descriptor->name == "RangeValue.Value") {
+        action = UiaPropertyAction::setRangeValue;
+    } else if (descriptor->name == "Toggle.ToggleState") {
+        action = UiaPropertyAction::setToggleState;
+    } else if (descriptor->name == "ExpandCollapse.State") {
+        action = UiaPropertyAction::setExpandCollapseState;
+    } else if (descriptor->name == "SelectionItem.Action") {
+        if (value == "select")
+            action = UiaPropertyAction::replaceSelection;
+        else if (value == "add")
+            action = UiaPropertyAction::addToSelection;
+        else
+            action = UiaPropertyAction::removeFromSelection;
+    } else if (descriptor->name == "Scroll.Action") {
+        action = UiaPropertyAction::scroll;
+    } else {
+        PropertyMutationResult result;
+        result.hresult = E_INVALIDARG;
+        result.error =
+            "The property descriptor has no UI Automation mutation adapter";
+        return result;
+    }
+
+    std::unique_lock<std::mutex> lock(m_state->mutex);
+    const auto runtime = m_state->runtimeIdsByHandle.find(handle);
+    IUIAutomation* automation = m_state->automation.get();
+    if (runtime == m_state->runtimeIdsByHandle.end() || !automation) {
+        PropertyMutationResult result;
+        result.hresult = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        result.error =
+            "The UI Automation element or session is no longer available";
+        return result;
+    }
+    std::vector<int> runtimeId;
+    if (!parse_runtime_id(runtime->second, runtimeId)) {
+        PropertyMutationResult result;
+        result.hresult = E_INVALIDARG;
+        result.error = "The UI Automation element has an invalid RuntimeId";
+        return result;
+    }
+
+    const HWND hwnd = m_hwnd;
+    PropertyMutationResult result;
+    const HRESULT hr = run_on_mta([&]() -> HRESULT {
+        result = perform_uia_property_action(
+            automation, hwnd, runtimeId, action, value);
+        return S_OK;
+    });
+    if (FAILED(hr)) {
+        result.ok = false;
+        result.hresult = hr;
+        result.error = "The UI Automation property action could not run";
+    }
+    return result;
+}
+
+PropertyMutationResult UiaConnection::clear_property(
+    uint64_t handle, const std::string& descriptorId) {
+    const auto snapshot = get_property_snapshot(handle);
+    if (!snapshot.ok || !snapshot.schema) {
+        PropertyMutationResult result;
+        result.hresult = snapshot.hresult;
+        result.error = snapshot.error;
+        return result;
+    }
+    if (!find_descriptor(*snapshot.schema, descriptorId)) {
+        PropertyMutationResult result;
+        result.hresult = E_INVALIDARG;
+        result.error =
+            "The property descriptor is unknown, stale, or belongs to a different UI Automation element";
+        return result;
+    }
+
+    PropertyMutationResult result;
+    result.hresult = E_NOTIMPL;
+    result.error =
+        "UI Automation does not expose a generic clear/reset operation for this property";
+    return result;
 }
 
 std::vector<ConnectionEvent> UiaConnection::poll_events() {

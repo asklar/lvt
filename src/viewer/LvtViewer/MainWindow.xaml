@@ -192,9 +192,8 @@
                     </Grid>
                     <Separator Margin="0,8,0,4"/>
                     <TextBlock Text="Properties" FontWeight="Bold"/>
-                    <TextBlock Text="Writable scalar XAML/WinUI properties can be edited below; Clear restores the inherited or default value."
-                               Foreground="#FF808080" FontStyle="Italic" TextWrapping="Wrap" Margin="0,2,0,0"
-                               Visibility="{Binding DataContext.UseUia, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource InverseBoolToVisibility}}"/>
+                    <TextBlock Text="Provider-described properties and commands can be edited below; Clear is enabled only when the provider supports reset."
+                               Foreground="#FF808080" FontStyle="Italic" TextWrapping="Wrap" Margin="0,2,0,0"/>
                 </StackPanel>
 
                 <Grid Grid.Row="1" Margin="10,2,10,6">
@@ -229,20 +228,6 @@
                                             <TextBlock Text="{Binding Value}" TextWrapping="Wrap" Margin="0,3,0,0"/>
                                             <TextBlock Text="{Binding Details}" Foreground="#FF707070"
                                                        FontSize="11" TextWrapping="Wrap"/>
-                                        </StackPanel>
-                                        <StackPanel Orientation="Horizontal"
-                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=LegacyToggle}">
-                                            <TextBlock Text="{Binding Value}" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                                            <Button Content="Toggle" Padding="10,1"
-                                                    Command="{Binding DataContext.ToggleCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                    CommandParameter="{Binding}"/>
-                                        </StackPanel>
-                                        <StackPanel Orientation="Horizontal"
-                                                    Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=LegacyTextValue}">
-                                            <TextBox Text="{Binding EditText, UpdateSourceTrigger=PropertyChanged}" Width="160" Margin="0,0,8,0"/>
-                                            <Button Content="Set" Padding="10,1"
-                                                    Command="{Binding DataContext.SetValueCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                                    CommandParameter="{Binding}"/>
                                         </StackPanel>
                                         <StackPanel Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=String|Integer|Number}">
                                             <TextBlock Text="{Binding Details}" Foreground="#FF707070"
@@ -306,6 +291,24 @@
                                                         Command="{Binding DataContext.ClearPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                                         CommandParameter="{Binding}"/>
                                             </StackPanel>
+                                        </StackPanel>
+                                        <StackPanel Visibility="{Binding Kind, Converter={StaticResource EditKindToVisibility}, ConverterParameter=Command}">
+                                            <TextBlock Text="{Binding Details}" Foreground="#FF707070"
+                                                       FontSize="11" Margin="0,0,0,2" TextWrapping="Wrap"/>
+                                            <TextBlock Text="{Binding Value}" Margin="0,0,0,3" TextWrapping="Wrap"/>
+                                            <StackPanel Orientation="Horizontal">
+                                                <ComboBox ItemsSource="{Binding Choices}"
+                                                          DisplayMemberPath="Label"
+                                                          SelectedValuePath="Value"
+                                                          SelectedValue="{Binding EditText, UpdateSourceTrigger=PropertyChanged}"
+                                                          Width="180" Margin="0,0,8,0"/>
+                                                <Button Content="Run" Padding="10,1"
+                                                        IsEnabled="{Binding CanApply}"
+                                                        Command="{Binding DataContext.SetPropertyCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                        CommandParameter="{Binding}"/>
+                                            </StackPanel>
+                                            <TextBlock Text="{Binding ValidationError}" Foreground="#FFC42B1C"
+                                                       FontSize="11" TextWrapping="Wrap"/>
                                         </StackPanel>
                                     </StackPanel>
                                 </Grid>

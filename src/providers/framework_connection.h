@@ -17,6 +17,7 @@ enum class PropertyEditorKind {
     integer,
     number,
     enumeration,
+    command,
 };
 
 const char* property_editor_kind_name(PropertyEditorKind kind);

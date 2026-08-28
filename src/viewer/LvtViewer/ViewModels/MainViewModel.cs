@@ -71,8 +71,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             IsConnected = false;
         });
 
-        ToggleCommand = new RelayCommand(p => _ = ToggleAsync(p as PropertyRowViewModel));
-        SetValueCommand = new RelayCommand(p => _ = SetValueAsync(p as PropertyRowViewModel));
         SetPropertyCommand =
             new RelayCommand(p => _ = SetPropertyAsync(p as PropertyRowViewModel));
         ClearPropertyCommand =
@@ -284,8 +282,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>Fired when FindNext resolves a match, so MainWindow can select+highlight it in the TreeView.</summary>
     public event Action<ElementNodeViewModel>? SearchMatchFound;
 
-    public RelayCommand ToggleCommand { get; }
-    public RelayCommand SetValueCommand { get; }
     public RelayCommand SetPropertyCommand { get; }
     public RelayCommand ClearPropertyCommand { get; }
     public RelayCommand ReconnectCommand { get; }
@@ -618,8 +614,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 return;
             node.ReplacePropertyRows(rows);
         }
-        IsPropertyPanelLoading = false;
         Logger.Log("properties", $"Loaded UIA properties in {stopwatch.ElapsedMilliseconds} ms");
+        await RefreshTypedPropertiesAsync(node);
     }
 
     private async System.Threading.Tasks.Task RefreshTypedPropertiesAsync(ElementNodeViewModel? node)
@@ -683,28 +679,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             "properties",
             $"Loaded {rows.Count} typed properties from schema {snapshot.SchemaId} " +
             $"in {stopwatch.ElapsedMilliseconds} ms");
-    }
-
-    private async System.Threading.Tasks.Task ToggleAsync(PropertyRowViewModel? row)
-    {
-        if (row == null || SelectedElement == null)
-            return;
-        StatusText = $"Toggling {SelectedElement.DisplayName}…";
-        var result = await _mcp.ToggleAsync(SelectedElement.Key);
-        StatusText = result.Ok
-            ? "Toggled. The live tree will confirm the new state shortly."
-            : $"Toggle failed: {result.Error}";
-    }
-
-    private async System.Threading.Tasks.Task SetValueAsync(PropertyRowViewModel? row)
-    {
-        if (row == null || SelectedElement == null)
-            return;
-        StatusText = $"Setting {row.Name} on {SelectedElement.DisplayName}…";
-        var result = await _mcp.SetValueAsync(SelectedElement.Key, row.EditText);
-        StatusText = result.Ok
-            ? "Value set. The live tree will confirm it shortly."
-            : $"set-value failed: {result.Error}";
     }
 
     private async System.Threading.Tasks.Task SetPropertyAsync(PropertyRowViewModel? row)

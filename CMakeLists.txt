@@ -176,6 +176,7 @@ if(LVT_ENABLE_UIA)
         src/providers/uia_provider.cpp
         src/providers/uia_props.cpp
         src/providers/uia_actions.cpp
+        src/providers/uia_property_adapter.cpp
     )
 endif()
 
