@@ -92,17 +92,30 @@ All cross-process messages go through one `SendMessageTimeoutW` wrapper with
 `SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT`. Common-control messages at or above
 `WM_USER` do not marshal caller pointers, so structures and strings for those
 messages live in RAII `VirtualAllocEx` buffers. The owning process handle uses
-only `PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE`. System
+only `PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE`; pointer
+message lifetime uses a separate `SYNCHRONIZE`-only process handle. System
 messages such as `WM_GETTEXT` and `EM_GETSEL` use User32's documented
 marshalling but remain disabled across architectures in the conservative
 first implementation.
+
+Because a timed-out send can return before the target WndProc has finished,
+pointer-message buffers are not released on caller timeout. A bounded
+retirement manager holds them until target-process exit; exhausting the bound
+refuses new pointer sends rather than accumulating unbounded remote memory.
+Toolbar text avoids the no-capacity `TB_GETBUTTONTEXT` copy: it uses that
+message only for the documented length query, then retrieves through
+`TB_GETBUTTONINFO` with `cchText` and bounded re-query/retry.
 
 Every mutation validates that the HWND still exists and has the same PID and
 class. Item operations additionally revalidate the current index and identity
 (or toolbar command id), range-constrained values are checked against live
 state, and every successful write is read back. Owner-data or ambiguous
-list-view items and ABI-sensitive cross-bitness operations remain visible but
-read-only with a reason.
+list-view/tab items and ABI-sensitive cross-bitness operations remain visible
+but read-only with a reason. Native connections accept only HWNDs registered
+from their root/descendant tree; compact handles do not authorize arbitrary
+same-process top-level windows. Connection lookup rechecks session liveness
+under the connection-map lock so a disconnect cannot recreate an erased
+session entry.
 
 ### Element ID assignment
 

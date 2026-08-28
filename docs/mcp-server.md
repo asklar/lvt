@@ -264,7 +264,23 @@ read/write/operation rights. Before every write lvt revalidates the HWND,
 owner PID, class, item index/identity or toolbar command, and value range, then
 reads the property back before reporting success. ABI-sensitive pointer
 operations are read-only across process architectures; tested scalar message
-operations remain available.
+operations remain available. This architecture check is also applied to
+one-shot tree enrichment, even when no property connection exists.
+
+`SendMessageTimeoutW` can return while a target WndProc is still using a
+pointer. Pointer operations therefore carry a bounded lifetime token; after a
+timeout their local or remote buffer is retained until the target exits rather
+than being freed underneath the target. Once the bounded retirement capacity is
+full, lvt refuses another pointer message instead of leaking without limit.
+Toolbar text is length-queried, safety-capped, and retrieved through a
+capacity-bearing `TB_GETBUTTONINFO` buffer with bounded growth rechecks.
+
+Native compact keys are valid only after that exact target was registered while
+building the session's root tree. A guessed same-process HWND, a sibling
+top-level window, or a key from a reconnected session before its first tree
+refresh is rejected. Tab items prefer a nonzero `TCITEM.lParam` identity; tabs
+without one must have unique text, and their ordered text fingerprint is
+revalidated before mutation.
 
 Tree reads and all three property operations share the session's existing
 persistent provider adapter: there is no second injection or caller-specified
