@@ -725,7 +725,8 @@ public:
             if (const auto* enumType = FindEnumType(property->propertyType)) {
                 const auto canonical =
                     lvt::detail::canonicalize_enum_member_list(
-                        command.value, enumType->members);
+                        command.value, enumType->members,
+                        enumType->isFlags);
                 if (!canonical) {
                     command.hresult = E_INVALIDARG;
                     command.error =
@@ -938,7 +939,9 @@ public:
                 response += L",";
             const auto& type = m_enumCatalog[i];
             response += L"{\"name\":\"" + Escape(type.name) +
-                        L"\",\"members\":[";
+                        L"\",\"flags\":" +
+                        (type.isFlags ? L"true" : L"false") +
+                        L",\"members\":[";
             for (size_t j = 0; j < type.members.size(); ++j) {
                 if (j)
                     response += L",";

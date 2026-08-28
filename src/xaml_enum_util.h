@@ -3,12 +3,23 @@
 #include <algorithm>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace lvt::detail {
 
+inline bool is_confirmed_xaml_flags_type(std::string_view typeName) {
+    return typeName == "Windows.UI.Xaml.Input.ManipulationModes" ||
+           typeName == "Microsoft.UI.Xaml.Input.ManipulationModes";
+}
+
+inline bool is_confirmed_xaml_flags_type(std::wstring_view typeName) {
+    return typeName == L"Windows.UI.Xaml.Input.ManipulationModes" ||
+           typeName == L"Microsoft.UI.Xaml.Input.ManipulationModes";
+}
+
 template <typename String, typename Members>
 std::optional<String> canonicalize_enum_member_list(
-    const String& value, const Members& members) {
+    const String& value, const Members& members, bool allowComposite) {
     using Char = typename String::value_type;
     const auto is_space = [](Char ch) {
         return ch == static_cast<Char>(' ') ||
@@ -23,6 +34,8 @@ std::optional<String> canonicalize_enum_member_list(
     size_t start = 0;
     for (;;) {
         const auto comma = value.find(static_cast<Char>(','), start);
+        if (comma != String::npos && !allowComposite)
+            return std::nullopt;
         const auto end = comma == String::npos ? value.size() : comma;
         size_t first = start;
         while (first < end && is_space(value[first]))

@@ -20,13 +20,22 @@ struct XamlEnumMember {
     std::string name;
 };
 
+struct XamlEnumTypeInfo {
+    bool isFlags = false;
+    std::vector<XamlEnumMember> members;
+};
+
 class XamlEnumCatalog {
 public:
-    void add(std::string typeName, std::vector<XamlEnumMember> members) {
-        m_types.insert_or_assign(std::move(typeName), std::move(members));
+    void add(
+        std::string typeName, std::vector<XamlEnumMember> members,
+        bool isFlags = false) {
+        m_types.insert_or_assign(
+            std::move(typeName),
+            XamlEnumTypeInfo{isFlags, std::move(members)});
     }
 
-    const std::vector<XamlEnumMember>* find(
+    const XamlEnumTypeInfo* find(
         const std::string& typeName) const {
         const auto found = m_types.find(typeName);
         return found == m_types.end() ? nullptr : &found->second;
@@ -35,11 +44,11 @@ public:
     std::vector<PropertyChoice> choices_for(
         const std::string& typeName) const {
         std::vector<PropertyChoice> choices;
-        const auto* members = find(typeName);
-        if (!members)
+        const auto* type = find(typeName);
+        if (!type)
             return choices;
-        choices.reserve(members->size());
-        for (const auto& member : *members)
+        choices.reserve(type->members.size());
+        for (const auto& member : type->members)
             choices.push_back({member.name, member.name});
         return choices;
     }
@@ -51,19 +60,21 @@ public:
 
     std::optional<std::string> canonical_input(
         const std::string& typeName, const std::string& value) const {
-        const auto* members = find(typeName);
-        if (!members)
+        const auto* type = find(typeName);
+        if (!type)
             return std::nullopt;
-        return detail::canonicalize_enum_member_list(value, *members);
+        return detail::canonicalize_enum_member_list(
+            value, type->members, type->isFlags);
     }
 
     std::optional<std::string> canonical_value(
         const std::string& typeName, const std::string& value) const {
-        const auto* members = find(typeName);
-        if (!members)
+        const auto* type = find(typeName);
+        if (!type)
             return std::nullopt;
         if (auto names =
-                detail::canonicalize_enum_member_list(value, *members)) {
+                detail::canonicalize_enum_member_list(
+                    value, type->members, type->isFlags)) {
             return names;
         }
 
@@ -74,15 +85,17 @@ public:
             parsed.ptr != value.data() + value.size()) {
             return std::nullopt;
         }
-        for (const auto& member : *members) {
+        for (const auto& member : type->members) {
             if (member.machineValue == numeric)
                 return member.name;
         }
+        if (!type->isFlags)
+            return value;
 
         uint32_t remaining = static_cast<uint32_t>(numeric);
         std::string composite;
         std::vector<uint32_t> seenValues;
-        for (const auto& member : *members) {
+        for (const auto& member : type->members) {
             const auto bits = static_cast<uint32_t>(member.machineValue);
             if (bits == 0 ||
                 std::find(
@@ -116,7 +129,7 @@ public:
     size_t size() const noexcept { return m_types.size(); }
 
 private:
-    std::unordered_map<std::string, std::vector<XamlEnumMember>> m_types;
+    std::unordered_map<std::string, XamlEnumTypeInfo> m_types;
 };
 
 } // namespace lvt

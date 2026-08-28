@@ -2443,6 +2443,7 @@ TEST(XamlEnumParser, DeepCopiesAliasesAndSanitizesTypeNames) {
     ASSERT_EQ(copied.size(), 1u);
     EXPECT_EQ(
         copied[0].name, L"Microsoft.UI.Xaml.TextAlignment");
+    EXPECT_FALSE(copied[0].isFlags);
     ASSERT_EQ(copied[0].members.size(), 3u);
     EXPECT_EQ(copied[0].members[0].machineValue, 0);
     EXPECT_EQ(copied[0].members[0].name, L"Left");
@@ -2503,6 +2504,14 @@ TEST(XamlEnumCatalog, AssociatesChoicesCanonicalValuesAndAliases) {
         std::optional<std::string>("Unset"));
     EXPECT_EQ(
         catalog.canonical_value(
+            "Microsoft.UI.Xaml.TextAlignment", "3"),
+        std::optional<std::string>("3"));
+    EXPECT_EQ(
+        catalog.canonical_input(
+            "Microsoft.UI.Xaml.TextAlignment", "Center,Right"),
+        std::nullopt);
+    EXPECT_EQ(
+        catalog.canonical_value(
             "Microsoft.UI.Xaml.TextAlignment", "Center"),
         std::optional<std::string>("Center"));
 }
@@ -2529,7 +2538,8 @@ TEST(XamlEnumCatalog, FlagsAcceptCompositeNamesAndPreserveResidualBits) {
             {1, "TranslateHorizontal"},
             {2, "TranslateY"},
             {4, "Scale"},
-        });
+        },
+        true);
 
     EXPECT_EQ(
         catalog.canonical_input(
@@ -2562,6 +2572,17 @@ TEST(XamlEnumCatalog, FlagsAcceptCompositeNamesAndPreserveResidualBits) {
         catalog.canonical_value(
             "Microsoft.UI.Xaml.Input.ManipulationModes", "9"),
         std::optional<std::string>("TranslateX,0x00000008"));
+}
+
+TEST(XamlEnumCatalog, FlagsDetectionIsConservativeAndProviderOwned) {
+    EXPECT_TRUE(detail::is_confirmed_xaml_flags_type(
+        "Microsoft.UI.Xaml.Input.ManipulationModes"));
+    EXPECT_TRUE(detail::is_confirmed_xaml_flags_type(
+        L"Windows.UI.Xaml.Input.ManipulationModes"));
+    EXPECT_FALSE(detail::is_confirmed_xaml_flags_type(
+        "Microsoft.UI.Xaml.TextAlignment"));
+    EXPECT_FALSE(detail::is_confirmed_xaml_flags_type(
+        L"Windows.UI.Xaml.Visibility"));
 }
 
 TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {

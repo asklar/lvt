@@ -895,7 +895,9 @@ private:
                         memberName,
                     });
                 }
-                catalog.add(typeName, std::move(members));
+                catalog.add(
+                    typeName, std::move(members),
+                    typeValue.value("flags", false));
             }
             m_enumCatalog = std::move(catalog);
             return true;
@@ -962,7 +964,8 @@ private:
             descriptor.propertyType = property.propertyType;
             const auto* enumMembers =
                 m_enumCatalog.find(property.propertyType);
-            descriptor.kind = enumMembers && !enumMembers->empty() && writable
+            descriptor.kind =
+                enumMembers && !enumMembers->members.empty() && writable
                 ? PropertyEditorKind::enumeration
                 : classify_property_editor(property.propertyType, writable);
             if (descriptor.kind == PropertyEditorKind::boolean) {
