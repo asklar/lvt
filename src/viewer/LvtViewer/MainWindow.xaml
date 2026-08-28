@@ -278,8 +278,7 @@
                                                           DisplayMemberPath="Label"
                                                           SelectedValuePath="Value"
                                                           SelectedValue="{Binding EditText, UpdateSourceTrigger=PropertyChanged}"
-                                                          Text="{Binding EditText, UpdateSourceTrigger=PropertyChanged}"
-                                                          IsEditable="True"
+                                                          IsEditable="False"
                                                           Width="180" Margin="0,0,8,0"/>
                                                 <Button Content="Set" Padding="10,1" Margin="0,0,6,0"
                                                         IsEnabled="{Binding CanApply}"

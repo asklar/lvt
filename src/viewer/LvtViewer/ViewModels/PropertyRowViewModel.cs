@@ -131,7 +131,17 @@ public sealed class PropertyRowViewModel : ObservableObject
                   descriptor.Choices.Count == 0
             ? BooleanChoices
             : descriptor.Choices;
-        Kind = descriptor.EditorKind;
+        Kind = descriptor.EditorKind == PropertyEditorKind.Enumeration &&
+               Choices.Count == 0
+            ? PropertyEditorKind.ReadOnly
+            : descriptor.EditorKind;
+        if (descriptor.EditorKind == PropertyEditorKind.Enumeration &&
+            Choices.Count == 0)
+        {
+            Description = string.IsNullOrWhiteSpace(Description)
+                ? "The provider did not supply enum choices."
+                : $"{Description} · The provider did not supply enum choices.";
+        }
         Value = value.Value;
         if (Kind == PropertyEditorKind.Command && Choices.Count != 0)
             EditText = Choices[0].Value;
@@ -179,7 +189,6 @@ public sealed class PropertyRowViewModel : ObservableObject
             }
         } else if ((Kind == PropertyEditorKind.Enumeration ||
                     Kind == PropertyEditorKind.Command) &&
-                   Choices.Count != 0 &&
                    !Choices.Any(choice =>
                        string.Equals(
                            choice.Value, EditText, StringComparison.Ordinal))) {
