@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cmath>
 #include "element.h"
 #include "tree_builder.h"
 #include "element_key.h"
@@ -33,6 +34,7 @@
 #include "debug.h"
 #include <wil/result.h>
 #include <nlohmann/json.hpp>
+#include <limits>
 #include <string>
 
 using json = nlohmann::json;
@@ -2534,6 +2536,60 @@ TEST(UiaRuntimeId, RejectsMalformedInput) {
     EXPECT_FALSE(lvt::parse_runtime_id("1..2", parsed));
 }
 
+TEST(UiaProperties, DoubleFormattingRoundTripsAdjacentValues) {
+    const double first = 1.2345678901234567;
+    const double second =
+        std::nextafter(first, std::numeric_limits<double>::infinity());
+    const auto firstText = format_uia_double(first);
+    const auto secondText = format_uia_double(second);
+    EXPECT_EQ(std::stod(firstText), first);
+    EXPECT_EQ(std::stod(secondText), second);
+    EXPECT_NE(firstText, secondText);
+}
+
+TEST(UiaProperties, OneShotFallbackTreeReceivesConnectionOwnedIdentities) {
+    UiaPropertyIdentityCache identities;
+    Element root;
+    root.type = "Window";
+    root.framework = "uia";
+    root.properties["RuntimeId"] = "42.100";
+    Element child;
+    child.type = "Edit";
+    child.framework = "uia";
+    child.properties["AutomationId"] = "RawOnlyInput";
+    child.properties["RuntimeId"] = "42.100.7";
+    root.children.push_back(child);
+
+    identities.attach(root);
+    ASSERT_NE(root.children[0].providerHandle, 0u);
+    const auto originalHandle = root.children[0].providerHandle;
+    assign_element_keys(root);
+    identities.remember(root);
+
+    std::string error;
+    const auto byKey =
+        identities.resolve(root.children[0].key, error);
+    ASSERT_TRUE(byKey.has_value()) << error;
+    EXPECT_EQ(*byKey, originalHandle);
+    const auto byRuntime =
+        identities.resolve("uia:42.100.7", error);
+    ASSERT_TRUE(byRuntime.has_value()) << error;
+    EXPECT_EQ(*byRuntime, originalHandle);
+
+    Element fallbackChild = child;
+    fallbackChild.providerHandle = 0;
+    identities.attach(fallbackChild);
+    EXPECT_EQ(fallbackChild.providerHandle, originalHandle);
+
+    Element conflicting = child;
+    conflicting.key = root.children[0].key;
+    conflicting.properties["RuntimeId"] = "42.100.8";
+    identities.remember(conflicting);
+    error.clear();
+    EXPECT_FALSE(identities.resolve(conflicting.key, error).has_value());
+    EXPECT_NE(error.find("ambiguous"), std::string::npos);
+}
+
 TEST(FindElementByRef, ResolvesUiaRuntimeIdReference) {
     lvt::Element root;
     root.type = "Window";
@@ -2905,6 +2961,22 @@ TEST(UiaTypedProperties, RangeValueSuppliesBoundsWithoutInventingStep) {
     EXPECT_FALSE(readOnlyDescriptor->writable);
     EXPECT_EQ(readOnlyDescriptor->minimum, descriptor->minimum);
     EXPECT_EQ(readOnlyDescriptor->maximum, descriptor->maximum);
+
+    slider.properties["RangeValue.Minimum"] = "0.12345678901234566";
+    slider.properties["RangeValue.Maximum"] = "0.12345678901239999";
+    slider.properties["RangeValue.IsReadOnly"] = "false";
+    auto precise = make_uia_property_snapshot(
+        slider, UiaSelectionCapabilities{}, cache);
+    const auto* preciseDescriptor =
+        descriptor_named(*precise.schema, "RangeValue.Value");
+    ASSERT_NE(preciseDescriptor, nullptr);
+    ASSERT_TRUE(preciseDescriptor->minimum.has_value());
+    ASSERT_TRUE(preciseDescriptor->maximum.has_value());
+    EXPECT_EQ(*preciseDescriptor->minimum,
+              std::stod("0.12345678901234566"));
+    EXPECT_EQ(*preciseDescriptor->maximum,
+              std::stod("0.12345678901239999"));
+    EXPECT_NE(precise.schema->schemaId, snapshot.schema->schemaId);
 }
 
 TEST(UiaTypedProperties, ToggleAndExpandExposeOnlyDeterministicStates) {

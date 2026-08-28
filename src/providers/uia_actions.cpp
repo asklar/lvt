@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <string>
 #include <thread>
 #include <vector>
@@ -498,6 +499,20 @@ PatternAttempt try_set_range_value(IUIAutomationElement* element, const std::str
     return attempt;
 }
 
+bool read_current_range_value(
+    IUIAutomationElement* element, std::string& value) {
+    wil::com_ptr<IUIAutomationRangeValuePattern> range;
+    if (FAILED(element->GetCurrentPatternAs(
+            UIA_RangeValuePatternId, IID_PPV_ARGS(&range))) || !range) {
+        return false;
+    }
+    double current = 0;
+    if (FAILED(range->get_CurrentValue(&current)) || !std::isfinite(current))
+        return false;
+    value = format_uia_double(current);
+    return true;
+}
+
 PatternAttempt try_change_selection(IUIAutomationElement* element, bool add,
                                     std::string& method) {
     wil::com_ptr<IUIAutomationSelectionItemPattern> pattern;
@@ -677,11 +692,15 @@ PropertyMutationResult perform_uia_property_action(
     result.error.clear();
     switch (action) {
     case UiaPropertyAction::setValue:
-    case UiaPropertyAction::setRangeValue:
     case UiaPropertyAction::setToggleState:
     case UiaPropertyAction::setExpandCollapseState:
         result.hasValue = true;
         result.value = value;
+        break;
+    case UiaPropertyAction::setRangeValue:
+        result.hasValue = true;
+        if (!read_current_range_value(element.get(), result.value))
+            result.value = value;
         break;
     default:
         break;

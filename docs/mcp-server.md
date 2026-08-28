@@ -203,7 +203,11 @@ method or notification is introduced.
 ### Typed property schemas and mutation
 
 `get_editable_properties` takes an `element` reference or durable key from the
-session's own UIA or visual tree.
+session's own UIA or visual tree. UIA positional references (`uia:eN`) are not
+accepted here because they do not encode whether `eN` came from the raw,
+control, or content view. Use the element's durable key or `uia:<RuntimeId>`;
+the session retains key-to-RuntimeId identity from each tree it returns and
+rejects a key if different views made it ambiguous.
 It returns a provider-owned `schemaId`, immutable `descriptors`, and separate
 per-element live `values`. Descriptors include an opaque `descriptorId`,
 declared property type, provider/framework identity, editor kind
@@ -304,8 +308,10 @@ revalidates the complete ordered label fingerprint. Duplicate toolbar command
 ids similarly make affected buttons read-only.
 
 Tree reads and all three property operations share the session's existing
-persistent provider adapter: there is no second injection or caller-specified
-native message side protocol.
+persistent connection: there is no second injection or side protocol. UIA
+connections are scoped to the session's target HWND, not merely its process,
+so two windows owned by one process cannot resolve or mutate through each
+other's UIA root.
 
 ## Addressing elements
 

@@ -5,7 +5,9 @@
 
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace lvt {
@@ -29,6 +31,27 @@ struct UiaOptions {
     //
     // 0 removes the lvt-imposed deadline; UIA's own default still applies.
     int timeoutMs = 10000;
+};
+
+// Session-local identity adapter used both for persistent UIA walks and for
+// one-shot fallback trees. It stores only RuntimeIds/keys and opaque numeric
+// handles—never live values or COM objects.
+class UiaPropertyIdentityCache {
+public:
+    void attach(Element& root);
+    void remember(const Element& root);
+    std::optional<uint64_t> resolve(
+        const std::string& reference, std::string& error);
+    std::optional<std::string> runtime_id(uint64_t handle) const;
+
+private:
+    void attach_element(Element& element);
+    void remember_element(const Element& element);
+
+    uint64_t m_nextHandle = 1;
+    std::unordered_map<std::string, uint64_t> m_handlesByRuntimeId;
+    std::unordered_map<uint64_t, std::string> m_runtimeIdsByHandle;
+    std::unordered_map<std::string, std::set<std::string>> m_runtimeIdsByKey;
 };
 
 // Walks the target's UI Automation tree and returns it as a standard
@@ -65,6 +88,12 @@ public:
                   const std::string& providerOption = {}) override;
     bool get_tree_with_options(Element& root, const UiaOptions& options,
                                bool* truncated = nullptr);
+    bool attach_property_identities(Element& root);
+    void remember_property_references(const Element& root);
+    std::optional<uint64_t> resolve_property_reference(
+        const std::string& reference, std::string& error);
+    HWND target_hwnd() const { return m_hwnd; }
+    bool matches_target(HWND hwnd) const;
     PropertySnapshotResult get_property_snapshot(uint64_t handle) override;
     PropertyMutationResult set_property(
         uint64_t handle, const std::string& descriptorId,
@@ -80,8 +109,13 @@ private:
     struct State;
 
     HWND m_hwnd = nullptr;
+    DWORD m_pid = 0;
     std::unique_ptr<State> m_state;
 };
+
+// Round-trip-safe wire formatting for UIA double properties and RangeValue
+// readback. Parsing the result with strtod reproduces the original double.
+std::string format_uia_double(double value);
 
 // Format a UIA RuntimeId as the dotted string lvt emits, e.g. "42.1234.0".
 std::string format_runtime_id(const std::vector<int>& runtimeId);

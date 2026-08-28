@@ -214,6 +214,15 @@ std::string native_connection_registry_key(
     return value;
 }
 
+std::string uia_connection_registry_key(HWND hwnd) {
+    char value[48]{};
+    snprintf(
+        value, sizeof(value), "uia@0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(hwnd)));
+    return value;
+}
+
 // Builds a ConnectionLookup for build_tree, lazily acquiring persistent
 // native property adapters and diagnostics/plugin connections.
 // Callers must already hold TargetGuard and have passed session_is_active().
@@ -320,8 +329,8 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         // A full, untrimmed probe tree, needed only to resolve which
         // process/DLL a connection should target (XamlProvider needs to
         // locate the CoreWindow) - discarded once that resolution is done. A
-        // session may already hold some other connection here (e.g. UIA, or
-        // only one of xaml/winui3 from an earlier partial success), so retry
+        // session may already hold only one of xaml/winui3 from an earlier
+        // partial success, so retry
         // only whichever framework labels are still missing instead of treating
         // "entry is non-empty" as "everything this session could ever need is
         // already connected".
@@ -544,16 +553,21 @@ void drain_session_connection_events(
 // keep one client-side IUIAutomation object alive and re-walk through it on
 // every request instead of CoCreateInstance + timeout setup on every call.
 std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& session) {
-    std::lock_guard<std::mutex> lock(g_connectionsMutex);
     if (!session_is_active(session.id))
         return nullptr;
+    std::lock_guard<std::mutex> lock(g_connectionsMutex);
     auto& entry = g_sessionConnections[session.id];
 
     for (auto it = entry.begin(); it != entry.end(); ++it) {
         if (it->first != "uia")
             continue;
-        if (it->second && it->second->is_alive())
-            return std::dynamic_pointer_cast<lvt::UiaConnection>(it->second.shared());
+        if (it->second && it->second->is_alive()) {
+            auto connection =
+                std::dynamic_pointer_cast<lvt::UiaConnection>(
+                    it->second.shared());
+            if (connection && connection->matches_target(session.hwnd))
+                return connection;
+        }
 
         it->second.reset();
         entry.erase(it);
@@ -561,16 +575,33 @@ std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& se
     }
 
     auto handle = lvt::ConnectionRegistry::instance().acquire(
-        session.pid, session.hwnd, "uia",
-        [](HWND hwnd, DWORD) -> std::shared_ptr<lvt::IFrameworkConnection> {
+        session.pid, session.hwnd,
+        uia_connection_registry_key(session.hwnd),
+        [](HWND hwnd, DWORD)
+            -> std::shared_ptr<lvt::IFrameworkConnection> {
             return lvt::UiaConnection::connect(hwnd);
         });
     if (!handle)
         return nullptr;
-
-    auto connection = std::dynamic_pointer_cast<lvt::UiaConnection>(handle.shared());
+    auto connection =
+        std::dynamic_pointer_cast<lvt::UiaConnection>(handle.shared());
+    if (!connection || !connection->matches_target(session.hwnd))
+        return nullptr;
     entry.emplace_back("uia", std::move(handle));
     return connection;
+}
+
+std::shared_ptr<lvt::UiaConnection> uia_connection_for_active_session(
+    const Session& session) {
+    std::lock_guard<std::mutex> sessionsLock(g_sessionsMutex);
+    const auto found = g_sessions.find(session.id);
+    if (found == g_sessions.end() ||
+        found->second.hwnd != session.hwnd ||
+        found->second.pid != session.pid ||
+        found->second.visualMode != session.visualMode) {
+        return nullptr;
+    }
+    return uia_connection_for_session(session);
 }
 #endif
 
@@ -999,13 +1030,15 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         // reported to a model as "this window cannot be read".
         std::optional<lvt::Element> result;
         bool wasTruncated = false;
+        std::shared_ptr<lvt::UiaConnection> connection;
         for (int attempt = 0; attempt < 3 && !result; ++attempt) {
             if (attempt > 0)
                 Sleep(static_cast<DWORD>(120 * attempt));
 
             bool attemptTruncated = false;
             lvt::Element connectedTree;
-            if (auto connection = uia_connection_for_session(session)) {
+            connection = uia_connection_for_active_session(session);
+            if (connection) {
                 if (connection->get_tree_with_options(connectedTree, options, &attemptTruncated)) {
                     result = std::move(connectedTree);
                     wasTruncated = attemptTruncated;
@@ -1021,11 +1054,28 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
                     "or not responding";
             return false;
         }
+        if (!session_is_active(session.id)) {
+            error = "this session was disconnected while the request was waiting";
+            return false;
+        }
+
+        // A one-shot fallback tree still needs identities owned by this
+        // session's persistent UIA connection. Otherwise it hands out keys
+        // that get_editable_properties cannot resolve.
+        if (!connection)
+            connection = uia_connection_for_active_session(session);
+        if (connection && !connection->attach_property_identities(*result)) {
+            error =
+                "the UI Automation connection no longer matches this session's target window";
+            return false;
+        }
         if (truncated)
             *truncated = wasTruncated;
         tree = std::move(*result);
         lvt::assign_element_ids(tree);
         lvt::assign_element_keys(tree);
+        if (connection)
+            connection->remember_property_references(tree);
         return true;
 #else
         error = "this build has UI Automation support compiled out";
@@ -1515,6 +1565,7 @@ std::string format_hresult(HRESULT hresult) {
 struct PropertyTarget {
     std::string provider;
     uint64_t handle = 0;
+    std::string reference;
 };
 
 bool parse_compact_property_target(
@@ -1562,12 +1613,29 @@ PropertyTarget require_property_target(
     }
 
     PropertyTarget target;
+    if (uia) {
+        if (is_element_id(parsedRef.ref)) {
+            throw std::runtime_error(
+                "positional UI Automation references such as '" + elementRef +
+                "' do not carry their originating raw/control/content view; "
+                "refresh that tree and use the element's durable key or uia:<RuntimeId>");
+        }
+        if (parsedRef.ref.rfind("uia:", 0) != 0 &&
+            parsedRef.ref.rfind("uia|", 0) != 0) {
+            throw std::runtime_error(
+                "'" + elementRef +
+                "' is not a durable UI Automation key or RuntimeId reference");
+        }
+        target.provider = "uia";
+        target.reference = parsedRef.ref;
+        return target;
+    }
+
     if (!uia && parse_compact_property_target(parsedRef.ref, target))
         return target;
 
     json treeParams = params;
-    if (!uia)
-        treeParams["fast"] = true;
+    treeParams["fast"] = true;
     lvt::Element tree;
     std::string error;
     if (!build_tree_for(
@@ -1581,11 +1649,6 @@ PropertyTarget require_property_target(
         throw std::runtime_error(
             "element '" + elementRef +
             "' has no provider-owned property identity");
-    }
-    if (uia && element->framework != "uia") {
-        throw std::runtime_error(
-            "element '" + elementRef +
-            "' does not belong to this session's UI Automation tree");
     }
     target.provider = element->framework;
     target.handle = element->providerHandle;
@@ -1601,11 +1664,12 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
                 "UI Automation properties require a session connected in uia mode");
         }
         auto connection = uia_connection_for_session(session);
-        if (!connection || !connection->is_alive()) {
+        if (!connection || !connection->is_alive() ||
+            !connection->matches_target(session.hwnd)) {
             throw std::runtime_error(
                 "the UI Automation property connection is no longer available");
         }
-        return connection.get();
+        return connection;
 #else
         throw std::runtime_error(
             "this build has UI Automation support compiled out");
@@ -1655,7 +1719,54 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
             "provider '" + target.provider +
             "' does not expose a live typed-property connection for this session");
     }
-    return connection;
+    std::lock_guard<std::mutex> lock(g_connectionsMutex);
+    const auto entry = g_sessionConnections.find(session.id);
+    if (entry != g_sessionConnections.end()) {
+        for (const auto& [label, handle] : entry->second) {
+            if (label == target.provider && handle.get() == connection)
+                return handle.shared();
+        }
+    }
+    throw std::runtime_error(
+        "provider '" + target.provider +
+        "' lost its typed-property connection for this session");
+}
+
+std::shared_ptr<lvt::IFrameworkConnection> active_typed_property_connection(
+    const Session& session, const PropertyTarget& target) {
+    std::lock_guard<std::mutex> sessionsLock(g_sessionsMutex);
+    const auto found = g_sessions.find(session.id);
+    if (found == g_sessions.end() ||
+        found->second.hwnd != session.hwnd ||
+        found->second.pid != session.pid ||
+        found->second.visualMode != session.visualMode) {
+        throw std::runtime_error(
+            "this session was disconnected while the property request was waiting");
+    }
+    return typed_property_connection(session, target);
+}
+
+uint64_t resolve_property_handle(
+    const Session& session, const PropertyTarget& target,
+    const std::shared_ptr<lvt::IFrameworkConnection>& connection) {
+    if (target.provider != "uia")
+        return target.handle;
+#ifdef LVT_ENABLE_UIA
+    auto uia = std::dynamic_pointer_cast<lvt::UiaConnection>(connection);
+    if (!uia || !uia->matches_target(session.hwnd)) {
+        throw std::runtime_error(
+            "the UI Automation property connection does not match this session's target window");
+    }
+    std::string error;
+    const auto handle =
+        uia->resolve_property_reference(target.reference, error);
+    if (!handle)
+        throw std::runtime_error(error);
+    return *handle;
+#else
+    throw std::runtime_error(
+        "this build has UI Automation support compiled out");
+#endif
 }
 
 json property_snapshot_result(
@@ -1757,11 +1868,13 @@ json method_get_editable_properties(const json& params) {
     const auto target =
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
-    auto result = connection->get_property_snapshot(target.handle);
+    auto handle = resolve_property_handle(session, target, connection);
+    auto result = connection->get_property_snapshot(handle);
     if (!result.ok && !connection->is_alive() &&
         session_is_active(session.id)) {
         connection = typed_property_connection(session, target);
-        result = connection->get_property_snapshot(target.handle);
+        handle = resolve_property_handle(session, target, connection);
+        result = connection->get_property_snapshot(handle);
     }
     return property_snapshot_result(get_string(params, "element"), result);
 }
@@ -1792,9 +1905,10 @@ json method_set_property(const json& params, bool allowInput) {
     const auto target =
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
+    const auto handle = resolve_property_handle(session, target, connection);
     return property_mutation_result(
         get_string(params, "element"), descriptorId,
-        connection->set_property(target.handle, descriptorId, value));
+        connection->set_property(handle, descriptorId, value));
 }
 
 json method_clear_property(const json& params, bool allowInput) {
@@ -1819,9 +1933,10 @@ json method_clear_property(const json& params, bool allowInput) {
     const auto target =
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
+    const auto handle = resolve_property_handle(session, target, connection);
     return property_mutation_result(
         get_string(params, "element"), descriptorId,
-        connection->clear_property(target.handle, descriptorId));
+        connection->clear_property(handle, descriptorId));
 }
 
 std::string tree_snapshot_options_key(const json& params, bool uia) {
@@ -2615,7 +2730,10 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
         options.timeoutMs = 10000;
     }
 
-    auto connection = uia_connection_for_session(session);
+    auto connection = uia_connection_for_active_session(session);
+    if (!connection)
+        throw std::runtime_error(
+            "this session was disconnected while the action request was waiting");
     const auto result = lvt::perform_action(session.hwnd, options, request, connection.get());
     auto out = action_result_to_json(result, actionName, get_string(params, "element"));
     if (!result.ok)

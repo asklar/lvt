@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <string>
@@ -56,9 +57,17 @@ std::wstring widen(const std::string& text) {
     return out;
 }
 
-std::string trim_double(double value) {
+std::string format_double_round_trip(double value) {
     char buf[64];
-    snprintf(buf, sizeof(buf), "%g", value);
+    snprintf(buf, sizeof(buf), "%.*g",
+             std::numeric_limits<double>::max_digits10, value);
+    return buf;
+}
+
+std::string format_float_round_trip(float value) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.*g",
+             std::numeric_limits<float>::max_digits10, value);
     return buf;
 }
 
@@ -102,7 +111,7 @@ std::string variant_to_string(const VARIANT& v) {
                 return {};
             if (!out.empty())
                 out += ',';
-            out += trim_double(element);
+            out += format_double_round_trip(element);
         }
         return out;
     }
@@ -114,8 +123,8 @@ std::string variant_to_string(const VARIANT& v) {
     case VT_I4:   return std::to_string(v.lVal);
     case VT_INT:  return std::to_string(v.intVal);
     case VT_UI4:  return std::to_string(v.ulVal);
-    case VT_R4:   return trim_double(v.fltVal);
-    case VT_R8:   return trim_double(v.dblVal);
+    case VT_R4:   return format_float_round_trip(v.fltVal);
+    case VT_R8:   return format_double_round_trip(v.dblVal);
     default:      return {};
     }
 }
@@ -495,6 +504,10 @@ HRESULT run_on_mta(Fn&& fn) {
 
 } // namespace
 
+std::string format_uia_double(double value) {
+    return format_double_round_trip(value);
+}
+
 std::string format_runtime_id(const std::vector<int>& runtimeId) {
     std::string out;
     for (int part : runtimeId) {
@@ -563,36 +576,91 @@ struct UiaConnection::State {
     std::mutex mutex;
     wil::com_ptr<IUIAutomation> automation;
     CO_MTA_USAGE_COOKIE mtaCookie = nullptr;
-    uint64_t nextProviderHandle = 1;
-    std::unordered_map<std::string, uint64_t> handlesByRuntimeId;
-    std::unordered_map<uint64_t, std::string> runtimeIdsByHandle;
+    UiaPropertyIdentityCache identities;
     UiaPropertySchemaCache schemaCache;
 };
 
-namespace {
+void UiaPropertyIdentityCache::attach(Element& root) {
+    attach_element(root);
+}
 
-void assign_uia_provider_handles(
-    Element& element,
-    uint64_t& nextHandle,
-    std::unordered_map<std::string, uint64_t>& handlesByRuntimeId,
-    std::unordered_map<uint64_t, std::string>& runtimeIdsByHandle) {
+void UiaPropertyIdentityCache::attach_element(Element& element) {
     const auto runtime = element.properties.find("RuntimeId");
     if (runtime != element.properties.end() && !runtime->second.empty()) {
-        auto found = handlesByRuntimeId.find(runtime->second);
-        if (found == handlesByRuntimeId.end()) {
-            const auto handle = nextHandle++;
-            handlesByRuntimeId.emplace(runtime->second, handle);
-            runtimeIdsByHandle.emplace(handle, runtime->second);
-            element.providerHandle = handle;
-        } else {
+        const auto found = m_handlesByRuntimeId.find(runtime->second);
+        if (found != m_handlesByRuntimeId.end()) {
             element.providerHandle = found->second;
+        } else {
+            const auto handle = m_nextHandle++;
+            m_handlesByRuntimeId.emplace(runtime->second, handle);
+            m_runtimeIdsByHandle.emplace(handle, runtime->second);
+            element.providerHandle = handle;
         }
     }
-    for (auto& child : element.children) {
-        assign_uia_provider_handles(
-            child, nextHandle, handlesByRuntimeId, runtimeIdsByHandle);
-    }
+    for (auto& child : element.children)
+        attach_element(child);
 }
+
+void UiaPropertyIdentityCache::remember(const Element& root) {
+    remember_element(root);
+}
+
+void UiaPropertyIdentityCache::remember_element(const Element& element) {
+    const auto runtime = element.properties.find("RuntimeId");
+    if (!element.key.empty() &&
+        runtime != element.properties.end() && !runtime->second.empty()) {
+        m_runtimeIdsByKey[element.key].insert(runtime->second);
+    }
+    for (const auto& child : element.children)
+        remember_element(child);
+}
+
+std::optional<uint64_t> UiaPropertyIdentityCache::resolve(
+    const std::string& reference, std::string& error) {
+    std::string runtimeId;
+    if (reference.rfind("uia:", 0) == 0) {
+        runtimeId = reference.substr(4);
+        std::vector<int> parsed;
+        if (!parse_runtime_id(runtimeId, parsed)) {
+            error = "The UI Automation RuntimeId reference is malformed";
+            return std::nullopt;
+        }
+    } else {
+        const auto found = m_runtimeIdsByKey.find(reference);
+        if (found == m_runtimeIdsByKey.end()) {
+            error =
+                "The UI Automation key is stale or was not returned by this session; "
+                "refresh the originating raw/control/content tree and use its key or RuntimeId";
+            return std::nullopt;
+        }
+        if (found->second.size() != 1) {
+            error =
+                "The UI Automation key is ambiguous across trees or views; "
+                "refresh the originating tree and use uia:<RuntimeId>";
+            return std::nullopt;
+        }
+        runtimeId = *found->second.begin();
+    }
+
+    const auto existing = m_handlesByRuntimeId.find(runtimeId);
+    if (existing != m_handlesByRuntimeId.end())
+        return existing->second;
+
+    const auto handle = m_nextHandle++;
+    m_handlesByRuntimeId.emplace(runtimeId, handle);
+    m_runtimeIdsByHandle.emplace(handle, runtimeId);
+    return handle;
+}
+
+std::optional<std::string> UiaPropertyIdentityCache::runtime_id(
+    uint64_t handle) const {
+    const auto found = m_runtimeIdsByHandle.find(handle);
+    if (found == m_runtimeIdsByHandle.end())
+        return std::nullopt;
+    return found->second;
+}
+
+namespace {
 
 bool has_supported_pattern(const Element& element, const char* wanted) {
     const auto found = element.properties.find("SupportedPatterns");
@@ -690,6 +758,7 @@ bool validate_number(
 
 UiaConnection::UiaConnection(HWND hwnd)
     : m_hwnd(hwnd), m_state(std::make_unique<State>()) {
+    GetWindowThreadProcessId(hwnd, &m_pid);
 }
 
 std::shared_ptr<UiaConnection> UiaConnection::connect(HWND hwnd) {
@@ -766,6 +835,8 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
     // only the raw pointer here; even com_ptr's AddRef would execute on the
     // caller's thread, which may be STA or not in COM at all.
     std::unique_lock<std::mutex> lock(m_state->mutex);
+    if (!matches_target(m_hwnd))
+        return false;
     IUIAutomation* automation = m_state->automation.get();
     if (!automation)
         return false;
@@ -784,11 +855,8 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
         apply_automation_timeouts(automation, options);
         return build_tree_with_automation(automation, hwnd, options, built, wasTruncated);
     });
-    if (SUCCEEDED(hr)) {
-        assign_uia_provider_handles(
-            built, m_state->nextProviderHandle,
-            m_state->handlesByRuntimeId, m_state->runtimeIdsByHandle);
-    }
+    if (SUCCEEDED(hr))
+        m_state->identities.attach(built);
     lock.unlock();
 
     if (truncated)
@@ -806,13 +874,57 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
     return true;
 }
 
+bool UiaConnection::attach_property_identities(Element& root) {
+    std::lock_guard<std::mutex> lock(m_state->mutex);
+    if (!m_state->automation || !matches_target(m_hwnd))
+        return false;
+    m_state->identities.attach(root);
+    return true;
+}
+
+void UiaConnection::remember_property_references(const Element& root) {
+    std::lock_guard<std::mutex> lock(m_state->mutex);
+    if (!m_state->automation || !matches_target(m_hwnd))
+        return;
+    m_state->identities.remember(root);
+}
+
+std::optional<uint64_t> UiaConnection::resolve_property_reference(
+    const std::string& reference, std::string& error) {
+    std::lock_guard<std::mutex> lock(m_state->mutex);
+    if (!m_state->automation || !matches_target(m_hwnd)) {
+        error = "The UI Automation connection no longer matches this session's target window";
+        return std::nullopt;
+    }
+
+    return m_state->identities.resolve(reference, error);
+}
+
+bool UiaConnection::matches_target(HWND hwnd) const {
+    if (!hwnd || hwnd != m_hwnd || !IsWindow(hwnd))
+        return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    return pid != 0 && pid == m_pid;
+}
+
 PropertySnapshotResult UiaConnection::get_property_snapshot(uint64_t handle) {
+    if (!matches_target(m_hwnd)) {
+        PropertySnapshotResult result;
+        result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
+        result.error =
+            "The UI Automation connection no longer matches this session's target window";
+        return result;
+    }
+
     Element tree;
     bool refreshed = false;
+    UiaOptions options;
+    options.view = UiaView::raw;
     for (int attempt = 0; attempt < 3 && !refreshed; ++attempt) {
         if (attempt > 0)
             Sleep(static_cast<DWORD>(120 * attempt));
-        refreshed = get_tree_with_options(tree, UiaOptions{});
+        refreshed = get_tree_with_options(tree, options);
     }
     if (!refreshed) {
         PropertySnapshotResult result;
@@ -907,9 +1019,16 @@ PropertyMutationResult UiaConnection::set_property(
     }
 
     std::unique_lock<std::mutex> lock(m_state->mutex);
-    const auto runtime = m_state->runtimeIdsByHandle.find(handle);
+    if (!matches_target(m_hwnd)) {
+        PropertyMutationResult result;
+        result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
+        result.error =
+            "The UI Automation connection no longer matches this session's target window";
+        return result;
+    }
+    const auto runtime = m_state->identities.runtime_id(handle);
     IUIAutomation* automation = m_state->automation.get();
-    if (runtime == m_state->runtimeIdsByHandle.end() || !automation) {
+    if (!runtime || !automation) {
         PropertyMutationResult result;
         result.hresult = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
         result.error =
@@ -917,7 +1036,7 @@ PropertyMutationResult UiaConnection::set_property(
         return result;
     }
     std::vector<int> runtimeId;
-    if (!parse_runtime_id(runtime->second, runtimeId)) {
+    if (!parse_runtime_id(*runtime, runtimeId)) {
         PropertyMutationResult result;
         result.hresult = E_INVALIDARG;
         result.error = "The UI Automation element has an invalid RuntimeId";

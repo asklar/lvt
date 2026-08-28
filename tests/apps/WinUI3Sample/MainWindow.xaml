@@ -4,8 +4,9 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Title="LVT WinUI3 Sample">
 
-    <Grid x:Name="RootGrid" Padding="24" RowSpacing="12" Width="460" Height="720">
+    <Grid x:Name="RootGrid" Padding="24" RowSpacing="12" Width="460" Height="760">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
@@ -22,11 +23,13 @@
         <TextBox x:Name="InputBox" Grid.Row="1" Header="Sample input" Text="Durable key text" />
         <TextBox x:Name="ReadOnlyBox" Grid.Row="2" Header="Read-only input"
                  Text="Cannot edit" IsReadOnly="True" />
-        <Button x:Name="PrimaryButton" Grid.Row="3" Content="Primary action" Click="OnPrimaryClick" />
-        <CheckBox x:Name="ReadyCheckBox" Grid.Row="4" Content="Ready" IsChecked="True" />
+        <TextBox x:Name="RawOnlyInput" Grid.Row="3" Header="Raw-view input"
+                 Text="raw value" AutomationProperties.AccessibilityView="Raw" />
+        <Button x:Name="PrimaryButton" Grid.Row="4" Content="Primary action" Click="OnPrimaryClick" />
+        <CheckBox x:Name="ReadyCheckBox" Grid.Row="5" Content="Ready" IsChecked="True" />
         <!-- Gives interaction tests something observable to assert against:
              a click has no effect a UIA walk can see unless it changes state. -->
-        <TextBlock x:Name="StatusText" Grid.Row="5" Text="clicks:0"
+        <TextBlock x:Name="StatusText" Grid.Row="6" Text="clicks:0"
                    TextAlignment="Left" ManipulationMode="TranslateX"
                    TextDecorations="None" />
 
@@ -34,14 +37,14 @@
              act on: a slider for RangeValue, a combo box for ExpandCollapse and
              Selection, and a long virtualized list for Scroll, SelectionItem
              and VirtualizedItem.Realize. -->
-        <Slider x:Name="LevelSlider" Grid.Row="6" Minimum="0" Maximum="100" Value="25" />
-        <Slider x:Name="ReadOnlyRange" Grid.Row="7"
+        <Slider x:Name="LevelSlider" Grid.Row="7" Minimum="0" Maximum="100" Value="25" />
+        <Slider x:Name="ReadOnlyRange" Grid.Row="8"
                 Minimum="0" Maximum="100" Value="40" IsEnabled="False" />
-        <ComboBox x:Name="ChoiceCombo" Grid.Row="8" SelectedIndex="0" Width="200">
+        <ComboBox x:Name="ChoiceCombo" Grid.Row="9" SelectedIndex="0" Width="200">
             <ComboBoxItem Content="Alpha" />
             <ComboBoxItem Content="Beta" />
             <ComboBoxItem Content="Gamma" />
         </ComboBox>
-        <ListView x:Name="ItemsList" Grid.Row="9" Height="220" SelectionMode="Multiple" />
+        <ListView x:Name="ItemsList" Grid.Row="10" Height="220" SelectionMode="Multiple" />
     </Grid>
 </Window>

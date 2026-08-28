@@ -1240,13 +1240,16 @@ protected:
         STARTUPINFOA si{sizeof(si)};
         PROCESS_INFORMATION pi{};
         std::string cmd = exe.string();
+        SetEnvironmentVariableA("LVT_TEST_SECONDARY_WINDOW", "1");
         if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
                             exe.parent_path().string().c_str(), &si, &pi)) {
+            SetEnvironmentVariableA("LVT_TEST_SECONDARY_WINDOW", nullptr);
             s_skip_reason =
                 "failed to launch the WinUI3 sample app (error " +
                 std::to_string(GetLastError()) + ")";
             return;
         }
+        SetEnvironmentVariableA("LVT_TEST_SECONDARY_WINDOW", nullptr);
         s_process.reset(pi.hProcess);
         s_thread.reset(pi.hThread);
         WaitForInputIdle(s_process.get(), 10000);
@@ -1320,6 +1323,32 @@ protected:
 
     static DWORD process_id() {
         return s_process ? GetProcessId(s_process.get()) : 0;
+    }
+
+    static std::string secondary_hwnd_string() {
+        struct Search {
+            DWORD pid;
+            HWND hwnd = nullptr;
+        } search{GetProcessId(s_process.get())};
+        EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+            auto* state = reinterpret_cast<Search*>(lParam);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != state->pid || !IsWindowVisible(hwnd))
+                return TRUE;
+            char title[256]{};
+            GetWindowTextA(hwnd, title, sizeof(title));
+            if (strcmp(title, "LVT Native Secondary") != 0)
+                return TRUE;
+            state->hwnd = hwnd;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&search));
+        if (!search.hwnd)
+            return {};
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "0x%p",
+                 static_cast<void*>(search.hwnd));
+        return buffer;
     }
 
     // Connect and return the session id, failing the test if it does not work.
@@ -2484,12 +2513,11 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto input = client.call_tool(
             "find_elements", json{{"session", session}, {"automationId", "InputBox"}});
         ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
-        const auto inputRef = input["elements"][0].value("ref", "");
         const auto inputKey = input["elements"][0].value("key", "");
 
         auto inputProperties = client.call_tool(
             "get_editable_properties",
-            json{{"session", session}, {"element", inputRef}}, &isError);
+            json{{"session", session}, {"element", inputKey}}, &isError);
         ASSERT_FALSE(isError) << inputProperties.dump(2);
         std::string schemaError;
         EXPECT_TRUE(schema_allows(
@@ -2522,7 +2550,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto setValue = client.call_tool(
             "set_property",
             json{{"session", session},
-                 {"element", inputRef},
+                 {"element", inputKey},
                  {"descriptorId", valueDescriptorId},
                  {"value", changedText}},
             &isError);
@@ -2539,7 +2567,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto readOnlyProperties = client.call_tool(
             "get_editable_properties",
             json{{"session", session},
-                 {"element", readOnly["elements"][0].value("ref", "")}},
+                 {"element", readOnly["elements"][0].value("key", "")}},
             &isError);
         ASSERT_FALSE(isError) << readOnlyProperties.dump(2);
         const auto* readOnlyValue =
@@ -2551,7 +2579,6 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto slider = client.call_tool(
             "find_elements", json{{"session", session}, {"automationId", "LevelSlider"}});
         ASSERT_EQ(slider["elements"].size(), 1u) << slider.dump(2);
-        const auto sliderRef = slider["elements"][0].value("ref", "");
         const auto sliderKey = slider["elements"][0].value("key", "");
         auto sliderProperties = client.call_tool(
             "get_editable_properties",
@@ -2575,7 +2602,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto readOnlyRangeProperties = client.call_tool(
             "get_editable_properties",
             json{{"session", session},
-                 {"element", readOnlyRange["elements"][0].value("ref", "")}},
+                 {"element", readOnlyRange["elements"][0].value("key", "")}},
             &isError);
         ASSERT_FALSE(isError) << readOnlyRangeProperties.dump(2);
         const auto* readOnlyRangeDescriptor =
@@ -2590,25 +2617,30 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         EXPECT_DOUBLE_EQ(
             readOnlyRangeDescriptor->value("maximum", -1.0), 100.0);
 
+        const auto requestedRange = "075.1300";
         auto setRange = client.call_tool(
             "set_property",
             json{{"session", session},
                  {"element", sliderKey},
                  {"descriptorId", rangeDescriptorId},
-                 {"value", "75"}},
+                 {"value", requestedRange}},
             &isError);
         ASSERT_FALSE(isError) << setRange.dump(2);
+        const auto providerRange = setRange.value("value", "");
+        ASSERT_FALSE(providerRange.empty()) << setRange.dump(2);
+        EXPECT_NE(providerRange, requestedRange)
+            << "RangeValue mutation returned the caller's spelling instead of provider readback";
         auto rangeAfter = client.call_tool(
             "get_editable_properties",
             json{{"session", session}, {"element", sliderKey}}, &isError);
         ASSERT_FALSE(isError) << rangeAfter.dump(2);
-        EXPECT_EQ(typed_property_value(rangeAfter, "RangeValue.Value"), "75")
+        EXPECT_EQ(
+            typed_property_value(rangeAfter, "RangeValue.Value"), providerRange)
             << rangeAfter.dump(2);
 
         auto checkbox = client.call_tool(
             "find_elements", json{{"session", session}, {"automationId", "ReadyCheckBox"}});
         ASSERT_EQ(checkbox["elements"].size(), 1u) << checkbox.dump(2);
-        const auto checkboxRef = checkbox["elements"][0].value("ref", "");
         const auto checkboxKey = checkbox["elements"][0].value("key", "");
         auto checkboxProperties = client.call_tool(
             "get_editable_properties",
@@ -2650,7 +2682,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto comboProperties = client.call_tool(
             "get_editable_properties",
             json{{"session", session},
-                 {"element", combo["elements"][0].value("ref", "")}},
+                 {"element", combo["elements"][0].value("key", "")}},
             &isError);
         ASSERT_FALSE(isError) << comboProperties.dump(2);
         const auto* expand =
@@ -2661,7 +2693,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto setExpanded = client.call_tool(
             "set_property",
             json{{"session", session},
-                 {"element", combo["elements"][0].value("ref", "")},
+                 {"element", combo["elements"][0].value("key", "")},
                  {"descriptorId", expand->value("descriptorId", "")},
                  {"value", "Expanded"}},
             &isError);
@@ -2672,7 +2704,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto expandedProperties = client.call_tool(
             "get_editable_properties",
             json{{"session", session},
-                 {"element", expandedCombo["elements"][0].value("ref", "")}},
+                 {"element", expandedCombo["elements"][0].value("key", "")}},
             &isError);
         ASSERT_FALSE(isError) << expandedProperties.dump(2);
         EXPECT_EQ(
@@ -2684,7 +2716,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto setCollapsed = client.call_tool(
             "set_property",
             json{{"session", session},
-                 {"element", expandedCombo["elements"][0].value("ref", "")},
+                 {"element", expandedCombo["elements"][0].value("key", "")},
                  {"descriptorId", collapse->value("descriptorId", "")},
                  {"value", "Collapsed"}},
             &isError);
@@ -2694,10 +2726,10 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
             "find_elements",
             json{{"session", session}, {"name", "Item 000"}, {"type", "ListItem"}});
         if (!item["elements"].empty()) {
-            const auto itemRef = item["elements"][0].value("ref", "");
+            const auto itemKey = item["elements"][0].value("key", "");
             auto itemProperties = client.call_tool(
                 "get_editable_properties",
-                json{{"session", session}, {"element", itemRef}}, &isError);
+                json{{"session", session}, {"element", itemKey}}, &isError);
             ASSERT_FALSE(isError) << itemProperties.dump(2);
             const auto* selection =
                 find_property_descriptor(itemProperties, "SelectionItem.Action");
@@ -2709,7 +2741,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
             auto add = client.call_tool(
                 "set_property",
                 json{{"session", session},
-                     {"element", itemRef},
+                     {"element", itemKey},
                      {"descriptorId", selection->value("descriptorId", "")},
                      {"value", "add"}},
                 &isError);
@@ -2722,7 +2754,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
             auto selectedProperties = client.call_tool(
                 "get_editable_properties",
                 json{{"session", session},
-                     {"element", currentItem["elements"][0].value("ref", "")}},
+                     {"element", currentItem["elements"][0].value("key", "")}},
                 &isError);
             ASSERT_FALSE(isError) << selectedProperties.dump(2);
             EXPECT_EQ(
@@ -2734,7 +2766,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
             auto removed = client.call_tool(
                 "set_property",
                 json{{"session", session},
-                     {"element", currentItem["elements"][0].value("ref", "")},
+                     {"element", currentItem["elements"][0].value("key", "")},
                      {"descriptorId", remove->value("descriptorId", "")},
                      {"value", "remove"}},
                 &isError);
@@ -2747,7 +2779,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
             auto replacementProperties = client.call_tool(
                 "get_editable_properties",
                 json{{"session", session},
-                     {"element", replacementItem["elements"][0].value("ref", "")}},
+                     {"element", replacementItem["elements"][0].value("key", "")}},
                 &isError);
             ASSERT_FALSE(isError) << replacementProperties.dump(2);
             const auto* replace =
@@ -2756,7 +2788,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
             auto selected = client.call_tool(
                 "set_property",
                 json{{"session", session},
-                     {"element", replacementItem["elements"][0].value("ref", "")},
+                     {"element", replacementItem["elements"][0].value("key", "")},
                      {"descriptorId", replace->value("descriptorId", "")},
                      {"value", "select"}},
                 &isError);
@@ -2769,7 +2801,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
             auto selectedSnapshot = client.call_tool(
                 "get_editable_properties",
                 json{{"session", session},
-                     {"element", selectedItem["elements"][0].value("ref", "")}},
+                     {"element", selectedItem["elements"][0].value("key", "")}},
                 &isError);
             ASSERT_FALSE(isError) << selectedSnapshot.dump(2);
             const auto* selectedDescriptor =
@@ -2778,7 +2810,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
             auto finalRemove = client.call_tool(
                 "set_property",
                 json{{"session", session},
-                     {"element", selectedItem["elements"][0].value("ref", "")},
+                     {"element", selectedItem["elements"][0].value("key", "")},
                      {"descriptorId", selectedDescriptor->value("descriptorId", "")},
                      {"value", "remove"}},
                 &isError);
@@ -2788,7 +2820,6 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto list = client.call_tool(
             "find_elements", json{{"session", session}, {"automationId", "ItemsList"}});
         ASSERT_EQ(list["elements"].size(), 1u) << list.dump(2);
-        const auto listRef = list["elements"][0].value("ref", "");
         const auto listKey = list["elements"][0].value("key", "");
         auto listProperties = client.call_tool(
             "get_editable_properties",
@@ -2866,13 +2897,12 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto input = client.call_tool(
             "find_elements", json{{"session", session}, {"automationId", "InputBox"}});
         ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
-        const auto inputRef = input["elements"][0].value("ref", "");
         const auto inputKey = input["elements"][0].value("key", "");
 
         bool isError = false;
         auto properties = client.call_tool(
             "get_editable_properties",
-            json{{"session", session}, {"element", inputRef}}, &isError);
+            json{{"session", session}, {"element", inputKey}}, &isError);
         ASSERT_FALSE(isError) << properties.dump(2);
         const auto* value =
             find_property_descriptor(properties, "Value.Value");
@@ -2889,7 +2919,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto changed = client.call_tool(
             "set_property",
             json{{"session", session},
-                 {"element", inputRef},
+                 {"element", inputKey},
                  {"descriptorId", descriptorId},
                  {"value", "typed resource mutation"}},
             &isError);
@@ -2918,7 +2948,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         auto restored = client.call_tool(
             "set_property",
             json{{"session", session},
-                 {"element", inputRef},
+                 {"element", inputKey},
                  {"descriptorId", descriptorId},
                  {"value", original}},
             &isError);
@@ -4079,6 +4109,246 @@ TEST_F(McpSampleFixture, ResourcesMatchEachSessionsFixedTreeMode) {
     EXPECT_EQ(std::find(uris.begin(), uris.end(), wrongVisualUri), uris.end());
 }
 
+TEST_F(McpSampleFixture, UiaTypedPropertiesStayScopedToEachWindowInOneProcess) {
+    SkipIfNotReady();
+    const auto secondaryHwnd = secondary_hwnd_string();
+    if (secondaryHwnd.empty())
+        GTEST_SKIP() << "the sample app's secondary window is unavailable";
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto primarySession = connect(client);
+    ASSERT_FALSE(primarySession.empty());
+    const auto secondaryConnect = client.call_tool(
+        "connect", json{{"hwnd", secondaryHwnd}, {"mode", "uia"}});
+    const auto secondarySession = secondaryConnect.value("session", "");
+    ASSERT_FALSE(secondarySession.empty()) << secondaryConnect.dump(2);
+
+    auto primaryInput = client.call_tool(
+        "find_elements",
+        json{{"session", primarySession}, {"automationId", "InputBox"}});
+    auto secondaryInput = client.call_tool(
+        "find_elements",
+        json{{"session", secondarySession}, {"automationId", "2001"}});
+    ASSERT_EQ(primaryInput["elements"].size(), 1u) << primaryInput.dump(2);
+    ASSERT_EQ(secondaryInput["elements"].size(), 1u) << secondaryInput.dump(2);
+    EXPECT_TRUE(client.call_tool(
+        "find_elements",
+        json{{"session", primarySession}, {"automationId", "2001"}})
+                    ["elements"].empty());
+    EXPECT_TRUE(client.call_tool(
+        "find_elements",
+        json{{"session", secondarySession}, {"automationId", "InputBox"}})
+                    ["elements"].empty());
+
+    const auto primaryKey = primaryInput["elements"][0].value("key", "");
+    const auto secondaryKey = secondaryInput["elements"][0].value("key", "");
+    bool isError = false;
+    auto primaryProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession}, {"element", primaryKey}}, &isError);
+    ASSERT_FALSE(isError) << primaryProperties.dump(2);
+    auto secondaryProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession}, {"element", secondaryKey}}, &isError);
+    ASSERT_FALSE(isError) << secondaryProperties.dump(2);
+    const auto* primaryValue =
+        find_property_descriptor(primaryProperties, "Value.Value");
+    const auto* secondaryValue =
+        find_property_descriptor(secondaryProperties, "Value.Value");
+    ASSERT_NE(primaryValue, nullptr);
+    ASSERT_NE(secondaryValue, nullptr);
+    const auto originalPrimary =
+        typed_property_value(primaryProperties, "Value.Value");
+    const auto originalSecondary =
+        typed_property_value(secondaryProperties, "Value.Value");
+
+    auto setPrimary = client.call_tool(
+        "set_property",
+        json{{"session", primarySession},
+             {"element", primaryKey},
+             {"descriptorId", primaryValue->value("descriptorId", "")},
+             {"value", "primary isolated"}},
+        &isError);
+    ASSERT_FALSE(isError) << setPrimary.dump(2);
+    auto setSecondary = client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryKey},
+             {"descriptorId", secondaryValue->value("descriptorId", "")},
+             {"value", "secondary isolated"}},
+        &isError);
+    ASSERT_FALSE(isError) << setSecondary.dump(2);
+
+    auto primaryAfter = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession}, {"element", primaryKey}}, &isError);
+    ASSERT_FALSE(isError) << primaryAfter.dump(2);
+    auto secondaryAfter = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession}, {"element", secondaryKey}}, &isError);
+    ASSERT_FALSE(isError) << secondaryAfter.dump(2);
+    EXPECT_EQ(typed_property_value(primaryAfter, "Value.Value"), "primary isolated");
+    EXPECT_EQ(typed_property_value(secondaryAfter, "Value.Value"), "secondary isolated");
+
+    auto primaryCheck = client.call_tool(
+        "find_elements",
+        json{{"session", primarySession}, {"automationId", "ReadyCheckBox"}});
+    auto secondaryCheck = client.call_tool(
+        "find_elements",
+        json{{"session", secondarySession}, {"automationId", "2002"}});
+    ASSERT_EQ(primaryCheck["elements"].size(), 1u);
+    ASSERT_EQ(secondaryCheck["elements"].size(), 1u);
+    const auto primaryCheckKey = primaryCheck["elements"][0].value("key", "");
+    const auto secondaryCheckKey = secondaryCheck["elements"][0].value("key", "");
+    auto primaryCheckProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession}, {"element", primaryCheckKey}}, &isError);
+    auto secondaryCheckProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession}, {"element", secondaryCheckKey}}, &isError);
+    ASSERT_FALSE(isError);
+    const auto* primaryToggle =
+        find_property_descriptor(primaryCheckProperties, "Toggle.ToggleState");
+    const auto* secondaryToggle =
+        find_property_descriptor(secondaryCheckProperties, "Toggle.ToggleState");
+    ASSERT_NE(primaryToggle, nullptr);
+    ASSERT_NE(secondaryToggle, nullptr);
+    const auto originalPrimaryToggle =
+        typed_property_value(primaryCheckProperties, "Toggle.ToggleState");
+    const auto originalSecondaryToggle =
+        typed_property_value(secondaryCheckProperties, "Toggle.ToggleState");
+
+    auto primaryOff = client.call_tool(
+        "set_property",
+        json{{"session", primarySession},
+             {"element", primaryCheckKey},
+             {"descriptorId", primaryToggle->value("descriptorId", "")},
+             {"value", "Off"}},
+        &isError);
+    ASSERT_FALSE(isError) << primaryOff.dump(2);
+    auto secondaryOn = client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryCheckKey},
+             {"descriptorId", secondaryToggle->value("descriptorId", "")},
+             {"value", "On"}},
+        &isError);
+    ASSERT_FALSE(isError) << secondaryOn.dump(2);
+
+    auto primaryToggleAfter = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession}, {"element", primaryCheckKey}}, &isError);
+    auto secondaryToggleAfter = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession}, {"element", secondaryCheckKey}}, &isError);
+    ASSERT_FALSE(isError);
+    EXPECT_EQ(
+        typed_property_value(primaryToggleAfter, "Toggle.ToggleState"), "Off");
+    EXPECT_EQ(
+        typed_property_value(secondaryToggleAfter, "Toggle.ToggleState"), "On");
+
+    client.call_tool(
+        "set_property",
+        json{{"session", primarySession},
+             {"element", primaryKey},
+             {"descriptorId", primaryValue->value("descriptorId", "")},
+             {"value", originalPrimary}},
+        &isError);
+    client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryKey},
+             {"descriptorId", secondaryValue->value("descriptorId", "")},
+             {"value", originalSecondary}},
+        &isError);
+    client.call_tool(
+        "set_property",
+        json{{"session", primarySession},
+             {"element", primaryCheckKey},
+             {"descriptorId", primaryToggle->value("descriptorId", "")},
+             {"value", originalPrimaryToggle}},
+        &isError);
+    client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryCheckKey},
+             {"descriptorId", secondaryToggle->value("descriptorId", "")},
+             {"value", originalSecondaryToggle}},
+        &isError);
+    EXPECT_FALSE(isError);
+}
+
+TEST_F(McpSampleFixture, UiaTypedPropertiesPreserveOriginatingViewIdentity) {
+    SkipIfNotReady();
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto raw = client.call_tool(
+        "find_elements",
+        json{{"session", session},
+             {"automationId", "RawOnlyInput"},
+             {"view", "raw"}});
+    ASSERT_EQ(raw["elements"].size(), 1u) << raw.dump(2);
+    const auto rawRef = raw["elements"][0].value("ref", "");
+    const auto rawKey = raw["elements"][0].value("key", "");
+
+    bool isError = false;
+    auto rawProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", rawKey}}, &isError);
+    ASSERT_FALSE(isError) << rawProperties.dump(2);
+    EXPECT_NE(
+        find_property_descriptor(rawProperties, "Value.Value"), nullptr);
+
+    auto rawElement = client.call_tool(
+        "get_element_properties",
+        json{{"session", session},
+             {"element", rawRef},
+             {"view", "raw"},
+             {"properties", json::array({"RuntimeId"})}},
+        &isError);
+    ASSERT_FALSE(isError) << rawElement.dump(2);
+    const auto runtimeId =
+        rawElement["properties"].value("RuntimeId", "");
+    ASSERT_FALSE(runtimeId.empty()) << rawElement.dump(2);
+    auto directRuntime = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", "uia:" + runtimeId}},
+        &isError);
+    ASSERT_FALSE(isError) << directRuntime.dump(2);
+    EXPECT_EQ(
+        directRuntime.value("schemaId", ""),
+        rawProperties.value("schemaId", ""));
+
+    auto positional = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", rawRef}}, &isError);
+    EXPECT_TRUE(isError) << positional.dump(2);
+    EXPECT_NE(positional.dump().find("originating raw/control/content view"),
+              std::string::npos) << positional.dump(2);
+
+    auto content = client.call_tool(
+        "find_elements",
+        json{{"session", session},
+             {"automationId", "InputBox"},
+             {"view", "content"}});
+    ASSERT_EQ(content["elements"].size(), 1u) << content.dump(2);
+    auto contentProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", content["elements"][0].value("key", "")}},
+        &isError);
+    ASSERT_FALSE(isError) << contentProperties.dump(2);
+    EXPECT_NE(
+        find_property_descriptor(contentProperties, "Value.Value"), nullptr);
+}
+
 TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
     SkipIfNotReady();
     McpClient client(true);
@@ -4611,6 +4881,65 @@ TEST_F(McpSampleFixture, DisconnectRacingVisualReadKeepsServerAndConnectionSafe)
         ASSERT_TRUE(disconnectResponse.contains("result")) << disconnectResponse.dump(2);
         EXPECT_FALSE(disconnectResponse["result"].value("isError", false))
             << disconnectResponse.dump(2);
+    }
+
+    auto healthy = client.call_tool("list_apps", json::object());
+    EXPECT_TRUE(healthy.contains("apps")) << healthy.dump(2);
+}
+
+TEST_F(McpSampleFixture, DisconnectRacingTypedPropertyDoesNotRecreateSession) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    for (int round = 0; round < 5; ++round) {
+        const auto session = connect(client);
+        ASSERT_FALSE(session.empty());
+        auto input = client.call_tool(
+            "find_elements",
+            json{{"session", session}, {"automationId", "InputBox"}});
+        ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
+        const auto key = input["elements"][0].value("key", "");
+        bool isError = false;
+        auto properties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", key}}, &isError);
+        ASSERT_FALSE(isError) << properties.dump(2);
+        const auto* descriptor =
+            find_property_descriptor(properties, "Value.Value");
+        ASSERT_NE(descriptor, nullptr);
+
+        const int propertyId = client.send_request(
+            "tools/call",
+            json{{"name", "set_property"},
+                 {"arguments",
+                  json{{"session", session},
+                       {"element", key},
+                       {"descriptorId", descriptor->value("descriptorId", "")},
+                       {"value", typed_property_value(properties, "Value.Value")}}}});
+        const int disconnectId = client.send_request(
+            "tools/call",
+            json{{"name", "disconnect"},
+                 {"arguments", json{{"session", session}}}});
+
+        auto disconnectResponse = client.await_response(disconnectId);
+        auto propertyResponse = client.await_response(propertyId);
+        ASSERT_FALSE(disconnectResponse.is_null());
+        ASSERT_FALSE(propertyResponse.is_null());
+        ASSERT_TRUE(disconnectResponse.contains("result"))
+            << disconnectResponse.dump(2);
+        EXPECT_FALSE(disconnectResponse["result"].value("isError", false))
+            << disconnectResponse.dump(2);
+        ASSERT_TRUE(propertyResponse.contains("result"))
+            << propertyResponse.dump(2);
+
+        auto afterDisconnect = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", key}}, &isError);
+        EXPECT_TRUE(isError) << afterDisconnect.dump(2);
+        EXPECT_NE(afterDisconnect.dump().find("unknown session"), std::string::npos)
+            << afterDisconnect.dump(2);
     }
 
     auto healthy = client.call_tool("list_apps", json::object());

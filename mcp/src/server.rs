@@ -177,7 +177,9 @@ pub struct UiaTreeChangesArgs {
 pub struct EditablePropertiesArgs {
     /// Session id returned by connect.
     pub session: String,
-    /// Element reference or durable key returned by this session's tree.
+    /// Visual element reference/key, or a durable UIA key / uia:<RuntimeId>.
+    /// Positional UIA refs (uia:eN) are rejected because they do not carry the
+    /// raw/control/content view that assigned the position.
     pub element: String,
 }
 
@@ -1410,7 +1412,8 @@ impl LvtServer {
                        for one element in this session's UIA or visual tree. Descriptors are \
                        framework-neutral and carry opaque \
                        ids, editor kinds, choices, writability, clear capability, and declared \
-                       types; live values are returned separately.",
+                       types; live values are returned separately. For UIA, use a durable key or \
+                       uia:<RuntimeId>; positional uia:eN references are intentionally rejected.",
         output_schema = crate::schema::editable_properties(),
         annotations(read_only_hint = true, open_world_hint = true)
     )]
