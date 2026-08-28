@@ -26,6 +26,7 @@
 
 #include "xaml_property_filter.h"
 #include "bounded_event_queue.h"
+#include "xaml_enum_catalog.h"
 
 // C++/WinRT projected types for XAML element inspection.
 // System XAML (Windows.UI.Xaml) headers are always available from the Windows SDK.
@@ -177,7 +178,8 @@ struct TapPropertyCommand {
     HRESULT hresult = E_FAIL;
     std::wstring error;
     std::vector<TapProperty> properties;
-    bool hasValue = false;
+    bool hasReadback = false;
+    TapProperty readback;
 };
 
 struct TapChangeEvent {
@@ -238,6 +240,8 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     std::atomic_bool m_acceptChangeEvents = false;
     static constexpr size_t kMaxChangeEvents = 4096;
     lvt::BoundedEventQueue<TapChangeEvent, kMaxChangeEvents> m_changeEvents;
+    std::vector<lvt::tap::EnumTypeInfo> m_enumCatalog;
+    bool m_enumCatalogServed = false;
 
 public:
     wil::com_ptr<IVisualTreeService> m_vts;
@@ -338,6 +342,7 @@ public:
         }
 
         m_diag = std::move(diag);
+        LoadEnumCatalog();
 
         // Create a message-only window on the UI thread for dispatching
         // GetPropertyValuesChain calls (which have thread affinity).
@@ -494,6 +499,35 @@ public:
                                    value.data(), length) == length;
     }
 
+    void LoadEnumCatalog() {
+        unsigned int count = 0;
+        EnumType* rawEnums = nullptr;
+        const HRESULT getHr = m_vts->GetEnums(&count, &rawEnums);
+        lvt::tap::OwnedEnumTypes owned(rawEnums, count);
+        LogMsg("GetEnums called once: hr=0x%08X count=%u", getHr, count);
+        if (FAILED(getHr))
+            return;
+
+        std::vector<lvt::tap::EnumTypeInfo> copied;
+        const HRESULT copyHr =
+            lvt::tap::copy_enum_types(owned.get(), owned.count(), copied);
+        if (FAILED(copyHr)) {
+            LogMsg("GetEnums deep copy failed: 0x%08X", copyHr);
+            return;
+        }
+        m_enumCatalog = std::move(copied);
+    }
+
+    const lvt::tap::EnumTypeInfo* FindEnumType(
+        const std::wstring& typeName) const {
+        auto found = std::find_if(
+            m_enumCatalog.begin(), m_enumCatalog.end(),
+            [&](const lvt::tap::EnumTypeInfo& type) {
+                return type.name == typeName;
+            });
+        return found == m_enumCatalog.end() ? nullptr : &*found;
+    }
+
     static std::wstring TakeBstr(BSTR& value) {
         wil::unique_bstr owned(value);
         value = nullptr;
@@ -594,6 +628,41 @@ public:
         return S_OK;
     }
 
+    bool ReadBackProperty(
+        TapPropertyCommand& command, const wchar_t* operation) {
+        std::vector<TapProperty> refreshedProperties;
+        std::wstring readbackError;
+        const HRESULT readbackHr = CollectPropertyChain(
+            command.object, refreshedProperties, readbackError);
+        if (FAILED(readbackHr)) {
+            command.hresult = readbackHr;
+            command.error =
+                std::wstring(operation) +
+                L" succeeded, but effective-value readback failed";
+            if (!readbackError.empty())
+                command.error += L": " + readbackError;
+            return false;
+        }
+
+        const auto refreshed = std::find_if(
+            refreshedProperties.begin(), refreshedProperties.end(),
+            [&](const TapProperty& candidate) {
+                return candidate.propertyIndex == command.propertyIndex;
+            });
+        if (refreshed == refreshedProperties.end()) {
+            command.hresult = E_FAIL;
+            command.error =
+                std::wstring(operation) +
+                L" succeeded, but the property was absent from effective-value readback";
+            return false;
+        }
+
+        command.readback = *refreshed;
+        command.hasReadback = true;
+        command.hresult = S_OK;
+        return true;
+    }
+
     void ExecutePropertyCommand(TapPropertyCommand& command) {
         if (!m_vts) {
             command.hresult = E_NOINTERFACE;
@@ -636,8 +705,11 @@ public:
             if (command.kind == TapPropertyCommandKind::clearProperty) {
                 command.hresult = m_vts->ClearProperty(
                     command.object, command.propertyIndex);
-                if (FAILED(command.hresult))
+                if (FAILED(command.hresult)) {
                     command.error = L"ClearProperty failed";
+                    return;
+                }
+                ReadBackProperty(command, L"ClearProperty");
                 return;
             }
 
@@ -645,6 +717,21 @@ public:
                 command.hresult = E_INVALIDARG;
                 command.error = L"The dependency property's declared type is unavailable";
                 return;
+            }
+
+            if (const auto* enumType = FindEnumType(property->propertyType)) {
+                const bool valid = std::any_of(
+                    enumType->members.begin(), enumType->members.end(),
+                    [&](const lvt::tap::EnumMember& member) {
+                        return member.name == command.value;
+                    });
+                if (!valid) {
+                    command.hresult = E_INVALIDARG;
+                    command.error =
+                        L"The value is not a named member of enum type '" +
+                        property->propertyType + L"'";
+                    return;
+                }
             }
 
             wil::unique_bstr type(SysAllocStringLen(
@@ -673,7 +760,7 @@ public:
                 command.error = L"SetProperty failed after CreateInstance succeeded";
                 return;
             }
-            command.hasValue = true;
+            ReadBackProperty(command, L"SetProperty");
             return;
         }
     }
@@ -705,8 +792,17 @@ public:
                         L",\"source\":\"" + Escape(property.source) + L"\"}";
             }
             json += L"]";
-        } else if (command.hasValue) {
-            json += L",\"value\":\"" + Escape(command.value) + L"\"";
+        } else if (command.hasReadback) {
+            json += L",\"readback\":{\"value\":\"" +
+                    Escape(command.readback.value) +
+                    L"\",\"propertyType\":\"" +
+                    Escape(command.readback.propertyType) +
+                    L"\",\"valueType\":\"" +
+                    Escape(command.readback.valueType) +
+                    L"\",\"overridden\":" +
+                    (command.readback.overridden ? L"true" : L"false") +
+                    L",\"source\":\"" +
+                    Escape(command.readback.source) + L"\"}";
         }
         json += L"}";
         return json;
@@ -809,6 +905,66 @@ public:
                   std::to_string(commandId) + "}");
     }
 
+    void HandleGetEnums(const std::string& line) {
+        std::istringstream tokens(line);
+        std::string verb;
+        std::string commandIdText;
+        std::string extra;
+        uint64_t commandId = 0;
+        tokens >> verb >> commandIdText;
+        if (verb != "GET_ENUMS" || !ParseUint64(commandIdText, commandId) ||
+            (tokens >> extra)) {
+            LogMsg("HandleGetEnums: malformed command");
+            return;
+        }
+
+        if (m_enumCatalogServed) {
+            WriteLine(
+                "{\"type\":\"ENUM_RESULT\",\"commandId\":" +
+                std::to_string(commandId) +
+                ",\"ok\":false,\"error\":\"Enum catalog was already served\"}");
+            return;
+        }
+        m_enumCatalogServed = true;
+
+        std::wstring response =
+            L"{\"type\":\"ENUM_RESULT\",\"commandId\":" +
+            std::to_wstring(commandId) +
+            L",\"ok\":true,\"catalog\":[";
+        for (size_t i = 0; i < m_enumCatalog.size(); ++i) {
+            if (i)
+                response += L",";
+            const auto& type = m_enumCatalog[i];
+            response += L"{\"name\":\"" + Escape(type.name) +
+                        L"\",\"members\":[";
+            for (size_t j = 0; j < type.members.size(); ++j) {
+                if (j)
+                    response += L",";
+                const auto& member = type.members[j];
+                response +=
+                    L"{\"machineValue\":" +
+                    std::to_wstring(member.machineValue) +
+                    L",\"name\":\"" + Escape(member.name) + L"\"}";
+            }
+            response += L"]}";
+        }
+        response += L"]}";
+
+        int length = WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, response.data(),
+            static_cast<int>(response.size()), nullptr, 0, nullptr, nullptr);
+        if (length <= 0) {
+            LogMsg("HandleGetEnums: response was not valid UTF-16");
+            return;
+        }
+        std::string utf8(length, '\0');
+        WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, response.data(),
+            static_cast<int>(response.size()), utf8.data(), length,
+            nullptr, nullptr);
+        WriteLine(utf8);
+    }
+
     DWORD AdviseThreadProcImpl() {
         LogMsg("AdviseThread starting");
 
@@ -895,6 +1051,8 @@ public:
                 HandlePropertyCommand(*line);
             } else if (line->rfind("POLL_EVENTS ", 0) == 0) {
                 HandlePollEvents(*line);
+            } else if (line->rfind("GET_ENUMS ", 0) == 0) {
+                HandleGetEnums(*line);
             } else {
                 LogMsg("RunCommandLoop: unknown command, ignoring");
             }
@@ -1624,7 +1782,8 @@ static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
             command->hresult = E_FAIL;
             command->error = L"Property command did not complete";
             command->properties.clear();
-            command->hasValue = false;
+            command->hasReadback = false;
+            command->readback = {};
             // ExecutePropertyCommand is called only here, on the message
             // window's owning XAML UI thread.
             auto* self = reinterpret_cast<LvtTap*>(

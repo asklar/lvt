@@ -4,6 +4,7 @@
 #include "xaml_diag_common.h"
 #include "framework_connection.h"
 #include "overlapped_io.h"
+#include "xaml_enum_catalog.h"
 #include "../tap/tap_clsid.h"
 #include "../debug.h"
 #include "../bounds_util.h"
@@ -489,9 +490,13 @@ struct XamlPropertyCommandResult {
     std::string error;
     bool hasProperties = false;
     std::vector<XamlRawProperty> properties;
-    bool hasValue = false;
-    std::string value;
+    bool hasReadback = false;
+    XamlRawProperty readback;
 };
+
+bool is_local_property_source(const std::string& source) {
+    return source == "Local" || source.rfind("Local: ", 0) == 0;
+}
 
 // A live, persistent connection to one XAML/WinUI3 diagnostics session in a
 // target process - the concrete IFrameworkConnection this file provides.
@@ -623,9 +628,14 @@ public:
             const auto& descriptor = result.schema->descriptors[i];
             PropertyValue value;
             value.descriptorId = descriptor.descriptorId;
-            value.value = property.value;
+            value.value = m_enumCatalog
+                              .canonical_value(
+                                  property.propertyType, property.value)
+                              .value_or(property.value);
             value.runtimeType = property.valueType;
-            value.canClear = descriptor.supportsClear && property.overridden;
+            value.canClear =
+                descriptor.supportsClear &&
+                is_local_property_source(property.source);
             value.overridden = property.overridden;
             value.source = property.source;
             if (!descriptor.writable)
@@ -643,6 +653,14 @@ public:
         CachedMutation mutation;
         if (!resolve_mutation(handle, descriptorId, true, mutation, result))
             return result;
+        if (mutation.kind == PropertyEditorKind::enumeration &&
+            !m_enumCatalog.accepts(mutation.propertyType, value)) {
+            result.hresult = E_INVALIDARG;
+            result.error =
+                "The value is not a named member of enum type '" +
+                mutation.propertyType + "'";
+            return result;
+        }
 
         const auto commandId = next_command_id();
         std::ostringstream command;
@@ -652,8 +670,27 @@ public:
         result.ok = raw.ok;
         result.hresult = raw.hresult;
         result.error = std::move(raw.error);
-        result.hasValue = raw.hasValue;
-        result.value = raw.hasValue ? value : std::string();
+        if (raw.ok && !raw.hasReadback) {
+            result.ok = false;
+            result.hresult = E_FAIL;
+            result.error =
+                "SetProperty completed without an effective-value readback";
+            return result;
+        }
+        if (raw.hasReadback) {
+            result.hasValue = true;
+            result.value = m_enumCatalog
+                               .canonical_value(
+                                   mutation.propertyType,
+                                   raw.readback.value)
+                               .value_or(raw.readback.value);
+            result.runtimeType = raw.readback.valueType;
+            result.overridden = raw.readback.overridden;
+            result.source = raw.readback.source;
+            result.canClear =
+                mutation.supportsClear &&
+                is_local_property_source(raw.readback.source);
+        }
         return result;
     }
 
@@ -672,7 +709,28 @@ public:
         result.ok = raw.ok;
         result.hresult = raw.hresult;
         result.error = std::move(raw.error);
-        result.cleared = raw.ok;
+        if (raw.ok && !raw.hasReadback) {
+            result.ok = false;
+            result.hresult = E_FAIL;
+            result.error =
+                "ClearProperty completed without an effective-value readback";
+            return result;
+        }
+        if (raw.hasReadback) {
+            result.hasValue = true;
+            result.value = m_enumCatalog
+                               .canonical_value(
+                                   mutation.propertyType,
+                                   raw.readback.value)
+                               .value_or(raw.readback.value);
+            result.runtimeType = raw.readback.valueType;
+            result.overridden = raw.readback.overridden;
+            result.source = raw.readback.source;
+            result.canClear =
+                mutation.supportsClear &&
+                is_local_property_source(raw.readback.source);
+        }
+        result.cleared = result.ok;
         return result;
     }
 
@@ -682,6 +740,8 @@ private:
         uint32_t propertyIndex = 0;
         bool writable = false;
         bool supportsClear = false;
+        PropertyEditorKind kind = PropertyEditorKind::readonly;
+        std::string propertyType;
     };
 
     XamlDiagConnection(wil::unique_hfile pipe, std::unique_ptr<DuplexPipeLineIO> io,
@@ -759,6 +819,84 @@ private:
         return m_nextCommandId.fetch_add(1);
     }
 
+    bool initialize_enum_catalog() {
+        std::lock_guard<std::mutex> lock(m_commandMutex);
+        if (!m_alive)
+            return false;
+
+        const auto commandId = next_command_id();
+        if (!m_io->write_line(
+                "GET_ENUMS " + std::to_string(commandId))) {
+            m_alive = false;
+            return false;
+        }
+
+        for (;;) {
+            std::string line;
+            if (!m_io->read_line(kXamlCollectionTimeoutMs, line)) {
+                m_alive = false;
+                return false;
+            }
+            json response = json::parse(line, nullptr, false);
+            if (response.is_discarded() || !response.is_object())
+                continue;
+            const auto type = response.value("type", "");
+            if (type == "CHANGE" || type == "EVENTS_OVERFLOW") {
+                queue_connection_event(line);
+                continue;
+            }
+            if (type != "ENUM_RESULT" ||
+                response.value("commandId", uint64_t{0}) != commandId) {
+                continue;
+            }
+            if (!response.value("ok", false))
+                return false;
+
+            XamlEnumCatalog catalog;
+            const auto values = response.find("catalog");
+            if (values == response.end() || !values->is_array())
+                return false;
+            for (const auto& typeValue : *values) {
+                if (!typeValue.is_object())
+                    return false;
+                const auto typeName = typeValue.value("name", "");
+                const auto membersValue = typeValue.find("members");
+                if (typeName.empty() ||
+                    membersValue == typeValue.end() ||
+                    !membersValue->is_array()) {
+                    return false;
+                }
+
+                std::vector<XamlEnumMember> members;
+                members.reserve(membersValue->size());
+                for (const auto& memberValue : *membersValue) {
+                    if (!memberValue.is_object() ||
+                        !memberValue.contains("machineValue") ||
+                        !memberValue["machineValue"].is_number_integer()) {
+                        return false;
+                    }
+                    const auto memberName =
+                        memberValue.value("name", "");
+                    if (memberName.empty())
+                        return false;
+                    const auto rawMachineValue =
+                        memberValue["machineValue"].get<int64_t>();
+                    if (rawMachineValue < INT32_MIN ||
+                        rawMachineValue > INT32_MAX) {
+                        return false;
+                    }
+                    members.push_back({
+                        static_cast<int32_t>(rawMachineValue),
+                        memberName,
+                    });
+                }
+                catalog.add(typeName, std::move(members));
+            }
+            m_enumCatalog = std::move(catalog);
+            return true;
+        }
+    }
+
     static HRESULT parse_hresult(const json& response) {
         auto it = response.find("hresult");
         if (it == response.end() || !it->is_string())
@@ -817,13 +955,20 @@ private:
             descriptor.framework = m_frameworkLabel;
             descriptor.declaringType = property.declaringType;
             descriptor.propertyType = property.propertyType;
-            descriptor.kind =
-                classify_property_editor(property.propertyType, writable);
+            const auto* enumMembers =
+                m_enumCatalog.find(property.propertyType);
+            descriptor.kind = enumMembers && !enumMembers->empty() && writable
+                ? PropertyEditorKind::enumeration
+                : classify_property_editor(property.propertyType, writable);
             if (descriptor.kind == PropertyEditorKind::boolean) {
                 descriptor.choices = {
                     {"False", "False"},
                     {"True", "True"},
                 };
+            } else if (descriptor.kind ==
+                       PropertyEditorKind::enumeration) {
+                descriptor.choices =
+                    m_enumCatalog.choices_for(property.propertyType);
             }
             descriptor.writable = writable;
             descriptor.supportsClear = writable;
@@ -833,6 +978,8 @@ private:
             mutation.propertyIndex = property.propertyIndex;
             mutation.writable = descriptor.writable;
             mutation.supportsClear = descriptor.supportsClear;
+            mutation.kind = descriptor.kind;
+            mutation.propertyType = descriptor.propertyType;
             m_mutationsByDescriptorId.emplace(
                 descriptor.descriptorId, std::move(mutation));
             schema->descriptors.push_back(std::move(descriptor));
@@ -922,10 +1069,18 @@ private:
             result.ok = response.value("ok", false);
             result.hresult = parse_hresult(response);
             result.error = response.value("error", "");
-            if (auto value = response.find("value");
-                value != response.end() && value->is_string()) {
-                result.hasValue = true;
-                result.value = value->get<std::string>();
+            if (auto readback = response.find("readback");
+                readback != response.end() && readback->is_object()) {
+                result.hasReadback = true;
+                result.readback.value = readback->value("value", "");
+                result.readback.propertyType =
+                    readback->value("propertyType", "");
+                result.readback.valueType =
+                    readback->value("valueType", "");
+                result.readback.overridden =
+                    readback->value("overridden", false);
+                result.readback.source =
+                    readback->value("source", "");
             }
             if (auto properties = response.find("properties");
                 properties != response.end() && properties->is_array()) {
@@ -964,6 +1119,7 @@ private:
         m_schemasByFingerprint;
     std::unordered_map<std::string, CachedMutation> m_mutationsByDescriptorId;
     std::unordered_map<uint64_t, std::string> m_elementSchemaIds;
+    XamlEnumCatalog m_enumCatalog;
     uint64_t m_nextSchemaId = 1;
     uint64_t m_nextDescriptorId = 1;
     inline static std::atomic_uint64_t s_nextPropertyConnectionId = 1;
@@ -1135,8 +1291,13 @@ std::shared_ptr<XamlDiagConnection> XamlDiagConnection::connect(
 
     // std::shared_ptr with a private constructor: std::make_shared can't
     // call it directly, so construct with new and wrap.
-    return std::shared_ptr<XamlDiagConnection>(
-        new XamlDiagConnection(std::move(pipe), std::move(io), std::move(frameworkLabel)));
+    auto connection = std::shared_ptr<XamlDiagConnection>(
+        new XamlDiagConnection(
+            std::move(pipe), std::move(io), std::move(frameworkLabel)));
+    if (!connection->initialize_enum_catalog() && g_debug) {
+        fprintf(stderr, "lvt: typed enum catalog was unavailable for this connection\n");
+    }
+    return connection;
 }
 
 // Establishes a persistent XAML/WinUI3 diagnostics connection for reuse

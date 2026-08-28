@@ -206,16 +206,24 @@ opaque descriptor id and owns conversion:
 Setting and clearing require `lvt mcp --allow-input`. Clearing removes the
 local/provider value, allowing inherited, style, or default resolution to
 resume. Unknown, stale, element-mismatched, and read-only descriptor ids are
-rejected.
+rejected. Successful mutations include provider readback of the effective
+`value`, `runtimeType`, `source`, `overridden`, and `canClear` state. The
+returned value is never the caller's input echoed back; a failed readback is
+reported as an explicit mutation failure.
 
 The provider-neutral contract is implemented by the XAML/WinUI3 adapter today.
 Its schema cache is connection-scoped and contains metadata only, never live
 values. For xamlOM properties, the descriptor's declared `propertyType` comes
 from `PropertyChainValue.Type` and drives editor selection and `CreateInstance`;
 the evaluated value's `ValueType` is reported only as live `runtimeType` and
-never trusted for mutation. Other built-in provider adapters can implement the
-same contract without adding framework catalogs to clients. External plugin ABI
-support is not part of this contract.
+never trusted for mutation. Each persistent connection also fetches its XAML
+runtime enum catalog once. Enum descriptors expose ordered member-name
+choices; numeric runtime values are translated back to their first canonical
+member name, aliases remain available as separate choices, and values not in
+the catalog are rejected before mutation. System XAML and WinUI catalogs stay
+isolated with their owning connections. Other built-in provider adapters can
+implement the same contract without adding framework catalogs to clients.
+External plugin ABI support is not part of this contract.
 
 Tree reads and all three property operations share the session's existing
 persistent connection: there is no second injection or side protocol.

@@ -346,6 +346,10 @@ cached!(property_mutation, {
             "element": { "type": "string" },
             "descriptorId": { "type": "string" },
             "value": { "type": "string" },
+            "runtimeType": { "type": "string" },
+            "canClear": { "type": "boolean" },
+            "overridden": { "type": "boolean" },
+            "source": { "type": "string" },
             "cleared": { "type": "boolean" }
         },
         "required": ["ok", "element", "descriptorId"]

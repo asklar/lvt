@@ -189,12 +189,14 @@ Every message on the pipe is one line (UTF-8, `\n`-terminated). lvt.exe → TAP 
 | Direction | Message | Meaning |
 |-----------|---------|---------|
 | TAP → lvt | `READY` | Sent once, right after `AdviseVisualTreeChange` succeeds — before any bounds/property collection |
+| lvt → TAP | `GET_ENUMS <id>` | One-time request for the connection's cached XAML runtime enum catalog |
+| TAP → lvt | `{"type":"ENUM_RESULT","commandId":...}` | Enum type names plus ordered member names and exact machine values |
 | lvt → TAP | `GET_TREE` / `GET_TREE FAST` | Request a refresh; `FAST` overrides the connection's default fast-mode setting for this one response |
 | TAP → lvt | `[...]` | One JSON array of root nodes, in response to `GET_TREE` |
 | lvt → TAP | `GET_PROPERTIES <id> <handle>` | Request the deduplicated property chain for one XAML instance handle |
 | lvt → TAP | `SET_PROPERTY <id> <handle> <index> <valueHex>` | Resolve the declared property type, create a typed value, and set one dependency property |
 | lvt → TAP | `CLEAR_PROPERTY <id> <handle> <index>` | Clear a local value so inheritance/style/default resolution resumes |
-| TAP → lvt | `{"type":"PROPERTY_RESULT","commandId":...}` | Correlated typed property result; queued `CHANGE`/reset lines may precede it |
+| TAP → lvt | `{"type":"PROPERTY_RESULT","commandId":...}` | Correlated typed property result with post-mutation effective-value readback; queued `CHANGE`/reset lines may precede it |
 | lvt → TAP | `POLL_EVENTS <id>` | Drain the bounded structural-event queue without collecting a tree |
 | TAP → lvt | `{"type":"EVENTS_OVERFLOW"}` | Queued deltas overflowed; discard them and require a fresh snapshot |
 | TAP → lvt | `{"type":"EVENTS_RESULT","commandId":...}` | Acknowledges `POLL_EVENTS`; preceding event records have been drained |
@@ -211,6 +213,22 @@ uses `PropertyChainValue.Type` as the authoritative declared conversion type.
 The pipe worker never invokes thread-affine xamlOM methods itself: it
 synchronously dispatches the operation through the existing message-only
 window, then writes the result from the command thread.
+
+After `SetProperty` or `ClearProperty` succeeds, the TAP immediately re-runs
+`GetPropertyValuesChain` on the target UI thread and returns the matching
+property's actual effective value, runtime type, source, and override state.
+If that readback fails or the property is absent, the mutation response is an
+explicit failure even though the underlying write may already have completed;
+the protocol never returns a success-shaped echo of caller input.
+
+`IVisualTreeService::GetEnums` is called once in `SetSite`, on the target XAML
+UI thread. The TAP deep-copies the returned enum type names, member names, and
+machine values, then releases each type-name BSTR, both SAFEARRAYs (including
+their BSTR elements), and the outer CoTaskMem array. The host fetches that
+cached catalog once with `GET_ENUMS`; subsequent property reads reuse it.
+Descriptor choice values are enum member names, which are the canonical strings
+passed to `CreateInstance`, while machine values are retained to translate
+numeric property snapshots and preserve aliases.
 
 `OnVisualTreeChange` performs no pipe I/O. It only updates the tracked tree and
 enqueues a bounded in-memory structural record. `GET_TREE` and `POLL_EVENTS`

@@ -84,6 +84,10 @@ struct PropertyMutationResult {
         "Typed property mutation is not supported by this framework connection";
     bool hasValue = false;
     std::string value;
+    std::string runtimeType;
+    bool canClear = false;
+    bool overridden = false;
+    std::string source;
     bool cleared = false;
 };
 

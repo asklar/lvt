@@ -38,7 +38,7 @@ std::string read_text_file(const std::string& path) {
     return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 }
 
-int count_tap_set_site_calls() {
+int count_tap_log_lines(const char* text) {
     wchar_t tempPath[MAX_PATH];
     if (GetTempPathW(MAX_PATH, tempPath) == 0)
         return 0;
@@ -46,10 +46,18 @@ int count_tap_set_site_calls() {
     int count = 0;
     std::string line;
     while (std::getline(log, line)) {
-        if (line.find("SetSite called") != std::string::npos)
+        if (line.find(text) != std::string::npos)
             ++count;
     }
     return count;
+}
+
+int count_tap_set_site_calls() {
+    return count_tap_log_lines("SetSite called");
+}
+
+int count_tap_get_enums_calls() {
+    return count_tap_log_lines("GetEnums called once");
 }
 
 // A live MCP conversation with `lvt mcp` over anonymous pipes.
@@ -942,6 +950,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
     const auto session = connect(client);
     ASSERT_FALSE(session.empty());
     const int setSiteBefore = count_tap_set_site_calls();
+    const int getEnumsBefore = count_tap_get_enums_calls();
 
     auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
     ASSERT_TRUE(visual.contains("root")) << visual.dump(2);
@@ -1024,6 +1033,85 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
     const auto originalText = typed_property_value(statusProperties, "Text");
     const auto changedText = "mcp \"quoted\"\nvalue";
 
+    const auto* textAlignment =
+        find_property_descriptor(statusProperties, "TextAlignment");
+    ASSERT_NE(textAlignment, nullptr)
+        << "StatusText did not report TextAlignment";
+    EXPECT_EQ(textAlignment->value("kind", ""), "enum");
+    const auto alignmentDescriptorId =
+        textAlignment->value("descriptorId", "");
+    ASSERT_FALSE(alignmentDescriptorId.empty());
+    const auto alignmentChoices =
+        textAlignment->value("choices", json::array());
+    ASSERT_FALSE(alignmentChoices.empty()) << textAlignment->dump(2);
+    std::string centerValue;
+    for (const auto& choice : alignmentChoices) {
+        if (choice.value("label", "") == "Center") {
+            centerValue = choice.value("value", "");
+            break;
+        }
+    }
+    ASSERT_FALSE(centerValue.empty()) << alignmentChoices.dump(2);
+    const auto originalAlignment =
+        typed_property_value(statusProperties, "TextAlignment");
+    ASSERT_FALSE(originalAlignment.empty());
+
+    auto setAlignment = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", alignmentDescriptorId},
+             {"value", centerValue}},
+        &isError);
+    ASSERT_FALSE(isError) << setAlignment.dump(2);
+    EXPECT_EQ(setAlignment.value("value", ""), centerValue)
+        << "enum mutation must return canonical effective readback, not raw numeric storage";
+    EXPECT_FALSE(setAlignment.value("runtimeType", "").empty());
+    EXPECT_FALSE(setAlignment.value("overridden", true));
+    EXPECT_TRUE(setAlignment.value("canClear", false));
+    EXPECT_NE(setAlignment.value("source", "").find("Local"), std::string::npos);
+    auto centeredProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << centeredProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(centeredProperties, "TextAlignment"),
+        centerValue);
+    EXPECT_EQ(
+        centeredProperties.value("schemaId", ""),
+        statusProperties.value("schemaId", ""));
+    const auto* centeredAlignment =
+        find_property_descriptor(centeredProperties, "TextAlignment");
+    ASSERT_NE(centeredAlignment, nullptr);
+    EXPECT_EQ(
+        centeredAlignment->value("descriptorId", ""),
+        alignmentDescriptorId);
+
+    auto invalidAlignment = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", alignmentDescriptorId},
+             {"value", "__not_a_text_alignment__"}},
+        &isError);
+    EXPECT_TRUE(isError) << invalidAlignment.dump(2);
+    auto afterInvalidAlignment = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << afterInvalidAlignment.dump(2);
+    EXPECT_EQ(
+        typed_property_value(afterInvalidAlignment, "TextAlignment"),
+        centerValue);
+
+    auto restoreAlignment = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", alignmentDescriptorId},
+             {"value", originalAlignment}},
+        &isError);
+    ASSERT_FALSE(isError) << restoreAlignment.dump(2);
+
     auto unknown = client.call_tool(
         "set_property",
         json{{"session", session},
@@ -1058,10 +1146,18 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         json{{"session", session},
              {"element", key},
              {"descriptorId", opacityDescriptorId},
-             {"value", "0.5"}},
+             {"value", "0.5000"}},
         &isError);
     ASSERT_FALSE(isError) << set.dump(2);
     EXPECT_TRUE(set.value("ok", false));
+    ASSERT_TRUE(set.contains("value")) << set.dump(2);
+    EXPECT_NE(set.value("value", ""), "0.5000")
+        << "set_property must return the framework's effective formatting, not echo input";
+    EXPECT_NEAR(std::stod(set.value("value", "")), 0.5, 0.001);
+    EXPECT_FALSE(set.value("runtimeType", "").empty());
+    EXPECT_FALSE(set.value("overridden", true));
+    EXPECT_TRUE(set.value("canClear", false));
+    EXPECT_NE(set.value("source", "").find("Local"), std::string::npos);
     schemaError.clear();
     EXPECT_TRUE(schema_allows(
         schemas.at("set_property"), set, schemaError)) << schemaError;
@@ -1109,6 +1205,12 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         &isError);
     ASSERT_FALSE(isError) << clear.dump(2);
     EXPECT_TRUE(clear.value("cleared", false));
+    ASSERT_TRUE(clear.contains("value")) << clear.dump(2);
+    EXPECT_NEAR(std::stod(clear.value("value", "")), 1.0, 0.001);
+    EXPECT_FALSE(clear.value("runtimeType", "").empty());
+    EXPECT_FALSE(clear.value("overridden", true));
+    EXPECT_FALSE(clear.value("canClear", true));
+    EXPECT_FALSE(clear.value("source", "").empty());
     schemaError.clear();
     EXPECT_TRUE(schema_allows(
         schemas.at("clear_property"), clear, schemaError)) << schemaError;
@@ -1129,6 +1231,10 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
     ASSERT_FALSE(typed_property_value(clearedProperties, "Opacity").empty());
     EXPECT_NEAR(
         std::stod(typed_property_value(clearedProperties, "Opacity")), 1.0, 0.001);
+    EXPECT_EQ(
+        typed_property_value(clearedProperties, "Opacity"),
+        clear.value("value", ""))
+        << "clear_property readback must match the subsequent property snapshot";
 
     auto afterClear = client.call_tool(
         "get_visual_tree_changes", json{{"session", session}}, &isError);
@@ -1141,6 +1247,8 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
     EXPECT_EQ(count_tap_set_site_calls() - setSiteBefore, 1)
         << "one MCP session must reuse one TAP injection across tree reads and "
            "get/set/clear property operations";
+    EXPECT_EQ(count_tap_get_enums_calls() - getEnumsBefore, 1)
+        << "one persistent XAML connection must fetch its enum catalog once";
 }
 
 TEST_F(McpSampleFixture, ResourcesMatchEachSessionsFixedTreeMode) {

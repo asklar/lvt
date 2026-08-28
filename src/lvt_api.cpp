@@ -1377,6 +1377,12 @@ json property_mutation_result(
     };
     if (result.hasValue)
         out["value"] = result.value;
+    if (result.hasValue) {
+        out["runtimeType"] = result.runtimeType;
+        out["canClear"] = result.canClear;
+        out["overridden"] = result.overridden;
+        out["source"] = result.source;
+    }
     if (result.cleared)
         out["cleared"] = true;
     return out;

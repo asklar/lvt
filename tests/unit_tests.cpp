@@ -15,11 +15,13 @@
 #include "providers/connection_registry.h"
 #include "providers/framework_connection.h"
 #include "providers/overlapped_io.h"
+#include "providers/xaml_enum_catalog.h"
 #include "providers/uia_props.h"
 #include "input.h"
 #include "providers/uia_actions.h"
 #include "tap/xaml_property_filter.h"
 #include "tap/bounded_event_queue.h"
+#include "tap/xaml_enum_catalog.h"
 #include <oleacc.h>
 #include <UIAutomation.h>
 #include "wil_diagnostics.h"
@@ -1871,6 +1873,123 @@ TEST(TypedPropertyContract, EditorKindWireNamesAreProviderNeutral) {
         property_editor_kind_name(PropertyEditorKind::number), "number");
     EXPECT_STREQ(
         property_editor_kind_name(PropertyEditorKind::enumeration), "enum");
+}
+
+TEST(XamlEnumParser, DeepCopiesAliasesAndSanitizesTypeNames) {
+    std::vector<tap::EnumTypeInfo> copied;
+    {
+        auto* raw = static_cast<EnumType*>(
+            CoTaskMemAlloc(sizeof(EnumType)));
+        ASSERT_NE(raw, nullptr);
+        ZeroMemory(raw, sizeof(EnumType));
+        tap::OwnedEnumTypes owned(raw, 1);
+
+        raw[0].Name =
+            SysAllocString(L"Microsoft.UI.Xaml.Text\nAlignment");
+        raw[0].ValueInts = SafeArrayCreateVector(VT_INT, 0, 3);
+        raw[0].ValueStrings = SafeArrayCreateVector(VT_BSTR, 0, 3);
+        ASSERT_NE(raw[0].Name, nullptr);
+        ASSERT_NE(raw[0].ValueInts, nullptr);
+        ASSERT_NE(raw[0].ValueStrings, nullptr);
+
+        const int machineValues[] = {0, 0, 1};
+        const wchar_t* names[] = {L"Left", L"Start", L"Center"};
+        for (LONG index = 0; index < 3; ++index) {
+            int machineValue = machineValues[index];
+            ASSERT_EQ(
+                SafeArrayPutElement(
+                    raw[0].ValueInts, &index, &machineValue),
+                S_OK);
+            wil::unique_bstr name(SysAllocString(names[index]));
+            ASSERT_TRUE(name);
+            ASSERT_EQ(
+                SafeArrayPutElement(
+                    raw[0].ValueStrings, &index, name.get()),
+                S_OK);
+        }
+
+        ASSERT_EQ(tap::copy_enum_types(
+                      owned.get(), owned.count(), copied),
+                  S_OK);
+    }
+
+    ASSERT_EQ(copied.size(), 1u);
+    EXPECT_EQ(
+        copied[0].name, L"Microsoft.UI.Xaml.TextAlignment");
+    ASSERT_EQ(copied[0].members.size(), 3u);
+    EXPECT_EQ(copied[0].members[0].machineValue, 0);
+    EXPECT_EQ(copied[0].members[0].name, L"Left");
+    EXPECT_EQ(copied[0].members[1].machineValue, 0);
+    EXPECT_EQ(copied[0].members[1].name, L"Start");
+    EXPECT_EQ(copied[0].members[2].machineValue, 1);
+    EXPECT_EQ(copied[0].members[2].name, L"Center");
+}
+
+TEST(XamlEnumParser, MalformedCatalogStillReleasesOwnedMemory) {
+    auto* raw = static_cast<EnumType*>(
+        CoTaskMemAlloc(sizeof(EnumType)));
+    ASSERT_NE(raw, nullptr);
+    ZeroMemory(raw, sizeof(EnumType));
+    tap::OwnedEnumTypes owned(raw, 1);
+    raw[0].Name = SysAllocString(L"Broken.Enum");
+    raw[0].ValueInts = SafeArrayCreateVector(VT_INT, 0, 1);
+    ASSERT_NE(raw[0].Name, nullptr);
+    ASSERT_NE(raw[0].ValueInts, nullptr);
+
+    std::vector<tap::EnumTypeInfo> copied;
+    EXPECT_EQ(
+        tap::copy_enum_types(owned.get(), owned.count(), copied),
+        E_INVALIDARG);
+    EXPECT_TRUE(copied.empty());
+}
+
+TEST(XamlEnumCatalog, AssociatesChoicesCanonicalValuesAndAliases) {
+    XamlEnumCatalog catalog;
+    catalog.add(
+        "Microsoft.UI.Xaml.TextAlignment",
+        {
+            {-1, "Unset"},
+            {0, "Left"},
+            {0, "Start"},
+            {1, "Center"},
+            {2, "Right"},
+        });
+
+    const auto choices =
+        catalog.choices_for("Microsoft.UI.Xaml.TextAlignment");
+    ASSERT_EQ(choices.size(), 5u);
+    EXPECT_EQ(choices[0].value, "Unset");
+    EXPECT_EQ(choices[1].value, "Left");
+    EXPECT_EQ(choices[2].value, "Start");
+    EXPECT_EQ(choices[3].label, "Center");
+    EXPECT_TRUE(catalog.accepts(
+        "Microsoft.UI.Xaml.TextAlignment", "Center"));
+    EXPECT_FALSE(catalog.accepts(
+        "Microsoft.UI.Xaml.TextAlignment", "1"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.TextAlignment", "0"),
+        std::optional<std::string>("Left"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.TextAlignment", "-1"),
+        std::optional<std::string>("Unset"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.TextAlignment", "Center"),
+        std::optional<std::string>("Center"));
+}
+
+TEST(XamlEnumCatalog, ConnectionCatalogsRemainIsolated) {
+    XamlEnumCatalog systemXaml;
+    XamlEnumCatalog winui;
+    systemXaml.add("Shared.Enum", {{0, "SystemValue"}});
+    winui.add("Shared.Enum", {{0, "WinUIValue"}});
+
+    EXPECT_TRUE(systemXaml.accepts("Shared.Enum", "SystemValue"));
+    EXPECT_FALSE(systemXaml.accepts("Shared.Enum", "WinUIValue"));
+    EXPECT_TRUE(winui.accepts("Shared.Enum", "WinUIValue"));
+    EXPECT_FALSE(winui.accepts("Shared.Enum", "SystemValue"));
 }
 
 TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {
