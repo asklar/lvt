@@ -22,11 +22,13 @@ public sealed class PropertyRowViewModel : ObservableObject
     public PropertyRowViewModel(string name, string value)
     {
         Name = name;
+        ProviderName = name;
         Kind = PropertyEditorKind.ReadOnly;
         Value = value;
     }
 
     public string Name { get; private set; }
+    public string ProviderName { get; private set; }
 
     public PropertyEditorKind Kind
     {
@@ -111,6 +113,7 @@ public sealed class PropertyRowViewModel : ObservableObject
         PropertyDescriptorDto descriptor, PropertyValueDto value)
     {
         IsTypedProperty = true;
+        ProviderName = descriptor.Name;
         Name = string.IsNullOrWhiteSpace(descriptor.DisplayName)
             ? descriptor.Name
             : descriptor.DisplayName;
@@ -148,6 +151,7 @@ public sealed class PropertyRowViewModel : ObservableObject
         Validate();
 
         OnPropertyChanged(nameof(Name));
+        OnPropertyChanged(nameof(ProviderName));
         OnPropertyChanged(nameof(IsTypedProperty));
         OnPropertyChanged(nameof(DescriptorId));
         OnPropertyChanged(nameof(PropertyType));

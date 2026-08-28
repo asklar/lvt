@@ -268,6 +268,16 @@ if(LVT_BUILD_VIEWER)
         )
         add_dependencies(lvt_viewer lvt)
     endif()
+
+    set(LVT_VIEWER_TEST_PROJECT
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer.Tests/LvtViewer.Tests.csproj")
+    add_custom_target(lvt_viewer_tests
+        COMMAND "${LVT_DOTNET_EXE}" build "${LVT_VIEWER_TEST_PROJECT}"
+            -c Release -p:Platform=x64
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Building lvt Viewer regression tests"
+    )
+    add_dependencies(lvt_viewer_tests lvt_viewer)
 endif()
 
 # --- MCP server (Rust) -----------------------------------------------------
@@ -1043,6 +1053,14 @@ target_link_libraries(lvt_unit_tests PRIVATE
     dwmapi windowsapp
 )
 add_test(NAME unit_tests COMMAND lvt_unit_tests)
+
+if(LVT_BUILD_VIEWER)
+    add_test(
+        NAME viewer_tests
+        COMMAND "${LVT_DOTNET_EXE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer.Tests/bin/x64/Release/net10.0-windows/LvtViewer.Tests.dll"
+    )
+endif()
 
 # Compile-only guard: links lvt_core with no include dirs of its own, so it sees
 # only what lvt_core propagates. Catches a public header depending on something

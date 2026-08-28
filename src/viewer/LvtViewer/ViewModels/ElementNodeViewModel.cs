@@ -213,7 +213,10 @@ public sealed class ElementNodeViewModel : ObservableObject
         }
         // Drop rows for properties that no longer appear at all (rare on a
         // full snapshot, but keeps a re-added node from carrying stale rows).
-        foreach (var stale in PropertyRows.Where(r => !seen.Contains(r.Name) && !r.IsEditable).ToList())
+        foreach (var stale in PropertyRows.Where(
+                     r => !r.IsTypedProperty &&
+                          !seen.Contains(r.ProviderName) &&
+                          !r.IsEditable).ToList())
         {
             PropertyRows.Remove(stale);
             PropertyVersion++;
@@ -248,7 +251,10 @@ public sealed class ElementNodeViewModel : ObservableObject
     /// <summary>Upserts a property row, or removes a non-editable row whose value went empty.</summary>
     public void SetProperty(string name, string value)
     {
-        var row = PropertyRows.FirstOrDefault(r => r.Name == name);
+        var row = PropertyRows.FirstOrDefault(
+                      r => r.IsTypedProperty && r.ProviderName == name)
+                  ?? PropertyRows.FirstOrDefault(
+                      r => !r.IsTypedProperty && r.ProviderName == name);
         if (row == null)
         {
             if (value.Length == 0)
@@ -293,7 +299,8 @@ public sealed class ElementNodeViewModel : ObservableObject
         var merged = PropertyRows.Where(row => !row.IsTypedProperty).ToList();
         foreach (var row in rows)
         {
-            var treeRow = merged.FirstOrDefault(existing => existing.Name == row.Name);
+            var treeRow = merged.FirstOrDefault(
+                existing => existing.ProviderName == row.ProviderName);
             if (treeRow != null)
                 merged.Remove(treeRow);
             merged.Add(row);
@@ -345,5 +352,5 @@ public sealed class ElementNodeViewModel : ObservableObject
     }
 
     public PropertyRowViewModel? FindProperty(string name) =>
-        PropertyRows.FirstOrDefault(r => r.Name == name);
+        PropertyRows.FirstOrDefault(r => r.ProviderName == name);
 }
