@@ -1221,6 +1221,37 @@ TEST_F(WinFormsSampleFixture, PersistentConnectionReusesServerAndStableIdentity)
     EXPECT_EQ(refreshedButton->providerHandle, firstButton->providerHandle);
     EXPECT_EQ(refreshedButton->key, firstButton->key);
 }
+
+TEST_F(WinFormsSampleFixture, X86HostfxrAbiRunsTreeAndProperties) {
+    if (sizeof(void*) != 4)
+        GTEST_SKIP() << "x86 ABI regression";
+
+    HWND hwnd = visible_window_for_pid(s_pid);
+    ASSERT_NE(hwnd, nullptr);
+    lvt::WinFormsProvider provider;
+    auto connection = provider.open_connection(hwnd, s_pid);
+    ASSERT_NE(connection, nullptr)
+        << "the x86 TAP must enter managed RunServer without a CRT ABI failure";
+
+    auto tree = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(connection->get_tree(tree, false));
+    const auto* form = find_named_element(tree, "MainForm");
+    ASSERT_NE(form, nullptr);
+    auto snapshot =
+        connection->get_property_snapshot(form->providerHandle);
+    ASSERT_TRUE(snapshot.ok) << snapshot.error;
+    const auto* property =
+        find_property_descriptor(snapshot, "EditableText");
+    ASSERT_NE(property, nullptr);
+    auto set = connection->set_property(
+        form->providerHandle, property->descriptorId, "x86 ABI");
+    ASSERT_TRUE(set.ok) << set.error;
+    EXPECT_EQ(set.value, "x86 ABI");
+    auto clear = connection->clear_property(
+        form->providerHandle, property->descriptorId);
+    ASSERT_TRUE(clear.ok) << clear.error;
+    EXPECT_EQ(clear.value, "Default text");
+}
 #endif
 
 class WpfSampleFixture : public ::testing::Test {
@@ -1489,6 +1520,37 @@ TEST_F(WpfSampleFixture, PersistentConnectionReusesServerAndStableIdentity) {
     ASSERT_NE(refreshedButton, nullptr);
     EXPECT_EQ(refreshedButton->providerHandle, firstButton->providerHandle);
     EXPECT_EQ(refreshedButton->key, firstButton->key);
+}
+
+TEST_F(WpfSampleFixture, X86HostfxrAbiRunsTreeAndProperties) {
+    if (sizeof(void*) != 4)
+        GTEST_SKIP() << "x86 ABI regression";
+
+    HWND hwnd = visible_window_for_pid(s_pid);
+    ASSERT_NE(hwnd, nullptr);
+    lvt::WpfProvider provider;
+    auto connection = provider.open_connection(hwnd, s_pid);
+    ASSERT_NE(connection, nullptr)
+        << "the x86 TAP must enter managed RunServer without a CRT ABI failure";
+
+    auto tree = lvt::build_tree(hwnd, s_pid, {});
+    ASSERT_TRUE(connection->get_tree(tree, false));
+    const auto* button = find_named_element(tree, "OkButton");
+    ASSERT_NE(button, nullptr);
+    auto snapshot =
+        connection->get_property_snapshot(button->providerHandle);
+    ASSERT_TRUE(snapshot.ok) << snapshot.error;
+    const auto* property =
+        find_property_descriptor(snapshot, "Opacity");
+    ASSERT_NE(property, nullptr);
+    auto set = connection->set_property(
+        button->providerHandle, property->descriptorId, "0.4");
+    ASSERT_TRUE(set.ok) << set.error;
+    EXPECT_NEAR(std::stod(set.value), 0.4, 0.001);
+    auto clear = connection->clear_property(
+        button->providerHandle, property->descriptorId);
+    ASSERT_TRUE(clear.ok) << clear.error;
+    EXPECT_NEAR(std::stod(clear.value), 0.75, 0.001);
 }
 #endif
 

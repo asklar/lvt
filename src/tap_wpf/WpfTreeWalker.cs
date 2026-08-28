@@ -19,6 +19,7 @@ namespace LvtWpfTap
 {
     public static class WpfTreeWalker
     {
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         public delegate int RunServerDelegate(IntPtr pipeNamePtr, int pipeNameLength);
 
         private const int UiTimeoutMilliseconds = 10000;

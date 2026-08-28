@@ -1,4 +1,5 @@
 #include "managed_tap_host.h"
+#include "managed_host_abi.h"
 
 #include <metahost.h>
 #include <wil/com.h>
@@ -169,19 +170,17 @@ HMODULE LoadHostFxr() {
 }
 
 bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pipeName) {
+    using namespace lvt::managed_host_abi;
+
     HMODULE hostFxr = LoadHostFxr();
     if (!hostFxr)
         return false;
 
-    using InitializeFn = int(__cdecl*)(
-        const wchar_t*, const void*, void**);
-    using GetDelegateFn = int(__cdecl*)(void*, int, void**);
-    using CloseFn = int(__cdecl*)(void*);
-    auto initialize = reinterpret_cast<InitializeFn>(
+    auto initialize = reinterpret_cast<hostfxr_initialize_for_runtime_config_fn>(
         GetProcAddress(hostFxr, "hostfxr_initialize_for_runtime_config"));
-    auto getDelegate = reinterpret_cast<GetDelegateFn>(
+    auto getDelegate = reinterpret_cast<hostfxr_get_runtime_delegate_fn>(
         GetProcAddress(hostFxr, "hostfxr_get_runtime_delegate"));
-    auto close = reinterpret_cast<CloseFn>(
+    auto close = reinterpret_cast<hostfxr_close_fn>(
         GetProcAddress(hostFxr, "hostfxr_close"));
     if (!initialize || !getDelegate || !close)
         return false;
@@ -196,7 +195,7 @@ bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pipeName) 
         return false;
     }
 
-    void* hostContext = nullptr;
+    hostfxr_handle hostContext = nullptr;
     int result = initialize(runtimeConfig.c_str(), nullptr, &hostContext);
     if (result < 0 || !hostContext) {
         if (hostContext)
@@ -205,17 +204,19 @@ bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pipeName) 
     }
 
     void* loadAndGetPointer = nullptr;
-    result = getDelegate(hostContext, 5, &loadAndGetPointer);
+    result = getDelegate(
+        hostContext,
+        hostfxr_delegate_type::load_assembly_and_get_function_pointer,
+        &loadAndGetPointer);
     if (result < 0 || !loadAndGetPointer) {
         close(hostContext);
         return false;
     }
 
-    using LoadAssemblyFn = int(STDMETHODCALLTYPE*)(
-        const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*, void*, void**);
-    auto loadAssembly = reinterpret_cast<LoadAssemblyFn>(loadAndGetPointer);
-    using RunServerFn = int(STDMETHODCALLTYPE*)(const wchar_t*, int);
-    RunServerFn runServer = nullptr;
+    auto loadAssembly =
+        reinterpret_cast<load_assembly_and_get_function_pointer_fn>(
+            loadAndGetPointer);
+    managed_run_server_fn runServer = nullptr;
     result = loadAssembly(
         assemblyPath.c_str(), g_config.coreTypeName, g_config.methodName,
         g_config.coreDelegateTypeName, nullptr,
