@@ -117,7 +117,16 @@ public sealed class McpSession : IAsyncDisposable, IDisposable
             catch (Exception ex)
             {
                 lock (_stateGate)
-                    _process = null;
+                {
+                    if (ReferenceEquals(_process, process))
+                        _process = null;
+                    if (ReferenceEquals(_cts, cts))
+                        _cts = null;
+                    _sessionId = null;
+                    _resourceUri = null;
+                    _resourceReadRunning = false;
+                    _resourceReadPending = false;
+                }
                 process.Dispose();
                 cts.Dispose();
                 return new(false, $"could not start '{exePath} mcp': {ex.Message}");

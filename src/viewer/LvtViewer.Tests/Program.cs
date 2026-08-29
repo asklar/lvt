@@ -1,3 +1,4 @@
+using System.IO;
 using LvtViewer.Models;
 using LvtViewer.Services;
 using LvtViewer.ViewModels;
@@ -310,5 +311,17 @@ Assert(schemaCache.TryGet(
     $"schema-{PropertyDescriptorSchemaCache.MaximumSchemas * 4 - 1}",
     out var currentSchema), "current Viewer schema was evicted");
 Assert(currentSchema.Count == 1, "current Viewer schema descriptors were lost");
+
+var missingExecutable = Path.Combine(
+    AppContext.BaseDirectory,
+    $"missing-lvt-{Guid.NewGuid():N}.exe");
+var failedSession = new McpSession();
+var firstFailure = await failedSession.StartAsync(
+    missingExecutable, "0x1", uia: true);
+Assert(!firstFailure.Ok, "missing MCP executable unexpectedly started");
+var secondFailure = await failedSession.StartAsync(
+    missingExecutable, "0x1", uia: true);
+Assert(!secondFailure.Ok, "second missing-executable start unexpectedly succeeded");
+failedSession.Dispose();
 
 Console.WriteLine("Viewer property regressions passed.");
