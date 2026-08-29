@@ -296,16 +296,20 @@ public sealed class ElementNodeViewModel : ObservableObject
 
     public void ReplaceTypedPropertyRows(
         IEnumerable<PropertyRowViewModel> rows,
-        bool preservePendingEdits = false)
+        bool preservePendingEdits = false,
+        string? acceptedProviderName = null)
     {
+        var incoming = rows.ToList();
         var existingTyped = PropertyRows
             .Where(row => row.IsTypedProperty)
             .ToDictionary(row => row.ProviderName, StringComparer.Ordinal);
         var merged = PropertyRows.Where(row => !row.IsTypedProperty).ToList();
-        foreach (var row in rows)
+        foreach (var row in incoming)
         {
             if (preservePendingEdits &&
-                existingTyped.TryGetValue(row.ProviderName, out var existing))
+                existingTyped.TryGetValue(row.ProviderName, out var existing) &&
+                row.ProviderName != acceptedProviderName &&
+                existing.IsDirty)
             {
                 row.PreservePendingEditFrom(existing);
             }
@@ -314,6 +318,25 @@ public sealed class ElementNodeViewModel : ObservableObject
             if (treeRow != null)
                 merged.Remove(treeRow);
             merged.Add(row);
+        }
+        if (preservePendingEdits)
+        {
+            var incomingNames = incoming
+                .Select(row => row.ProviderName)
+                .ToHashSet(StringComparer.Ordinal);
+            foreach (var existing in existingTyped.Values)
+            {
+                if (!existing.IsDirty ||
+                    existing.ProviderName == acceptedProviderName ||
+                    incomingNames.Contains(existing.ProviderName))
+                {
+                    continue;
+                }
+                existing.MarkUnavailable(
+                    "The provider no longer exposes this descriptor. "
+                    + "Your pending edit was retained until you reselect or reload.");
+                merged.Add(existing);
+            }
         }
         // One collection replacement produces one ItemsControl refresh.
         // Clearing/adding hundreds of dependency properties individually

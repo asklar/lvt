@@ -220,6 +220,26 @@ public sealed class PropertyRowViewModel : ObservableObject
              !string.Equals(existing.Value, Value, StringComparison.Ordinal));
     }
 
+    public void MarkUnavailable(string reason)
+    {
+        Kind = PropertyEditorKind.ReadOnly;
+        CanClear = false;
+        Description = string.IsNullOrWhiteSpace(Description)
+            ? reason
+            : $"{Description} · {reason}";
+        HasExternalConflict = IsDirty;
+        OnPropertyChanged(nameof(CanClear));
+        OnPropertyChanged(nameof(Description));
+        OnPropertyChanged(nameof(Details));
+        OnPropertyChanged(nameof(CanApply));
+    }
+
+    public void DiscardPendingEdit()
+    {
+        EditText = Value;
+        HasExternalConflict = false;
+    }
+
     private void Validate()
     {
         string error = "";

@@ -21,8 +21,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly Dispatcher _dispatcher;
     private readonly LiveTree _liveTree = new();
     private readonly McpSession _mcp = new();
-    private readonly Dictionary<string, IReadOnlyList<PropertyDescriptorDto>>
-        _propertySchemas = new(StringComparer.Ordinal);
+    private readonly PropertyDescriptorSchemaCache _propertySchemas = new();
 
     private string _statusText = "Drag the crosshair onto a window to inspect it.";
     private string _targetText = "No target";
@@ -36,6 +35,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private int _connectionGeneration;
     private readonly DispatcherTimer _targetLivenessTimer;
     private readonly DispatcherTimer _typedPropertyRefreshTimer;
+    private readonly TypedPropertyRefreshState _typedPropertyRefreshState = new();
+    private int _typedPropertyRefreshDelayMs = 100;
     private bool _awaitingSnapshot;
     private bool _resourceProbeRunning;
     private int _resourceProbeFailures;
@@ -66,14 +67,37 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _typedPropertyRefreshTimer.Tick += async (_, _) =>
         {
             _typedPropertyRefreshTimer.Stop();
+            if (!_typedPropertyRefreshState.TryBegin(out var refreshGeneration))
+                return;
             var node = SelectedElement;
             var generation = _connectionGeneration;
-            if (!UseUia || node == null)
-                return;
-            await RefreshTypedPropertiesAsync(
-                node, preservePendingEdits: true);
-            if (generation != _connectionGeneration)
-                return;
+            bool applied = false;
+            try
+            {
+                if (UseUia && node != null)
+                {
+                    applied = await RefreshTypedPropertiesAsync(
+                        node, preservePendingEdits: true);
+                    applied = applied &&
+                              generation == _connectionGeneration &&
+                              SelectedElement == node;
+                }
+            }
+            finally
+            {
+                _typedPropertyRefreshState.Complete(
+                    refreshGeneration, applied);
+                _typedPropertyRefreshDelayMs = applied
+                    ? 100
+                    : Math.Min(_typedPropertyRefreshDelayMs * 2, 1000);
+                if (_typedPropertyRefreshState.HasPending &&
+                    UseUia && SelectedElement != null)
+                {
+                    _typedPropertyRefreshTimer.Interval =
+                        TimeSpan.FromMilliseconds(_typedPropertyRefreshDelayMs);
+                    _typedPropertyRefreshTimer.Start();
+                }
+            }
         };
 
         _mcp.PatchReceived += (generation, patch) =>
@@ -239,6 +263,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (_selectedElement != null)
                 _selectedElement.PropertyChanged += OnSelectedElementPropertyChanged;
             RebuildPropertyView();
+            _typedPropertyRefreshTimer.Stop();
+            _typedPropertyRefreshState.Reset();
             IsPropertyPanelLoading = value != null;
             if (UseUia)
                 _ = RefreshUiaPropertiesAsync(value);
@@ -377,19 +403,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         bool refreshTypedSchema = false;
         foreach (var evt in patch.Events)
         {
-            _liveTree.Apply(evt);
             if (UseUia && SelectedElement != null &&
                 PatchAffectsTypedSchema(evt, SelectedElement))
             {
                 refreshTypedSchema = true;
             }
+            _liveTree.Apply(evt);
             DiscoverFrameworks(evt);
         }
         if (refreshTypedSchema)
-        {
-            _typedPropertyRefreshTimer.Stop();
-            _typedPropertyRefreshTimer.Start();
-        }
+            RequestTypedPropertySchemaRefresh();
         ScheduleFilterRefresh();
         _lastPatchUtc = DateTime.UtcNow;
         _resourceProbeFailures = 0;
@@ -647,27 +670,40 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         await RefreshTypedPropertiesAsync(node);
     }
 
-    private async System.Threading.Tasks.Task RefreshTypedPropertiesAsync(
-        ElementNodeViewModel? node, bool preservePendingEdits = false)
+    private void RequestTypedPropertySchemaRefresh()
+    {
+        _typedPropertyRefreshState.Request();
+        if (_typedPropertyRefreshState.IsRunning)
+            return;
+        _typedPropertyRefreshDelayMs = 100;
+        _typedPropertyRefreshTimer.Interval =
+            TimeSpan.FromMilliseconds(_typedPropertyRefreshDelayMs);
+        _typedPropertyRefreshTimer.Stop();
+        _typedPropertyRefreshTimer.Start();
+    }
+
+    private async System.Threading.Tasks.Task<bool> RefreshTypedPropertiesAsync(
+        ElementNodeViewModel? node, bool preservePendingEdits = false,
+        string? acceptedProviderName = null)
     {
         if (node == null)
         {
             IsPropertyPanelLoading = false;
-            return;
+            return true;
         }
 
         long propertyVersion = node.PropertyVersion;
         var stopwatch = Stopwatch.StartNew();
         var result = await _mcp.GetEditablePropertiesAsync(node.Key);
         if (SelectedElement != node || node.PropertyVersion != propertyVersion)
-            return;
+            return false;
         if (!result.Ok)
         {
             Logger.Log(
                 "properties",
                 $"No typed property provider for {node.Key}: {result.Error}");
             IsPropertyPanelLoading = false;
-            return;
+            return false;
         }
 
         string snapshotJson = result.Payload.GetRawText();
@@ -675,19 +711,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             System.Text.Json.JsonSerializer.Deserialize<PropertySnapshotDto>(
                 snapshotJson, JsonDefaults.Options));
         if (SelectedElement != node || node.PropertyVersion != propertyVersion)
-            return;
+            return false;
         if (snapshot == null || string.IsNullOrWhiteSpace(snapshot.SchemaId))
         {
             IsPropertyPanelLoading = false;
-            return;
+            return false;
         }
 
-        if (!_propertySchemas.TryGetValue(snapshot.SchemaId, out var descriptors))
+        if (!_propertySchemas.TryGet(snapshot.SchemaId, out var descriptors))
         {
             foreach (var descriptor in snapshot.Descriptors)
                 descriptor.PreparePresentation();
             descriptors = snapshot.Descriptors;
-            _propertySchemas[snapshot.SchemaId] = descriptors;
+            _propertySchemas.Store(
+                snapshot.SchemaId, descriptors, snapshot.SchemaId);
         }
 
         var values = snapshot.Values.ToDictionary(
@@ -703,12 +740,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             })
             .ToList();
 
-        node.ReplaceTypedPropertyRows(rows, preservePendingEdits);
+        node.ReplaceTypedPropertyRows(
+            rows, preservePendingEdits, acceptedProviderName);
         IsPropertyPanelLoading = false;
         Logger.Log(
             "properties",
             $"Loaded {rows.Count} typed properties from schema {snapshot.SchemaId} " +
             $"in {stopwatch.ElapsedMilliseconds} ms");
+        return true;
     }
 
     private async System.Threading.Tasks.Task SetPropertyAsync(PropertyRowViewModel? row)
@@ -727,8 +766,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             StatusText = $"Set failed: {result.Error}";
             return;
         }
+        var acceptedValue = row.EditText;
+        if (result.Payload.TryGetProperty("value", out var returnedValue) &&
+            returnedValue.ValueKind == System.Text.Json.JsonValueKind.String)
+        {
+            acceptedValue = returnedValue.GetString() ?? acceptedValue;
+        }
+        row.UpdateProviderValue(
+            acceptedValue, preservePendingEdit: false);
         StatusText = $"{row.Name} updated.";
-        await RefreshTypedPropertiesAsync(node);
+        await RefreshTypedPropertiesAsync(
+            node,
+            preservePendingEdits: true,
+            acceptedProviderName: row.ProviderName);
     }
 
     private async System.Threading.Tasks.Task ClearPropertyAsync(PropertyRowViewModel? row)
@@ -746,8 +796,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             StatusText = $"Clear failed: {result.Error}";
             return;
         }
+        row.DiscardPendingEdit();
         StatusText = $"{row.Name} restored.";
-        await RefreshTypedPropertiesAsync(node);
+        await RefreshTypedPropertiesAsync(
+            node,
+            preservePendingEdits: true,
+            acceptedProviderName: row.ProviderName);
     }
 
     private async System.Threading.Tasks.Task HandleTargetClosedAsync()
@@ -777,9 +831,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public static bool PatchAffectsTypedSchema(
         TreeChangeEventDto evt, ElementNodeViewModel selected)
     {
-        if (evt.Event != "changed" || evt.Fields == null)
-            return false;
-
         bool isSelected = evt.Key == selected.Key;
         bool isSelectionAncestor = false;
         for (var ancestor = selected.Parent;
@@ -792,6 +843,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 break;
             }
         }
+        bool selectedOrAncestor = isSelected || isSelectionAncestor;
+        if (evt.Event == "removed" && selectedOrAncestor)
+            return true;
+        if (evt.Event == "added" &&
+            !string.IsNullOrEmpty(evt.Path) &&
+            selected.Path.StartsWith(evt.Path + ".", StringComparison.Ordinal))
+        {
+            return true;
+        }
+        if (evt.Event != "changed" || evt.Fields == null)
+            return false;
+        if (selectedOrAncestor && evt.Fields.ContainsKey("path"))
+            return true;
+        if (isSelected && evt.Fields.ContainsKey("type"))
+            return true;
 
         foreach (var field in evt.Fields.Keys)
         {
@@ -805,6 +871,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 "RangeValue.IsReadOnly" or
                 "RangeValue.Minimum" or
                 "RangeValue.Maximum" or
+                "ExpandCollapse.State" or
                 "Scroll.HorizontallyScrollable" or
                 "Scroll.VerticallyScrollable"))
             {

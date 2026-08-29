@@ -82,6 +82,25 @@ Assert(toggleRow.HasExternalConflict, "enum conflict was not surfaced");
 Assert(numberRow.HasExternalConflict, "number conflict was not surfaced");
 Assert(node.PropertyRows.Count == 3, "resource patches created duplicate property rows");
 
+var acceptedValue = TypedRow(
+    "Value.Value", "Value", "accepted text", "string");
+var retainedToggle = TypedRow(
+    "Toggle.ToggleState", "Toggle state", "Indeterminate", "enum",
+    ("Off", "Off"), ("On", "On"));
+var retainedNumber = TypedRow(
+    "RangeValue.Value", "Range value", "11", "number");
+node.ReplaceTypedPropertyRows(
+    [acceptedValue, retainedToggle, retainedNumber],
+    preservePendingEdits: true,
+    acceptedProviderName: "Value.Value");
+var acceptedValueRow = node.FindProperty("Value.Value")!;
+var unrelatedToggle = node.FindProperty("Toggle.ToggleState")!;
+var unrelatedNumber = node.FindProperty("RangeValue.Value")!;
+Assert(!acceptedValueRow.IsDirty, "submitted row was not explicitly accepted");
+Assert(acceptedValueRow.EditText == "accepted text", "submitted row did not reset");
+Assert(unrelatedToggle.EditText == "On", "setting one row discarded another enum edit");
+Assert(unrelatedNumber.EditText == "12.5", "setting one row discarded another number edit");
+
 var refreshedValue = TypedRowFromDescriptor(
     new PropertyDescriptorDto
     {
@@ -124,16 +143,19 @@ node.ReplaceTypedPropertyRows(
 var preservedValue = node.FindProperty("Value.Value")!;
 var preservedToggle = node.FindProperty("Toggle.ToggleState")!;
 var preservedNumber = node.FindProperty("RangeValue.Value")!;
-Assert(preservedValue.EditText == "pending text", "metadata refresh lost the pending edit");
-Assert(preservedValue.HasExternalConflict, "metadata refresh hid the edit conflict");
 Assert(preservedValue.Kind == PropertyEditorKind.ReadOnly, "writability/kind metadata did not refresh");
 Assert(preservedToggle.Choices.Count == 1, "enum choices did not refresh");
 Assert(!preservedToggle.CanApply, "removed enum choice remained applicable");
 Assert(preservedNumber.Maximum == 20, "numeric limits did not refresh");
 Assert(preservedNumber.EditText == "12.5", "numeric metadata refresh lost pending edit");
-preservedValue.UpdateProviderValue("accepted text", preservePendingEdit: false);
-Assert(!preservedValue.IsDirty, "successful refresh did not reset dirty state");
-Assert(preservedValue.EditText == "accepted text", "successful refresh did not accept provider value");
+
+node.ReplaceTypedPropertyRows(
+    [refreshedValue, refreshedToggle],
+    preservePendingEdits: true);
+preservedNumber = node.FindProperty("RangeValue.Value")!;
+Assert(preservedNumber.Kind == PropertyEditorKind.ReadOnly, "disappearing dirty descriptor was not retained read-only");
+Assert(preservedNumber.EditText == "12.5", "numeric metadata refresh lost pending edit");
+Assert(preservedNumber.HasExternalConflict, "disappearing dirty descriptor conflict was hidden");
 
 preservedToggle.EditText = "not-a-provider-value";
 Assert(!preservedToggle.CanApply, "arbitrary enum text was accepted");
@@ -143,6 +165,16 @@ Assert(preservedToggle.CanApply, "provider enum choice was rejected");
 var booleanRow = TypedRow("Flag", "Flag", "true", "boolean");
 booleanRow.EditText = "TRUE";
 Assert(booleanRow.CanApply, "boolean validation stopped being case-insensitive");
+
+var refreshState = new TypedPropertyRefreshState();
+var requested = refreshState.Request();
+Assert(refreshState.TryBegin(out var firstAttempt), "schema refresh did not start");
+Assert(firstAttempt == requested, "schema refresh generation drifted");
+refreshState.Complete(firstAttempt, applied: false);
+Assert(refreshState.HasPending, "ordinary value race lost the pending schema refresh");
+Assert(refreshState.TryBegin(out var retryAttempt), "stale schema refresh was not retried");
+refreshState.Complete(retryAttempt, applied: true);
+Assert(!refreshState.HasPending, "latest schema refresh was not marked applied");
 
 var liveTree = new LiveTree();
 liveTree.Apply(new TreeChangeEventDto
@@ -179,6 +211,21 @@ Assert(MainViewModel.PatchAffectsTypedSchema(
     new TreeChangeEventDto
     {
         Event = "changed",
+        Key = "selected",
+        Fields = new()
+        {
+            ["properties.ExpandCollapse.State"] = new FieldChangeDto
+            {
+                Old = "LeafNode",
+                New = "Collapsed",
+            },
+        },
+    },
+    selected), "ExpandCollapse schema transition did not request a refresh");
+Assert(MainViewModel.PatchAffectsTypedSchema(
+    new TreeChangeEventDto
+    {
+        Event = "changed",
         Key = "parent",
         Fields = new()
         {
@@ -190,6 +237,21 @@ Assert(MainViewModel.PatchAffectsTypedSchema(
         },
     },
     selected), "ancestor selection-capability patch did not request a descriptor refresh");
+Assert(MainViewModel.PatchAffectsTypedSchema(
+    new TreeChangeEventDto
+    {
+        Event = "changed",
+        Key = "parent",
+        Fields = new()
+        {
+            ["path"] = new FieldChangeDto
+            {
+                Old = "0",
+                New = "1",
+            },
+        },
+    },
+    selected), "ancestor reparent did not request a descriptor refresh");
 Assert(!MainViewModel.PatchAffectsTypedSchema(
     new TreeChangeEventDto
     {
@@ -205,5 +267,27 @@ Assert(!MainViewModel.PatchAffectsTypedSchema(
         },
     },
     selected), "ordinary value patch incorrectly requested a descriptor refresh");
+
+var schemaCache = new PropertyDescriptorSchemaCache();
+for (int i = 0; i < PropertyDescriptorSchemaCache.MaximumSchemas * 4; ++i)
+{
+    schemaCache.Store(
+        $"schema-{i}",
+        [
+            new PropertyDescriptorDto
+            {
+                DescriptorId = $"descriptor-{i}",
+                Name = "Value.Value",
+            },
+        ],
+        $"schema-{i}");
+    Assert(
+        schemaCache.Count <= PropertyDescriptorSchemaCache.MaximumSchemas,
+        "Viewer schema cache grew without bound");
+}
+Assert(schemaCache.TryGet(
+    $"schema-{PropertyDescriptorSchemaCache.MaximumSchemas * 4 - 1}",
+    out var currentSchema), "current Viewer schema was evicted");
+Assert(currentSchema.Count == 1, "current Viewer schema descriptors were lost");
 
 Console.WriteLine("Viewer property regressions passed.");
