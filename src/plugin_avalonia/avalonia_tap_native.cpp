@@ -68,15 +68,15 @@ static std::wstring ReadPipeName() {
 }
 
 // Host .NET via hostfxr (Avalonia apps always use .NET Core/.NET 5+)
-using hostfxr_initialize_fn = int(STDMETHODCALLTYPE*)(
+using hostfxr_initialize_fn = int(__cdecl*)(
     const wchar_t* runtime_config_path,
     const void* parameters,
     void** host_context_handle);
-using hostfxr_get_delegate_fn = int(STDMETHODCALLTYPE*)(
+using hostfxr_get_delegate_fn = int(__cdecl*)(
     void* host_context_handle,
     int type,
     void** delegate);
-using hostfxr_close_fn = int(STDMETHODCALLTYPE*)(void* host_context_handle);
+using hostfxr_close_fn = int(__cdecl*)(void* host_context_handle);
 
 static bool TryNetCore(const std::wstring& assemblyPath, const std::wstring& pipeName) {
     HMODULE hHostfxr = GetModuleHandleW(L"hostfxr.dll");

@@ -18,6 +18,10 @@
 #define LVT_FAKE_PLUGIN_API_VERSION 2
 #endif
 
+#ifndef LVT_FAKE_FRAMEWORK_NAME
+#define LVT_FAKE_FRAMEWORK_NAME LVT_FAKE_PLUGIN_NAME
+#endif
+
 namespace {
 
 struct FakeConnection {
@@ -26,6 +30,7 @@ struct FakeConnection {
 
 std::atomic<uint32_t> g_getCount{0};
 std::atomic<uint32_t> g_openCount{0};
+std::atomic<uint32_t> g_detectCount{0};
 std::mutex g_logMutex;
 
 bool enabled() {
@@ -39,6 +44,18 @@ uint32_t env_uint(const char* name) {
     char value[32]{};
     const DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
     return length > 0 ? static_cast<uint32_t>(strtoul(value, nullptr, 10)) : 0;
+}
+
+bool detection_marker_present() {
+    wchar_t path[32768]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"LVT_FAKE_PLUGIN_DETECT_FILE", path,
+        static_cast<DWORD>(std::size(path)));
+    if (length == 0)
+        return true;
+    if (length >= std::size(path))
+        return false;
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
 void append_stat(const std::string& line) {
@@ -99,9 +116,11 @@ int return_tree(
     const std::string json =
         "[{\"target_hwnd\":\"" + std::string(hwndText) +
         "\",\"children\":[{\"type\":\"FakePluginNode\",\"name\":\"" +
-        source + "-" + std::to_string(generation) +
+        std::string("fake-node") +
         "\",\"properties\":{\"source\":\"" + source +
-        "\",\"filter\":\"" + escapedFilter + "\"}}]}]";
+        "\",\"filter\":\"" + escapedFilter +
+        "\",\"generation\":\"" + std::to_string(generation) +
+        "\",\"plugin\":\"" + LVT_FAKE_PLUGIN_NAME + "\"}}]}]";
     auto* result = static_cast<char*>(malloc(json.size() + 1));
     if (!result)
         return 0;
@@ -127,10 +146,18 @@ __declspec(dllexport) LvtPluginInfo* lvt_plugin_info(void) {
 
 __declspec(dllexport) int lvt_detect_framework(
     DWORD, HWND, LvtFrameworkDetection* out) {
-    if (!enabled() || !out)
+    if (!enabled() || !out || !detection_marker_present())
         return 0;
+    const uint32_t call = ++g_detectCount;
+    append_stat("detect " + std::to_string(call));
+    if (call == env_uint("LVT_FAKE_PLUGIN_DELAY_DETECT_AT")) {
+        const uint32_t delay =
+            env_uint("LVT_FAKE_PLUGIN_DETECT_DELAY_MS");
+        if (delay)
+            Sleep(delay);
+    }
     out->struct_size = sizeof(*out);
-    out->name = LVT_FAKE_PLUGIN_NAME;
+    out->name = LVT_FAKE_FRAMEWORK_NAME;
     out->version = "test";
     return 1;
 }
@@ -175,6 +202,11 @@ __declspec(dllexport) int lvt_connection_get_tree(
     if (call == env_uint("LVT_FAKE_PLUGIN_FAIL_GET_AT")) {
         append_stat("get_failed " + std::to_string(call));
         return 0;
+    }
+    if (call == env_uint("LVT_FAKE_PLUGIN_MALFORMED_GET_AT")) {
+        append_stat("get_malformed " + std::to_string(call));
+        *jsonOut = _strdup("42");
+        return *jsonOut != nullptr;
     }
     return return_tree(
         fake->hwnd, "persistent", elementClassFilter, call, jsonOut);

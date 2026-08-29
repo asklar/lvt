@@ -922,6 +922,18 @@ lvt_add_fake_plugin(
 lvt_add_fake_plugin(
     lvt_fake_plugin_partial partial fake-partial 2
     LVT_FAKE_PLUGIN_PARTIAL)
+lvt_add_fake_plugin(
+    lvt_fake_plugin_identity_a identity fake-plugin-a 2
+    LVT_FAKE_PLUGIN_PERSISTENT
+    "LVT_FAKE_FRAMEWORK_NAME=\"shared-alias\"")
+set_target_properties(
+    lvt_fake_plugin_identity_a PROPERTIES OUTPUT_NAME "lvt_fake_plugin_a")
+lvt_add_fake_plugin(
+    lvt_fake_plugin_identity_b identity fake-plugin-b 2
+    LVT_FAKE_PLUGIN_PERSISTENT
+    "LVT_FAKE_FRAMEWORK_NAME=\"shared-alias\"")
+set_target_properties(
+    lvt_fake_plugin_identity_b PROPERTIES OUTPUT_NAME "lvt_fake_plugin_b")
 
 # Unit tests — pure logic, no live HWND needed
 add_executable(lvt_unit_tests
@@ -1030,7 +1042,11 @@ string(REPLACE "\\" "\\\\" WINUI3_SAMPLE_EXE_ESCAPED "${WINUI3_SAMPLE_EXE_NATIVE
 set(AVALONIA_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/avalonia_test_app/AvaloniaTestApp.csproj")
 set(AVALONIA_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/avalonia_test_app")
 add_custom_target(avalonia_test_app ALL
-    COMMAND dotnet build "${AVALONIA_SAMPLE_PROJECT}" -c Release -o "${AVALONIA_SAMPLE_OUTPUT_DIR}"
+    COMMAND dotnet publish "${AVALONIA_SAMPLE_PROJECT}" -c Release
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${AVALONIA_SAMPLE_OUTPUT_DIR}"
     BYPRODUCTS "${AVALONIA_SAMPLE_OUTPUT_DIR}/AvaloniaTestApp.exe"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building Avalonia integration test app"
@@ -1122,6 +1138,7 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     "LVT_FAKE_PLUGIN_V2_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v2>\""
     "LVT_FAKE_PLUGIN_V1_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v1>\""
     "LVT_FAKE_PLUGIN_PARTIAL_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_partial>\""
+    "LVT_FAKE_PLUGIN_IDENTITY_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_identity_a>\""
     # Lets tests assert on repository files, e.g. that the packaged skill has
     # not drifted from the one this repo's own agent reads.
     "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
@@ -1145,6 +1162,8 @@ set(LVT_INTEGRATION_DEPS
     lvt_fake_plugin_v2
     lvt_fake_plugin_v1
     lvt_fake_plugin_partial
+    lvt_fake_plugin_identity_a
+    lvt_fake_plugin_identity_b
 )
 if(LVT_BUILD_TOOL)
     list(APPEND LVT_INTEGRATION_DEPS lvt)
@@ -1180,6 +1199,7 @@ if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
         "LVT_FAKE_PLUGIN_V2_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v2>\""
         "LVT_FAKE_PLUGIN_V1_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v1>\""
         "LVT_FAKE_PLUGIN_PARTIAL_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_partial>\""
+        "LVT_FAKE_PLUGIN_IDENTITY_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_identity_a>\""
     )
     target_link_libraries(lvt_mcp_tests PRIVATE
         GTest::gtest GTest::gtest_main
@@ -1188,7 +1208,8 @@ if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
     )
     add_dependencies(
         lvt_mcp_tests lvt lvt_native_controls_fixture
-        lvt_fake_plugin_v2 lvt_fake_plugin_v1 lvt_fake_plugin_partial)
+        lvt_fake_plugin_v2 lvt_fake_plugin_v1 lvt_fake_plugin_partial
+        lvt_fake_plugin_identity_a lvt_fake_plugin_identity_b)
     if(TARGET lvt_tap)
         add_dependencies(lvt_mcp_tests lvt_tap)
     endif()

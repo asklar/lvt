@@ -226,6 +226,8 @@ __declspec(dllexport) int lvt_enrich_tree(HWND hwnd, DWORD pid,
 
 #if defined(_M_ARM64)
     std::wstring tapDll = tapDir + L"\\lvt_avalonia_tap_arm64.dll";
+#elif defined(_M_IX86)
+    std::wstring tapDll = tapDir + L"\\lvt_avalonia_tap_x86.dll";
 #else
     std::wstring tapDll = tapDir + L"\\lvt_avalonia_tap_x64.dll";
 #endif

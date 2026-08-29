@@ -55,6 +55,14 @@ bool has_incomplete_framework_refresh(const Element& root) {
         });
 }
 
+void copy_incomplete_framework_refresh_markers(
+    const Element& source, Element& destination) {
+    for (const auto& [name, value] : source.properties) {
+        if (name.rfind(kIncompleteFrameworkPrefix, 0) == 0)
+            destination.properties[name] = value;
+    }
+}
+
 static void assign_ids_recursive(Element& el, int& counter) {
     el.id = "e" + std::to_string(counter++);
     for (auto& child : el.children) {
@@ -307,7 +315,8 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
             break;
         }
         case Framework::Plugin: {
-            auto pf = find_plugin_framework(fi.name, fi.version);
+            auto pf = find_plugin_framework(
+                fi.name, fi.version, fi.pluginToken);
             if (!pf.plugin)
                 break;
 

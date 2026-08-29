@@ -126,6 +126,7 @@ struct Session {
     // them apart means a reference is never resolved against the tree it did
     // not come from.
     bool visualMode = false;
+    bool disconnecting = false;
 };
 
 std::mutex g_sessionsMutex;
@@ -176,7 +177,7 @@ std::string add_session(const lvt::TargetInfo& target, bool visualMode,
 bool find_session(const std::string& id, Session& out) {
     std::lock_guard<std::mutex> lock(g_sessionsMutex);
     auto it = g_sessions.find(id);
-    if (it == g_sessions.end())
+    if (it == g_sessions.end() || it->second.disconnecting)
         return false;
     out = it->second;
     return true;
@@ -184,7 +185,8 @@ bool find_session(const std::string& id, Session& out) {
 
 bool session_is_active(const std::string& id) {
     std::lock_guard<std::mutex> lock(g_sessionsMutex);
-    return g_sessions.contains(id);
+    const auto found = g_sessions.find(id);
+    return found != g_sessions.end() && !found->second.disconnecting;
 }
 
 // --- per-session persistent connections ----------------------------------
@@ -212,14 +214,14 @@ std::string native_connection_registry_key(
     return value;
 }
 
-// Builds a ConnectionLookup for build_tree, lazily acquiring (once per
-// session, on whichever call first needs it) persistent native property
-// adapters plus any diagnostics connections the target needs.
+// Builds a ConnectionLookup for build_tree, lazily acquiring persistent
+// native property adapters and diagnostics/plugin connections.
+// Callers must already hold TargetGuard and have passed session_is_active().
+// Deliberately do not recheck activity here: disconnect marks the session
+// "disconnecting" before waiting for that same guard, and a read already
+// inside it owns the right to finish with its retained connection snapshot.
 lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
                                                     const std::vector<lvt::FrameworkInfo>& frameworks) {
-    if (!session_is_active(session.id))
-        return {};
-
     bool hasXaml = false, hasWinUI3 = false;
     bool hasWpf = false, hasWinForms = false;
     bool hasComCtl = false;
@@ -235,7 +237,8 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
             comCtlVersion = fi.version;
         }
         if (fi.type == lvt::Framework::Plugin) {
-            auto plugin = lvt::find_plugin_framework(fi.name, fi.version);
+            auto plugin = lvt::find_plugin_framework(
+                fi.name, fi.version, fi.pluginToken);
             if (plugin.plugin &&
                 lvt::plugin_supports_persistent_connections(*plugin.plugin)) {
                 persistentPlugins.push_back(std::move(plugin));
@@ -244,14 +247,12 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
     }
 
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
-    if (!session_is_active(session.id))
-        return {};
     auto [entryIt, _] = g_sessionConnections.try_emplace(session.id);
     auto& entry = entryIt->second;
 
     // A connection can die mid-session (a transient timeout against an
     // unusually large/busy tree, or the target recycling something XAML
-    // diagnostics-related - see main.cpp's refresh_dead_watch_connections
+    // diagnostics-related - see main.cpp's reconcile_watch_connections
     // for the live evidence and full reasoning, which applies identically
     // here). Drop any dead entries first so the "what does this session
     // still need" check below is based on current reality, not just
@@ -1161,22 +1162,34 @@ json method_disconnect(const json& params) {
     {
         std::lock_guard<std::mutex> lock(g_sessionsMutex);
         auto it = g_sessions.find(id);
-        if (it == g_sessions.end())
+        if (it == g_sessions.end() || it->second.disconnecting)
             throw std::runtime_error("unknown session '" + id + "'");
         released = it->second.hwnd;
-        g_sessions.erase(it);
-        // Two sessions may point at the same window, so the lock entry can only
-        // go once nothing else needs it.
-        for (const auto& [_, session] : g_sessions)
-            stillReferenced = stillReferenced || session.hwnd == released;
+        // Refuse every request that has not yet crossed its TargetGuard
+        // activity check, while allowing a request already inside the guard
+        // to finish with its retained connection snapshot.
+        it->second.disconnecting = true;
     }
     {
-        // Match the lock order used by tree/action reads: target first,
-        // connection map second. This waits for any operation that already
-        // entered the target critical section, while those operations hold
-        // their own shared connection snapshot so teardown cannot invalidate
-        // a raw pointer in flight.
+        // The session was marked disconnecting above so queued/new requests
+        // refuse it. Erase it only after acquiring the same target guard used
+        // by reads: an in-flight read that already crossed its activity check
+        // completes with its retained connection snapshot first. Erasing
+        // immediately used to let that read receive an empty lookup after
+        // framework detection and silently invoke a plugin's one-shot path.
         TargetGuard guard(released);
+        {
+            std::lock_guard<std::mutex> lock(g_sessionsMutex);
+            auto it = g_sessions.find(id);
+            if (it == g_sessions.end())
+                throw std::runtime_error("unknown session '" + id + "'");
+            g_sessions.erase(it);
+            // Two sessions may point at the same window, so the lock entry can
+            // only go once nothing else needs it.
+            for (const auto& [_, session] : g_sessions)
+                stillReferenced =
+                    stillReferenced || session.hwnd == released;
+        }
         // Dropping this session's ConnectionHandles here releases the
         // registry's references (see connection_registry.h); if this was
         // the last reference to a given (pid, framework) connection, its

@@ -18,6 +18,7 @@
 #include <vector>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <nlohmann/json.hpp>
 #include <thread>
@@ -378,7 +379,11 @@ static WatchPluginResult run_plugin_watch(
     PluginTargetProcess& target, const fs::path& pluginDir,
     const fs::path& statsPath, const std::string& option,
     const std::string& failOpenAt, const std::string& failGetAt,
-    size_t desiredRefreshes) {
+    size_t desiredRefreshes, const std::string& elementRef = {},
+    const fs::path& detectionFile = {},
+    const std::function<bool(
+        const std::vector<std::string>&, ULONGLONG)>& driver = {},
+    const std::string& malformedGetAt = "0") {
     std::error_code ec;
     fs::remove(statsPath, ec);
 
@@ -398,7 +403,10 @@ static WatchPluginResult run_plugin_watch(
         make_cmd(
             get_lvt_path(),
             target.hwnd_arg() + " --title \"" + option +
-                "\" watch --interval 50");
+                "\" watch --interval 50" +
+                (elementRef.empty()
+                     ? std::string()
+                     : " --element \"" + elementRef + "\""));
     {
         ScopedEnvironmentVariable pluginPath(
             "LVT_PLUGIN_DIR", pluginDir.string());
@@ -407,12 +415,20 @@ static WatchPluginResult run_plugin_watch(
             "LVT_FAKE_PLUGIN_STATE", statsPath.string());
         ScopedEnvironmentVariable fail(
             "LVT_FAKE_PLUGIN_FAIL_GET_AT", failGetAt);
+        ScopedEnvironmentVariable malformed(
+            "LVT_FAKE_PLUGIN_MALFORMED_GET_AT", malformedGetAt);
         ScopedEnvironmentVariable failOpen(
             "LVT_FAKE_PLUGIN_FAIL_OPEN_AT", failOpenAt);
         ScopedEnvironmentVariable events(
             "LVT_FAKE_PLUGIN_EMIT_EVENTS", "1");
         ScopedEnvironmentVariable delay(
             "LVT_FAKE_PLUGIN_GET_DELAY_MS", "0");
+        ScopedEnvironmentVariable detectFile(
+            "LVT_FAKE_PLUGIN_DETECT_FILE", detectionFile.string());
+        ScopedEnvironmentVariable detectDelayAt(
+            "LVT_FAKE_PLUGIN_DELAY_DETECT_AT", "0");
+        ScopedEnvironmentVariable detectDelay(
+            "LVT_FAKE_PLUGIN_DETECT_DELAY_MS", "0");
         if (!CreateProcessA(
                 nullptr, command.data(), nullptr, nullptr, TRUE,
                 CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info)) {
@@ -424,6 +440,7 @@ static WatchPluginResult run_plugin_watch(
     writeEnd.reset();
 
     WatchPluginResult result;
+    const auto startedAt = GetTickCount64();
     const auto deadline = GetTickCount64() + 15000;
     while (GetTickCount64() < deadline) {
         DWORD available = 0;
@@ -438,10 +455,12 @@ static WatchPluginResult run_plugin_watch(
             }
         }
         const auto stats = read_plugin_stats(statsPath);
+        if (driver && driver(stats, GetTickCount64() - startedAt))
+            break;
         const size_t refreshes =
             count_plugin_stats(stats, "get ") +
             count_plugin_stats(stats, "enrich ");
-        if (refreshes >= desiredRefreshes)
+        if (!driver && refreshes >= desiredRefreshes)
             break;
         if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0)
             break;
@@ -544,6 +563,71 @@ TEST(PluginPersistentWatch, V1AndPartialV2RemainOneShot) {
                     line.find("filter=legacy-filter"), std::string::npos);
         }
     }
+}
+
+TEST(PluginPersistentWatch, ReconcilesLateDetectionAndRemoval) {
+    PluginTargetProcess target;
+    ASSERT_TRUE(target.start());
+    const auto statsPath = plugin_stats_path("watch-reconcile");
+    const auto markerPath = plugin_stats_path("watch-detected");
+    std::error_code ec;
+    fs::remove(markerPath, ec);
+
+    int phase = 0;
+    const auto driver =
+        [&](const std::vector<std::string>& stats, ULONGLONG elapsed) {
+            if (phase == 0 && elapsed >= 300) {
+                std::ofstream marker(markerPath, std::ios::binary);
+                marker << "detected";
+                marker.close();
+                phase = 1;
+            }
+            if (phase == 1 &&
+                count_plugin_stats(stats, "get ") >= 2) {
+                fs::remove(markerPath, ec);
+                phase = 2;
+            }
+            return phase == 2 &&
+                   count_plugin_stats(stats, "close") >= 1;
+        };
+    const auto started = GetTickCount64();
+    const auto result = run_plugin_watch(
+        target, LVT_FAKE_PLUGIN_V2_DIR, statsPath, "late-filter",
+        "0", "0", 0, {}, markerPath, driver);
+    const auto elapsed = GetTickCount64() - started;
+
+    EXPECT_EQ(result.exitCode, 0u);
+    EXPECT_LT(elapsed, 5000u)
+        << "obsolete plugin connection was not released during watch";
+    EXPECT_EQ(phase, 2);
+    EXPECT_EQ(count_plugin_stats(result.stats, "open "), 1u);
+    EXPECT_EQ(count_plugin_stats(result.stats, "close"), 1u);
+    EXPECT_GE(count_plugin_stats(result.stats, "get "), 2u);
+    EXPECT_NE(result.output.find("FakePluginNode"), std::string::npos);
+    EXPECT_NE(result.output.find("\"event\":\"added\""), std::string::npos);
+    EXPECT_NE(result.output.find("\"event\":\"removed\""), std::string::npos);
+    fs::remove(markerPath, ec);
+}
+
+TEST(PluginPersistentWatch, ScopedPluginFailurePreservesPreviousSnapshot) {
+    PluginTargetProcess target;
+    ASSERT_TRUE(target.start());
+    const auto statsPath = plugin_stats_path("watch-scoped");
+    const std::string pluginKey =
+        "win32|LvtNativePropertyFixtureWindow/"
+        "fake-persistent|FakePluginNode|name:fake-node";
+    const auto result = run_plugin_watch(
+        target, LVT_FAKE_PLUGIN_V2_DIR, statsPath, "scoped-filter",
+        "0", "0", 4, pluginKey, {}, {}, "2");
+
+    EXPECT_EQ(result.exitCode, 0u);
+    EXPECT_NE(result.output.find("FakePluginNode"), std::string::npos);
+    EXPECT_EQ(result.output.find("\"event\":\"removed\""), std::string::npos)
+        << result.output;
+    EXPECT_EQ(count_plugin_stats(result.stats, "get_malformed "), 1u);
+    EXPECT_EQ(count_plugin_stats(result.stats, "enrich "), 0u);
+    EXPECT_EQ(count_plugin_stats(result.stats, "open "), 2u);
+    EXPECT_EQ(count_plugin_stats(result.stats, "close"), 2u);
 }
 
 // Launch a dedicated Notepad instance for testing

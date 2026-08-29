@@ -1682,6 +1682,14 @@ static PluginFrameworkInfo make_mock_fw(const LoadedPlugin* p) {
 namespace {
 
 struct PersistentPluginMockState {
+    enum class EventMode {
+        normal,
+        oversized,
+        nullPointer,
+        shortStruct,
+        unknownMutation,
+    };
+
     int opens = 0;
     int gets = 0;
     int polls = 0;
@@ -1689,7 +1697,9 @@ struct PersistentPluginMockState {
     int eventFrees = 0;
     int closes = 0;
     int failGetAt = 0;
+    std::string treeJson = "[]";
     std::string filter;
+    EventMode eventMode = EventMode::normal;
 };
 
 PersistentPluginMockState s_persistentPlugin;
@@ -1704,21 +1714,39 @@ int persistent_mock_get_tree(void*, const char* filter, char** jsonOut) {
     s_persistentPlugin.filter = filter ? filter : "";
     if (call == s_persistentPlugin.failGetAt)
         return 0;
-    *jsonOut = _strdup("[]");
+    *jsonOut = _strdup(s_persistentPlugin.treeJson.c_str());
     return *jsonOut != nullptr;
 }
 
 int persistent_mock_poll(
     void*, LvtConnectionEvent** eventsOut, uint32_t* countOut) {
     ++s_persistentPlugin.polls;
+    if (s_persistentPlugin.eventMode ==
+        PersistentPluginMockState::EventMode::nullPointer) {
+        *eventsOut = nullptr;
+        *countOut = 1;
+        return 1;
+    }
     auto* events = static_cast<LvtConnectionEvent*>(
         malloc(sizeof(LvtConnectionEvent)));
     if (!events)
         return 0;
     *events = {
-        sizeof(LvtConnectionEvent), "remove", 42, 7, 3, nullptr, nullptr};
+        s_persistentPlugin.eventMode ==
+                PersistentPluginMockState::EventMode::shortStruct
+            ? sizeof(uint32_t)
+            : sizeof(LvtConnectionEvent),
+        s_persistentPlugin.eventMode ==
+                PersistentPluginMockState::EventMode::unknownMutation
+            ? "replace"
+            : "remove",
+        42, 7, 3, nullptr, nullptr};
     *eventsOut = events;
-    *countOut = 1;
+    *countOut =
+        s_persistentPlugin.eventMode ==
+                PersistentPluginMockState::EventMode::oversized
+            ? 10001
+            : 1;
     return 1;
 }
 
@@ -1812,6 +1840,79 @@ TEST(PluginConnectionContract, FailedRefreshMarksConnectionDead) {
     EXPECT_EQ(s_persistentPlugin.closes, 1);
 }
 
+TEST(PluginConnectionContract, MalformedTreesAreFreedAndMarkConnectionDead) {
+    for (const char* malformed : {
+             "42",
+             R"([{"children":{}}])",
+             R"([{"offsetX":"left"}])",
+             "{not-json",
+         }) {
+        SCOPED_TRACE(malformed);
+        s_persistentPlugin = {};
+        s_persistentPlugin.treeJson = malformed;
+        auto plugin = make_persistent_mock_plugin();
+        auto connection =
+            open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+        ASSERT_NE(connection, nullptr);
+
+        Element root;
+        EXPECT_FALSE(connection->get_tree(root, false));
+        EXPECT_FALSE(connection->is_alive());
+        EXPECT_TRUE(root.children.empty());
+        EXPECT_EQ(s_persistentPlugin.frees, 1);
+        connection.reset();
+        EXPECT_EQ(s_persistentPlugin.closes, 1);
+    }
+}
+
+TEST(PluginConnectionContract, OversizedTreeIsRejectedBeforeGrafting) {
+    s_persistentPlugin = {};
+    s_persistentPlugin.treeJson.reserve(300005);
+    s_persistentPlugin.treeJson = "[";
+    for (int i = 0; i < 100001; ++i) {
+        if (i > 0)
+            s_persistentPlugin.treeJson += ",";
+        s_persistentPlugin.treeJson += "{}";
+    }
+    s_persistentPlugin.treeJson += "]";
+
+    auto plugin = make_persistent_mock_plugin();
+    auto connection =
+        open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+    ASSERT_NE(connection, nullptr);
+    Element root;
+    EXPECT_FALSE(connection->get_tree(root, false));
+    EXPECT_FALSE(connection->is_alive());
+    EXPECT_TRUE(root.children.empty());
+    EXPECT_EQ(s_persistentPlugin.frees, 1);
+    connection.reset();
+    EXPECT_EQ(s_persistentPlugin.closes, 1);
+}
+
+TEST(PluginConnectionContract, MalformedEventsAreBoundedFreedAndMarkDead) {
+    for (const auto mode : {
+             PersistentPluginMockState::EventMode::oversized,
+             PersistentPluginMockState::EventMode::nullPointer,
+             PersistentPluginMockState::EventMode::shortStruct,
+             PersistentPluginMockState::EventMode::unknownMutation,
+         }) {
+        s_persistentPlugin = {};
+        s_persistentPlugin.eventMode = mode;
+        auto plugin = make_persistent_mock_plugin();
+        auto connection =
+            open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+        ASSERT_NE(connection, nullptr);
+
+        EXPECT_TRUE(connection->poll_events().empty());
+        EXPECT_FALSE(connection->is_alive());
+        EXPECT_EQ(
+            s_persistentPlugin.eventFrees,
+            mode == PersistentPluginMockState::EventMode::nullPointer ? 0 : 1);
+        connection.reset();
+        EXPECT_EQ(s_persistentPlugin.closes, 1);
+    }
+}
+
 TEST(PluginConnectionContract, PersistentPluginWithoutPollStillRefreshes) {
     s_persistentPlugin = {};
     auto plugin = make_persistent_mock_plugin();
@@ -1849,6 +1950,8 @@ TEST(PluginConnectionContract, V1AndPartialV2StayOneShot) {
 TEST(PluginConnectionContract, RegistryLabelsIsolatePluginAndWindowInstances) {
     auto first = make_persistent_mock_plugin();
     auto second = make_persistent_mock_plugin();
+    first.sourcePath = L"C:\\plugins\\first.dll";
+    second.sourcePath = L"C:\\plugins\\second.dll";
     const PluginFrameworkInfo firstFramework{"mock", "", &first};
     const PluginFrameworkInfo secondFramework{"mock", "", &second};
     const auto firstLabel = plugin_connection_label(
@@ -1862,6 +1965,20 @@ TEST(PluginConnectionContract, RegistryLabelsIsolatePluginAndWindowInstances) {
     EXPECT_NE(firstLabel, "xaml");
     EXPECT_NE(firstLabel, otherPluginLabel);
     EXPECT_NE(firstLabel, otherWindowLabel);
+}
+
+TEST(FrameworkRefreshCompleteness, CopiesEveryProviderMarkerToScopedTree) {
+    Element full;
+    full.properties["lvt.incomplete.wpf"] = "true";
+    full.properties["lvt.incomplete.fake-plugin"] = "true";
+    full.properties["unrelated"] = "value";
+    Element scoped;
+
+    copy_incomplete_framework_refresh_markers(full, scoped);
+
+    EXPECT_TRUE(framework_refresh_incomplete(scoped, "wpf"));
+    EXPECT_TRUE(framework_refresh_incomplete(scoped, "fake-plugin"));
+    EXPECT_FALSE(scoped.properties.contains("unrelated"));
 }
 
 TEST(PluginGraft, GraftByTargetHwnd) {

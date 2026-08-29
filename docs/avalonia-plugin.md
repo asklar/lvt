@@ -93,7 +93,7 @@ $ lvt --name AvaloniaTestApp --format xml --depth 3
 ## Requirements
 
 - Target Avalonia app must be .NET 6+ (Avalonia 11.x)
-- Target process must match lvt's architecture (x64 or ARM64)
+- Target process must match lvt's architecture (x86, x64, or ARM64)
 - The .NET runtime (`hostfxr.dll`) must be installed on the system
 
 ## Persistent connections (optional)
@@ -110,6 +110,12 @@ does not silently switch a v2-capable session back to repeated one-shot
 injection after a connection failure. This plugin does not implement the
 group yet, so it continues to use `lvt_enrich_tree` on every refresh
 unchanged.
+
+Persistent implementations must return an object or array of object nodes in
+the documented tree schema. Field types, nesting, and node counts are
+validated before grafting. Event arrays are bounded and every event must
+report the current `LvtConnectionEvent::struct_size`; core frees plugin-owned
+tree and event allocations on every path, including malformed responses.
 
 ## Test app
 

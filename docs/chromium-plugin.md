@@ -210,3 +210,9 @@ lvt --name chrome
   `lvt_connection_poll_events`/`lvt_connection_events_free` pair. Chromium
   currently exports only the v1 one-shot path, so existing behavior remains
   unchanged until it adopts v2.
+
+  A future v2 implementation must keep the existing object/array tree schema:
+  core validates node field types and bounds nesting/node counts before
+  grafting. Incremental event arrays are also count-bounded and each entry's
+  `struct_size` is checked before dereference. Plugin-owned tree and event
+  buffers are freed on all success and failure paths.

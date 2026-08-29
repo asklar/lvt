@@ -45,6 +45,8 @@ void mark_framework_refresh_incomplete(Element& root, const std::string& framewo
 bool framework_refresh_incomplete(
     const Element& root, const std::string& framework);
 bool has_incomplete_framework_refresh(const Element& root);
+void copy_incomplete_framework_refresh_markers(
+    const Element& source, Element& destination);
 
 // Assign deterministic element IDs (e0, e1, ...) in depth-first order.
 void assign_element_ids(Element& root);

@@ -621,14 +621,17 @@ static std::string uia_framework_label(const Args&) { return "uia"; }
 // sessions; every other caller (dump/query/screenshot) sees no behavior change.
 static bool build_root_tree(const lvt::TargetInfo& target, const Args& args,
                             lvt::Element& tree,
-                            const lvt::ConnectionLookup& connectionLookup = {}) {
+                            const lvt::ConnectionLookup& connectionLookup = {},
+                            const std::vector<lvt::FrameworkInfo>* detectedFrameworks = nullptr) {
     if (args.uia) {
         if (!build_uia_tree_with_connection(target, args, connectionLookup, tree))
             return false;
         return true;
     }
 
-    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+    auto frameworks = detectedFrameworks
+                          ? *detectedFrameworks
+                          : lvt::detect_frameworks(target.hwnd, target.pid);
     tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption,
                           args.fastProperties, connectionLookup);
     return true;
@@ -636,14 +639,12 @@ static bool build_root_tree(const lvt::TargetInfo& target, const Args& args,
 
 static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
                               lvt::Element& outputTree,
-                              const lvt::ConnectionLookup& connectionLookup = {}) {
+                              const lvt::ConnectionLookup& connectionLookup = {},
+                              const std::vector<lvt::FrameworkInfo>* detectedFrameworks = nullptr) {
     lvt::Element tree;
-    if (!build_root_tree(target, args, tree, connectionLookup))
+    if (!build_root_tree(
+            target, args, tree, connectionLookup, detectedFrameworks))
         return false;
-    const bool incompleteWpf =
-        lvt::framework_refresh_incomplete(tree, "wpf");
-    const bool incompleteWinForms =
-        lvt::framework_refresh_incomplete(tree, "winforms");
 
     lvt::Element* outputRoot = &tree;
     if (!args.elementId.empty()) {
@@ -658,10 +659,7 @@ static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
         lvt::trim_to_depth(*outputRoot, args.depth);
 
     outputTree = *outputRoot;
-    if (incompleteWpf)
-        lvt::mark_framework_refresh_incomplete(outputTree, "wpf");
-    if (incompleteWinForms)
-        lvt::mark_framework_refresh_incomplete(outputTree, "winforms");
+    lvt::copy_incomplete_framework_refresh_markers(tree, outputTree);
     return true;
 }
 
@@ -710,7 +708,8 @@ static bool lost_injected_framework_content(const lvt::Element& previous, const 
 // process to inject into. UIA needs no such probe because it does not resolve
 // a framework island before connecting.
 static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_connections(
-    const lvt::TargetInfo& target, const Args& args) {
+    const lvt::TargetInfo& target, const Args& args,
+    const std::vector<lvt::FrameworkInfo>& frameworks) {
     std::vector<std::pair<std::string, lvt::ConnectionHandle>> connections;
 
 #ifdef LVT_ENABLE_UIA
@@ -726,7 +725,6 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
     }
 #endif
 
-    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
     bool hasXaml = false, hasWinUI3 = false, hasWpf = false, hasWinForms = false;
     std::vector<lvt::PluginFrameworkInfo> persistentPlugins;
     for (auto& fi : frameworks) {
@@ -735,7 +733,8 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
         if (fi.type == lvt::Framework::Wpf) hasWpf = true;
         if (fi.type == lvt::Framework::WinForms) hasWinForms = true;
         if (fi.type == lvt::Framework::Plugin) {
-            auto plugin = lvt::find_plugin_framework(fi.name, fi.version);
+            auto plugin = lvt::find_plugin_framework(
+                fi.name, fi.version, fi.pluginToken);
             if (plugin.plugin &&
                 lvt::plugin_supports_persistent_connections(*plugin.plugin)) {
                 persistentPlugins.push_back(std::move(plugin));
@@ -773,7 +772,7 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
         // falsy) - InitializeXamlDiagnosticsEx is known to fail transiently
         // on a first try against a slow/busy target (observed live against
         // Microsoft Store) even though a retry moments later succeeds.
-        // Without an entry here at all, refresh_dead_watch_connections has
+        // Without an entry here at all, reconcile_watch_connections has
         // nothing to notice and retry: it can only detect and fix an
         // existing (label, handle) pair going dead, not a framework whose
         // very first acquisition never even produced one - which silently
@@ -849,40 +848,45 @@ static lvt::ConnectionLookup make_lookup(
     };
 }
 
-// Called once per tick, before building the tree: if a held connection has
-// died (a transient timeout against an unusually large/busy tree - observed
-// live against Microsoft Store's home page, whose own collection can take
-// several seconds even in --fast mode - or the target recycling something
-// XAML-diagnostics-related), is_alive() goes false; and, separately, a
-// framework can have been detected but never successfully acquired a
-// connection in the first place (its very first InitializeXamlDiagnosticsEx
-// attempt failed - also observed live against Microsoft Store, transient
-// but common against a slow/busy target). Since tree_builder.cpp no longer
-// silently falls back to one-shot reinjection when a supplied
-// ConnectionLookup returns nothing for a framework (see the commit that
-// tightened that), *both* cases need this function to actively retry them -
-// otherwise either one would silently and permanently skip that
-// framework's enrichment for the rest of the watch session, with nothing
-// left to notice or recover. Observed live: once Microsoft Store's XAML
-// connection timed out once, every following tick logged
-// "InitializeXamlDiagnosticsEx failed" - the connection endpoints were still
-// consumed/settling from the connection that had just died, so immediately
-// retrying via the one-shot path on every single tick kept losing that race
-// too, compounding rather than recovering.
-//
-// Releasing a dead ConnectionHandle before calling acquire() again for the
-// same key is required, not just tidy: ConnectionRegistry::release() only
-// looks up its map by (pid, label), not by matching the specific connection
-// instance a caller's handle refers to. Reacquiring first (while still
-// holding the old, dead handle) would create a new entry in the map under
-// that same key; the old handle's *later* release would then decrement the
-// brand new entry's refcount instead of the dead one's, since release() has
-// no way to tell them apart - risking the fresh connection being torn down
-// prematurely. Resetting first ensures the dead entry is fully erased
-// before any new one for the same key can exist.
-static void refresh_dead_watch_connections(
+// Reconciles the held set with the frameworks detected for this exact tick.
+// Plugin frameworks can appear or disappear while the target stays alive
+// (late assembly/module load, teardown, navigation). Add newly detected v2
+// slots before building, erase obsolete plugin slots immediately, and retry
+// every missing/dead built-in or plugin connection through the registry.
+static void reconcile_watch_connections(
     const lvt::TargetInfo& target, const Args& args,
+    const std::vector<lvt::FrameworkInfo>& frameworks,
     std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
+    std::set<std::string> desiredPluginLabels;
+    for (const auto& framework : frameworks) {
+        if (framework.type != lvt::Framework::Plugin)
+            continue;
+        auto plugin = lvt::find_plugin_framework(
+            framework.name, framework.version, framework.pluginToken);
+        if (!plugin.plugin ||
+            !lvt::plugin_supports_persistent_connections(*plugin.plugin)) {
+            continue;
+        }
+        desiredPluginLabels.insert(
+            lvt::plugin_connection_label(plugin, target.hwnd));
+    }
+
+    for (auto it = connections.begin(); it != connections.end();) {
+        if (it->first.rfind("plugin:", 0) != 0) {
+            ++it;
+            continue;
+        }
+        const auto desired = desiredPluginLabels.find(it->first);
+        if (desired == desiredPluginLabels.end()) {
+            it = connections.erase(it);
+            continue;
+        }
+        desiredPluginLabels.erase(desired);
+        ++it;
+    }
+    for (const auto& label : desiredPluginLabels)
+        connections.emplace_back(label, lvt::ConnectionHandle{});
+
     bool anyDead = false;
     for (auto& [label, handle] : connections) {
         // A missing/never-acquired handle (acquire_watch_connections still
@@ -909,7 +913,7 @@ static void refresh_dead_watch_connections(
     // for the same live key, even transiently, is safe: it is just a
     // temporary extra refcount that `fresh` going out of scope drops again,
     // never releasing anything this function did not itself acquire).
-    auto fresh = acquire_watch_connections(target, args);
+    auto fresh = acquire_watch_connections(target, args, frameworks);
     for (auto& [label, handle] : connections) {
         if (handle)
             continue;
@@ -925,12 +929,13 @@ static void refresh_dead_watch_connections(
 static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
-    // Acquired at the start of the session and refreshed whenever a held
-    // connection dies (see refresh_dead_watch_connections) - not
-    // re-acquired from scratch every tick, which is the entire point of
-    // this mechanism.
+    // Acquired at the start of the session, reconciled against fresh
+    // framework detection each tick, and reused while alive.
     std::vector<std::pair<std::string, lvt::ConnectionHandle>> connections;
-    connections = acquire_watch_connections(target, args);
+    std::vector<lvt::FrameworkInfo> frameworks;
+    if (!args.uia)
+        frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+    connections = acquire_watch_connections(target, args, frameworks);
     lvt::ConnectionLookup lookup = make_lookup(connections);
 
     // The very first tree build did not get the same tolerance the tick loop
@@ -954,9 +959,14 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             if (lvt::g_debug)
                 fprintf(stderr, "lvt: retrying initial watch connection (attempt %d)\n", attempt + 1);
             Sleep(static_cast<DWORD>(300 * attempt));
-            refresh_dead_watch_connections(target, args, connections);
+            if (!args.uia)
+                frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+            reconcile_watch_connections(
+                target, args, frameworks, connections);
         }
-        built = build_output_tree(target, args, previous, lookup) &&
+        built = build_output_tree(
+                    target, args, previous, lookup,
+                    args.uia ? nullptr : &frameworks) &&
                 !lvt::has_incomplete_framework_refresh(previous);
     }
     if (!built)
@@ -980,10 +990,14 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             break;
         }
 
-        refresh_dead_watch_connections(target, args, connections);
+        if (!args.uia)
+            frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+        reconcile_watch_connections(target, args, frameworks, connections);
 
         lvt::Element current;
-        if (!build_output_tree(target, args, current, lookup)) {
+        if (!build_output_tree(
+                target, args, current, lookup,
+                args.uia ? nullptr : &frameworks)) {
             // A tick can fail transiently — most easily in UIA mode, where a
             // momentarily busy target trips the transaction timeout. That is
             // precisely the condition --watch exists to observe, so skip the
@@ -1031,9 +1045,15 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
                 if (lvt::g_debug)
                     fprintf(stderr, "lvt: injected framework content vanished this tick; retrying (attempt %d)\n", extra + 1);
                 Sleep(1000);
-                refresh_dead_watch_connections(target, args, connections);
+                if (!args.uia)
+                    frameworks =
+                        lvt::detect_frameworks(target.hwnd, target.pid);
+                reconcile_watch_connections(
+                    target, args, frameworks, connections);
                 lvt::Element retryTree;
-                if (build_output_tree(target, args, retryTree, lookup))
+                if (build_output_tree(
+                        target, args, retryTree, lookup,
+                        args.uia ? nullptr : &frameworks))
                     current = std::move(retryTree);
             }
             if (lost_injected_framework_content(previous, current)) {

@@ -601,7 +601,9 @@ const json* find_fake_plugin_node(const json& root) {
 std::unique_ptr<McpClient> start_plugin_mcp(
     const fs::path& pluginDirectory, const fs::path& statsPath,
     const std::string& failOpenAt, const std::string& failGetAt,
-    const std::string& delayMs, const std::string& emitEvents) {
+    const std::string& delayMs, const std::string& emitEvents,
+    const std::string& delayDetectAt = "0",
+    const std::string& detectDelayMs = "0") {
     ScopedEnvironmentVariable pluginPath(
         "LVT_PLUGIN_DIR", pluginDirectory.string());
     ScopedEnvironmentVariable enabled("LVT_FAKE_PLUGIN_ENABLE", "1");
@@ -609,12 +611,20 @@ std::unique_ptr<McpClient> start_plugin_mcp(
         "LVT_FAKE_PLUGIN_STATE", statsPath.string());
     ScopedEnvironmentVariable fail(
         "LVT_FAKE_PLUGIN_FAIL_GET_AT", failGetAt);
+    ScopedEnvironmentVariable malformed(
+        "LVT_FAKE_PLUGIN_MALFORMED_GET_AT", "0");
     ScopedEnvironmentVariable failOpen(
         "LVT_FAKE_PLUGIN_FAIL_OPEN_AT", failOpenAt);
     ScopedEnvironmentVariable delay(
         "LVT_FAKE_PLUGIN_GET_DELAY_MS", delayMs);
     ScopedEnvironmentVariable events(
         "LVT_FAKE_PLUGIN_EMIT_EVENTS", emitEvents);
+    ScopedEnvironmentVariable detectFile(
+        "LVT_FAKE_PLUGIN_DETECT_FILE", "");
+    ScopedEnvironmentVariable detectAt(
+        "LVT_FAKE_PLUGIN_DELAY_DETECT_AT", delayDetectAt);
+    ScopedEnvironmentVariable detectDelay(
+        "LVT_FAKE_PLUGIN_DETECT_DELAY_MS", detectDelayMs);
     return std::make_unique<McpClient>(false);
 }
 
@@ -765,6 +775,116 @@ TEST(McpPluginPersistent, SharesRegistryConnectionAcrossSessions) {
     EXPECT_EQ(count_plugin_stats(stats, "poll"), 3u);
     EXPECT_EQ(count_plugin_stats(stats, "events_free"), 0u);
     EXPECT_EQ(count_plugin_stats(stats, "close"), 1u);
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+TEST(McpPluginPersistent, DisconnectDuringDetectionNeverFallsBackOneShot) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path("disconnect-detection");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_V2_DIR, statsPath, "0", "0", "0", "0",
+        "2", "500");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+    const auto connected = client->call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    const int readId = client->send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    const auto detectionDeadline = GetTickCount64() + 5000;
+    while (GetTickCount64() < detectionDeadline) {
+        if (count_plugin_stats(read_plugin_stats(statsPath), "detect ") >= 2)
+            break;
+        Sleep(10);
+    }
+    ASSERT_GE(
+        count_plugin_stats(read_plugin_stats(statsPath), "detect "), 2u);
+
+    const int disconnectId = client->send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+    const auto readResponse = client->await_response(readId);
+    const auto disconnectResponse = client->await_response(disconnectId);
+    ASSERT_TRUE(readResponse.contains("result")) << readResponse.dump(2);
+    ASSERT_TRUE(disconnectResponse.contains("result"))
+        << disconnectResponse.dump(2);
+    EXPECT_FALSE(readResponse["result"].value("isError", false));
+    EXPECT_FALSE(disconnectResponse["result"].value("isError", false));
+
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "enrich "), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "get "), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 1u);
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+TEST(McpPluginPersistent, PreservesDetectingPluginIdentityAndAlias) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path("identity");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_IDENTITY_DIR, statsPath, "0", "0", "0", "0");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+    const auto connected = client->call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"title", "identity-filter"},
+             {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    ASSERT_TRUE(connected.contains("frameworks"));
+    EXPECT_EQ(
+        std::count(
+            connected["frameworks"].begin(), connected["frameworks"].end(),
+            "shared-alias test"),
+        2);
+
+    const auto tree =
+        client->call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    std::set<std::string> pluginNames;
+    std::vector<const json*> elements;
+    collect_json_elements(tree["root"], elements);
+    for (const auto* element : elements) {
+        if (element->value("type", "") != "FakePluginNode")
+            continue;
+        EXPECT_EQ(element->value("framework", ""), "shared-alias");
+        const auto properties =
+            element->value("properties", json::object());
+        EXPECT_EQ(properties.value("filter", ""), "identity-filter");
+        pluginNames.insert(properties.value("plugin", ""));
+    }
+    EXPECT_EQ(
+        pluginNames,
+        (std::set<std::string>{"fake-plugin-a", "fake-plugin-b"}));
+
+    bool isError = false;
+    client->call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError);
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "get "), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 2u);
 
     client->shutdown();
     fs::remove(statsPath, ec);

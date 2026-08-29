@@ -12,6 +12,7 @@ namespace lvt {
 
 struct LoadedPlugin {
     wil::unique_hmodule module;
+    std::wstring sourcePath;
     LvtPluginInfo* info;
     LvtDetectFrameworkFn detect;
     LvtEnrichTreeFn enrich;
@@ -51,7 +52,8 @@ bool plugin_supports_event_polling(const LoadedPlugin& plugin);
 
 // Resolve a detected plugin framework back to its loaded plugin.
 PluginFrameworkInfo find_plugin_framework(const std::string& name,
-                                          const std::string& version = {});
+                                          const std::string& version = {},
+                                          uintptr_t pluginToken = 0);
 
 // Registry/lookup key for one plugin connection. Includes the loaded plugin
 // instance and target HWND so plugin providers cannot collide with built-in

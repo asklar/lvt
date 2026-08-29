@@ -1,5 +1,6 @@
 #pragma once
 #include <Windows.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,9 @@ struct FrameworkInfo {
     Framework type;
     std::string version; // e.g. "3.1.7.2602" for WinUI3, "6.10" for comctl
     std::string name;    // Plugin-provided name (empty for built-in frameworks)
+    // Opaque process-local identity of the LoadedPlugin that produced this
+    // detection. Zero for built-ins and legacy hand-constructed values.
+    uintptr_t pluginToken = 0;
 };
 
 std::string framework_to_string(Framework f);
