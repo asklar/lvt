@@ -861,23 +861,12 @@ if(LVT_BUILD_VIEWER AND LVT_BUILD_TOOL)
 
     if(TARGET lvt_avalonia_tap)
         add_custom_command(TARGET lvt_viewer POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:lvt_avalonia_tap>" "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/"
-            COMMENT "Copying the Avalonia TAP DLL next to the viewer"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
+                "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia"
+            COMMENT "Copying the complete Avalonia published runtime next to the viewer"
         )
         add_dependencies(lvt_viewer lvt_avalonia_tap)
-        if(LVT_BUILD_MANAGED)
-            add_custom_command(TARGET lvt_viewer POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
-                    "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
-                    "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
-                COMMENT "Copying the managed Avalonia tree walker assembly next to the viewer"
-            )
-        endif()
     endif()
 
     if(TARGET lvt_chromium_plugin)
@@ -886,6 +875,9 @@ if(LVT_BUILD_VIEWER AND LVT_BUILD_TOOL)
                 "${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium" "${LVT_VIEWER_OUTPUT_DIR}/plugins/chromium"
             COMMENT "Copying the Chromium native host + extension next to the viewer"
         )
+        if(TARGET lvt_chromium_host)
+            add_dependencies(lvt_viewer lvt_chromium_host)
+        endif()
     endif()
 endif()
 

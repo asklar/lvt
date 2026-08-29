@@ -143,6 +143,14 @@ host-only tree.
 
 ## Runtime support
 
+- WPF and WinForms intentionally ship one managed helper assembly per
+  framework, not one per native architecture. Each helper is AnyCPU,
+  `net48`-compatible IL: that same DLL loads under .NET Framework 4.8 and
+  under supported CoreCLR processes. Only the native TAP DLL is
+  architecture-specific.
+- The adjacent runtime config does not retarget the managed assembly. It
+  selects `Microsoft.WindowsDesktop.App` 6.0 with `LatestMajor`, so CoreCLR
+  6 and newer can host the same `net48`-compatible IL assembly.
 - .NET Framework targets require **.NET Framework 4.8**, matching the managed
   TAP assemblies' `net48` target.
 - CoreCLR WPF/WinForms targets require **Microsoft.WindowsDesktop.App 6.0 or
@@ -152,6 +160,10 @@ host-only tree.
 - Active CoreCLR 3.1 and 5 are rejected explicitly rather than attempting to
   load an incompatible component. .NET 7 is covered by the 6+ policy, although
   the regression matrix pins the supported floor at .NET 6 LTS.
+- Integration tests exercise WPF and WinForms targets on .NET 6, .NET 10, and
+  .NET Framework 4.8. Do not retarget the helpers to `net6.0` or publish
+  per-architecture managed copies; doing so would split the single assembly
+  model that supports both CLR families.
 
 Connection registry handles also carry a generation and exact connection
 identity, so releasing holders from a dead generation cannot decrement a

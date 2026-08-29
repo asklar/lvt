@@ -21,13 +21,18 @@ Copy the plugin files to `%USERPROFILE%\.lvt\plugins\`:
 ```
 %USERPROFILE%\.lvt\plugins\
 ├── lvt_avalonia_plugin.dll          # Plugin DLL (loaded by lvt)
-└── avalonia\                        # Subdirectory for TAP + managed DLLs
+└── avalonia\                        # Complete matching-RID publish directory
     ├── lvt_avalonia_tap_<arch>.dll  # Matching x86, x64, or ARM64 native TAP
     ├── LvtAvaloniaTreeWalker.dll    # Managed tree walker
-    └── LvtAvaloniaTreeWalker.runtimeconfig.json
+    ├── LvtAvaloniaTreeWalker.deps.json
+    ├── LvtAvaloniaTreeWalker.runtimeconfig.json
+    ├── Avalonia.*.dll               # Published managed dependencies
+    └── runtimes\win-<arch>\native\  # Matching native runtime assets
 ```
 
 > **Important:** The TAP DLL and managed assembly must be in the `avalonia\` subdirectory, not directly in the `plugins\` directory. This prevents the plugin loader from attempting to load them as plugins.
+> Keep the complete published `avalonia\` directory together; copying only the
+> tree walker and runtime config omits dependency and native runtime assets.
 
 ### From source
 

@@ -86,11 +86,29 @@ jobs:
       - name: Build managed WPF assembly
         run: msbuild src/tap_wpf/LvtWpfTap.csproj /p:Configuration=Release /p:Platform=AnyCPU /restore /v:minimal
 
+      - name: Build managed WinForms assembly
+        run: dotnet build src/tap_winforms/LvtWinFormsTap.csproj -c Release --nologo
+
       - name: Build managed Avalonia tree walker
         run: dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj -c Release
 
       - name: Build
         run: cmake --build ${{ matrix.build_dir }}
+
+      - name: Validate build outputs
+        run: |
+          .\scripts\validate-release-package.ps1 `
+            -Root ${{ matrix.build_dir }} `
+            -Architecture ${{ matrix.arch }} `
+            -PackageMode CLI `
+            -Layout Build
+          if ('${{ matrix.build_viewer }}' -eq 'ON') {
+            .\scripts\validate-release-package.ps1 `
+              -Root ${{ matrix.build_dir }}\viewer `
+              -Architecture ${{ matrix.arch }} `
+              -PackageMode Viewer `
+              -Layout Build
+          }
 
       - name: Unit tests
         if: matrix.arch == 'x64'
@@ -106,36 +124,24 @@ jobs:
 
       - name: Package
         run: |
+          Remove-Item release -Recurse -Force -ErrorAction Ignore
           New-Item -ItemType Directory -Path release -Force
           Copy-Item ${{ matrix.build_dir }}\lvt.exe release\
           Copy-Item ${{ matrix.build_dir }}\lvt_tap_${{ matrix.arch }}.dll release\
-          if (Test-Path ${{ matrix.build_dir }}\lvt_wpf_tap_${{ matrix.arch }}.dll) {
-            Copy-Item ${{ matrix.build_dir }}\lvt_wpf_tap_${{ matrix.arch }}.dll release\
-          }
-          if (Test-Path ${{ matrix.build_dir }}\LvtWpfTap.dll) {
-            Copy-Item ${{ matrix.build_dir }}\LvtWpfTap.dll release\
-          }
-          if (Test-Path ${{ matrix.build_dir }}\LvtWpfTap.runtimeconfig.json) {
-            Copy-Item ${{ matrix.build_dir }}\LvtWpfTap.runtimeconfig.json release\
-          }
-          # WinForms TAP DLL + managed assembly - same shape as WPF above. These
-          # used to be missing from the release zip entirely, so every release
-          # silently shipped without WinForms enrichment even though it was
-          # built and tested.
-          if (Test-Path ${{ matrix.build_dir }}\lvt_winforms_tap_${{ matrix.arch }}.dll) {
-            Copy-Item ${{ matrix.build_dir }}\lvt_winforms_tap_${{ matrix.arch }}.dll release\
-          }
-          if (Test-Path ${{ matrix.build_dir }}\LvtWinFormsTap.dll) {
-            Copy-Item ${{ matrix.build_dir }}\LvtWinFormsTap.dll release\
-          }
-          if (Test-Path ${{ matrix.build_dir }}\LvtWinFormsTap.runtimeconfig.json) {
-            Copy-Item ${{ matrix.build_dir }}\LvtWinFormsTap.runtimeconfig.json release\
-          }
-          if (Test-Path ${{ matrix.build_dir }}\plugins) {
-            Copy-Item -Recurse ${{ matrix.build_dir }}\plugins release\plugins
-          }
+          Copy-Item ${{ matrix.build_dir }}\lvt_wpf_tap_${{ matrix.arch }}.dll release\
+          Copy-Item ${{ matrix.build_dir }}\LvtWpfTap.dll release\
+          Copy-Item ${{ matrix.build_dir }}\LvtWpfTap.runtimeconfig.json release\
+          Copy-Item ${{ matrix.build_dir }}\lvt_winforms_tap_${{ matrix.arch }}.dll release\
+          Copy-Item ${{ matrix.build_dir }}\LvtWinFormsTap.dll release\
+          Copy-Item ${{ matrix.build_dir }}\LvtWinFormsTap.runtimeconfig.json release\
+          Copy-Item -Recurse ${{ matrix.build_dir }}\plugins release\plugins
           New-Item -ItemType Directory -Path release\skills\lvt -Force
           Copy-Item .github\skills\lvt\SKILL.md release\skills\lvt\
+          .\scripts\validate-release-package.ps1 `
+            -Root release `
+            -Architecture ${{ matrix.arch }} `
+            -PackageMode CLI `
+            -Layout Package
           Compress-Archive -Path release\* -DestinationPath lvt-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip
 
       # Keep the normal CLI archive lean. The viewer has a .NET Desktop
@@ -145,9 +151,7 @@ jobs:
       - name: Package viewer
         if: matrix.build_viewer == 'ON'
         run: |
-          if (!(Test-Path ${{ matrix.build_dir }}\viewer\LvtViewer.exe)) {
-            throw "The viewer build output was not produced."
-          }
+          Remove-Item viewer-release -Recurse -Force -ErrorAction Ignore
           New-Item -ItemType Directory -Path viewer-release -Force
           Copy-Item -Recurse ${{ matrix.build_dir }}\viewer\* viewer-release\
           Copy-Item src\viewer\RELEASE-README.txt viewer-release\README.txt
@@ -156,6 +160,11 @@ jobs:
           # but not runtime dependencies and add substantial release weight.
           Get-ChildItem viewer-release -Recurse -File -Include *.pdb,*.ilk,*.locked* |
             Remove-Item -Force
+          .\scripts\validate-release-package.ps1 `
+            -Root viewer-release `
+            -Architecture ${{ matrix.arch }} `
+            -PackageMode Viewer `
+            -Layout Package
           Compress-Archive -Path viewer-release\* `
             -DestinationPath lvt-viewer-${{ env.RELEASE_TAG }}-x64.zip
 
