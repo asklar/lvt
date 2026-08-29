@@ -2,35 +2,46 @@ namespace LvtViewer.ViewModels;
 
 public sealed class TypedPropertyRefreshState
 {
+    public readonly record struct Token(long Epoch, long Generation);
+
+    private long _epoch = 1;
     private long _requestedGeneration;
     private long _appliedGeneration;
-    private bool _running;
+    private Token? _active;
 
     public bool HasPending => _requestedGeneration > _appliedGeneration;
-    public bool IsRunning => _running;
+    public bool IsRunning => _active.HasValue;
+    public long Epoch => _epoch;
+    public bool IsCurrent(Token token) =>
+        token.Epoch == _epoch && _active == token;
 
-    public long Request() => ++_requestedGeneration;
+    public Token Request() =>
+        new(_epoch, ++_requestedGeneration);
 
-    public bool TryBegin(out long generation)
+    public bool TryBegin(out Token token)
     {
-        generation = _requestedGeneration;
-        if (_running || !HasPending)
+        token = new Token(_epoch, _requestedGeneration);
+        if (_active.HasValue || !HasPending)
             return false;
-        _running = true;
+        _active = token;
         return true;
     }
 
-    public void Complete(long generation, bool applied)
+    public bool Complete(Token token, bool applied)
     {
-        if (applied && generation > _appliedGeneration)
-            _appliedGeneration = generation;
-        _running = false;
+        if (_active != token || token.Epoch != _epoch)
+            return false;
+        if (applied && token.Generation > _appliedGeneration)
+            _appliedGeneration = token.Generation;
+        _active = null;
+        return true;
     }
 
     public void Reset()
     {
+        ++_epoch;
         _requestedGeneration = 0;
         _appliedGeneration = 0;
-        _running = false;
+        _active = null;
     }
 }

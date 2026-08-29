@@ -37,6 +37,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly DispatcherTimer _typedPropertyRefreshTimer;
     private readonly TypedPropertyRefreshState _typedPropertyRefreshState = new();
     private int _typedPropertyRefreshDelayMs = 100;
+    private bool _typedRefreshNeedsFullUiaLoad;
+    private bool _typedRefreshPreservePendingEdits;
     private bool _awaitingSnapshot;
     private bool _resourceProbeRunning;
     private int _resourceProbeFailures;
@@ -67,17 +69,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _typedPropertyRefreshTimer.Tick += async (_, _) =>
         {
             _typedPropertyRefreshTimer.Stop();
-            if (!_typedPropertyRefreshState.TryBegin(out var refreshGeneration))
+            if (!_typedPropertyRefreshState.TryBegin(out var refreshToken))
                 return;
             var node = SelectedElement;
             var generation = _connectionGeneration;
+            var fullUiaLoad = _typedRefreshNeedsFullUiaLoad;
+            var preservePendingEdits = _typedRefreshPreservePendingEdits;
+            _typedRefreshNeedsFullUiaLoad = false;
+            _typedRefreshPreservePendingEdits = false;
             bool applied = false;
             try
             {
                 if (UseUia && node != null)
                 {
-                    applied = await RefreshTypedPropertiesAsync(
-                        node, preservePendingEdits: true);
+                    applied = fullUiaLoad
+                        ? await RefreshUiaPropertiesAsync(
+                            node, preservePendingEdits, refreshToken)
+                        : await RefreshTypedPropertiesAsync(
+                            node, preservePendingEdits, refreshToken: refreshToken);
                     applied = applied &&
                               generation == _connectionGeneration &&
                               SelectedElement == node;
@@ -85,17 +94,29 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
             finally
             {
-                _typedPropertyRefreshState.Complete(
-                    refreshGeneration, applied);
-                _typedPropertyRefreshDelayMs = applied
-                    ? 100
-                    : Math.Min(_typedPropertyRefreshDelayMs * 2, 1000);
-                if (_typedPropertyRefreshState.HasPending &&
+                var completionAccepted =
+                    _typedPropertyRefreshState.Complete(
+                        refreshToken, applied);
+                if (completionAccepted && !applied)
+                {
+                    _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+                    _typedRefreshPreservePendingEdits |= preservePendingEdits;
+                }
+                if (completionAccepted)
+                    _typedPropertyRefreshDelayMs = applied
+                        ? 100
+                        : Math.Min(_typedPropertyRefreshDelayMs * 2, 1000);
+                if (completionAccepted &&
+                    _typedPropertyRefreshState.HasPending &&
                     UseUia && SelectedElement != null)
                 {
                     _typedPropertyRefreshTimer.Interval =
                         TimeSpan.FromMilliseconds(_typedPropertyRefreshDelayMs);
                     _typedPropertyRefreshTimer.Start();
+                }
+                else if (completionAccepted && applied)
+                {
+                    IsPropertyPanelLoading = false;
                 }
             }
         };
@@ -265,9 +286,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             RebuildPropertyView();
             _typedPropertyRefreshTimer.Stop();
             _typedPropertyRefreshState.Reset();
+            _typedRefreshNeedsFullUiaLoad = false;
+            _typedRefreshPreservePendingEdits = false;
             IsPropertyPanelLoading = value != null;
             if (UseUia)
-                _ = RefreshUiaPropertiesAsync(value);
+            {
+                if (value != null)
+                {
+                    RequestTypedPropertySchemaRefresh(
+                        fullUiaLoad: true,
+                        preservePendingEdits: false);
+                }
+            }
             else
                 _ = RefreshTypedPropertiesAsync(value);
         }
@@ -625,24 +655,31 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         title = Interop.NativeMethods.GetWindowTitle(hwnd);
     }
 
-    private async System.Threading.Tasks.Task RefreshUiaPropertiesAsync(ElementNodeViewModel? node)
+    private async System.Threading.Tasks.Task<bool> RefreshUiaPropertiesAsync(
+        ElementNodeViewModel? node,
+        bool preservePendingEdits = false,
+        TypedPropertyRefreshState.Token? refreshToken = null)
     {
         if (node == null)
         {
             IsPropertyPanelLoading = false;
-            return;
+            return true;
         }
 
         long propertyVersion = node.PropertyVersion;
         var stopwatch = Stopwatch.StartNew();
         var result = await _mcp.GetElementPropertiesAsync(node.Key);
-        if (SelectedElement != node || node.PropertyVersion != propertyVersion)
-            return;
+        if (SelectedElement != node ||
+            node.PropertyVersion != propertyVersion ||
+            (refreshToken.HasValue &&
+             !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
+        {
+            return false;
+        }
         if (!result.Ok)
         {
             StatusText = $"Could not read UI Automation properties: {result.Error}";
-            IsPropertyPanelLoading = false;
-            return;
+            return true;
         }
 
         if (result.Payload.TryGetProperty("element", out var element) &&
@@ -662,16 +699,29 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                             : property.Value.ToString()))
                     .ToList();
             });
-            if (SelectedElement != node || node.PropertyVersion != propertyVersion)
-                return;
+            if (SelectedElement != node ||
+                node.PropertyVersion != propertyVersion ||
+                (refreshToken.HasValue &&
+                 !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
+            {
+                return false;
+            }
             node.ReplacePropertyRows(rows);
         }
         Logger.Log("properties", $"Loaded UIA properties in {stopwatch.ElapsedMilliseconds} ms");
-        await RefreshTypedPropertiesAsync(node);
+        return await RefreshTypedPropertiesAsync(
+            node,
+            preservePendingEdits,
+            refreshToken: refreshToken,
+            clearLoadingOnCompletion: false);
     }
 
-    private void RequestTypedPropertySchemaRefresh()
+    private void RequestTypedPropertySchemaRefresh(
+        bool fullUiaLoad = false,
+        bool preservePendingEdits = true)
     {
+        _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+        _typedRefreshPreservePendingEdits |= preservePendingEdits;
         _typedPropertyRefreshState.Request();
         if (_typedPropertyRefreshState.IsRunning)
             return;
@@ -684,7 +734,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async System.Threading.Tasks.Task<bool> RefreshTypedPropertiesAsync(
         ElementNodeViewModel? node, bool preservePendingEdits = false,
-        string? acceptedProviderName = null)
+        string? acceptedProviderName = null,
+        TypedPropertyRefreshState.Token? refreshToken = null,
+        bool clearLoadingOnCompletion = true)
     {
         if (node == null)
         {
@@ -695,27 +747,35 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         long propertyVersion = node.PropertyVersion;
         var stopwatch = Stopwatch.StartNew();
         var result = await _mcp.GetEditablePropertiesAsync(node.Key);
-        if (SelectedElement != node || node.PropertyVersion != propertyVersion)
+        if (SelectedElement != node ||
+            node.PropertyVersion != propertyVersion ||
+            (refreshToken.HasValue &&
+             !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
             return false;
         if (!result.Ok)
         {
             Logger.Log(
                 "properties",
                 $"No typed property provider for {node.Key}: {result.Error}");
-            IsPropertyPanelLoading = false;
-            return false;
+            if (clearLoadingOnCompletion)
+                IsPropertyPanelLoading = false;
+            return true;
         }
 
         string snapshotJson = result.Payload.GetRawText();
         var snapshot = await System.Threading.Tasks.Task.Run(() =>
             System.Text.Json.JsonSerializer.Deserialize<PropertySnapshotDto>(
                 snapshotJson, JsonDefaults.Options));
-        if (SelectedElement != node || node.PropertyVersion != propertyVersion)
+        if (SelectedElement != node ||
+            node.PropertyVersion != propertyVersion ||
+            (refreshToken.HasValue &&
+             !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
             return false;
         if (snapshot == null || string.IsNullOrWhiteSpace(snapshot.SchemaId))
         {
-            IsPropertyPanelLoading = false;
-            return false;
+            if (clearLoadingOnCompletion)
+                IsPropertyPanelLoading = false;
+            return true;
         }
 
         if (!_propertySchemas.TryGet(snapshot.SchemaId, out var descriptors))
@@ -742,7 +802,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         node.ReplaceTypedPropertyRows(
             rows, preservePendingEdits, acceptedProviderName);
-        IsPropertyPanelLoading = false;
+        if (clearLoadingOnCompletion)
+            IsPropertyPanelLoading = false;
         Logger.Log(
             "properties",
             $"Loaded {rows.Count} typed properties from schema {snapshot.SchemaId} " +

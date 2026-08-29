@@ -171,10 +171,31 @@ var requested = refreshState.Request();
 Assert(refreshState.TryBegin(out var firstAttempt), "schema refresh did not start");
 Assert(firstAttempt == requested, "schema refresh generation drifted");
 refreshState.Complete(firstAttempt, applied: false);
-Assert(refreshState.HasPending, "ordinary value race lost the pending schema refresh");
+Assert(refreshState.HasPending, "ordinary value patch racing initial load lost its retry");
 Assert(refreshState.TryBegin(out var retryAttempt), "stale schema refresh was not retried");
 refreshState.Complete(retryAttempt, applied: true);
 Assert(!refreshState.HasPending, "latest schema refresh was not marked applied");
+
+var abaState = new TypedPropertyRefreshState();
+abaState.Request();
+Assert(abaState.TryBegin(out var selectionA), "selection A refresh did not start");
+abaState.Reset();
+abaState.Request();
+Assert(abaState.TryBegin(out var selectionB), "selection B refresh did not start");
+abaState.Reset();
+abaState.Request();
+Assert(abaState.TryBegin(out var selectionAAgain), "reselected A refresh did not start");
+Assert(!abaState.Complete(selectionA, applied: true),
+    "stale selection A completion was accepted after reset");
+Assert(!abaState.Complete(selectionB, applied: true),
+    "stale selection B completion was accepted after A→B→A");
+Assert(abaState.IsCurrent(selectionAAgain),
+    "stale completion cleared the active reselected-A token");
+Assert(abaState.HasPending,
+    "stale completion marked the reselected-A generation applied");
+Assert(abaState.Complete(selectionAAgain, applied: true),
+    "current reselected-A completion was rejected");
+Assert(!abaState.HasPending, "current reselected-A completion did not settle");
 
 var liveTree = new LiveTree();
 liveTree.Apply(new TreeChangeEventDto
