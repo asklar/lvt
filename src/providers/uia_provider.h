@@ -8,6 +8,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace lvt {
@@ -40,9 +41,14 @@ class UiaPropertyIdentityCache {
 public:
     static constexpr size_t kMaximumRuntimeIds = 16384;
     static constexpr size_t kMaximumKeyAliases = 32768;
+    static constexpr size_t kMaximumScopes = 16;
 
-    void attach(Element& root, bool completeSnapshot = true);
-    void remember(const Element& root);
+    bool attach(
+        Element& root, const std::string& scope = "default",
+        bool completeSnapshot = true);
+    bool remember(
+        const Element& root, const std::string& scope = "default",
+        bool completeSnapshot = true);
     std::optional<uint64_t> resolve(
         const std::string& reference, std::string& error);
     std::optional<std::string> runtime_id(uint64_t handle) const;
@@ -52,15 +58,37 @@ public:
 private:
     struct RuntimeIdentity {
         uint64_t handle = 0;
-        uint64_t lastSeenGeneration = 0;
+        uint64_t lastUsed = 0;
+        std::unordered_map<std::string, uint64_t> lastSeenByScope;
+    };
+    struct ScopeState {
+        uint64_t generation = 0;
+        uint64_t lastUsed = 0;
     };
 
     void attach_element(Element& element);
     void remember_element(const Element& element);
-    void prune();
+    void collect_runtime_ids(
+        const Element& element,
+        std::unordered_set<std::string>& runtimeIds) const;
+    void collect_keys(
+        const Element& element,
+        std::unordered_set<std::string>& keys) const;
+    void prune(
+        const std::unordered_set<std::string>& protectedRuntimeIds = {},
+        const std::unordered_set<std::string>& protectedKeys = {});
 
     uint64_t m_nextHandle = 1;
-    uint64_t m_generation = 0;
+    uint64_t m_clock = 0;
+    std::string m_activeScope = "default";
+    uint64_t m_activeGeneration = 0;
+    std::unordered_map<std::string, ScopeState> m_scopes;
+    std::unordered_map<
+        std::string, std::unordered_set<std::string>>
+        m_currentRuntimeIdsByScope;
+    std::unordered_map<
+        std::string, std::unordered_set<std::string>>
+        m_currentKeysByScope;
     std::unordered_map<std::string, RuntimeIdentity> m_handlesByRuntimeId;
     std::unordered_map<uint64_t, std::string> m_runtimeIdsByHandle;
     std::unordered_map<
@@ -102,8 +130,12 @@ public:
     bool get_tree_with_options(Element& root, const UiaOptions& options,
                                bool* truncated = nullptr);
     bool attach_property_identities(
-        Element& root, bool completeSnapshot = true);
-    void remember_property_references(const Element& root);
+        Element& root, const UiaOptions& options,
+        bool completeSnapshot = true);
+    bool remember_property_references(
+        const Element& root, const UiaOptions& options,
+        bool completeSnapshot = true);
+    std::string property_identity_error();
     std::optional<uint64_t> resolve_property_reference(
         const std::string& reference, std::string& error);
     HWND target_hwnd() const { return m_hwnd; }

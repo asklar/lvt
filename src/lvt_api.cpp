@@ -1068,9 +1068,12 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             connection = uia_connection_for_active_session(session);
         if (connection && !usedPersistentConnection &&
             !connection->attach_property_identities(
-                *result, !wasTruncated)) {
-            error =
-                "the UI Automation connection no longer matches this session's target window";
+                *result, options, !wasTruncated)) {
+            error = connection->property_identity_error();
+            if (error.empty()) {
+                error =
+                    "the UI Automation connection no longer matches this session's target window";
+            }
             return false;
         }
         if (truncated)
@@ -1078,8 +1081,12 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         tree = std::move(*result);
         lvt::assign_element_ids(tree);
         lvt::assign_element_keys(tree);
-        if (connection)
-            connection->remember_property_references(tree);
+        if (connection &&
+            !connection->remember_property_references(
+                tree, options, !wasTruncated)) {
+            error = connection->property_identity_error();
+            return false;
+        }
         return true;
 #else
         error = "this build has UI Automation support compiled out";

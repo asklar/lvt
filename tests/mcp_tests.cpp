@@ -4347,6 +4347,14 @@ TEST_F(McpSampleFixture, UiaTypedPropertiesPreserveOriginatingViewIdentity) {
     ASSERT_FALSE(isError) << contentProperties.dump(2);
     EXPECT_NE(
         find_property_descriptor(contentProperties, "Value.Value"), nullptr);
+
+    auto rawAfterOtherViews = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", rawKey}}, &isError);
+    ASSERT_FALSE(isError) << rawAfterOtherViews.dump(2);
+    EXPECT_EQ(
+        rawAfterOtherViews.value("schemaId", ""),
+        rawProperties.value("schemaId", ""));
 }
 
 TEST_F(McpSampleFixture, TypedScrollRejectsAStaleMissingScrollPattern) {

@@ -376,6 +376,17 @@ std::vector<long> resolve_properties(const UiaOptions& options,
     return properties;
 }
 
+std::string identity_scope(const UiaOptions& options) {
+    std::vector<std::string> properties = options.extraProperties;
+    std::sort(properties.begin(), properties.end());
+    std::string scope =
+        std::string(uia_view_name(options.view)) +
+        "|timeout=" + std::to_string(options.timeoutMs);
+    for (const auto& property : properties)
+        scope += "|property=" + property;
+    return scope;
+}
+
 void apply_automation_timeouts(IUIAutomation* automation, const UiaOptions& options) {
     if (!automation)
         return;
@@ -578,17 +589,42 @@ struct UiaConnection::State {
     CO_MTA_USAGE_COOKIE mtaCookie = nullptr;
     UiaPropertyIdentityCache identities;
     UiaPropertySchemaCache schemaCache;
+    std::string identityError;
 };
 
-void UiaPropertyIdentityCache::attach(
-    Element& root, bool completeSnapshot) {
+bool UiaPropertyIdentityCache::attach(
+    Element& root, const std::string& scope, bool completeSnapshot) {
+    if (!m_scopes.contains(scope) &&
+        m_scopes.size() >= kMaximumScopes) {
+        return false;
+    }
+    std::unordered_set<std::string> snapshotRuntimeIds;
+    collect_runtime_ids(root, snapshotRuntimeIds);
+    std::unordered_set<std::string> protectedRuntimeIds;
+    for (const auto& [knownScope, current] :
+         m_currentRuntimeIdsByScope) {
+        if (completeSnapshot && knownScope == scope)
+            continue;
+        protectedRuntimeIds.insert(current.begin(), current.end());
+    }
+    protectedRuntimeIds.insert(
+        snapshotRuntimeIds.begin(), snapshotRuntimeIds.end());
+    if (protectedRuntimeIds.size() > kMaximumRuntimeIds)
+        return false;
     if (completeSnapshot)
-        ++m_generation;
-    else if (m_generation == 0)
-        m_generation = 1;
+        m_currentRuntimeIdsByScope[scope] = snapshotRuntimeIds;
+
+    auto& scopeState = m_scopes[scope];
+    scopeState.lastUsed = ++m_clock;
+    if (completeSnapshot)
+        ++scopeState.generation;
+    else if (scopeState.generation == 0)
+        scopeState.generation = 1;
+    m_activeScope = scope;
+    m_activeGeneration = scopeState.generation;
     attach_element(root);
-    if (completeSnapshot)
-        prune();
+    prune(protectedRuntimeIds);
+    return true;
 }
 
 void UiaPropertyIdentityCache::attach_element(Element& element) {
@@ -596,7 +632,9 @@ void UiaPropertyIdentityCache::attach_element(Element& element) {
     if (runtime != element.properties.end() && !runtime->second.empty()) {
         auto found = m_handlesByRuntimeId.find(runtime->second);
         if (found != m_handlesByRuntimeId.end()) {
-            found->second.lastSeenGeneration = m_generation;
+            found->second.lastUsed = ++m_clock;
+            found->second.lastSeenByScope[m_activeScope] =
+                m_activeGeneration;
             element.providerHandle = found->second.handle;
         } else {
             const auto handle = m_nextHandle++;
@@ -604,7 +642,10 @@ void UiaPropertyIdentityCache::attach_element(Element& element) {
                 runtime->second,
                 RuntimeIdentity{
                     .handle = handle,
-                    .lastSeenGeneration = m_generation,
+                    .lastUsed = ++m_clock,
+                    .lastSeenByScope = {
+                        {m_activeScope, m_activeGeneration},
+                    },
                 });
             m_runtimeIdsByHandle.emplace(handle, runtime->second);
             element.providerHandle = handle;
@@ -614,18 +655,46 @@ void UiaPropertyIdentityCache::attach_element(Element& element) {
         attach_element(child);
 }
 
-void UiaPropertyIdentityCache::remember(const Element& root) {
-    if (m_generation == 0)
-        m_generation = 1;
+bool UiaPropertyIdentityCache::remember(
+    const Element& root, const std::string& scope,
+    bool completeSnapshot) {
+    if (!m_scopes.contains(scope) &&
+        m_scopes.size() >= kMaximumScopes) {
+        return false;
+    }
+    std::unordered_set<std::string> snapshotKeys;
+    collect_keys(root, snapshotKeys);
+    std::unordered_set<std::string> protectedKeys;
+    for (const auto& [knownScope, current] : m_currentKeysByScope) {
+        if (completeSnapshot && knownScope == scope)
+            continue;
+        protectedKeys.insert(current.begin(), current.end());
+    }
+    protectedKeys.insert(snapshotKeys.begin(), snapshotKeys.end());
+    if (protectedKeys.size() > kMaximumKeyAliases)
+        return false;
+    if (completeSnapshot)
+        m_currentKeysByScope[scope] = snapshotKeys;
+
+    auto& scopeState = m_scopes[scope];
+    scopeState.lastUsed = ++m_clock;
+    if (scopeState.generation == 0)
+        scopeState.generation = 1;
+    m_activeScope = scope;
+    m_activeGeneration = scopeState.generation;
     remember_element(root);
-    prune();
+    std::unordered_set<std::string> protectedRuntimeIds;
+    for (const auto& [_, current] : m_currentRuntimeIdsByScope)
+        protectedRuntimeIds.insert(current.begin(), current.end());
+    prune(protectedRuntimeIds, protectedKeys);
+    return true;
 }
 
 void UiaPropertyIdentityCache::remember_element(const Element& element) {
     const auto runtime = element.properties.find("RuntimeId");
     if (!element.key.empty() &&
         runtime != element.properties.end() && !runtime->second.empty()) {
-        m_runtimeIdsByKey[element.key][runtime->second] = m_generation;
+        m_runtimeIdsByKey[element.key][runtime->second] = ++m_clock;
     }
     for (const auto& child : element.children)
         remember_element(child);
@@ -659,15 +728,36 @@ std::optional<uint64_t> UiaPropertyIdentityCache::resolve(
     }
 
     auto existing = m_handlesByRuntimeId.find(runtimeId);
-    if (existing != m_handlesByRuntimeId.end())
+    if (existing != m_handlesByRuntimeId.end()) {
+        existing->second.lastUsed = ++m_clock;
         return existing->second.handle;
+    }
+
+    std::unordered_set<std::string> currentRuntimeIds;
+    for (const auto& [_, current] : m_currentRuntimeIdsByScope)
+        currentRuntimeIds.insert(current.begin(), current.end());
+    if (currentRuntimeIds.size() >= kMaximumRuntimeIds) {
+        error =
+            "The UI Automation RuntimeId cannot be retained because current "
+            "session trees already fill the bounded identity cache; use a "
+            "narrower view or element scope";
+        return std::nullopt;
+    }
+
+    auto& scopeState = m_scopes[m_activeScope];
+    if (scopeState.generation == 0)
+        scopeState.generation = 1;
+    scopeState.lastUsed = ++m_clock;
 
     const auto handle = m_nextHandle++;
     m_handlesByRuntimeId.emplace(
         runtimeId,
         RuntimeIdentity{
             .handle = handle,
-            .lastSeenGeneration = m_generation,
+            .lastUsed = ++m_clock,
+            .lastSeenByScope = {
+                {m_activeScope, scopeState.generation},
+            },
         });
     m_runtimeIdsByHandle.emplace(handle, runtimeId);
     prune();
@@ -689,7 +779,35 @@ size_t UiaPropertyIdentityCache::key_alias_count() const {
     return count;
 }
 
-void UiaPropertyIdentityCache::prune() {
+void UiaPropertyIdentityCache::collect_runtime_ids(
+    const Element& element,
+    std::unordered_set<std::string>& runtimeIds) const {
+    const auto runtime = element.properties.find("RuntimeId");
+    if (runtime != element.properties.end() && !runtime->second.empty())
+        runtimeIds.insert(runtime->second);
+    for (const auto& child : element.children)
+        collect_runtime_ids(child, runtimeIds);
+}
+
+void UiaPropertyIdentityCache::collect_keys(
+    const Element& element,
+    std::unordered_set<std::string>& keys) const {
+    if (!element.key.empty())
+        keys.insert(element.key);
+    for (const auto& child : element.children)
+        collect_keys(child, keys);
+}
+
+void UiaPropertyIdentityCache::prune(
+    const std::unordered_set<std::string>& extraProtectedRuntimeIds,
+    const std::unordered_set<std::string>& extraProtectedKeys) {
+    std::unordered_set<std::string> protectedRuntimeIds =
+        extraProtectedRuntimeIds;
+    for (const auto& [_, current] : m_currentRuntimeIdsByScope)
+        protectedRuntimeIds.insert(current.begin(), current.end());
+    std::unordered_set<std::string> protectedKeys = extraProtectedKeys;
+    for (const auto& [_, current] : m_currentKeysByScope)
+        protectedKeys.insert(current.begin(), current.end());
     const auto remove_runtime = [&](const std::string& runtimeId) {
         const auto found = m_handlesByRuntimeId.find(runtimeId);
         if (found == m_handlesByRuntimeId.end())
@@ -700,7 +818,16 @@ void UiaPropertyIdentityCache::prune() {
 
     std::vector<std::string> staleRuntimeIds;
     for (const auto& [runtimeId, identity] : m_handlesByRuntimeId) {
-        if (identity.lastSeenGeneration + 1 < m_generation)
+        bool fresh = false;
+        for (const auto& [scope, lastSeen] : identity.lastSeenByScope) {
+            const auto state = m_scopes.find(scope);
+            if (state != m_scopes.end() &&
+                lastSeen + 1 >= state->second.generation) {
+                fresh = true;
+                break;
+            }
+        }
+        if (!fresh && !protectedRuntimeIds.contains(runtimeId))
             staleRuntimeIds.push_back(runtimeId);
     }
     for (const auto& runtimeId : staleRuntimeIds)
@@ -710,9 +837,10 @@ void UiaPropertyIdentityCache::prune() {
         auto oldest = m_handlesByRuntimeId.end();
         for (auto it = m_handlesByRuntimeId.begin();
              it != m_handlesByRuntimeId.end(); ++it) {
+            if (protectedRuntimeIds.contains(it->first))
+                continue;
             if (oldest == m_handlesByRuntimeId.end() ||
-                it->second.lastSeenGeneration <
-                    oldest->second.lastSeenGeneration) {
+                it->second.lastUsed < oldest->second.lastUsed) {
                 oldest = it;
             }
         }
@@ -745,6 +873,8 @@ void UiaPropertyIdentityCache::prune() {
              key != m_runtimeIdsByKey.end(); ++key) {
             for (auto alias = key->second.begin();
                  alias != key->second.end(); ++alias) {
+                if (protectedKeys.contains(key->first))
+                    continue;
                 if (alias->second < oldestGeneration) {
                     oldestGeneration = alias->second;
                     oldestKey = key;
@@ -955,8 +1085,17 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
         apply_automation_timeouts(automation, options);
         return build_tree_with_automation(automation, hwnd, options, built, wasTruncated);
     });
-    if (SUCCEEDED(hr))
-        m_state->identities.attach(built, !wasTruncated);
+    if (SUCCEEDED(hr)) {
+        if (!m_state->identities.attach(
+                built, identity_scope(options), !wasTruncated)) {
+            m_state->identityError =
+                "The UI Automation tree exceeds lvt's bounded identity capacity; "
+                "use a narrower view or element scope";
+            lock.unlock();
+            return false;
+        }
+        m_state->identityError.clear();
+    }
     lock.unlock();
 
     if (truncated)
@@ -975,19 +1114,38 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
 }
 
 bool UiaConnection::attach_property_identities(
-    Element& root, bool completeSnapshot) {
+    Element& root, const UiaOptions& options, bool completeSnapshot) {
     std::lock_guard<std::mutex> lock(m_state->mutex);
     if (!m_state->automation || !matches_target(m_hwnd))
         return false;
-    m_state->identities.attach(root, completeSnapshot);
-    return true;
+    const bool attached = m_state->identities.attach(
+        root, identity_scope(options), completeSnapshot);
+    m_state->identityError = attached
+        ? std::string()
+        : "The UI Automation tree exceeds lvt's bounded identity capacity; "
+          "use a narrower view or element scope";
+    return attached;
 }
 
-void UiaConnection::remember_property_references(const Element& root) {
+bool UiaConnection::remember_property_references(
+    const Element& root, const UiaOptions& options,
+    bool completeSnapshot) {
     std::lock_guard<std::mutex> lock(m_state->mutex);
     if (!m_state->automation || !matches_target(m_hwnd))
-        return;
-    m_state->identities.remember(root);
+        return false;
+    const bool remembered =
+        m_state->identities.remember(
+            root, identity_scope(options), completeSnapshot);
+    m_state->identityError = remembered
+        ? std::string()
+        : "The UI Automation tree has too many keys for lvt's bounded "
+          "identity cache; use a narrower view or element scope";
+    return remembered;
+}
+
+std::string UiaConnection::property_identity_error() {
+    std::lock_guard<std::mutex> lock(m_state->mutex);
+    return m_state->identityError;
 }
 
 std::optional<uint64_t> UiaConnection::resolve_property_reference(

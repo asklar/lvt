@@ -2668,9 +2668,94 @@ TEST(UiaProperties, TruncatedSnapshotsDoNotPruneKnownIdentities) {
         partial.framework = "uia";
         partial.properties["RuntimeId"] =
             "42.700." + std::to_string(i + 2);
-        identities.attach(partial, false);
+        identities.attach(partial, "default", false);
     }
     EXPECT_EQ(identities.runtime_id(handle), "42.700.1");
+}
+
+TEST(UiaProperties, RawIdentitySurvivesControlAndContentWalks) {
+    UiaPropertyIdentityCache identities;
+    Element rawOnly;
+    rawOnly.type = "Edit";
+    rawOnly.framework = "uia";
+    rawOnly.properties["AutomationId"] = "RawOnly";
+    rawOnly.properties["RuntimeId"] = "42.800.1";
+    ASSERT_TRUE(identities.attach(rawOnly, "raw"));
+    assign_element_keys(rawOnly);
+    ASSERT_TRUE(identities.remember(rawOnly, "raw"));
+    const auto rawKey = rawOnly.key;
+    const auto rawHandle = rawOnly.providerHandle;
+
+    for (int i = 0; i < 20; ++i) {
+        Element control;
+        control.type = "Button";
+        control.framework = "uia";
+        control.properties["RuntimeId"] =
+            "42.801." + std::to_string(i);
+        ASSERT_TRUE(identities.attach(control, "control"));
+        assign_element_keys(control);
+        ASSERT_TRUE(identities.remember(control, "control"));
+
+        Element content;
+        content.type = "Text";
+        content.framework = "uia";
+        content.properties["RuntimeId"] =
+            "42.802." + std::to_string(i);
+        ASSERT_TRUE(identities.attach(content, "content"));
+        assign_element_keys(content);
+        ASSERT_TRUE(identities.remember(content, "content"));
+    }
+
+    std::string error;
+    const auto resolved = identities.resolve(rawKey, error);
+    ASSERT_TRUE(resolved.has_value()) << error;
+    EXPECT_EQ(*resolved, rawHandle);
+}
+
+TEST(UiaProperties, OversizedSnapshotIsRefusedBeforeReturningInvalidKeys) {
+    UiaPropertyIdentityCache identities;
+    Element root;
+    root.type = "Window";
+    root.framework = "uia";
+    root.children.reserve(
+        UiaPropertyIdentityCache::kMaximumRuntimeIds + 1);
+    for (size_t i = 0;
+         i <= UiaPropertyIdentityCache::kMaximumRuntimeIds;
+         ++i) {
+        Element child;
+        child.type = "Text";
+        child.framework = "uia";
+        child.properties["RuntimeId"] =
+            "42.900." + std::to_string(i);
+        root.children.push_back(std::move(child));
+    }
+    EXPECT_FALSE(identities.attach(root, "raw"));
+    EXPECT_EQ(identities.runtime_id_count(), 0u);
+    EXPECT_EQ(identities.key_alias_count(), 0u);
+
+    root.children.pop_back();
+    ASSERT_TRUE(identities.attach(root, "raw"));
+    const auto protectedHandle = root.children.front().providerHandle;
+    Element additional;
+    additional.type = "Text";
+    additional.framework = "uia";
+    additional.properties["RuntimeId"] = "42.999.1";
+    EXPECT_FALSE(identities.attach(additional, "control"));
+    EXPECT_TRUE(identities.runtime_id(protectedHandle).has_value())
+        << "capacity handling evicted an identity from the current raw snapshot";
+
+    UiaPropertyIdentityCache scoped;
+    Element one;
+    one.type = "Text";
+    one.framework = "uia";
+    one.properties["RuntimeId"] = "42.901.1";
+    for (size_t i = 0;
+         i < UiaPropertyIdentityCache::kMaximumScopes;
+         ++i) {
+        EXPECT_TRUE(scoped.attach(
+            one, "scope-" + std::to_string(i)));
+    }
+    EXPECT_FALSE(scoped.attach(one, "one-scope-too-many"));
 }
 
 TEST(FindElementByRef, ResolvesUiaRuntimeIdReference) {
