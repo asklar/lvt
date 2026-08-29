@@ -113,9 +113,21 @@ state, and every successful write is read back. Owner-data or ambiguous
 list-view/tab items and ABI-sensitive cross-bitness operations remain visible
 but read-only with a reason. Native connections accept only HWNDs registered
 from their root/descendant tree; compact handles do not authorize arbitrary
-same-process top-level windows. Connection lookup rechecks session liveness
-under the connection-map lock so a disconnect cannot recreate an erased
-session entry.
+same-process top-level windows, and every operation repeats the root/descendant
+check so reparented controls stop being actionable. Publishing a new visual
+snapshot replaces, rather than accumulates, the session allow-list.
+Connection lookup rechecks session liveness under the connection-map lock so a
+disconnect cannot recreate an erased session entry.
+
+List-view, tree-view, and tab text reads grow their capacity and retry up to the
+provider safety limit; setters reject values beyond that same readback limit
+before mutation. Tab reads request `TCIF_TEXT` only: `TCIF_PARAM` is
+intentionally avoided because `TCM_SETITEMEXTRA` replaces the `TCITEM` ABI with
+an application-defined `TCITEMHEADER`-based structure. Toolbar buttons require
+both a stable index and a unique command id. Status parts inspect the returned
+`SBT_*` type before any copy; `SBT_OWNERDRAW` is item data, never a string, so
+those parts are unavailable/read-only and their flag is never combined with a
+temporary text pointer.
 
 ### Element ID assignment
 

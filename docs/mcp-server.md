@@ -233,11 +233,11 @@ exposes semantic properties rather than styles or messages:
 | Edit | Text, selection start/end, and read-only state |
 | ComboBox / single-select ListBox | Selected index; clear removes selection |
 | ScrollBar | Minimum, maximum, position; page size is read-only |
-| SysListView32 | View mode; item selected/focused/text when item identity is verified and it is not owner-data |
-| SysTreeView32 | Item selected, expanded, and text |
-| ToolbarWindow32 | Button checked/enabled/text after command-id revalidation |
-| Status bar | Part text |
-| Tab control | Selected index and tab text |
+| SysListView32 | View mode; bounded grow/retry item selected/focused/text when identity is verified and it is not owner-data |
+| SysTreeView32 | Item selected, expanded, and bounded grow/retry text |
+| ToolbarWindow32 | Button checked/enabled/text after index and unique command-id revalidation |
+| Status bar | Text parts only; owner-drawn item-data parts are unavailable/read-only |
+| Tab control | Selected index and bounded tab text when the label/order identity is unique |
 
 When a native operation is not safe for a particular class/style, owner-data
 control, stale item, or architecture combination, the descriptor/value is
@@ -277,10 +277,13 @@ capacity-bearing `TB_GETBUTTONINFO` buffer with bounded growth rechecks.
 
 Native compact keys are valid only after that exact target was registered while
 building the session's root tree. A guessed same-process HWND, a sibling
-top-level window, or a key from a reconnected session before its first tree
-refresh is rejected. Tab items prefer a nonzero `TCITEM.lParam` identity; tabs
-without one must have unique text, and their ordered text fingerprint is
-revalidated before mutation.
+top-level window, a reparented child that left the root, or a key from a
+reconnected session before its first tree refresh is rejected. Each published
+snapshot replaces the native allow-list, so narrowing to a subtree prunes
+siblings. Tab identity never requests `TCIF_PARAM`, because
+`TCM_SETITEMEXTRA` changes that ABI; it instead requires unique text and
+revalidates the complete ordered label fingerprint. Duplicate toolbar command
+ids similarly make affected buttons read-only.
 
 Tree reads and all three property operations share the session's existing
 persistent provider adapter: there is no second injection or caller-specified
