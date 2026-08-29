@@ -494,16 +494,28 @@ void drain_session_connection_events(const std::string& sessionId) {
         }
     }
 
-    for (const auto& [label, connection] : connections) {
+    size_t count = 0;
+    bool snapshotRequired = false;
+    for (const auto& [_, connection] : connections) {
         if (!connection->is_alive())
             continue;
         const auto events = connection->poll_events();
-        if (lvt::g_debug && !events.empty()) {
-            fprintf(
-                stderr,
-                "lvt: MCP %s connection reported %zu pushed change event(s)\n",
-                label.c_str(), events.size());
-        }
+        count += events.size();
+        snapshotRequired =
+            snapshotRequired ||
+            std::any_of(
+                events.begin(), events.end(),
+                [](const lvt::ConnectionEvent& event) {
+                    return event.mutation ==
+                           lvt::ConnectionEvent::Mutation::snapshotRequired;
+                });
+    }
+    if (lvt::g_debug && count != 0) {
+        fprintf(
+            stderr,
+            "lvt: MCP drained %zu pushed connection event(s)%s; "
+            "this request's authoritative tree refresh will consume the signal\n",
+            count, snapshotRequired ? " including snapshotRequired" : "");
     }
 }
 
@@ -1025,6 +1037,7 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
     const bool fastProperties = get_bool(params, "fast", false);
     for (int attempt = 0; attempt < 3; ++attempt) {
         auto connectionLookup = connection_lookup_for_session(session, frameworks);
+        drain_session_connection_events(session.id);
         tree = lvt::build_tree(
             session.hwnd, session.pid, frameworks, -1,
             session.pluginOption, fastProperties, connectionLookup);

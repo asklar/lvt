@@ -87,8 +87,43 @@ long-running sessions — open connection, `GET_TREE`, `DISCONNECT` — so
 injection and teardown have one implementation. Win32Provider and
 ComCtlProvider use lightweight per-session connections, not for tree
 collection, but to register opaque native element identities and cache
-provider-owned typed-property schemas. Plugins can adopt the interface without
-changing how callers acquire or use them.
+provider-owned typed-property schemas. The Win32 connection also owns one
+root-scoped WinEvent subscription that covers the native HWND subtree and
+common-control logical-item notifications. Plugins can adopt the interface
+without changing how callers acquire or use them.
+
+### Native WinEvent refresh hints (`native_win_event.*`)
+
+Long-running visual sessions install one `SetWinEventHook` subscription on the
+Win32 connection for `EVENT_OBJECT_CREATE` through
+`EVENT_OBJECT_PARENTCHANGE`, filtered by the target PID. The hook is
+`WINEVENT_OUTOFCONTEXT`; targets outside lvt also use
+`WINEVENT_SKIPOWNPROCESS`. A dedicated thread installs the hook, owns the
+required message loop, and calls `UnhookWinEvent` exactly once on that same
+thread when the last connection-generation reference is released or the
+target process exits.
+
+Out-of-context callbacks route through thread-local state, so simultaneous
+sessions have no global hook-to-connection map that could collide. The callback
+does not send messages, inspect HWNDs, take locks, or allocate. It only copies a
+small event record into a fixed 256-entry single-producer queue; reentrancy or
+overflow sets a bounded reset marker. `poll_events()` drains off-callback,
+filters records against the root and the HWNDs from the last published
+snapshot, and coalesces any relevant native/control-item activity to one
+provider-neutral `snapshotRequired` event. Destroy notifications are matched
+only against stored handle values and never dereference or query the destroyed
+HWND. Current HWND subtree checks for create/reparent events happen only during
+the later drain.
+
+Native eventing is an optimization signal, never a correctness source. Both
+`watch` and MCP still build complete periodic snapshots and derive public
+added/removed/changed output only from `diff_trees`; they drain pushed events
+after that authoritative refresh instead of also emitting native structural
+deltas. Missing, delayed, coalesced, or overflowed WinEvents therefore cannot
+hide text, bounds, state, or structure changes and cannot create duplicate
+add/remove storms. The current schedulers do not wait on a provider event
+handle: `watch` latency remains bounded by `--interval`, and subscribed MCP
+resources by their approximately 500 ms polling cadence.
 
 ### Native typed-property safety (`native_message.*`,
 `native_property_connection.*`)

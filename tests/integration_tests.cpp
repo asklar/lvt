@@ -41,6 +41,8 @@
 #include "framework_detector.h"
 #include "providers/native_message.h"
 #include "providers/native_property_connection.h"
+#include "providers/native_win_event.h"
+#include "providers/connection_registry.h"
 #include "tree_builder.h"
 
 using json = nlohmann::json;
@@ -3679,6 +3681,389 @@ wil::unique_handle NativeControlsFixture::s_thread;
 DWORD NativeControlsFixture::s_pid = 0;
 HWND NativeControlsFixture::s_hwnd = nullptr;
 
+static LRESULT send_native_fixture_message(
+    HWND hwnd, UINT message, WPARAM wParam = 0, LPARAM lParam = 0) {
+    DWORD_PTR result = 0;
+    const LRESULT sent = SendMessageTimeoutW(
+        hwnd, message, wParam, lParam,
+        SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 5000, &result);
+    EXPECT_NE(sent, 0);
+    return sent ? static_cast<LRESULT>(result) : 0;
+}
+
+static bool wait_for_native_snapshot(
+    lvt::IFrameworkConnection& connection,
+    std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        const auto events = connection.poll_events();
+        if (std::any_of(
+                events.begin(), events.end(),
+                [](const lvt::ConnectionEvent& event) {
+                    return event.mutation ==
+                           lvt::ConnectionEvent::Mutation::snapshotRequired;
+                })) {
+            return true;
+        }
+        Sleep(20);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+static void drain_native_events(lvt::IFrameworkConnection& connection) {
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        Sleep(20);
+        (void)connection.poll_events();
+    }
+}
+
+static void publish_native_event_snapshot(
+    const std::shared_ptr<lvt::NativePropertyConnection>& connection,
+    HWND hwnd, DWORD pid) {
+    auto lookup =
+        [&connection](const std::string& provider)
+            -> lvt::IFrameworkConnection* {
+        return provider == "win32" ? connection.get() : nullptr;
+    };
+    auto tree = lvt::build_tree(
+        hwnd, pid, lvt::detect_frameworks(hwnd, pid),
+        -1, {}, false, lookup);
+    connection->publish_targets(tree);
+}
+
+static bool wait_for_atomic_at_least(
+    const std::atomic<uint32_t>& value, uint32_t expected,
+    std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (value.load(std::memory_order_acquire) >= expected)
+            return true;
+        Sleep(20);
+    }
+    return value.load(std::memory_order_acquire) >= expected;
+}
+
+TEST_F(NativeControlsFixture, NativeWinEventsSignalCreateDestroyReorderAndBurst) {
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+
+    auto connection = lvt::NativePropertyConnection::connect(
+        s_hwnd, s_pid, "win32");
+    ASSERT_NE(connection, nullptr);
+    ASSERT_TRUE(connection->event_hook_active_for_testing());
+    auto diagnostics = connection->event_diagnostics_for_testing();
+    ASSERT_NE(diagnostics, nullptr);
+
+    publish_native_event_snapshot(connection, s_hwnd, s_pid);
+    drain_native_events(*connection);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kCreateEventChildMessage),
+        0);
+    EXPECT_TRUE(wait_for_native_snapshot(*connection))
+        << "EVENT_OBJECT_CREATE did not request a native snapshot";
+
+    publish_native_event_snapshot(connection, s_hwnd, s_pid);
+    drain_native_events(*connection);
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kReorderEventChildrenMessage);
+    EXPECT_TRUE(wait_for_native_snapshot(*connection))
+        << "EVENT_OBJECT_REORDER did not request a native snapshot";
+
+    drain_native_events(*connection);
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kReparentGenericOutOfTreeMessage);
+    EXPECT_TRUE(wait_for_native_snapshot(*connection))
+        << "reparenting a published HWND out of the root was missed";
+    drain_native_events(*connection);
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kRestoreGenericParentMessage);
+    EXPECT_TRUE(wait_for_native_snapshot(*connection))
+        << "reparenting an HWND into the root was missed";
+
+    drain_native_events(*connection);
+    const uint32_t overflowBefore =
+        diagnostics->overflows.load(std::memory_order_acquire);
+    const uint32_t callbacksBefore =
+        diagnostics->callbacks.load(std::memory_order_acquire);
+    const uint32_t burstCount = static_cast<uint32_t>(
+        lvt::native_eventing_detail::kNativeWinEventQueueCapacity * 4);
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kBurstEventMessage,
+        static_cast<WPARAM>(burstCount));
+    ASSERT_TRUE(wait_for_atomic_at_least(
+        diagnostics->callbacks, callbacksBefore + burstCount))
+        << "the out-of-context hook did not drain the generated burst";
+    ASSERT_TRUE(wait_for_atomic_at_least(
+        diagnostics->overflows, overflowBefore + 1))
+        << "the fixed native callback queue did not report overflow";
+    const auto burst = connection->poll_events();
+    ASSERT_EQ(burst.size(), 1u);
+    EXPECT_EQ(
+        burst[0].mutation,
+        lvt::ConnectionEvent::Mutation::snapshotRequired);
+    EXPECT_TRUE(connection->poll_events().empty())
+        << "a burst must coalesce to one snapshotRequired notification";
+
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+    EXPECT_TRUE(wait_for_native_snapshot(*connection))
+        << "EVENT_OBJECT_DESTROY did not request a native snapshot";
+}
+
+TEST_F(NativeControlsFixture, NativeWatchDoesNotDuplicateStructuralDiffs) {
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    wil::unique_handle readEnd;
+    wil::unique_handle writeEnd;
+    ASSERT_TRUE(CreatePipe(readEnd.put(), writeEnd.put(), &security, 0));
+    ASSERT_TRUE(SetHandleInformation(
+        readEnd.get(), HANDLE_FLAG_INHERIT, 0));
+
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = writeEnd.get();
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION processInfo{};
+    std::string command = make_cmd(
+        get_lvt_path(), get_hwnd_arg() + " watch --interval 50");
+    ASSERT_TRUE(CreateProcessA(
+        nullptr, command.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &processInfo));
+    wil::unique_handle process(processInfo.hProcess);
+    wil::unique_handle thread(processInfo.hThread);
+    writeEnd.reset();
+
+    std::string output;
+    const auto read_until =
+        [&](const std::function<bool(const std::string&)>& ready,
+            DWORD timeoutMs) {
+        const auto deadline = GetTickCount64() + timeoutMs;
+        while (GetTickCount64() < deadline && !ready(output)) {
+            DWORD available = 0;
+            if (!PeekNamedPipe(
+                    readEnd.get(), nullptr, 0, nullptr,
+                    &available, nullptr)) {
+                break;
+            }
+            if (available == 0) {
+                Sleep(20);
+                continue;
+            }
+            std::string chunk(available, '\0');
+            DWORD read = 0;
+            if (!ReadFile(
+                    readEnd.get(), chunk.data(), available,
+                    &read, nullptr) ||
+                read == 0) {
+                break;
+            }
+            output.append(chunk, 0, read);
+        }
+        return ready(output);
+    };
+    const auto has_complete = [](const std::string& value,
+                                 const std::string& needle) {
+        const auto at = value.find(needle);
+        return at != std::string::npos &&
+               value.find('\n', at) != std::string::npos;
+    };
+
+    ASSERT_TRUE(read_until(
+        [&](const std::string& value) {
+            return has_complete(value, "protocol=2");
+        },
+        10000))
+        << "watch did not finish its initial native snapshot";
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kCreateEventChildMessage),
+        0);
+    ASSERT_TRUE(read_until(
+        [&](const std::string& value) {
+            return has_complete(value, "Event child");
+        },
+        5000))
+        << "watch did not report the created HWND";
+
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+    const bool sawRemoved = read_until(
+        [&](const std::string& value) {
+            std::istringstream lines(value);
+            std::string line;
+            while (std::getline(lines, line)) {
+                auto event = json::parse(line, nullptr, false);
+                if (!event.is_discarded() &&
+                    event.value("event", "") == "removed" &&
+                    event.contains("element") &&
+                    event["element"].value("text", "") ==
+                        "Event child") {
+                    return true;
+                }
+            }
+            return false;
+        },
+        5000);
+
+    Sleep(250);
+    (void)read_until(
+        [](const std::string&) { return false; }, 100);
+    TerminateProcess(process.get(), 0);
+    WaitForSingleObject(process.get(), 5000);
+    ASSERT_TRUE(sawRemoved)
+        << "watch did not report the destroyed HWND:\n"
+        << output;
+
+    size_t added = 0;
+    size_t removed = 0;
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        auto event = json::parse(line, nullptr, false);
+        if (event.is_discarded() || !event.contains("element") ||
+            event["element"].value("text", "") != "Event child") {
+            continue;
+        }
+        added += event.value("event", "") == "added" ? 1u : 0u;
+        removed += event.value("event", "") == "removed" ? 1u : 0u;
+    }
+    EXPECT_EQ(added, 1u)
+        << "WinEvent hints were emitted beside the authoritative add diff";
+    EXPECT_EQ(removed, 1u)
+        << "WinEvent hints were emitted beside the authoritative remove diff";
+}
+
+TEST(NativeWinEventing, SimultaneousRootsAndProcessesDoNotLeakEvents) {
+    ScopedNativeFixtureProcess first;
+    ScopedNativeFixtureProcess second;
+    ASSERT_TRUE(first.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    ASSERT_TRUE(second.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+
+    const HWND sibling = reinterpret_cast<HWND>(
+        send_native_fixture_message(
+            first.hwnd, native_fixture::kGetOutOfTreeHwndMessage));
+    ASSERT_NE(sibling, nullptr);
+
+    auto firstRoot = lvt::NativePropertyConnection::connect(
+        first.hwnd, first.pid, "win32");
+    auto siblingRoot = lvt::NativePropertyConnection::connect(
+        sibling, first.pid, "win32");
+    auto secondRoot = lvt::NativePropertyConnection::connect(
+        second.hwnd, second.pid, "win32");
+    ASSERT_NE(firstRoot, nullptr);
+    ASSERT_NE(siblingRoot, nullptr);
+    ASSERT_NE(secondRoot, nullptr);
+    ASSERT_TRUE(firstRoot->event_hook_active_for_testing());
+    ASSERT_TRUE(siblingRoot->event_hook_active_for_testing());
+    ASSERT_TRUE(secondRoot->event_hook_active_for_testing());
+
+    publish_native_event_snapshot(firstRoot, first.hwnd, first.pid);
+    publish_native_event_snapshot(siblingRoot, sibling, first.pid);
+    publish_native_event_snapshot(secondRoot, second.hwnd, second.pid);
+    drain_native_events(*firstRoot);
+    drain_native_events(*siblingRoot);
+    drain_native_events(*secondRoot);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            first.hwnd, native_fixture::kCreateEventChildMessage),
+        0);
+    EXPECT_TRUE(wait_for_native_snapshot(*firstRoot));
+    Sleep(150);
+    EXPECT_TRUE(siblingRoot->poll_events().empty())
+        << "another root in the same process received this root's event";
+    EXPECT_TRUE(secondRoot->poll_events().empty())
+        << "another process received this process's event";
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            first.hwnd, native_fixture::kCreateEventChildMessage, 1),
+        0);
+    EXPECT_TRUE(wait_for_native_snapshot(*siblingRoot));
+    Sleep(150);
+    EXPECT_TRUE(firstRoot->poll_events().empty())
+        << "the main root received its sibling top-level window's event";
+    EXPECT_TRUE(secondRoot->poll_events().empty());
+
+    send_native_fixture_message(
+        first.hwnd, native_fixture::kDestroyEventChildMessage);
+    send_native_fixture_message(
+        first.hwnd, native_fixture::kDestroyEventChildMessage, 1);
+}
+
+TEST(NativeWinEventing, RefcountedTeardownTargetExitAndPostDisconnectAreSafe) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+
+    const std::string key =
+        "native-event-lifecycle-" +
+        std::to_string(GetTickCount64());
+    auto created = lvt::NativePropertyConnection::connect(
+        fixture.hwnd, fixture.pid, "win32");
+    ASSERT_NE(created, nullptr);
+    auto first = lvt::ConnectionRegistry::instance().acquire(
+        fixture.pid, fixture.hwnd, key,
+        [&created](HWND, DWORD)
+            -> std::shared_ptr<lvt::IFrameworkConnection> {
+            return created;
+        });
+    auto second = lvt::ConnectionRegistry::instance().acquire(
+        fixture.pid, fixture.hwnd, key,
+        [](HWND, DWORD) -> std::shared_ptr<lvt::IFrameworkConnection> {
+            ADD_FAILURE() << "the second holder must reuse the same generation";
+            return nullptr;
+        });
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    auto diagnostics = created->event_diagnostics_for_testing();
+    ASSERT_NE(diagnostics, nullptr);
+    ASSERT_TRUE(created->event_hook_active_for_testing());
+    created.reset();
+
+    first.reset();
+    Sleep(100);
+    EXPECT_EQ(
+        diagnostics->unhooks.load(std::memory_order_acquire), 0u)
+        << "the first refcount release tore down a shared generation";
+    second.reset();
+    ASSERT_TRUE(wait_for_atomic_at_least(diagnostics->unhooks, 1));
+    EXPECT_EQ(
+        diagnostics->unhooks.load(std::memory_order_acquire), 1u);
+
+    const uint32_t callbacksAfterDisconnect =
+        diagnostics->callbacks.load(std::memory_order_acquire);
+    ASSERT_NE(
+        send_native_fixture_message(
+            fixture.hwnd, native_fixture::kCreateEventChildMessage),
+        0);
+    Sleep(200);
+    EXPECT_EQ(
+        diagnostics->callbacks.load(std::memory_order_acquire),
+        callbacksAfterDisconnect)
+        << "a callback ran after UnhookWinEvent returned";
+    send_native_fixture_message(
+        fixture.hwnd, native_fixture::kDestroyEventChildMessage);
+
+    auto exitConnection = lvt::NativePropertyConnection::connect(
+        fixture.hwnd, fixture.pid, "win32");
+    ASSERT_NE(exitConnection, nullptr);
+    auto exitDiagnostics =
+        exitConnection->event_diagnostics_for_testing();
+    ASSERT_NE(exitDiagnostics, nullptr);
+    fixture.stop();
+    ASSERT_TRUE(wait_for_atomic_at_least(exitDiagnostics->unhooks, 1));
+    EXPECT_FALSE(exitConnection->is_alive());
+    exitConnection.reset();
+    EXPECT_EQ(
+        exitDiagnostics->unhooks.load(std::memory_order_acquire), 1u)
+        << "target exit and destructor unhooked the same hook twice";
+}
+
 TEST_F(NativeControlsFixture, ProviderDumpExposesAllControlsAndBaselineValues) {
     auto frameworkOutput =
         run_command(make_cmd(get_lvt_path(), get_hwnd_arg() + " frameworks"));
@@ -4834,6 +5219,40 @@ TEST(NativePointerMessageSafety, TimedOutRemoteBufferLivesUntilTargetExit) {
         lvt::deferred_native_pointer_message_count_for_testing(),
         deferredBefore)
         << "deferred pointer buffers must be released after target exit";
+}
+
+TEST(NativeCrossBitness, WinEventSnapshotsRemainAvailable) {
+    const fs::path source = LVT_SOURCE_DIR;
+    const fs::path otherFixture =
+        sizeof(void*) == 8
+            ? source / "build-x86" / "lvt_native_controls_fixture.exe"
+            : source / "build" / "lvt_native_controls_fixture.exe";
+    if (!fs::exists(otherFixture))
+        GTEST_SKIP() << "opposite-architecture fixture is not built";
+
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(otherFixture));
+    ASSERT_NE(
+        lvt::detect_process_architecture(fixture.pid),
+        lvt::get_host_architecture());
+
+    auto connection = lvt::NativePropertyConnection::connect(
+        fixture.hwnd, fixture.pid, "win32");
+    ASSERT_NE(connection, nullptr);
+    ASSERT_TRUE(connection->event_hook_active_for_testing());
+    publish_native_event_snapshot(
+        connection, fixture.hwnd, fixture.pid);
+    drain_native_events(*connection);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            fixture.hwnd,
+            native_fixture::kCreateEventChildMessage),
+        0);
+    EXPECT_TRUE(wait_for_native_snapshot(*connection));
+    send_native_fixture_message(
+        fixture.hwnd,
+        native_fixture::kDestroyEventChildMessage);
 }
 
 TEST(NativeCrossBitness, PublicBuildTreeSkipsAbiSensitiveComCtlMessages) {

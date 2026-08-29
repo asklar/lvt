@@ -17,6 +17,7 @@
 #include "providers/managed_connection.h"
 #include "providers/native_message.h"
 #include "providers/native_property_connection.h"
+#include "providers/native_win_event.h"
 #include "providers/overlapped_io.h"
 #include "providers/xaml_enum_catalog.h"
 #include "providers/uia_props.h"
@@ -1436,6 +1437,37 @@ TEST(BoundedEventQueue, OverflowRequiresSnapshotAndRecoversAfterDrain) {
     EXPECT_FALSE(recovered.snapshotRequired);
     ASSERT_EQ(recovered.events.size(), 1u);
     EXPECT_EQ(recovered.events[0], 4);
+}
+
+TEST(NativeWinEventQueue, BurstOverflowIsBoundedAndRecoversAfterDrain) {
+    using namespace lvt::native_eventing_detail;
+    NativeWinEventQueue<4> queue;
+    const NativeWinEventRecord event{
+        EVENT_OBJECT_REORDER,
+        reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1234)),
+        OBJID_CLIENT,
+        CHILDID_SELF};
+
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_FALSE(queue.push(event));
+
+    size_t drainedCount = 0;
+    EXPECT_TRUE(queue.drain(
+        [&](const NativeWinEventRecord&) noexcept {
+            ++drainedCount;
+        }));
+    EXPECT_EQ(drainedCount, 4u);
+
+    drainedCount = 0;
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_FALSE(queue.drain(
+        [&](const NativeWinEventRecord&) noexcept {
+            ++drainedCount;
+        }));
+    EXPECT_EQ(drainedCount, 1u);
 }
 
 TEST(OverlappedIo, CancellationCompletesBeforeStackStorageIsReleased) {

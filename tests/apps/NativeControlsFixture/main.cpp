@@ -27,6 +27,8 @@ struct FixtureControls {
     HWND genericText = nullptr;
     HWND stateSummary = nullptr;
     HWND outOfTree = nullptr;
+    HWND eventChild = nullptr;
+    HWND outOfTreeEventChild = nullptr;
     HTREEITEM treeRoot = nullptr;
     HTREEITEM treeChild = nullptr;
     HTREEITEM treeGrandchild = nullptr;
@@ -688,12 +690,94 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return SendMessageW(g_controls.toolbar, TB_MOVEBUTTON, 0, 2);
     case fixture::kRestoreToolbarOrderMessage:
         return SendMessageW(g_controls.toolbar, TB_MOVEBUTTON, 2, 0);
-    case fixture::kReparentGenericOutOfTreeMessage:
-        return reinterpret_cast<LRESULT>(
-            SetParent(g_controls.genericText, g_controls.outOfTree));
-    case fixture::kRestoreGenericParentMessage:
-        return reinterpret_cast<LRESULT>(
-            SetParent(g_controls.genericText, hwnd));
+    case fixture::kReparentGenericOutOfTreeMessage: {
+        const HWND oldParent = SetParent(
+            g_controls.genericText, g_controls.outOfTree);
+        NotifyWinEvent(
+            EVENT_OBJECT_PARENTCHANGE, g_controls.genericText,
+            OBJID_WINDOW, CHILDID_SELF);
+        NotifyWinEvent(
+            EVENT_OBJECT_REORDER, hwnd,
+            OBJID_CLIENT, CHILDID_SELF);
+        return reinterpret_cast<LRESULT>(oldParent);
+    }
+    case fixture::kRestoreGenericParentMessage: {
+        const HWND oldParent = SetParent(g_controls.genericText, hwnd);
+        NotifyWinEvent(
+            EVENT_OBJECT_PARENTCHANGE, g_controls.genericText,
+            OBJID_WINDOW, CHILDID_SELF);
+        NotifyWinEvent(
+            EVENT_OBJECT_REORDER, hwnd,
+            OBJID_CLIENT, CHILDID_SELF);
+        return reinterpret_cast<LRESULT>(oldParent);
+    }
+    case fixture::kCreateEventChildMessage: {
+        const bool outOfTree = wParam != 0;
+        HWND parent = outOfTree ? g_controls.outOfTree : hwnd;
+        HWND& child = outOfTree
+            ? g_controls.outOfTreeEventChild
+            : g_controls.eventChild;
+        if (!child || !IsWindow(child)) {
+            child = create_child(
+                parent, 0, fixture::kGenericChildClass,
+                outOfTree ? L"Out-of-tree event child" : L"Event child",
+                0, 8, 8, 160, 24, outOfTree ? 1017 : 1016);
+        }
+        if (child) {
+            NotifyWinEvent(
+                EVENT_OBJECT_CREATE, child,
+                OBJID_WINDOW, CHILDID_SELF);
+            NotifyWinEvent(
+                EVENT_OBJECT_REORDER, parent,
+                OBJID_CLIENT, CHILDID_SELF);
+        }
+        return reinterpret_cast<LRESULT>(child);
+    }
+    case fixture::kDestroyEventChildMessage: {
+        const bool outOfTree = wParam != 0;
+        HWND parent = outOfTree ? g_controls.outOfTree : hwnd;
+        HWND& child = outOfTree
+            ? g_controls.outOfTreeEventChild
+            : g_controls.eventChild;
+        if (child && IsWindow(child)) {
+            NotifyWinEvent(
+                EVENT_OBJECT_DESTROY, child,
+                OBJID_WINDOW, CHILDID_SELF);
+            DestroyWindow(child);
+            child = nullptr;
+            NotifyWinEvent(
+                EVENT_OBJECT_REORDER, parent,
+                OBJID_CLIENT, CHILDID_SELF);
+        }
+        return TRUE;
+    }
+    case fixture::kReorderEventChildrenMessage: {
+        const bool outOfTree = wParam != 0;
+        HWND parent = outOfTree ? g_controls.outOfTree : hwnd;
+        HWND child = outOfTree
+            ? g_controls.outOfTreeEventChild
+            : g_controls.eventChild;
+        if (child && IsWindow(child)) {
+            SetWindowPos(
+                child, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            NotifyWinEvent(
+                EVENT_OBJECT_REORDER, parent,
+                OBJID_CLIENT, CHILDID_SELF);
+        }
+        return TRUE;
+    }
+    case fixture::kBurstEventMessage: {
+        const DWORD count =
+            wParam == 0 ? 1024u : static_cast<DWORD>(wParam);
+        HWND target = lParam != 0 ? g_controls.outOfTree : hwnd;
+        for (DWORD index = 0; index < count; ++index) {
+            NotifyWinEvent(
+                EVENT_OBJECT_STATECHANGE, target,
+                OBJID_CLIENT, CHILDID_SELF);
+        }
+        return count;
+    }
     case fixture::kHangMessage:
         Sleep(2500);
         return TRUE;

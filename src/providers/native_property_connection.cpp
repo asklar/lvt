@@ -1,6 +1,7 @@
 #include "native_property_connection.h"
 
 #include "native_message.h"
+#include "native_win_event.h"
 
 #include <CommCtrl.h>
 
@@ -906,6 +907,7 @@ struct NativePropertyConnection::Impl {
     uint64_t nextSyntheticHandle = kSyntheticHandleBase;
     std::map<std::string, std::shared_ptr<const PropertySchema>> schemasByKey;
     std::map<std::string, Mutation> mutationsByDescriptor;
+    std::unique_ptr<native_eventing_detail::NativeWinEventSource> events;
 
     bool capture_live(
         const Target& target, LiveTarget& live,
@@ -2314,6 +2316,13 @@ NativePropertyConnection::connect(
     impl->provider = std::move(provider);
     impl->controlVersion = std::move(controlVersion);
     impl->requirePublishedTargets = requirePublishedTargets;
+    // One root-scoped hook covers both HWND structure and common-control
+    // logical item events. MCP/watch always acquire the Win32 adapter, so the
+    // ComCtl adapter does not install a duplicate process hook.
+    if (impl->provider == "win32") {
+        impl->events =
+            native_eventing_detail::NativeWinEventSource::create(root, pid);
+    }
     return std::shared_ptr<NativePropertyConnection>(
         new NativePropertyConnection(std::move(impl)));
 }
@@ -2371,8 +2380,13 @@ uint64_t NativePropertyConnection::register_tab_item(
 
 void NativePropertyConnection::publish_targets(const Element& root) {
     std::set<uint64_t> handles;
+    std::set<HWND> windows;
     const auto collect =
         [&](const auto& self, const Element& element) -> void {
+        if (element.nativeHandle != 0) {
+            windows.insert(reinterpret_cast<HWND>(
+                static_cast<uintptr_t>(element.nativeHandle)));
+        }
         if (element.framework == m_impl->provider &&
             element.providerHandle != 0) {
             handles.insert(element.providerHandle);
@@ -2388,6 +2402,10 @@ void NativePropertyConnection::publish_targets(const Element& root) {
         if (m_impl->targets.contains(handle))
             m_impl->publishedTargets.insert(handle);
     }
+    if (m_impl->events) {
+        m_impl->events->publish_windows(
+            std::vector<HWND>(windows.begin(), windows.end()));
+    }
 }
 
 size_t NativePropertyConnection::cached_schema_count_for_testing() const {
@@ -2395,8 +2413,28 @@ size_t NativePropertyConnection::cached_schema_count_for_testing() const {
     return m_impl->schemasByKey.size();
 }
 
+std::vector<ConnectionEvent> NativePropertyConnection::poll_events() {
+    return m_impl->events
+        ? m_impl->events->poll_events()
+        : std::vector<ConnectionEvent>{};
+}
+
 bool NativePropertyConnection::is_alive() const {
+    if (m_impl->events &&
+        (m_impl->events->root_destroyed() ||
+         m_impl->events->target_exited())) {
+        return false;
+    }
     return validate_native_window(m_impl->root).ok;
+}
+
+bool NativePropertyConnection::event_hook_active_for_testing() const {
+    return m_impl->events && m_impl->events->hook_active();
+}
+
+std::shared_ptr<native_eventing_detail::NativeWinEventDiagnostics>
+NativePropertyConnection::event_diagnostics_for_testing() const {
+    return m_impl->events ? m_impl->events->diagnostics() : nullptr;
 }
 
 PropertySnapshotResult NativePropertyConnection::get_property_snapshot(

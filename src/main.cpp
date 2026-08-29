@@ -13,6 +13,7 @@
 #include "providers/uia_actions.h"
 #endif
 #include "providers/connection_registry.h"
+#include "providers/native_property_connection.h"
 #if LVT_ENABLE_XAML
 #include "providers/xaml_provider.h"
 #endif
@@ -34,6 +35,7 @@
 #include <fstream>
 #include <sstream>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -646,6 +648,19 @@ static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
             target, args, tree, connectionLookup, detectedFrameworks))
         return false;
 
+    // The native WinEvent source filters destroyed HWND notifications against
+    // the last authoritative snapshot. Publish the untrimmed tree before
+    // --element/--depth scoping so callback delivery never needs to inspect an
+    // HWND and the fixed-interval tree walk remains the source of truth.
+    if (!args.uia && connectionLookup) {
+        for (const char* label : {"win32", "comctl"}) {
+            auto* native = dynamic_cast<lvt::NativePropertyConnection*>(
+                connectionLookup(label));
+            if (native)
+                native->publish_targets(tree);
+        }
+    }
+
     lvt::Element* outputRoot = &tree;
     if (!args.elementId.empty()) {
         outputRoot = lvt::find_element_by_ref(tree, args.elementId);
@@ -696,8 +711,9 @@ static bool lost_injected_framework_content(const lvt::Element& previous, const 
 }
 
 // Acquires the persistent connections a watch session can reuse across ticks.
-// For visual-tree sessions that means one connection per injectable framework;
-// for --uia it means one reusable UI Automation client. Held
+// For visual-tree sessions that means one native subscription/property adapter
+// plus one connection per injectable framework; for --uia it means one reusable
+// UI Automation client. Held
 // for the whole watch session; released automatically when run_watch_loop
 // returns.
 //
@@ -725,6 +741,8 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
     }
 #endif
 
+    bool hasComCtl = false;
+    std::string comCtlVersion;
     bool hasXaml = false, hasWinUI3 = false, hasWpf = false, hasWinForms = false;
     std::vector<lvt::PluginFrameworkInfo> persistentPlugins;
     for (auto& fi : frameworks) {
@@ -732,6 +750,10 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
         if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
         if (fi.type == lvt::Framework::Wpf) hasWpf = true;
         if (fi.type == lvt::Framework::WinForms) hasWinForms = true;
+        if (fi.type == lvt::Framework::ComCtl) {
+            hasComCtl = true;
+            comCtlVersion = fi.version;
+        }
         if (fi.type == lvt::Framework::Plugin) {
             auto plugin = lvt::find_plugin_framework(
                 fi.name, fi.version, fi.pluginToken);
@@ -741,6 +763,34 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
             }
         }
     }
+
+    const auto native_key = [&target](const char* provider) {
+        char key[96]{};
+        snprintf(
+            key, sizeof(key), "%s@watch@0x%llX", provider,
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(target.hwnd)));
+        return std::string(key);
+    };
+    auto win32 = lvt::ConnectionRegistry::instance().acquire(
+        target.pid, target.hwnd, native_key("win32"),
+        [](HWND hwnd, DWORD pid)
+            -> std::shared_ptr<lvt::IFrameworkConnection> {
+            return lvt::NativePropertyConnection::connect(
+                hwnd, pid, "win32", {}, true);
+        });
+    connections.emplace_back("win32", std::move(win32));
+    if (hasComCtl) {
+        auto comctl = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, native_key("comctl"),
+            [comCtlVersion](HWND hwnd, DWORD pid)
+                -> std::shared_ptr<lvt::IFrameworkConnection> {
+                return lvt::NativePropertyConnection::connect(
+                    hwnd, pid, "comctl", comCtlVersion, true);
+            });
+        connections.emplace_back("comctl", std::move(comctl));
+    }
+
     if (!hasXaml && !hasWinUI3 && !hasWpf && !hasWinForms &&
         persistentPlugins.empty())
         return connections;
@@ -848,6 +898,33 @@ static lvt::ConnectionLookup make_lookup(
     };
 }
 
+static void drain_watch_connection_events(
+    std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
+    size_t count = 0;
+    bool snapshotRequired = false;
+    for (auto& [_, handle] : connections) {
+        if (!handle)
+            continue;
+        auto events = handle->poll_events();
+        count += events.size();
+        snapshotRequired =
+            snapshotRequired ||
+            std::any_of(
+                events.begin(), events.end(),
+                [](const lvt::ConnectionEvent& event) {
+                    return event.mutation ==
+                           lvt::ConnectionEvent::Mutation::snapshotRequired;
+                });
+    }
+    if (lvt::g_debug && count != 0) {
+        fprintf(
+            stderr,
+            "lvt: drained %zu pushed connection event(s)%s; "
+            "this tick's authoritative snapshot will consume the signal\n",
+            count, snapshotRequired ? " including snapshotRequired" : "");
+    }
+}
+
 // Reconciles the held set with the frameworks detected for this exact tick.
 // Plugin frameworks can appear or disappear while the target stays alive
 // (late assembly/module load, teardown, navigation). Add newly detected v2
@@ -858,6 +935,11 @@ static void reconcile_watch_connections(
     const std::vector<lvt::FrameworkInfo>& frameworks,
     std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
     std::set<std::string> desiredPluginLabels;
+    const bool wantsComCtl = std::any_of(
+        frameworks.begin(), frameworks.end(),
+        [](const lvt::FrameworkInfo& framework) {
+            return framework.type == lvt::Framework::ComCtl;
+        });
     for (const auto& framework : frameworks) {
         if (framework.type != lvt::Framework::Plugin)
             continue;
@@ -872,6 +954,10 @@ static void reconcile_watch_connections(
     }
 
     for (auto it = connections.begin(); it != connections.end();) {
+        if (it->first == "comctl" && !wantsComCtl) {
+            it = connections.erase(it);
+            continue;
+        }
         if (it->first.rfind("plugin:", 0) != 0) {
             ++it;
             continue;
@@ -884,6 +970,17 @@ static void reconcile_watch_connections(
         desiredPluginLabels.erase(desired);
         ++it;
     }
+    const auto has_slot = [&connections](const std::string& label) {
+        return std::any_of(
+            connections.begin(), connections.end(),
+            [&label](const auto& entry) {
+                return entry.first == label;
+            });
+    };
+    if (!has_slot("win32"))
+        connections.emplace_back("win32", lvt::ConnectionHandle{});
+    if (wantsComCtl && !has_slot("comctl"))
+        connections.emplace_back("comctl", lvt::ConnectionHandle{});
     for (const auto& label : desiredPluginLabels)
         connections.emplace_back(label, lvt::ConnectionHandle{});
 
@@ -993,6 +1090,7 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
         if (!args.uia)
             frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
         reconcile_watch_connections(target, args, frameworks, connections);
+        drain_watch_connection_events(connections);
 
         lvt::Element current;
         if (!build_output_tree(
@@ -1005,29 +1103,6 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             if (lvt::g_debug)
                 fprintf(stderr, "lvt: skipping watch tick; tree unavailable\n");
             continue;
-        }
-
-        // Drain whatever incremental Add/Remove notifications a connection
-        // queued since the last tick (see QueueChangeEvent in lvt_tap.cpp
-        // and IFrameworkConnection::poll_events). watch's own change events
-        // (emitted below via diff_trees) already come from comparing two
-        // full GET_TREE snapshots, so these are not fed into that today -
-        // this just drains each connection's bounded internal event queue
-        // (see XamlDiagConnection::queue_connection_event) and surfaces them
-        // for debugging. A future phase could drive watch's ticks from
-        // these directly instead of polling on a fixed interval.
-        if (lvt::g_debug) {
-            for (auto& [label, handle] : connections) {
-                if (!handle) continue;
-                auto events = handle->poll_events();
-                if (!events.empty())
-                    fprintf(stderr, "lvt: %s connection reported %zu pushed change event(s) this tick\n",
-                            label.c_str(), events.size());
-            }
-        } else {
-            for (auto& [label, handle] : connections) {
-                if (handle) (void)handle->poll_events();
-            }
         }
 
         // See lost_injected_framework_content's doc comment: this is now a

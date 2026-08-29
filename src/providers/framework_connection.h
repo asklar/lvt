@@ -130,13 +130,12 @@ public:
     virtual bool get_tree(Element& root, bool fastProperties,
                           const std::string& providerOption = {}) = 0;
 
-    // Non-blocking: returns whatever incremental Add/Remove change
-    // notifications have arrived since the last call, without triggering a
-    // full tree walk. Empty until the connection's provider implements
-    // incremental push (see ConnectionEvent below) - safe to call, and
-    // safe to ignore the result, even for a provider that never populates
-    // it, since a caller can always fall back to get_tree() for a full
-    // refresh.
+    // Non-blocking: returns whatever incremental Add/Remove notifications or
+    // coalesced snapshotRequired hints have arrived since the last call,
+    // without triggering a full tree walk. Empty until the connection's
+    // provider implements push notification (see ConnectionEvent below).
+    // These events are always advisory: callers retain their correctness
+    // polling/full-refresh path for changes a provider cannot report.
     virtual std::vector<struct ConnectionEvent> poll_events() = 0;
 
     // Give a provider with an unsolicited event stream a chance to move bytes
@@ -171,12 +170,11 @@ public:
     virtual bool is_alive() const = 0;
 };
 
-// One incremental structural change reported by a provider that supports
-// push notifications (see IFrameworkConnection::poll_events). Mirrors the
-// shape of the Add/Remove mutations XAML diagnostics' own
-// IVisualTreeServiceCallback::OnVisualTreeChange already reports — this
-// struct is the framework-agnostic version of that, so `watch`'s loop and
-// MCP sessions don't need to know which underlying API produced it.
+// One change reported by a provider that supports push notifications (see
+// IFrameworkConnection::poll_events). XAML/plugins can report precise
+// Add/Remove mutations; native WinEvents use snapshotRequired because HWND
+// and common-control item notifications are ambiguous and coalesced. This is
+// framework-agnostic so watch and MCP do not know which API produced it.
 struct ConnectionEvent {
     enum class Mutation { added, removed, snapshotRequired };
     Mutation mutation = Mutation::added;

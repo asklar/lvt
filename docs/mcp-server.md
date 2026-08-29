@@ -164,6 +164,16 @@ skipped. This is necessary for both modes: UIA event-handler integration is a
 future optimization, while XAML's structural callbacks do not report
 text/property/bounds changes.
 
+Visual sessions also maintain a PID- and root-scoped out-of-context WinEvent
+hook for native Win32/Common Controls create, destroy, reorder, parent, state,
+name, value, selection, and location notifications. Those notifications are
+bounded and coalesced to an internal `snapshotRequired` hint. They do not
+replace or short-circuit the resource poll, and the current resource scheduler
+does not yet wait directly on the hook, so notification latency is still
+bounded by the roughly 500 ms cadence. The next full tree refresh consumes the
+hint; only its authoritative diff is cached/notified, avoiding a second stream
+of duplicate native add/remove events.
+
 Visual resources always poll `get_visual_tree_changes` with `fast: true`,
 matching the Viewer's former `watch --fast` path. The live stream still carries
 the bounds, text, content, and basic state needed to render and search the tree;

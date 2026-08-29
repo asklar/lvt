@@ -138,6 +138,7 @@ set(LVT_CORE_SOURCES
     src/providers/comctl_provider.cpp
     src/providers/native_message.cpp
     src/providers/native_property_connection.cpp
+    src/providers/native_win_event.cpp
     src/providers/connection_registry.cpp
     src/providers/property_contract.cpp
 )

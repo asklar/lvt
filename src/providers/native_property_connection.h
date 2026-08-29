@@ -12,6 +12,10 @@ namespace lvt {
 
 inline constexpr size_t kMaximumNativePropertyTextChars = 1024 * 1024;
 
+namespace native_eventing_detail {
+struct NativeWinEventDiagnostics;
+}
+
 namespace native_property_detail {
 
 bool parse_boolean(const std::string& value, bool& parsed);
@@ -20,9 +24,10 @@ int effective_scroll_max(int minimum, int maximum, unsigned pageSize);
 
 } // namespace native_property_detail
 
-// Persistent per-session adapter for curated Win32 and common-control typed
-// properties. Providers register the native identities they emit in the tree;
-// callers only receive opaque handles and descriptor ids.
+// Persistent per-session adapter for curated Win32/common-control typed
+// properties and native refresh hints. Providers register the native
+// identities they emit in the tree; callers only receive opaque handles and
+// descriptor ids. The Win32 instance also owns the root-scoped WinEvent hook.
 class NativePropertyConnection final : public IFrameworkConnection {
 public:
     static std::shared_ptr<NativePropertyConnection> connect(
@@ -44,12 +49,15 @@ public:
     void publish_targets(const Element& root);
 
     size_t cached_schema_count_for_testing() const;
+    bool event_hook_active_for_testing() const;
+    std::shared_ptr<native_eventing_detail::NativeWinEventDiagnostics>
+        event_diagnostics_for_testing() const;
 
     bool get_tree(
         Element&, bool, const std::string& = {}) override {
         return true;
     }
-    std::vector<ConnectionEvent> poll_events() override { return {}; }
+    std::vector<ConnectionEvent> poll_events() override;
     bool is_alive() const override;
     PropertySnapshotResult get_property_snapshot(uint64_t handle) override;
     PropertyMutationResult set_property(
