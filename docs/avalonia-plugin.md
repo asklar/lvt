@@ -27,12 +27,17 @@ Copy the plugin files to `%USERPROFILE%\.lvt\plugins\`:
     ├── LvtAvaloniaTreeWalker.deps.json
     ├── LvtAvaloniaTreeWalker.runtimeconfig.json
     ├── Avalonia.*.dll               # Published managed dependencies
-    └── runtimes\win-<arch>\native\  # Matching native runtime assets
+    ├── av_libglesv2.dll             # Native assets for this package's RID
+    ├── libHarfBuzzSharp.dll
+    └── libSkiaSharp.dll
 ```
 
 > **Important:** The TAP DLL and managed assembly must be in the `avalonia\` subdirectory, not directly in the `plugins\` directory. This prevents the plugin loader from attempting to load them as plugins.
 > Keep the complete published `avalonia\` directory together; copying only the
 > tree walker and runtime config omits dependency and native runtime assets.
+> Release builds use a framework-dependent, RID-specific publish, so an x64
+> package contains only the `win-x64` native assets (and likewise for x86 and
+> ARM64), never Linux, macOS, or another Windows architecture.
 
 ### From source
 

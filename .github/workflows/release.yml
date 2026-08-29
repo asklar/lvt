@@ -90,7 +90,11 @@ jobs:
         run: dotnet build src/tap_winforms/LvtWinFormsTap.csproj -c Release --nologo
 
       - name: Build managed Avalonia tree walker
-        run: dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj -c Release
+        run: >
+          dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj
+          -c Release
+          -r win-${{ matrix.arch }}
+          --self-contained false
 
       - name: Build
         run: cmake --build ${{ matrix.build_dir }}
@@ -137,6 +141,12 @@ jobs:
           Copy-Item -Recurse ${{ matrix.build_dir }}\plugins release\plugins
           New-Item -ItemType Directory -Path release\skills\lvt -Force
           Copy-Item .github\skills\lvt\SKILL.md release\skills\lvt\
+          $forbiddenExtensions = @('.pdb', '.ilk', '.dbg', '.dmp', '.map')
+          Get-ChildItem release -Recurse -File -Force |
+            Where-Object {
+              $_.Extension -in $forbiddenExtensions -or $_.Name -like '*.locked*'
+            } |
+            Remove-Item -Force
           .\scripts\validate-release-package.ps1 `
             -Root release `
             -Architecture ${{ matrix.arch }} `
@@ -158,7 +168,11 @@ jobs:
           Copy-Item LICENSE viewer-release\
           # Debug symbols and incremental-link files are useful CI artifacts,
           # but not runtime dependencies and add substantial release weight.
-          Get-ChildItem viewer-release -Recurse -File -Include *.pdb,*.ilk,*.locked* |
+          $forbiddenExtensions = @('.pdb', '.ilk', '.dbg', '.dmp', '.map')
+          Get-ChildItem viewer-release -Recurse -File -Force |
+            Where-Object {
+              $_.Extension -in $forbiddenExtensions -or $_.Name -like '*.locked*'
+            } |
             Remove-Item -Force
           .\scripts\validate-release-package.ps1 `
             -Root viewer-release `

@@ -746,25 +746,25 @@ lvt_add_version_resource(lvt_avalonia_tap
 # The csproj sets AppendTargetFrameworkToOutputPath=false so output is bin/Release/,
 # but as a fallback we also build via a custom command that publishes to a known location.
 if(LVT_BUILD_MANAGED)
-add_custom_command(TARGET lvt_avalonia_tap POST_BUILD
-    COMMAND dotnet publish "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj"
-        -c Release -o "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia" --no-restore
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
-        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
-    COMMENT "Publishing managed Avalonia tree walker assembly"
-)
-
+set(LVT_AVALONIA_RID "win-${TAP_ARCH_SUFFIX}")
+set(LVT_AVALONIA_PUBLISH_DIR "${CMAKE_CURRENT_BINARY_DIR}/avalonia-publish-${TAP_ARCH_SUFFIX}")
 add_custom_target(lvt_avalonia_tree_walker
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
+    COMMAND ${CMAKE_COMMAND} -E remove_directory "${LVT_AVALONIA_PUBLISH_DIR}"
     COMMAND dotnet publish "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj"
-        -c Release -o "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
+        -c Release -r "${LVT_AVALONIA_RID}" --self-contained false
+        -o "${LVT_AVALONIA_PUBLISH_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E remove_directory
+        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/runtimes"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${LVT_AVALONIA_PUBLISH_DIR}"
+        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
         "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Publishing managed Avalonia tree walker assembly"
+    COMMENT "Publishing managed Avalonia tree walker for ${LVT_AVALONIA_RID}"
 )
+add_dependencies(lvt_avalonia_tap lvt_avalonia_tree_walker)
 endif()
 endif()
 
@@ -861,10 +861,12 @@ if(LVT_BUILD_VIEWER AND LVT_BUILD_TOOL)
 
     if(TARGET lvt_avalonia_tap)
         add_custom_command(TARGET lvt_viewer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E remove_directory
+                "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia"
             COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
                 "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia"
-            COMMENT "Copying the complete Avalonia published runtime next to the viewer"
+            COMMENT "Copying the matching Avalonia published runtime next to the viewer"
         )
         add_dependencies(lvt_viewer lvt_avalonia_tap)
     endif()
@@ -1183,9 +1185,6 @@ if(LVT_ENABLE_WINFORMS)
 endif()
 if(LVT_ENABLE_AVALONIA)
     list(APPEND LVT_INTEGRATION_DEPS lvt_avalonia_plugin lvt_avalonia_tap avalonia_test_app)
-    if(LVT_BUILD_MANAGED)
-        list(APPEND LVT_INTEGRATION_DEPS lvt_avalonia_tree_walker)
-    endif()
 endif()
 add_dependencies(lvt_integration_tests ${LVT_INTEGRATION_DEPS})
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
