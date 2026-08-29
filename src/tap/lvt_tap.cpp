@@ -1857,6 +1857,24 @@ HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* p
     return factory->QueryInterface(riid, ppv);
 }
 
+// Always returns S_FALSE: this module cannot be safely unloaded mid-session.
+//
+// InitializeXamlDiagnosticsEx calls LoadLibraryEx on this DLL (refcount=1),
+// then creates an LvtTap object via DllGetClassObject and calls SetSite on it.
+// The runtime retains the resulting IObjectWithSite* COM pointer — whose vtable
+// points into this module — for the entire lifetime of the diagnostics session.
+// No public API (IXamlDiagnostics, IVisualTreeService, or the free functions in
+// xamlOM.h) provides a way to force the runtime to release that reference.
+//
+// After DISCONNECT teardown (CleanupUIResources), the runtime still holds the
+// IObjectWithSite* and will call SetSite(newSite) on it if the same endpoint is
+// reused for a subsequent lvt connection. Calling FreeLibrary here would unmap
+// this code segment, leaving the runtime's pointer dangling and crashing the
+// target on the next vtable call.
+//
+// See docs/tap-dll-design.md § "Module lifetime and why DllCanUnloadNow returns
+// S_FALSE" for the full evidence chain and the specific runtime API change that
+// would be needed to make safe unload possible.
 HRESULT STDAPICALLTYPE DllCanUnloadNow() { return S_FALSE; }
 
 BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {

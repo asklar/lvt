@@ -267,3 +267,52 @@ The TAP DLL is built with `/MT` (static CRT). This is essential because:
 - **Log file:** `%TEMP%\lvt_tap.log` for unpackaged targets, but `%LOCALAPPDATA%\Packages\<PackageFamilyName>\AC\Temp\lvt_tap.log` for AppContainer (UWP/MSIX-packaged) targets — the two are easy to confuse when debugging a packaged app. All TAP DLL operations are logged with millisecond timestamps and thread IDs. Because the TAP DLL never unloads (`DllCanUnloadNow` returns `S_FALSE`, see below), this file accumulates across every run against that target for as long as the target process lives, not just the most recent one.
 - **Debugger:** Use `C:\Debuggers\cdb.exe` to attach to the target process and debug injection issues
 - **File lock:** `lvt_tap.dll` is locked by the target process after injection. Kill the target before rebuilding. For AppContainer targets, the staged copy at `%TEMP%\lvt_tap\` can also be held open by an unrelated, long-lived AppContainer host process from an earlier test run — if a rebuilt DLL isn't taking effect, check for and kill stale processes still holding that staged file before assuming the build itself is broken.
+
+## Module lifetime and why DllCanUnloadNow returns S_FALSE
+
+`DllCanUnloadNow` unconditionally returns `S_FALSE`. This is correct and intentional. Safe unload of `lvt_tap.dll` from a still-running target is impossible without a runtime API that does not exist. This section documents the full evidence chain so the decision is not revisited without new information.
+
+### What InitializeXamlDiagnosticsEx does to the module
+
+`InitializeXamlDiagnosticsEx` (exported from `Windows.UI.Xaml.dll` / `FrameworkUdk.dll`) injects the TAP DLL into the target process by calling `LoadLibraryEx` on `lvt_tap.dll`. This is the **sole** module reference: refcount = 1. The function then calls `DllGetClassObject → IClassFactory::CreateInstance` to create an `LvtTap` object, and calls `SetSite(IXamlDiagnostics*)` on it. The runtime **retains** the resulting `IObjectWithSite*` COM pointer for the lifetime of the diagnostics session. That pointer's vtable points into the module's code segment.
+
+### What the runtime holds after DISCONNECT teardown
+
+After `DISCONNECT` or a broken pipe, `CleanupUIResources()` runs and releases every resource owned by a single connection:
+
+| Resource | Released in CleanupUIResources? |
+|---|---|
+| `IVisualTreeServiceCallback*` (AdviseVisualTreeChange) | ✅ UnadviseVisualTreeChange called |
+| Message-only window (`m_msgWnd`) | ✅ DestroyWindow dispatched to UI thread |
+| `IVisualTreeService*` (`m_vts`) | ✅ `m_vts.reset()` |
+| `IXamlDiagnostics*` (`m_diag`) | ✅ `m_diag.reset()` |
+| Pipe handle (`m_pipe`) | ✅ `m_pipe.reset()` |
+| **`IObjectWithSite*` held by the runtime** | ❌ Runtime never releases it |
+| **Module LoadLibrary refcount** | ❌ Not decremented |
+
+The runtime-held `IObjectWithSite*` — the pointer the runtime created during `InitializeXamlDiagnosticsEx` — persists. On a subsequent `lvt` connection to the **same diagnostics endpoint**, the runtime calls `SetSite(newSite)` on that existing object rather than creating a new one. Any call through that pointer (QueryInterface, AddRef, Release, SetSite) dispatches through a vtable that lives in the module's code segment.
+
+### Why FreeLibrary after DISCONNECT is unsafe
+
+Calling `FreeLibrary(GetCurrentModuleHandle())` after `CleanupUIResources` would decrement the module's LoadLibrary refcount from 1 to 0, unmapping the code segment. The runtime's retained `IObjectWithSite*` would then point at freed memory. The next vtable call from the runtime — whether `SetSite` on reconnect, `Release` on process shutdown, or any other method — would jump to an unmapped address and crash the target process. There is no documented way to force the runtime to release its reference early.
+
+### No public uninitialize API exists
+
+The Windows SDK headers confirm there is no teardown API. `xamlOM.idl` (Windows SDK 10.0.26410.0, `um/xamlOM.idl`) defines four interfaces — `IVisualTreeServiceCallback`, `IVisualTreeServiceCallback2`, `IVisualTreeService` (and its `-2`/`-3` extensions), `IXamlDiagnostics`, `IBitmapData` — plus the `InitializeXamlDiagnosticsEx` free function. None of these has a `Close()`, `Disconnect()`, `Shutdown()`, or `Uninitialize()` method. `IVisualTreeService::UnadviseVisualTreeChange` removes the mutation-event subscriber but does not terminate the session or release the `IObjectWithSite` reference.
+
+### Windhawk's FreeLibrary call is not a counterexample
+
+Windhawk mods call `FreeLibrary(GetCurrentModuleHandle())` inside `SetSite` to balance the LoadLibrary refcount. The key detail in the Windhawk comment preserved in `SetSite`: Windhawk's hook loader calls `LoadLibraryEx` on the mod DLL **in addition to** the `LoadLibraryEx` the diagnostics runtime performs during `InitializeXamlDiagnosticsEx`. That gives the module a refcount of 2. Windhawk's `FreeLibrary` in `SetSite` brings it back to 1 — the module **stays mapped**. Windhawk never attempts a second `FreeLibrary` that would bring the count to 0 while the process is alive. LVT does not have a second LoadLibrary reference, so `FreeLibrary` in `SetSite` would immediately unmap the DLL while `SetSite` itself is still executing — an instant crash.
+
+### The Microsoft XAML Profiler's approach is a forceful ejection, not clean unload
+
+The Microsoft WinUI 3 XAML Profiler (internal tool, `tools/XamlProfiler` in the `microsoft/microsoft-ui-xaml` repo) handles `CLOSE` by having the profiler app call `CreateRemoteThread(FreeLibrary, hTapModule)` in the target process after the TAP DLL has processed its teardown. This is a "burn it down" ejection used when the profiler session is fully ending and the profiler app itself is closing. It is explicitly not a clean mid-session unload: the runtime still holds the `IObjectWithSite*` when the remote `FreeLibrary` fires. This approach is acceptable in that context because the entire diagnostic session and typically the target process are being closed simultaneously, so no subsequent vtable call through the stale pointer occurs in practice.
+
+### What is needed for safe mid-session unload
+
+Safe unload requires the runtime to release its `IObjectWithSite` COM reference **before** the module is freed. That would require one of:
+
+1. A new `IXamlDiagnostics::Close()` (or equivalent) method added to the XAML OM that causes the runtime to call `SetSite(nullptr)` and `IObjectWithSite::Release()` synchronously, so the `LvtTap` object's refcount can reach zero and all vtable pointers can be safely invalidated before `FreeLibrary` is called.
+2. The runtime calling `SetSite(nullptr)` + `Release()` as a documented response to the pipe closing or the endpoint going idle — which it does not currently do.
+
+Until such an API exists, `DllCanUnloadNow` must return `S_FALSE` and the module must remain mapped for the target process's lifetime. This is a conscious design choice, not an oversight.

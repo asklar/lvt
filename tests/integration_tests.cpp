@@ -3712,6 +3712,119 @@ TEST_F(WinUI3SampleFixture, WatchReusesOnePersistentConnectionAcrossManyTicks) {
         << after << " times after)";
 }
 
+// Proof-of-safety test for the non-unload policy described in
+// docs/tap-dll-design.md § "Module lifetime and why DllCanUnloadNow returns
+// S_FALSE".  Each lvt dump is a separate process: it injects (or re-activates
+// an existing session via SetSite), collects the tree, and exits — closing the
+// pipe and triggering CleanupUIResources in the TAP DLL. The test verifies:
+//   (a) the target process survives every round,
+//   (b) each round returns a valid WinUI3 tree with the expected controls, and
+//   (c) every message window created by the TAP DLL produces a matching
+//       "Cleanup: message window destroyed" log entry, proving teardown
+//       properly releases active resources without leaking windows.
+//
+// Log filtering is scoped to s_pi.dwProcessId via the "][<pid>]["
+// process marker that LogMsg emits. Concurrent TAP sessions in other
+// processes do not affect the counts.
+//
+// To run in isolation:
+//   ctest --test-dir build -R RepeatedDumpCycles
+// or:
+//   lvt_integration_tests --gtest_filter=WinUI3SampleFixture.RepeatedDumpCyclesPreserveTargetAndCleanUpResources
+TEST_F(WinUI3SampleFixture, RepeatedDumpCyclesPreserveTargetAndCleanUpResources) {
+    SkipIfNotReady();
+
+    wchar_t tempPath[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempPath);
+    const std::wstring logPath = std::wstring(tempPath) + L"lvt_tap.log";
+
+    // The TAP log process marker for this target: "][<pid>][". Any other
+    // process's TAP entries are excluded from all counts.
+    const std::string process_marker =
+        "][" + std::to_string(s_pi.dwProcessId) + "][";
+
+    // Count log lines that match both the PID marker and a substring pattern.
+    const auto count_pid_log = [&](const char* pattern) -> int {
+        std::ifstream log(logPath, std::ios::binary);
+        if (!log) return 0;
+        int n = 0;
+        std::string line;
+        while (std::getline(log, line)) {
+            if (line.find(process_marker) != std::string::npos &&
+                line.find(pattern) != std::string::npos)
+                ++n;
+        }
+        return n;
+    };
+
+    // Baseline before this test.  The fixture's SetUpTestSuite already ran
+    // one or more dumps to verify readiness; those may have left entries for
+    // this PID in the log.  We compare deltas, not absolute values.
+    const int created_before = count_pid_log("Created message window");
+    const int cleanup_before = count_pid_log("Cleanup: message window destroyed");
+
+    // Poll until the PID-filtered cleanup count reaches `expected_total`, or
+    // until `timeout_ms` elapses.  Returns true if the count was reached.
+    const auto wait_for_cleanup = [&](int expected_total, int timeout_ms) -> bool {
+        const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+        while (true) {
+            if (count_pid_log("Cleanup: message window destroyed") >= expected_total)
+                return true;
+            if (GetTickCount64() >= deadline)
+                return false;
+            Sleep(100);
+        }
+    };
+
+    const auto lvt = get_lvt_path();
+    constexpr int kRounds = 5;
+
+    for (int round = 0; round < kRounds; ++round) {
+        // Run a complete dump: inject (or reuse the session), collect the
+        // tree, then exit — which breaks the pipe and triggers CleanupUIResources.
+        const auto output = run_command(make_cmd(lvt, get_pid_arg()));
+
+        ASSERT_EQ(WaitForSingleObject(s_pi.hProcess, 0), WAIT_TIMEOUT)
+            << "target process crashed on dump cycle " << round + 1;
+
+        auto j = json::parse(output, nullptr, false);
+        ASSERT_FALSE(j.is_discarded())
+            << "dump on cycle " << round + 1 << " returned non-JSON output";
+        ASSERT_TRUE(j.contains("root"))
+            << "dump on cycle " << round + 1 << " is missing the root element";
+        EXPECT_TRUE(frameworks_contain_winui3(j))
+            << "dump on cycle " << round + 1 << " lost WinUI3 framework detection";
+        EXPECT_TRUE(json_tree_has_named_control(j["root"], "PrimaryButton"))
+            << "dump on cycle " << round + 1 << " lost PrimaryButton control";
+
+        // Wait for CleanupUIResources to complete for this round.
+        // The TAP DLL's SendMessageTimeout has a 2 s budget; allow 3 s total.
+        // EXPECT (not ASSERT) so we still run the target-survival check below.
+        EXPECT_TRUE(wait_for_cleanup(cleanup_before + round + 1, 3000))
+            << "cleanup did not complete within 3 s for cycle " << round + 1
+            << " (target PID " << s_pi.dwProcessId << ")";
+    }
+
+    // Final resource-balance check: every message window that was created in
+    // this test run must have been destroyed exactly once.  A deficit means
+    // a leaked window; a surplus is impossible.
+    const int new_created = count_pid_log("Created message window")  - created_before;
+    const int new_cleaned = count_pid_log("Cleanup: message window destroyed") - cleanup_before;
+
+    EXPECT_GE(new_created, 1)
+        << "expected at least one message window across " << kRounds << " dump cycles "
+           "(target PID " << s_pi.dwProcessId << ")";
+    EXPECT_EQ(new_created, new_cleaned)
+        << "every created message window must be destroyed exactly once; "
+           "mismatch indicates a leak ("
+        << new_created << " created, " << new_cleaned << " destroyed, "
+           "target PID " << s_pi.dwProcessId << ")";
+
+    // Target must still be alive after all cycles.
+    EXPECT_EQ(WaitForSingleObject(s_pi.hProcess, 0), WAIT_TIMEOUT)
+        << "target process crashed during or after " << kRounds << " dump cycles";
+}
+
 // --- Cross-architecture behaviour ---
 // --uia injects nothing, so it is exempt from the architecture-match check that
 // the visual-tree providers need. Both halves of that claim are asserted here,
