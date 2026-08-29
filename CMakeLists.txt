@@ -1119,6 +1119,17 @@ add_executable(lvt_managed_pipe_spoof
     tests/apps/ManagedPipeSpoof/main.cpp
 )
 
+add_library(lvt_loader_lock_blocker SHARED
+    tests/apps/LoaderLockBlocker/dllmain.cpp
+)
+target_compile_definitions(lvt_loader_lock_blocker PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
+)
+set_property(
+    TARGET lvt_loader_lock_blocker
+    PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
 # Integration tests — require a running Notepad instance
 add_executable(lvt_integration_tests
     tests/integration_tests.cpp
@@ -1137,6 +1148,7 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     WINFORMS_NET48_SAMPLE_EXE_PATH="${WINFORMS_NET48_SAMPLE_EXE_ESCAPED}"
     "NATIVE_CONTROLS_FIXTURE_EXE_PATH=\"$<TARGET_FILE:lvt_native_controls_fixture>\""
     "MANAGED_PIPE_SPOOF_EXE_PATH=\"$<TARGET_FILE:lvt_managed_pipe_spoof>\""
+    "LOADER_LOCK_BLOCKER_DLL_PATH=\"$<TARGET_FILE:lvt_loader_lock_blocker>\""
     "LVT_FAKE_PLUGIN_V2_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v2>\""
     "LVT_FAKE_PLUGIN_V1_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v1>\""
     "LVT_FAKE_PLUGIN_PARTIAL_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_partial>\""
@@ -1159,6 +1171,7 @@ set(LVT_INTEGRATION_DEPS
     winui3_sample_app
     lvt_native_controls_fixture
     lvt_managed_pipe_spoof
+    lvt_loader_lock_blocker
     winforms_net6_sample_app
     winforms_net48_sample_app
     lvt_fake_plugin_v2

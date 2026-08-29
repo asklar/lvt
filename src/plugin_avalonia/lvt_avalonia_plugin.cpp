@@ -139,7 +139,8 @@ static bool write_pipe_name_file(const std::wstring& path, const std::wstring& p
 
 static bool inject_dll(DWORD pid, const std::wstring& dllPath) {
     wil::unique_handle proc(OpenProcess(
-        PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION,
+        PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+            PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
         FALSE, pid));
     if (!proc) {
         DebugLog("failed to open target process %lu (error %lu)", pid, GetLastError());
@@ -170,14 +171,51 @@ static bool inject_dll(DWORD pid, const std::wstring& dllPath) {
         return false;
     }
 
-    if (WaitForSingleObject(thread.get(), 5000) != WAIT_OBJECT_0) {
-        DebugLog("LoadLibraryW timed out in target process");
+    DWORD waitResult = WaitForSingleObject(thread.get(), 5000);
+    if (waitResult != WAIT_OBJECT_0) {
+        if (waitResult == WAIT_TIMEOUT) {
+            DebugLog(
+                "LoadLibraryW is still pending in target process; "
+                "holding the injection transaction until it completes");
+        } else {
+            DebugLog(
+                "initial remote LoadLibraryW wait failed (error %lu); "
+                "holding the transaction",
+                GetLastError());
+        }
+        HANDLE waits[] = {thread.get(), proc.get()};
+        for (;;) {
+            waitResult = WaitForMultipleObjects(
+                static_cast<DWORD>(_countof(waits)), waits, FALSE, INFINITE);
+            if (waitResult == WAIT_OBJECT_0)
+                break;
+            if (waitResult == WAIT_OBJECT_0 + 1) {
+                DebugLog("target exited while LoadLibraryW was pending");
+                return false;
+            }
+            DebugLog(
+                "remote LoadLibraryW wait failed (error %lu); "
+                "retaining transaction ownership",
+                GetLastError());
+            Sleep(100);
+        }
+    }
+
+    if (WaitForSingleObject(proc.get(), 0) == WAIT_OBJECT_0) {
+        DebugLog("target exited after remote LoadLibraryW completed");
         return false;
     }
 
     DWORD exitCode = 0;
-    GetExitCodeThread(thread.get(), &exitCode);
-    VirtualFreeEx(proc.get(), remoteMem, 0, MEM_RELEASE);
+    const bool gotExitCode = GetExitCodeThread(thread.get(), &exitCode) != FALSE;
+    const bool freed =
+        VirtualFreeEx(proc.get(), remoteMem, 0, MEM_RELEASE) != FALSE;
+    if (!gotExitCode || !freed) {
+        DebugLog(
+            "failed to finalize remote LoadLibraryW (exit=%d, free=%d, error %lu)",
+            gotExitCode, freed, GetLastError());
+        return false;
+    }
 
     if (exitCode == 0) {
         DebugLog("LoadLibraryW failed in target process");

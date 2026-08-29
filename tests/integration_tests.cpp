@@ -1304,6 +1304,83 @@ static bool has_runtime_error_dialog(DWORD pid) {
     return search.found;
 }
 
+class PendingRemoteLoad {
+public:
+    bool start(DWORD pid, const fs::path& dllPath) {
+        process_.reset(OpenProcess(
+            PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+                PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
+            FALSE, pid));
+        if (!process_)
+            return false;
+
+        const std::wstring path = dllPath.wstring();
+        const size_t pathBytes = (path.size() + 1) * sizeof(wchar_t);
+        remotePath_ = VirtualAllocEx(
+            process_.get(), nullptr, pathBytes, MEM_COMMIT, PAGE_READWRITE);
+        if (!remotePath_)
+            return false;
+        if (!WriteProcessMemory(
+                process_.get(), remotePath_, path.c_str(), pathBytes,
+                nullptr)) {
+            VirtualFreeEx(process_.get(), remotePath_, 0, MEM_RELEASE);
+            remotePath_ = nullptr;
+            return false;
+        }
+
+        auto loadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
+        if (!loadLibrary) {
+            VirtualFreeEx(process_.get(), remotePath_, 0, MEM_RELEASE);
+            remotePath_ = nullptr;
+            return false;
+        }
+        thread_.reset(CreateRemoteThread(
+            process_.get(), nullptr, 0, loadLibrary, remotePath_, 0, nullptr));
+        if (thread_)
+            return true;
+        VirtualFreeEx(process_.get(), remotePath_, 0, MEM_RELEASE);
+        remotePath_ = nullptr;
+        return false;
+    }
+
+    bool complete(DWORD timeoutMs, DWORD& exitCode) {
+        if (!thread_)
+            return false;
+        if (WaitForSingleObject(thread_.get(), timeoutMs) != WAIT_OBJECT_0)
+            return false;
+
+        const bool targetExited =
+            WaitForSingleObject(process_.get(), 0) == WAIT_OBJECT_0;
+        const bool gotExitCode =
+            GetExitCodeThread(thread_.get(), &exitCode) != FALSE;
+        bool freed = true;
+        if (!targetExited && remotePath_) {
+            freed =
+                VirtualFreeEx(
+                    process_.get(), remotePath_, 0, MEM_RELEASE) != FALSE;
+        }
+        remotePath_ = nullptr;
+        thread_.reset();
+        return gotExitCode && freed;
+    }
+
+    ~PendingRemoteLoad() {
+        if (!thread_)
+            return;
+        WaitForSingleObject(thread_.get(), INFINITE);
+        if (WaitForSingleObject(process_.get(), 0) != WAIT_OBJECT_0 &&
+            remotePath_) {
+            VirtualFreeEx(process_.get(), remotePath_, 0, MEM_RELEASE);
+        }
+    }
+
+private:
+    wil::unique_handle process_;
+    wil::unique_handle thread_;
+    void* remotePath_ = nullptr;
+};
+
 #if LVT_ENABLE_WPF || LVT_ENABLE_WINFORMS
 class ScopedSampleProcess {
 public:
@@ -1642,6 +1719,77 @@ TEST_F(AvaloniaFixture, HostfxrAbiReturnsTreeAndReconnectsCleanly) {
         << "the query reconnect left the Avalonia TAP pinned";
     EXPECT_FALSE(fs::exists(sidecar_path()))
         << "the query reconnect left a stale sidecar";
+}
+
+TEST_F(AvaloniaFixture, DelayedRemoteLoadRemainsSerializedAndCleansUp) {
+    ASSERT_TRUE(wait_for_module_unloaded(pi_.dwProcessId, tap_name()));
+
+    const std::wstring readyName =
+        L"Local\\LvtLoaderLockBlocker_" +
+        std::to_wstring(pi_.dwProcessId);
+    wil::unique_event blockerReady(
+        CreateEventW(nullptr, TRUE, FALSE, readyName.c_str()));
+    ASSERT_TRUE(blockerReady);
+
+    PendingRemoteLoad blocker;
+    ASSERT_TRUE(blocker.start(
+        pi_.dwProcessId, fs::path(LOADER_LOCK_BLOCKER_DLL_PATH)));
+    ASSERT_EQ(
+        WaitForSingleObject(blockerReady.get(), 3000), WAIT_OBJECT_0)
+        << "the test DLL did not acquire the target loader lock";
+
+    const auto lvt = get_lvt_path();
+    const auto target = pid_arg();
+    auto first = std::async(std::launch::async, [lvt, target] {
+        return run_command(make_cmd(lvt, target));
+    });
+
+    Sleep(5500);
+    EXPECT_EQ(
+        first.wait_for(std::chrono::milliseconds(0)),
+        std::future_status::timeout)
+        << "the first caller escaped while remote LoadLibraryW was pending";
+
+    auto second = std::async(std::launch::async, [lvt, target] {
+        return run_command(make_cmd(lvt, target));
+    });
+    EXPECT_EQ(
+        second.wait_for(std::chrono::milliseconds(0)),
+        std::future_status::timeout)
+        << "the retry should wait for ownership of the injection transaction";
+
+    DWORD blockerExitCode = STILL_ACTIVE;
+    ASSERT_TRUE(blocker.complete(10000, blockerExitCode));
+    EXPECT_EQ(blockerExitCode, 0u)
+        << "the loader-lock blocker intentionally fails its LoadLibraryW";
+
+    const auto firstOutput = first.get();
+    const auto secondOutput = second.get();
+    const auto firstTree = json::parse(firstOutput, nullptr, false);
+    const auto secondTree = json::parse(secondOutput, nullptr, false);
+    auto ready = [](const json& tree) {
+        return !tree.is_discarded() &&
+               frameworks_contain_avalonia(tree) &&
+               tree.contains("root") &&
+               has_avalonia_control(tree["root"]);
+    };
+    EXPECT_TRUE(ready(firstTree))
+        << "the delayed initial injection did not return Avalonia content";
+    EXPECT_TRUE(ready(secondTree))
+        << "the serialized retry did not reconnect with Avalonia content";
+
+    EXPECT_EQ(WaitForSingleObject(process_.get(), 0), WAIT_TIMEOUT);
+    EXPECT_FALSE(has_runtime_error_dialog(pi_.dwProcessId));
+    EXPECT_TRUE(wait_for_module_unloaded(pi_.dwProcessId, tap_name()))
+        << "overlapping LoadLibraryW calls left an extra TAP module reference";
+    EXPECT_FALSE(fs::exists(sidecar_path()))
+        << "the delayed injection transaction left a stale sidecar";
+
+    const std::wstring blockerName =
+        fs::path(LOADER_LOCK_BLOCKER_DLL_PATH).filename().wstring();
+    EXPECT_TRUE(wait_for_module_unloaded(
+        pi_.dwProcessId, blockerName.c_str()))
+        << "the loader-lock blocker should fail loading and leave no module";
 }
 
 class WinFormsSampleFixture : public ::testing::Test {

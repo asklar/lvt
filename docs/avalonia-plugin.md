@@ -120,6 +120,14 @@ injection after a connection failure. This plugin does not implement the
 group yet, so it continues to use `lvt_enrich_tree` on every refresh
 unchanged.
 
+One-shot injection is serialized per target process through remote
+`LoadLibraryW` completion. The five-second threshold is diagnostic only: if
+the remote thread is delayed by the target's loader lock, the caller retains
+connection ownership until that thread completes or the target exits. The
+remote DLL-path allocation is released only after completion, so a retry
+cannot launch a second load against an outstanding transaction or add an
+unbalanced TAP module reference.
+
 Persistent implementations must return an object or array of object nodes in
 the documented tree schema. Field types, nesting, and node counts are
 validated before grafting. Event arrays are bounded and every event must

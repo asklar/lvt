@@ -72,7 +72,10 @@ flowchart BT
    `x64`, or `arm64`) and loads one AnyCPU managed walker through CoreCLR's
    default component entry point. Its current ABI-v1 path is one-shot: each
    enrichment unloads the native TAP before a later refresh reconnects.
-   CoreCLR 8 is the supported floor.
+   Per-target injection ownership remains held until the remote `LoadLibraryW`
+   thread completes or the target exits, even after the diagnostic timeout,
+   preventing a retry from racing a delayed load. CoreCLR 8 is the supported
+   floor.
 
 ### Reusable connections (`providers/framework_connection.h`, `connection_registry.h`)
 
