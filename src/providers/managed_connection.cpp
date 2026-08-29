@@ -437,20 +437,27 @@ bool wait_for_pipe_connection(
            GetLastError() == ERROR_PIPE_CONNECTED;
 }
 
-bool wait_for_expected_pipe_client(
+bool wait_for_expected_pipe_client_impl(
     HANDLE pipe, HANDLE process, DWORD expectedPid, OVERLAPPED& overlapped,
     DWORD connectError, DWORD timeoutMs) {
     const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    bool connectPending = connectError == ERROR_IO_PENDING;
     for (;;) {
         const ULONGLONG now = GetTickCount64();
-        if (now >= deadline)
+        if (now >= deadline) {
+            if (connectPending)
+                detail::cancel_and_complete_overlapped(pipe, overlapped);
             return false;
+        }
         const DWORD remaining = static_cast<DWORD>(
             std::min<ULONGLONG>(
                 deadline - now, std::numeric_limits<DWORD>::max()));
         if (!wait_for_pipe_connection(
-                pipe, process, overlapped, connectError, remaining))
+                pipe, process, overlapped, connectError, remaining)) {
+            connectPending = false;
             return false;
+        }
+        connectPending = false;
         if (detail::managed_pipe_client_matches_pid(pipe, expectedPid))
             return true;
 
@@ -470,6 +477,7 @@ bool wait_for_expected_pipe_client(
             ConnectNamedPipe(pipe, &overlapped);
         connectError =
             connectedSynchronously ? ERROR_SUCCESS : GetLastError();
+        connectPending = connectError == ERROR_IO_PENDING;
     }
 }
 
@@ -595,7 +603,7 @@ public:
             return nullptr;
         }
 
-        const bool connected = wait_for_expected_pipe_client(
+        const bool connected = detail::wait_for_expected_pipe_client(
             pipe.get(), process.get(), pid, connectOverlapped, connectError,
             options.connectTimeoutMs);
         DeleteFileW(sidecar.c_str());
@@ -1087,6 +1095,17 @@ private:
 };
 
 } // namespace
+
+namespace detail {
+
+bool wait_for_expected_pipe_client(
+    HANDLE pipe, HANDLE process, DWORD expectedPid, OVERLAPPED& overlapped,
+    DWORD connectError, DWORD timeoutMs) {
+    return wait_for_expected_pipe_client_impl(
+        pipe, process, expectedPid, overlapped, connectError, timeoutMs);
+}
+
+} // namespace detail
 
 std::shared_ptr<IFrameworkConnection> open_managed_framework_connection(
     HWND hwnd, DWORD pid, ManagedConnectionOptions options, ManagedTreeApplier applyTree) {

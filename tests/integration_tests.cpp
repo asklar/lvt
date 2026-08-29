@@ -112,6 +112,74 @@ TEST(ManagedConnectionSecurity, RejectsSpoofedPipeClientProcess) {
     ASSERT_EQ(expectedWait, WAIT_OBJECT_0);
     EXPECT_TRUE(expectedClientOpened);
 }
+
+TEST(ManagedConnectionSecurity, RepeatedSpoofsDrainFinalPendingRearm) {
+    const std::wstring pipeName =
+        L"\\\\.\\pipe\\lvt_spoof_deadline_" +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64());
+    wil::unique_hfile pipe(CreateNamedPipeW(
+        pipeName.c_str(),
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 4096, 4096, 5000, nullptr));
+    ASSERT_TRUE(pipe);
+
+    wil::unique_event event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ASSERT_TRUE(event);
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.get();
+    ASSERT_FALSE(ConnectNamedPipe(pipe.get(), &overlapped));
+    const DWORD connectError = GetLastError();
+    ASSERT_EQ(connectError, ERROR_IO_PENDING);
+
+    const std::wstring spoofPath =
+        fs::path(MANAGED_PIPE_SPOOF_EXE_PATH).wstring();
+    std::atomic_int clientsCompleted = 0;
+    std::thread clients([&] {
+        for (int index = 0; index < 2; ++index) {
+            STARTUPINFOW startup{sizeof(startup)};
+            PROCESS_INFORMATION info{};
+            std::wstring command =
+                L"\"" + spoofPath + L"\" \"" + pipeName + L"\"";
+            if (!CreateProcessW(
+                    nullptr, command.data(), nullptr, nullptr, FALSE,
+                    CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info))
+                return;
+            wil::unique_handle process(info.hProcess);
+            wil::unique_handle thread(info.hThread);
+            if (WaitForSingleObject(process.get(), 5000) != WAIT_OBJECT_0)
+                return;
+            ++clientsCompleted;
+        }
+    });
+
+    EXPECT_FALSE(lvt::detail::wait_for_expected_pipe_client(
+        pipe.get(), nullptr, GetCurrentProcessId(), overlapped,
+        connectError, 1500));
+    clients.join();
+    EXPECT_EQ(clientsCompleted.load(), 2);
+
+    DWORD transferred = 0;
+    SetLastError(ERROR_SUCCESS);
+    EXPECT_FALSE(GetOverlappedResult(
+        pipe.get(), &overlapped, &transferred, FALSE));
+    EXPECT_EQ(GetLastError(), ERROR_OPERATION_ABORTED)
+        << "the final re-armed connect must be synchronously drained";
+
+    ResetEvent(event.get());
+    ZeroMemory(&overlapped, sizeof(overlapped));
+    overlapped.hEvent = event.get();
+    ASSERT_FALSE(ConnectNamedPipe(pipe.get(), &overlapped));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+    EXPECT_FALSE(lvt::detail::wait_for_expected_pipe_client(
+        pipe.get(), nullptr, GetCurrentProcessId(), overlapped,
+        ERROR_IO_PENDING, 0));
+    SetLastError(ERROR_SUCCESS);
+    EXPECT_FALSE(GetOverlappedResult(
+        pipe.get(), &overlapped, &transferred, FALSE));
+    EXPECT_EQ(GetLastError(), ERROR_OPERATION_ABORTED);
+}
 #endif
 
 // Locate lvt.exe relative to this test binary
