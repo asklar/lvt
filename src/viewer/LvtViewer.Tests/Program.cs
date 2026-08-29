@@ -83,6 +83,7 @@ Assert(toggleRow.HasExternalConflict, "enum conflict was not surfaced");
 Assert(numberRow.HasExternalConflict, "number conflict was not surfaced");
 Assert(node.PropertyRows.Count == 3, "resource patches created duplicate property rows");
 
+var submittedValueRevision = valueRow.EditRevision;
 var acceptedValue = TypedRow(
     "Value.Value", "Value", "accepted text", "string");
 var retainedToggle = TypedRow(
@@ -93,7 +94,8 @@ var retainedNumber = TypedRow(
 node.ReplaceTypedPropertyRows(
     [acceptedValue, retainedToggle, retainedNumber],
     preservePendingEdits: true,
-    acceptedProviderName: "Value.Value");
+    acceptedProviderName: "Value.Value",
+    acceptedEditRevision: submittedValueRevision);
 var acceptedValueRow = node.FindProperty("Value.Value")!;
 var unrelatedToggle = node.FindProperty("Toggle.ToggleState")!;
 var unrelatedNumber = node.FindProperty("RangeValue.Value")!;
@@ -101,6 +103,47 @@ Assert(!acceptedValueRow.IsDirty, "submitted row was not explicitly accepted");
 Assert(acceptedValueRow.EditText == "accepted text", "submitted row did not reset");
 Assert(unrelatedToggle.EditText == "On", "setting one row discarded another enum edit");
 Assert(unrelatedNumber.EditText == "12.5", "setting one row discarded another number edit");
+
+var setRaceNode = new ElementNodeViewModel();
+var setRaceRow = TypedRow("Value.Value", "Value", "old", "string");
+setRaceNode.ReplaceTypedPropertyRows([setRaceRow]);
+setRaceRow.EditText = "A";
+var submittedSetRevision = setRaceRow.EditRevision;
+setRaceRow.EditText = "B";
+setRaceRow.ApplyMutationValue("A", submittedSetRevision);
+Assert(setRaceRow.Value == "A", "set completion did not update effective provider value");
+Assert(setRaceRow.EditText == "B", "set completion overwrote newer pending edit");
+Assert(setRaceRow.IsDirty && setRaceRow.HasExternalConflict,
+    "set completion did not preserve newer edit as a conflict");
+var setRefreshRow = TypedRow("Value.Value", "Value", "A", "string");
+setRaceNode.ReplaceTypedPropertyRows(
+    [setRefreshRow],
+    preservePendingEdits: true,
+    acceptedProviderName: "Value.Value",
+    acceptedEditRevision: submittedSetRevision);
+setRaceRow = setRaceNode.FindProperty("Value.Value")!;
+Assert(setRaceRow.Value == "A" && setRaceRow.EditText == "B",
+    "follow-up set refresh suppressed preservation of a later edit");
+
+var clearRaceNode = new ElementNodeViewModel();
+var clearRaceRow = TypedRow("Value.Value", "Value", "effective", "string");
+clearRaceNode.ReplaceTypedPropertyRows([clearRaceRow]);
+clearRaceRow.EditText = "clear-A";
+var submittedClearRevision = clearRaceRow.EditRevision;
+clearRaceRow.EditText = "clear-B";
+Assert(!clearRaceRow.TryDiscardSubmittedEdit(submittedClearRevision),
+    "clear completion discarded a newer edit");
+var clearRefreshRow = TypedRow("Value.Value", "Value", "default", "string");
+clearRaceNode.ReplaceTypedPropertyRows(
+    [clearRefreshRow],
+    preservePendingEdits: true,
+    acceptedProviderName: "Value.Value",
+    acceptedEditRevision: submittedClearRevision);
+clearRaceRow = clearRaceNode.FindProperty("Value.Value")!;
+Assert(clearRaceRow.Value == "default" && clearRaceRow.EditText == "clear-B",
+    "follow-up clear refresh overwrote a newer pending edit");
+Assert(clearRaceRow.IsDirty && clearRaceRow.HasExternalConflict,
+    "clear race did not remain visible as a conflict");
 
 var refreshedValue = TypedRowFromDescriptor(
     new PropertyDescriptorDto

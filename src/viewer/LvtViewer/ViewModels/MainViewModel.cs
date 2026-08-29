@@ -735,6 +735,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async System.Threading.Tasks.Task<bool> RefreshTypedPropertiesAsync(
         ElementNodeViewModel? node, bool preservePendingEdits = false,
         string? acceptedProviderName = null,
+        long? acceptedEditRevision = null,
         TypedPropertyRefreshState.Token? refreshToken = null,
         bool clearLoadingOnCompletion = true)
     {
@@ -801,7 +802,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             .ToList();
 
         node.ReplaceTypedPropertyRows(
-            rows, preservePendingEdits, acceptedProviderName);
+            rows, preservePendingEdits,
+            acceptedProviderName, acceptedEditRevision);
         if (clearLoadingOnCompletion)
             IsPropertyPanelLoading = false;
         Logger.Log(
@@ -817,9 +819,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (row == null || node == null || !row.IsTypedProperty || !row.CanApply)
             return;
 
+        var submittedProviderName = row.ProviderName;
+        var submittedRevision = row.EditRevision;
+        var submittedValue = row.EditText;
         StatusText = $"Setting {row.Name}…";
         var result = await _mcp.SetPropertyAsync(
-            node.Key, row.DescriptorId, row.EditText);
+            node.Key, row.DescriptorId, submittedValue);
         if (SelectedElement != node)
             return;
         if (!result.Ok)
@@ -827,19 +832,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             StatusText = $"Set failed: {result.Error}";
             return;
         }
-        var acceptedValue = row.EditText;
+        var acceptedValue = submittedValue;
         if (result.Payload.TryGetProperty("value", out var returnedValue) &&
             returnedValue.ValueKind == System.Text.Json.JsonValueKind.String)
         {
             acceptedValue = returnedValue.GetString() ?? acceptedValue;
         }
-        row.UpdateProviderValue(
-            acceptedValue, preservePendingEdit: false);
+        var currentRow = node.FindProperty(submittedProviderName);
+        currentRow?.ApplyMutationValue(
+            acceptedValue, submittedRevision);
         StatusText = $"{row.Name} updated.";
         await RefreshTypedPropertiesAsync(
             node,
             preservePendingEdits: true,
-            acceptedProviderName: row.ProviderName);
+            acceptedProviderName: submittedProviderName,
+            acceptedEditRevision: submittedRevision);
     }
 
     private async System.Threading.Tasks.Task ClearPropertyAsync(PropertyRowViewModel? row)
@@ -848,6 +855,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (row == null || node == null || !row.IsTypedProperty)
             return;
 
+        var submittedProviderName = row.ProviderName;
+        var submittedRevision = row.EditRevision;
         StatusText = $"Clearing {row.Name}…";
         var result = await _mcp.ClearPropertyAsync(node.Key, row.DescriptorId);
         if (SelectedElement != node)
@@ -857,12 +866,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             StatusText = $"Clear failed: {result.Error}";
             return;
         }
-        row.DiscardPendingEdit();
+        var currentRow = node.FindProperty(submittedProviderName);
+        currentRow?.TryDiscardSubmittedEdit(submittedRevision);
         StatusText = $"{row.Name} restored.";
         await RefreshTypedPropertiesAsync(
             node,
             preservePendingEdits: true,
-            acceptedProviderName: row.ProviderName);
+            acceptedProviderName: submittedProviderName,
+            acceptedEditRevision: submittedRevision);
     }
 
     private async System.Threading.Tasks.Task HandleTargetClosedAsync()

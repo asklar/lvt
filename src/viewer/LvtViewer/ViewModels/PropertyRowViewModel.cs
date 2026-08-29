@@ -20,6 +20,7 @@ public sealed class PropertyRowViewModel : ObservableObject
     private PropertyEditorKind _kind;
     private bool _isDirty;
     private bool _hasExternalConflict;
+    private long _editRevision;
 
     public PropertyRowViewModel(string name, string value)
     {
@@ -47,6 +48,7 @@ public sealed class PropertyRowViewModel : ObservableObject
 
     public bool IsEditable => Kind != PropertyEditorKind.ReadOnly;
     public bool IsTypedProperty { get; private set; }
+    public long EditRevision => _editRevision;
     public bool IsDirty
     {
         get => _isDirty;
@@ -102,14 +104,7 @@ public sealed class PropertyRowViewModel : ObservableObject
     public string EditText
     {
         get => _editText;
-        set
-        {
-            if (SetField(ref _editText, value))
-            {
-                Validate();
-                UpdateDirtyState();
-            }
-        }
+        set => SetEditText(value, incrementRevision: true);
     }
 
     public string ValidationError
@@ -165,7 +160,7 @@ public sealed class PropertyRowViewModel : ObservableObject
         }
         UpdateProviderValue(value.Value, preservePendingEdit: false);
         if (Kind == PropertyEditorKind.Command && Choices.Count != 0)
-            EditText = Choices[0].Value;
+            SetEditText(Choices[0].Value, incrementRevision: false);
         Validate();
 
         OnPropertyChanged(nameof(Name));
@@ -193,7 +188,7 @@ public sealed class PropertyRowViewModel : ObservableObject
 
         if (!preservePendingEdit || !wasDirty)
         {
-            EditText = value;
+            SetEditText(value, incrementRevision: false);
             HasExternalConflict = false;
             return;
         }
@@ -213,7 +208,9 @@ public sealed class PropertyRowViewModel : ObservableObject
     {
         if (!existing.IsDirty)
             return;
-        EditText = existing.EditText;
+        _editRevision = existing.EditRevision;
+        OnPropertyChanged(nameof(EditRevision));
+        SetEditText(existing.EditText, incrementRevision: false);
         HasExternalConflict =
             IsDirty &&
             (existing.HasExternalConflict ||
@@ -236,8 +233,28 @@ public sealed class PropertyRowViewModel : ObservableObject
 
     public void DiscardPendingEdit()
     {
-        EditText = Value;
+        SetEditText(Value, incrementRevision: false);
         HasExternalConflict = false;
+    }
+
+    public void ApplyMutationValue(string value, long submittedRevision)
+    {
+        bool hasNewerEdit = EditRevision != submittedRevision;
+        UpdateProviderValue(value, preservePendingEdit: hasNewerEdit);
+        if (hasNewerEdit && IsDirty)
+            HasExternalConflict = true;
+    }
+
+    public bool TryDiscardSubmittedEdit(long submittedRevision)
+    {
+        if (EditRevision != submittedRevision)
+        {
+            if (IsDirty)
+                HasExternalConflict = true;
+            return false;
+        }
+        DiscardPendingEdit();
+        return true;
     }
 
     private void Validate()
@@ -292,6 +309,19 @@ public sealed class PropertyRowViewModel : ObservableObject
         if (!IsDirty)
             HasExternalConflict = false;
         OnPropertyChanged(nameof(ConflictMessage));
+    }
+
+    private void SetEditText(string value, bool incrementRevision)
+    {
+        if (!SetField(ref _editText, value, nameof(EditText)))
+            return;
+        if (incrementRevision)
+        {
+            ++_editRevision;
+            OnPropertyChanged(nameof(EditRevision));
+        }
+        Validate();
+        UpdateDirtyState();
     }
 
 }

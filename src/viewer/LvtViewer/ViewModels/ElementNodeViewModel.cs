@@ -297,7 +297,8 @@ public sealed class ElementNodeViewModel : ObservableObject
     public void ReplaceTypedPropertyRows(
         IEnumerable<PropertyRowViewModel> rows,
         bool preservePendingEdits = false,
-        string? acceptedProviderName = null)
+        string? acceptedProviderName = null,
+        long? acceptedEditRevision = null)
     {
         var incoming = rows.ToList();
         var existingTyped = PropertyRows
@@ -306,9 +307,15 @@ public sealed class ElementNodeViewModel : ObservableObject
         var merged = PropertyRows.Where(row => !row.IsTypedProperty).ToList();
         foreach (var row in incoming)
         {
+            existingTyped.TryGetValue(row.ProviderName, out var existing);
+            bool isExactAcceptedEdit =
+                existing != null &&
+                row.ProviderName == acceptedProviderName &&
+                acceptedEditRevision.HasValue &&
+                existing.EditRevision == acceptedEditRevision.Value;
             if (preservePendingEdits &&
-                existingTyped.TryGetValue(row.ProviderName, out var existing) &&
-                row.ProviderName != acceptedProviderName &&
+                existing != null &&
+                !isExactAcceptedEdit &&
                 existing.IsDirty)
             {
                 row.PreservePendingEditFrom(existing);
@@ -327,7 +334,9 @@ public sealed class ElementNodeViewModel : ObservableObject
             foreach (var existing in existingTyped.Values)
             {
                 if (!existing.IsDirty ||
-                    existing.ProviderName == acceptedProviderName ||
+                    (existing.ProviderName == acceptedProviderName &&
+                     acceptedEditRevision.HasValue &&
+                     existing.EditRevision == acceptedEditRevision.Value) ||
                     incomingNames.Contains(existing.ProviderName))
                 {
                     continue;
