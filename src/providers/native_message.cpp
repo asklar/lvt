@@ -385,7 +385,7 @@ void RemoteBuffer::reset() {
 }
 
 NativeMessageResult read_native_toolbar_button_text(
-    const NativeWindowIdentity& identity, int commandId,
+    const NativeWindowIdentity& identity, int index, int commandId,
     std::string& text, size_t maximumChars) {
     text.clear();
     if (maximumChars == 0 ||
@@ -423,7 +423,7 @@ NativeMessageResult read_native_toolbar_button_text(
             return native;
 
         TBBUTTONINFOW info{sizeof(info)};
-        info.dwMask = TBIF_TEXT;
+        info.dwMask = TBIF_TEXT | TBIF_BYINDEX;
         info.pszText = reinterpret_cast<wchar_t*>(
             static_cast<std::byte*>(remote->address()) + infoSize);
         info.cchText = static_cast<int>(chars);
@@ -437,7 +437,7 @@ NativeMessageResult read_native_toolbar_button_text(
 
         auto copied = send_native_pointer_message(
             identity, TB_GETBUTTONINFOW,
-            static_cast<WPARAM>(commandId),
+            static_cast<WPARAM>(index),
             reinterpret_cast<LPARAM>(remote->address()), remote);
         if (!copied.ok)
             return copied;
@@ -480,6 +480,216 @@ NativeMessageResult read_native_toolbar_button_text(
     return failure(
         ERROR_RETRY,
         "The toolbar button text kept growing while it was read");
+}
+
+NativeMessageResult read_native_listview_item_text(
+    const NativeWindowIdentity& identity, int index,
+    std::string& text, size_t maximumChars) {
+    text.clear();
+    if (maximumChars == 0 ||
+        maximumChars >
+            static_cast<size_t>((std::numeric_limits<int>::max)() - 2)) {
+        return failure(
+            ERROR_INVALID_PARAMETER,
+            "Invalid list-view text capacity limit");
+    }
+
+    size_t chars = (std::min)(size_t{256}, maximumChars + 2);
+    for (;;) {
+        const size_t itemSize = sizeof(LVITEMW);
+        NativeMessageResult native;
+        auto remote = std::make_shared<RemoteBuffer>(
+            RemoteBuffer::allocate(
+                identity, itemSize + chars * sizeof(wchar_t), native));
+        if (!*remote)
+            return native;
+
+        LVITEMW item{};
+        item.iSubItem = 0;
+        item.pszText = reinterpret_cast<wchar_t*>(
+            static_cast<std::byte*>(remote->address()) + itemSize);
+        item.cchTextMax = static_cast<int>(chars);
+        std::vector<wchar_t> zero(chars, L'\0');
+        if (!remote->write(&item, sizeof(item), native) ||
+            !remote->write(
+                zero.data(), zero.size() * sizeof(wchar_t),
+                native, itemSize)) {
+            return native;
+        }
+
+        auto copied = send_native_pointer_message(
+            identity, LVM_GETITEMTEXTW,
+            static_cast<WPARAM>(index),
+            reinterpret_cast<LPARAM>(remote->address()), remote);
+        if (!copied.ok)
+            return copied;
+        if (copied.value < 0)
+            return failure(
+                ERROR_INVALID_DATA,
+                "The list-view item text is unavailable");
+        if (static_cast<uint64_t>(copied.value) > maximumChars) {
+            return failure(
+                ERROR_BUFFER_OVERFLOW,
+                "The list-view item text exceeds the configured safety limit");
+        }
+
+        if (static_cast<size_t>(copied.value) < chars - 1 ||
+            chars == maximumChars + 2) {
+            std::vector<wchar_t> value(chars, L'\0');
+            if (!remote->read(
+                    value.data(), value.size() * sizeof(wchar_t),
+                    native, itemSize)) {
+                return native;
+            }
+            const size_t length =
+                wcsnlen_s(value.data(), value.size());
+            if (length > maximumChars) {
+                return failure(
+                    ERROR_BUFFER_OVERFLOW,
+                    "The list-view item text exceeds the configured safety limit");
+            }
+            text = native_utf16_to_utf8(
+                std::wstring_view(value.data(), length));
+            return success(static_cast<LRESULT>(length));
+        }
+        chars = (std::min)(chars * 2, maximumChars + 2);
+    }
+}
+
+NativeMessageResult read_native_treeview_item_text(
+    const NativeWindowIdentity& identity, HTREEITEM treeItem,
+    std::string& text, size_t maximumChars) {
+    text.clear();
+    if (!treeItem || maximumChars == 0 ||
+        maximumChars >
+            static_cast<size_t>((std::numeric_limits<int>::max)() - 2)) {
+        return failure(
+            ERROR_INVALID_PARAMETER,
+            "Invalid tree-view text request");
+    }
+
+    size_t chars = (std::min)(size_t{256}, maximumChars + 2);
+    for (;;) {
+        const size_t itemSize = sizeof(TVITEMW);
+        NativeMessageResult native;
+        auto remote = std::make_shared<RemoteBuffer>(
+            RemoteBuffer::allocate(
+                identity, itemSize + chars * sizeof(wchar_t), native));
+        if (!*remote)
+            return native;
+
+        TVITEMW item{};
+        item.mask = TVIF_TEXT;
+        item.hItem = treeItem;
+        item.pszText = reinterpret_cast<wchar_t*>(
+            static_cast<std::byte*>(remote->address()) + itemSize);
+        item.cchTextMax = static_cast<int>(chars);
+        std::vector<wchar_t> zero(chars, L'\0');
+        if (!remote->write(&item, sizeof(item), native) ||
+            !remote->write(
+                zero.data(), zero.size() * sizeof(wchar_t),
+                native, itemSize)) {
+            return native;
+        }
+
+        auto got = send_native_pointer_message(
+            identity, TVM_GETITEMW, 0,
+            reinterpret_cast<LPARAM>(remote->address()), remote);
+        if (!got.ok)
+            return got;
+        if (!got.value)
+            return failure(
+                ERROR_INVALID_HANDLE,
+                "The tree-view item no longer exists");
+
+        std::vector<wchar_t> value(chars, L'\0');
+        if (!remote->read(
+                value.data(), value.size() * sizeof(wchar_t),
+                native, itemSize)) {
+            return native;
+        }
+        const size_t length =
+            wcsnlen_s(value.data(), value.size());
+        if (length > maximumChars) {
+            return failure(
+                ERROR_BUFFER_OVERFLOW,
+                "The tree-view item text exceeds the configured safety limit");
+        }
+        if (length < chars - 1 || chars == maximumChars + 2) {
+            text = native_utf16_to_utf8(
+                std::wstring_view(value.data(), length));
+            return success(static_cast<LRESULT>(length));
+        }
+        chars = (std::min)(chars * 2, maximumChars + 2);
+    }
+}
+
+NativeMessageResult read_native_tab_item_text(
+    const NativeWindowIdentity& identity, int index,
+    std::string& text, size_t maximumChars) {
+    text.clear();
+    if (maximumChars == 0 ||
+        maximumChars >
+            static_cast<size_t>((std::numeric_limits<int>::max)() - 2)) {
+        return failure(
+            ERROR_INVALID_PARAMETER,
+            "Invalid tab text capacity limit");
+    }
+
+    size_t chars = (std::min)(size_t{256}, maximumChars + 2);
+    for (;;) {
+        const size_t itemSize = sizeof(TCITEMW);
+        NativeMessageResult native;
+        auto remote = std::make_shared<RemoteBuffer>(
+            RemoteBuffer::allocate(
+                identity, itemSize + chars * sizeof(wchar_t), native));
+        if (!*remote)
+            return native;
+
+        TCITEMW item{};
+        item.mask = TCIF_TEXT;
+        item.pszText = reinterpret_cast<wchar_t*>(
+            static_cast<std::byte*>(remote->address()) + itemSize);
+        item.cchTextMax = static_cast<int>(chars);
+        std::vector<wchar_t> zero(chars, L'\0');
+        if (!remote->write(&item, sizeof(item), native) ||
+            !remote->write(
+                zero.data(), zero.size() * sizeof(wchar_t),
+                native, itemSize)) {
+            return native;
+        }
+
+        auto got = send_native_pointer_message(
+            identity, TCM_GETITEMW,
+            static_cast<WPARAM>(index),
+            reinterpret_cast<LPARAM>(remote->address()), remote);
+        if (!got.ok)
+            return got;
+        if (!got.value)
+            return failure(
+                ERROR_INVALID_INDEX,
+                "The tab item no longer exists");
+
+        std::vector<wchar_t> value(chars, L'\0');
+        if (!remote->read(
+                value.data(), value.size() * sizeof(wchar_t),
+                native, itemSize)) {
+            return native;
+        }
+        const size_t length =
+            wcsnlen_s(value.data(), value.size());
+        if (length > maximumChars) {
+            return failure(
+                ERROR_BUFFER_OVERFLOW,
+                "The tab item text exceeds the configured safety limit");
+        }
+        if (length < chars - 1 || chars == maximumChars + 2) {
+            text = native_utf16_to_utf8(
+                std::wstring_view(value.data(), length));
+            return success(static_cast<LRESULT>(length));
+        }
+        chars = (std::min)(chars * 2, maximumChars + 2);
+    }
 }
 
 } // namespace lvt

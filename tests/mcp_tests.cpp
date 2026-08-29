@@ -2565,6 +2565,16 @@ TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
              {"element", parallelGeneric->value("key", "")}},
         &isError);
     EXPECT_FALSE(isError) << parallelProperties.dump(2);
+    auto narrowedParallelTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", parallelSession}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << narrowedParallelTree.dump(2);
+    auto prunedParallelSibling = client.call_tool(
+        "get_editable_properties",
+        json{{"session", parallelSession}, {"element", comboKey}},
+        &isError);
+    EXPECT_TRUE(isError) << prunedParallelSibling.dump(2);
 
     const auto scopedSession = connect(client);
     ASSERT_FALSE(scopedSession.empty());

@@ -3,6 +3,7 @@
 #include "../target.h"
 
 #include <Windows.h>
+#include <CommCtrl.h>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -89,7 +90,16 @@ private:
 };
 
 NativeMessageResult read_native_toolbar_button_text(
-    const NativeWindowIdentity& identity, int commandId,
+    const NativeWindowIdentity& identity, int index, int commandId,
+    std::string& text, size_t maximumChars = 1024 * 1024);
+NativeMessageResult read_native_listview_item_text(
+    const NativeWindowIdentity& identity, int index,
+    std::string& text, size_t maximumChars = 1024 * 1024);
+NativeMessageResult read_native_treeview_item_text(
+    const NativeWindowIdentity& identity, HTREEITEM item,
+    std::string& text, size_t maximumChars = 1024 * 1024);
+NativeMessageResult read_native_tab_item_text(
+    const NativeWindowIdentity& identity, int index,
     std::string& text, size_t maximumChars = 1024 * 1024);
 
 } // namespace lvt

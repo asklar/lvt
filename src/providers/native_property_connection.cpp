@@ -23,7 +23,8 @@
 namespace lvt {
 namespace {
 
-constexpr size_t kMaximumNativeTextChars = 1024 * 1024;
+constexpr size_t kMaximumNativeTextChars =
+    kMaximumNativePropertyTextChars;
 constexpr size_t kMaximumIdentityScanItems = 256;
 constexpr size_t kControlTextChars = 4096;
 constexpr size_t kMaximumStatusTextChars = 0xFFFF;
@@ -81,6 +82,7 @@ struct LiveTarget {
     LONG_PTR style = 0;
     bool pointerAllowed = false;
     bool ownerData = false;
+    bool ownerDraw = false;
     bool identityVerified = true;
     bool checkable = false;
     std::string identity;
@@ -302,6 +304,11 @@ PropertyMutationResult set_window_text(
     std::string conversionError;
     if (!native_utf8_to_utf16(value, *text, conversionError))
         return mutation_failure(E_INVALIDARG, conversionError);
+    if (text->size() > kMaximumNativeTextChars) {
+        return mutation_failure(
+            E_INVALIDARG,
+            "The text exceeds the native property safety limit");
+    }
     text->push_back(L'\0');
     // WM_SETTEXT has the same system marshalling guarantee as WM_GETTEXT.
     auto message = send_native_pointer_message(
@@ -398,21 +405,16 @@ bool read_listview_item(
         return false;
     }
 
-    constexpr size_t itemSize = sizeof(LVITEMW);
-    constexpr size_t textBytes = kControlTextChars * sizeof(wchar_t);
     auto remote = allocate_remote_buffer(
-        live.target.window, itemSize + textBytes, failureResult);
+        live.target.window, sizeof(LVITEMW), failureResult);
     if (!remote)
         return false;
 
     LVITEMW item{};
-    item.mask = LVIF_TEXT | LVIF_PARAM | LVIF_STATE;
+    item.mask = LVIF_PARAM | LVIF_STATE;
     item.iItem = index;
     item.iSubItem = 0;
     item.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
-    item.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote->address()) + itemSize);
-    item.cchTextMax = static_cast<int>(kControlTextChars);
     if (!remote->write(&item, sizeof(item), failureResult))
         return false;
 
@@ -431,15 +433,16 @@ bool read_listview_item(
     }
 
     LVITEMW returned{};
-    std::vector<wchar_t> text(kControlTextChars, L'\0');
-    if (!remote->read(&returned, sizeof(returned), failureResult) ||
-        !remote->read(
-            text.data(), textBytes, failureResult, itemSize)) {
+    if (!remote->read(&returned, sizeof(returned), failureResult)) {
         return false;
     }
-    const size_t length = wcsnlen_s(text.data(), text.size());
-    data.text = native_utf16_to_utf8(
-        std::wstring_view(text.data(), length));
+    auto text = read_native_listview_item_text(
+        live.target.window, index, data.text,
+        kMaximumNativeTextChars);
+    if (!text.ok) {
+        failureResult = std::move(text);
+        return false;
+    }
     data.parameter = returned.lParam;
     data.state = returned.state;
     return true;
@@ -477,6 +480,11 @@ PropertyMutationResult write_listview_item_text(
     std::string conversionError;
     if (!native_utf8_to_utf16(value, text, conversionError))
         return mutation_failure(E_INVALIDARG, conversionError);
+    if (text.size() > kMaximumNativeTextChars) {
+        return mutation_failure(
+            E_INVALIDARG,
+            "The list-view text exceeds the native property safety limit");
+    }
     text.push_back(L'\0');
 
     const size_t itemSize = sizeof(LVITEMW);
@@ -516,20 +524,15 @@ struct TreeViewItemData {
 bool read_treeview_item(
     const LiveTarget& live, TreeViewItemData& data,
     NativeMessageResult& failureResult) {
-    constexpr size_t itemSize = sizeof(TVITEMW);
-    constexpr size_t textBytes = kControlTextChars * sizeof(wchar_t);
     auto remote = allocate_remote_buffer(
-        live.target.window, itemSize + textBytes, failureResult);
+        live.target.window, sizeof(TVITEMW), failureResult);
     if (!remote)
         return false;
 
     TVITEMW item{};
-    item.mask = TVIF_TEXT | TVIF_STATE;
+    item.mask = TVIF_STATE;
     item.hItem = reinterpret_cast<HTREEITEM>(live.target.itemHandle);
     item.stateMask = TVIS_SELECTED | TVIS_EXPANDED;
-    item.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote->address()) + itemSize);
-    item.cchTextMax = static_cast<int>(kControlTextChars);
     if (!remote->write(&item, sizeof(item), failureResult))
         return false;
     auto message = send_native_pointer_message(
@@ -547,14 +550,17 @@ bool read_treeview_item(
     }
 
     TVITEMW returned{};
-    std::vector<wchar_t> text(kControlTextChars, L'\0');
-    if (!remote->read(&returned, sizeof(returned), failureResult) ||
-        !remote->read(text.data(), textBytes, failureResult, itemSize)) {
+    if (!remote->read(&returned, sizeof(returned), failureResult)) {
         return false;
     }
-    const size_t length = wcsnlen_s(text.data(), text.size());
-    data.text = native_utf16_to_utf8(
-        std::wstring_view(text.data(), length));
+    auto text = read_native_treeview_item_text(
+        live.target.window,
+        reinterpret_cast<HTREEITEM>(live.target.itemHandle),
+        data.text, kMaximumNativeTextChars);
+    if (!text.ok) {
+        failureResult = std::move(text);
+        return false;
+    }
     data.state = returned.state;
     return true;
 }
@@ -565,6 +571,11 @@ PropertyMutationResult write_treeview_item_text(
     std::string conversionError;
     if (!native_utf8_to_utf16(value, text, conversionError))
         return mutation_failure(E_INVALIDARG, conversionError);
+    if (text.size() > kMaximumNativeTextChars) {
+        return mutation_failure(
+            E_INVALIDARG,
+            "The tree-view text exceeds the native property safety limit");
+    }
     text.push_back(L'\0');
 
     const size_t itemSize = sizeof(TVITEMW);
@@ -597,7 +608,7 @@ PropertyMutationResult write_treeview_item_text(
 }
 
 bool read_toolbar_button(
-    const LiveTarget& live, TBBUTTON& button,
+    const LiveTarget& live, int index, TBBUTTON& button,
     NativeMessageResult& failureResult) {
     auto remote = allocate_remote_buffer(
         live.target.window, sizeof(TBBUTTON), failureResult);
@@ -605,7 +616,7 @@ bool read_toolbar_button(
         return false;
     auto message = send_native_pointer_message(
         live.target.window, TB_GETBUTTON,
-        static_cast<WPARAM>(live.target.index),
+        static_cast<WPARAM>(index),
         reinterpret_cast<LPARAM>(remote->address()), remote);
     if (!message.ok) {
         failureResult = std::move(message);
@@ -623,7 +634,8 @@ bool read_toolbar_button(
 ReadResult read_toolbar_text(const LiveTarget& live) {
     std::string text;
     auto native = read_native_toolbar_button_text(
-        live.target.window, live.target.commandId, text,
+        live.target.window, live.target.index,
+        live.target.commandId, text,
         kMaximumNativeTextChars);
     if (!native.ok)
         return read_failure(native);
@@ -638,6 +650,11 @@ PropertyMutationResult write_toolbar_text(
     std::string conversionError;
     if (!native_utf8_to_utf16(value, text, conversionError))
         return mutation_failure(E_INVALIDARG, conversionError);
+    if (text.size() > kMaximumNativeTextChars) {
+        return mutation_failure(
+            E_INVALIDARG,
+            "The toolbar text exceeds the native property safety limit");
+    }
     text.push_back(L'\0');
 
     const size_t infoSize = sizeof(TBBUTTONINFOW);
@@ -672,6 +689,7 @@ PropertyMutationResult write_toolbar_text(
 struct StatusTextData {
     std::string text;
     UINT style = 0;
+    bool ownerDraw = false;
 };
 
 bool read_status_text(
@@ -686,6 +704,9 @@ bool read_status_text(
     }
     const size_t chars = kMaximumStatusTextChars + 1;
     data.style = HIWORD(length.value);
+    data.ownerDraw = (data.style & SBT_OWNERDRAW) != 0;
+    if (data.ownerDraw)
+        return true;
     auto remote = allocate_remote_buffer(
         live.target.window, chars * sizeof(wchar_t), failureResult);
     if (!remote)
@@ -720,11 +741,21 @@ PropertyMutationResult write_status_text(
     NativeMessageResult native;
     if (!read_status_text(live, current, native))
         return mutation_failure(native);
+    if (current.ownerDraw) {
+        return mutation_failure(
+            E_ACCESSDENIED,
+            "Owner-drawn status-bar parts expose application item data, not text");
+    }
 
     std::wstring text;
     std::string conversionError;
     if (!native_utf8_to_utf16(value, text, conversionError))
         return mutation_failure(E_INVALIDARG, conversionError);
+    if (text.size() > kMaximumStatusTextChars) {
+        return mutation_failure(
+            E_INVALIDARG,
+            "The status-bar text exceeds the native property safety limit");
+    }
     text.push_back(L'\0');
     auto remote = allocate_remote_buffer(
         live.target.window, text.size() * sizeof(wchar_t), native);
@@ -749,49 +780,18 @@ PropertyMutationResult write_status_text(
 
 struct TabItemData {
     std::string text;
-    LPARAM parameter = 0;
 };
 
 bool read_tab_item(
     const LiveTarget& live, int index, TabItemData& data,
     NativeMessageResult& failureResult) {
-    constexpr size_t itemSize = sizeof(TCITEMW);
-    constexpr size_t textBytes = kControlTextChars * sizeof(wchar_t);
-    auto remote = allocate_remote_buffer(
-        live.target.window, itemSize + textBytes, failureResult);
-    if (!remote)
-        return false;
-    TCITEMW item{};
-    item.mask = TCIF_TEXT | TCIF_PARAM;
-    item.pszText = reinterpret_cast<wchar_t*>(
-        static_cast<std::byte*>(remote->address()) + itemSize);
-    item.cchTextMax = static_cast<int>(kControlTextChars);
-    if (!remote->write(&item, sizeof(item), failureResult))
-        return false;
-    auto message = send_native_pointer_message(
-        live.target.window, TCM_GETITEMW,
-        static_cast<WPARAM>(index),
-        reinterpret_cast<LPARAM>(remote->address()), remote);
-    if (!message.ok) {
-        failureResult = std::move(message);
+    auto result = read_native_tab_item_text(
+        live.target.window, index, data.text,
+        kMaximumNativeTextChars);
+    if (!result.ok) {
+        failureResult = std::move(result);
         return false;
     }
-    if (!message.value) {
-        failureResult.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_INDEX);
-        failureResult.win32Error = ERROR_INVALID_INDEX;
-        failureResult.error = "The tab item no longer exists";
-        return false;
-    }
-    TCITEMW returned{};
-    std::vector<wchar_t> text(kControlTextChars, L'\0');
-    if (!remote->read(&returned, sizeof(returned), failureResult) ||
-        !remote->read(text.data(), textBytes, failureResult, itemSize)) {
-        return false;
-    }
-    const size_t length = wcsnlen_s(text.data(), text.size());
-    data.text = native_utf16_to_utf8(
-        std::wstring_view(text.data(), length));
-    data.parameter = returned.lParam;
     return true;
 }
 
@@ -813,6 +813,11 @@ PropertyMutationResult write_tab_text(
     std::string conversionError;
     if (!native_utf8_to_utf16(value, text, conversionError))
         return mutation_failure(E_INVALIDARG, conversionError);
+    if (text.size() > kMaximumNativeTextChars) {
+        return mutation_failure(
+            E_INVALIDARG,
+            "The tab text exceeds the native property safety limit");
+    }
     text.push_back(L'\0');
 
     const size_t itemSize = sizeof(TCITEMW);
@@ -909,6 +914,13 @@ struct NativePropertyConnection::Impl {
         if (!valid.ok) {
             hresult = valid.hresult;
             error = valid.error;
+            return false;
+        }
+        if (target.window.hwnd != root.hwnd &&
+            !IsChild(root.hwnd, target.window.hwnd)) {
+            hresult = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+            error =
+                "The native HWND is no longer in this session's root tree";
             return false;
         }
 
@@ -1040,9 +1052,22 @@ struct NativePropertyConnection::Impl {
                 live.identityReason = cross_bitness_reason();
                 return true;
             }
+            auto count = send_native_message(
+                target.window, TB_BUTTONCOUNT);
+            if (!count.ok) {
+                hresult = count.hresult;
+                error = count.error;
+                return false;
+            }
+            if (target.index < 0 || target.index >= count.value) {
+                hresult = HRESULT_FROM_WIN32(ERROR_INVALID_INDEX);
+                error = "The toolbar button index is no longer valid";
+                return false;
+            }
             TBBUTTON button{};
             NativeMessageResult native;
-            if (!read_toolbar_button(live, button, native)) {
+            if (!read_toolbar_button(
+                    live, target.index, button, native)) {
                 hresult = native.hresult;
                 error = native.error;
                 return false;
@@ -1053,8 +1078,30 @@ struct NativePropertyConnection::Impl {
                     "The toolbar index now refers to a different command";
                 return false;
             }
+            int matchingCommands = 0;
+            for (int index = 0; index < count.value; ++index) {
+                TBBUTTON candidate{};
+                if (!read_toolbar_button(
+                        live, index, candidate, native)) {
+                    hresult = native.hresult;
+                    error = native.error;
+                    return false;
+                }
+                if (!(candidate.fsStyle & BTNS_SEP) &&
+                    candidate.idCommand == target.commandId) {
+                    ++matchingCommands;
+                }
+            }
+            if (matchingCommands != 1) {
+                live.identityVerified = false;
+                live.identityReason =
+                    "The toolbar command id is duplicated and cannot safely "
+                    "address one button";
+            }
             live.checkable = (button.fsStyle & BTNS_CHECK) != 0;
-            live.identity = "command:" + std::to_string(target.commandId);
+            live.identity =
+                "index:" + std::to_string(target.index) +
+                "|command:" + std::to_string(target.commandId);
             return true;
         }
         case TargetKind::statusbarPart: {
@@ -1082,6 +1129,7 @@ struct NativePropertyConnection::Impl {
                 error = native.error;
                 return false;
             }
+            live.ownerDraw = current.ownerDraw;
             live.identity =
                 "part:" + std::to_string(target.index) +
                 "|count:" + std::to_string(count.value) +
@@ -1121,13 +1169,7 @@ struct NativePropertyConnection::Impl {
                 live.identityReason =
                     "The tab control is too large to prove that this item's "
                     "current identity is unique";
-                live.identity =
-                    current.parameter != 0
-                        ? "param:" +
-                              hex_u64(static_cast<uint64_t>(
-                                  static_cast<ULONG_PTR>(
-                                      current.parameter)))
-                        : "text:" + current.text;
+                live.identity = "text:" + current.text;
                 return true;
             }
 
@@ -1141,33 +1183,21 @@ struct NativePropertyConnection::Impl {
                     error = native.error;
                     return false;
                 }
-                if (current.parameter != 0
-                        ? candidate.parameter == current.parameter
-                        : candidate.text == current.text) {
+                if (candidate.text == current.text) {
                     ++matchingIdentity;
                 }
-                if (current.parameter == 0) {
-                    textFingerprint +=
-                        std::to_string(candidate.text.size()) + ":" +
-                        candidate.text + "|";
-                }
+                textFingerprint +=
+                    std::to_string(candidate.text.size()) + ":" +
+                    candidate.text + "|";
             }
             live.identity =
-                current.parameter != 0
-                    ? "param:" +
-                          hex_u64(static_cast<uint64_t>(
-                              static_cast<ULONG_PTR>(
-                                  current.parameter)))
-                    : "text:" + current.text +
-                          "|tabs:" +
-                          hex_u64(stable_hash(textFingerprint));
+                "text:" + current.text +
+                "|tabs:" + hex_u64(stable_hash(textFingerprint));
             if (matchingIdentity != 1) {
                 live.identityVerified = false;
                 live.identityReason =
-                    current.parameter != 0
-                        ? "This tab item has a duplicate application identity"
-                        : "This tab item has no application identity and its "
-                          "current text is not unique";
+                    "This tab item has no safe generic application identity "
+                    "and its current text is not unique";
             }
             return true;
         }
@@ -1186,6 +1216,7 @@ struct NativePropertyConnection::Impl {
             << architecture_name(targetArchitecture) << '|'
             << (live.pointerAllowed ? "same-abi" : "cross-abi") << '|'
             << (live.ownerData ? "owner-data" : "stored-data") << '|'
+            << (live.ownerDraw ? "owner-draw" : "text-draw") << '|'
             << (live.identityVerified ? "verified" : "unverified") << '|'
             << (live.checkable ? "checkable" : "not-checkable");
         return key.str();
@@ -1238,6 +1269,12 @@ struct NativePropertyConnection::Impl {
         case Operation::toolbarButtonChecked:
             if (!live.checkable)
                 return "This toolbar button style is not checkable";
+            break;
+        case Operation::statusbarPartText:
+            if (live.ownerDraw) {
+                return "Owner-drawn status-bar parts expose application item "
+                       "data rather than mutable text";
+            }
             break;
         default:
             break;
@@ -1616,6 +1653,8 @@ struct NativePropertyConnection::Impl {
         case Operation::toolbarButtonText:
             return read_toolbar_text(live);
         case Operation::statusbarPartText: {
+            if (!reason.empty())
+                return unavailable(reason);
             StatusTextData data;
             NativeMessageResult native;
             if (!read_status_text(live, data, native))
@@ -2344,6 +2383,7 @@ void NativePropertyConnection::publish_targets(const Element& root) {
     collect(collect, root);
 
     std::lock_guard<std::mutex> lock(m_impl->mutex);
+    m_impl->publishedTargets.clear();
     for (const auto handle : handles) {
         if (m_impl->targets.contains(handle))
             m_impl->publishedTargets.insert(handle);

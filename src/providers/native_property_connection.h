@@ -4,10 +4,13 @@
 
 #include <Windows.h>
 #include <CommCtrl.h>
+#include <cstddef>
 #include <memory>
 #include <string>
 
 namespace lvt {
+
+inline constexpr size_t kMaximumNativePropertyTextChars = 1024 * 1024;
 
 namespace native_property_detail {
 

@@ -1,8 +1,10 @@
 #include "native_controls_fixture_ids.h"
 
 #include <CommCtrl.h>
+#include <array>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace fixture = lvt::native_fixture;
 
@@ -32,6 +34,9 @@ struct FixtureControls {
 
 bool g_delayNextToolbarPointerMessage = false;
 LONG g_delayedPointerState = 0;
+bool g_ownerDrawStatusStable = true;
+int g_ownerDrawStatusPaints = 0;
+size_t g_tabExtraBytes = 0;
 
 bool committed_pointer(const void* pointer) {
     if (!pointer)
@@ -142,6 +147,8 @@ std::wstring toolbar_text(HWND hwnd, int commandId) {
 
 std::wstring statusbar_text(HWND hwnd, int part) {
     const LRESULT info = SendMessageW(hwnd, SB_GETTEXTLENGTHW, part, 0);
+    if (HIWORD(info) & SBT_OWNERDRAW)
+        return L"<ownerdraw>";
     const int length = LOWORD(info);
     std::wstring text(static_cast<size_t>(length) + 1, L'\0');
     SendMessageW(hwnd, SB_GETTEXTW, part, reinterpret_cast<LPARAM>(text.data()));
@@ -259,7 +266,8 @@ void refresh_state_summary() {
         << L"\n"
         << L"status(id=1012)=" << statusbar_text(g_controls.statusBar, 0) << L"|"
         << statusbar_text(g_controls.statusBar, 1) << L"|"
-        << statusbar_text(g_controls.statusBar, 2) << L"\n"
+        << statusbar_text(g_controls.statusBar, 2) << L"|"
+        << statusbar_text(g_controls.statusBar, 3) << L"\n"
         << L"tab(id=1013)=" << tabSelection << L":"
         << tab_text(g_controls.tabControl, tabSelection)
         << L";items=" << tab_text(g_controls.tabControl, 0) << L"|"
@@ -389,7 +397,7 @@ void populate_toolbar() {
 }
 
 void populate_statusbar() {
-    int parts[] = {220, 440, -1};
+    int parts[] = {220, 440, 660, -1};
     SendMessageW(
         g_controls.statusBar,
         SB_SETPARTS,
@@ -401,23 +409,80 @@ void populate_statusbar() {
         g_controls.statusBar, SB_SETTEXTW, 1, reinterpret_cast<LPARAM>(L"3 items"));
     SendMessageW(
         g_controls.statusBar, SB_SETTEXTW, 2, reinterpret_cast<LPARAM>(L"Idle"));
+    SendMessageW(
+        g_controls.statusBar, SB_SETTEXTW, 3 | SBT_OWNERDRAW,
+        static_cast<LPARAM>(fixture::kOwnerDrawStatusData));
 }
 
-void populate_tabs(bool duplicateLabels = false, bool includeIdentity = true) {
+void populate_tabs(bool duplicateLabels = false, size_t extraBytes = 0) {
     while (TabCtrl_GetItemCount(g_controls.tabControl) > 0)
         TabCtrl_DeleteItem(g_controls.tabControl, 0);
+    SendMessageW(
+        g_controls.tabControl, TCM_SETITEMEXTRA,
+        static_cast<WPARAM>(extraBytes), 0);
+    g_tabExtraBytes = extraBytes;
 
     const wchar_t* normalLabels[] = {L"Overview", L"Details", L"Advanced"};
     const wchar_t* duplicate[] = {L"Overview", L"Overview", L"Advanced"};
     const auto* labels = duplicateLabels ? duplicate : normalLabels;
     for (int index = 0; index < 3; ++index) {
-        TCITEMW item{};
-        item.mask = TCIF_TEXT | TCIF_PARAM;
-        item.pszText = const_cast<LPWSTR>(labels[index]);
-        item.lParam = includeIdentity ? 3001 + index : 0;
-        TabCtrl_InsertItem(g_controls.tabControl, index, &item);
+        if (extraBytes == 0) {
+            TCITEMW item{};
+            item.mask = TCIF_TEXT;
+            item.pszText = const_cast<LPWSTR>(labels[index]);
+            TabCtrl_InsertItem(g_controls.tabControl, index, &item);
+            continue;
+        }
+        std::vector<std::byte> storage(
+            sizeof(TCITEMHEADERW) + extraBytes, std::byte{0});
+        auto* item =
+            reinterpret_cast<TCITEMHEADERW*>(storage.data());
+        item->mask = TCIF_TEXT;
+        item->pszText = const_cast<LPWSTR>(labels[index]);
+        item->mask |= TCIF_PARAM;
+        for (size_t offset = 0; offset < extraBytes; ++offset) {
+            storage[sizeof(TCITEMHEADERW) + offset] =
+                static_cast<std::byte>((index * 31 + offset) & 0xFF);
+        }
+        TabCtrl_InsertItem(
+            g_controls.tabControl, index,
+            reinterpret_cast<TCITEMW*>(item));
     }
     TabCtrl_SetCurSel(g_controls.tabControl, 1);
+}
+
+bool validate_tab_extra() {
+    if (g_tabExtraBytes == 0)
+        return false;
+    for (int index = 0; index < TabCtrl_GetItemCount(g_controls.tabControl);
+         ++index) {
+        std::vector<std::byte> storage(
+            sizeof(TCITEMHEADERW) + g_tabExtraBytes, std::byte{0});
+        auto* item =
+            reinterpret_cast<TCITEMHEADERW*>(storage.data());
+        item->mask = TCIF_PARAM;
+        if (!TabCtrl_GetItem(
+                g_controls.tabControl, index,
+                reinterpret_cast<TCITEMW*>(item))) {
+            return false;
+        }
+        for (size_t offset = 0; offset < g_tabExtraBytes; ++offset) {
+            const auto expected =
+                static_cast<std::byte>((index * 31 + offset) & 0xFF);
+            if (storage[sizeof(TCITEMHEADERW) + offset] != expected)
+                return false;
+        }
+    }
+    return true;
+}
+
+bool set_toolbar_command_by_index(int index, int commandId) {
+    TBBUTTONINFOW info{sizeof(info)};
+    info.dwMask = TBIF_BYINDEX | TBIF_COMMAND;
+    info.idCommand = commandId;
+    return SendMessageW(
+               g_controls.toolbar, TB_SETBUTTONINFOW, index,
+               reinterpret_cast<LPARAM>(&info)) != FALSE;
 }
 
 bool create_controls(HWND parent) {
@@ -594,13 +659,41 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case fixture::kDeleteFirstTabMessage:
         return TabCtrl_DeleteItem(g_controls.tabControl, 0);
     case fixture::kMakeDuplicateTabsMessage:
-        populate_tabs(true, false);
+        populate_tabs(true);
         refresh_state_summary();
         return TRUE;
     case fixture::kRestoreTabsMessage:
         populate_tabs();
         refresh_state_summary();
         return TRUE;
+    case fixture::kValidateOwnerDrawStatusMessage:
+        g_ownerDrawStatusStable = true;
+        g_ownerDrawStatusPaints = 0;
+        InvalidateRect(g_controls.statusBar, nullptr, TRUE);
+        UpdateWindow(g_controls.statusBar);
+        return g_ownerDrawStatusStable &&
+               g_ownerDrawStatusPaints > 0;
+    case fixture::kSetTabItemExtraMessage:
+        populate_tabs(true, 64);
+        return TRUE;
+    case fixture::kValidateTabItemExtraMessage:
+        return validate_tab_extra();
+    case fixture::kDuplicateToolbarCommandsMessage:
+        return set_toolbar_command_by_index(
+            2, fixture::kToolbarApplyCommand);
+    case fixture::kRestoreToolbarCommandsMessage:
+        return set_toolbar_command_by_index(
+            2, fixture::kToolbarDisabledCommand);
+    case fixture::kMoveToolbarApplyMessage:
+        return SendMessageW(g_controls.toolbar, TB_MOVEBUTTON, 0, 2);
+    case fixture::kRestoreToolbarOrderMessage:
+        return SendMessageW(g_controls.toolbar, TB_MOVEBUTTON, 2, 0);
+    case fixture::kReparentGenericOutOfTreeMessage:
+        return reinterpret_cast<LRESULT>(
+            SetParent(g_controls.genericText, g_controls.outOfTree));
+    case fixture::kRestoreGenericParentMessage:
+        return reinterpret_cast<LRESULT>(
+            SetParent(g_controls.genericText, hwnd));
     case fixture::kHangMessage:
         Sleep(2500);
         return TRUE;
@@ -616,6 +709,25 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case WM_NOTIFY:
         refresh_state_summary();
         break;
+    case WM_DRAWITEM: {
+        auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        if (draw && draw->hwndItem == g_controls.statusBar &&
+            draw->itemID == 3) {
+            ++g_ownerDrawStatusPaints;
+            g_ownerDrawStatusStable =
+                g_ownerDrawStatusStable &&
+                draw->itemData == fixture::kOwnerDrawStatusData;
+            FillRect(
+                draw->hDC, &draw->rcItem,
+                reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+            DrawTextW(
+                draw->hDC, L"Owner data", -1,
+                &draw->rcItem,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
+        break;
+    }
     case WM_SIZE:
         if (g_controls.statusBar)
             SendMessageW(g_controls.statusBar, WM_SIZE, wParam, lParam);

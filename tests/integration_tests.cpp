@@ -3098,11 +3098,15 @@ TEST_F(NativeControlsFixture, ProviderDumpExposesAllControlsAndBaselineValues) {
     const json* status =
         find_element_by_hwnd(tree["root"], control(native_fixture::kStatusBarId));
     ASSERT_NE(status, nullptr);
-    EXPECT_EQ((*status)["properties"].value("partCount", ""), "3");
-    ASSERT_EQ((*status)["children"].size(), 3u);
+    EXPECT_EQ((*status)["properties"].value("partCount", ""), "4");
+    ASSERT_EQ((*status)["children"].size(), 4u);
     EXPECT_EQ((*status)["children"][0].value("text", ""), "Ready");
     EXPECT_EQ((*status)["children"][1].value("text", ""), "3 items");
     EXPECT_EQ((*status)["children"][2].value("text", ""), "Idle");
+    EXPECT_EQ((*status)["children"][3].value("text", ""), "");
+    EXPECT_EQ(
+        (*status)["children"][3]["properties"].value("ownerDraw", ""),
+        "true");
 
     const json* tabs =
         find_element_by_hwnd(tree["root"], control(native_fixture::kTabControlId));
@@ -3193,7 +3197,9 @@ TEST_F(NativeControlsFixture, ReadOnlySummaryReportsCompleteNativeState) {
             "toolbar(id=1011)=2001:Apply:enabled,2002:Pinned:enabled+checked,"
             "2003:Disabled:disabled"),
         std::string::npos);
-    EXPECT_NE(text.find("status(id=1012)=Ready|3 items|Idle"), std::string::npos);
+    EXPECT_NE(
+        text.find("status(id=1012)=Ready|3 items|Idle|<ownerdraw>"),
+        std::string::npos);
     EXPECT_NE(
         text.find("tab(id=1013)=1:Details;items=Overview|Details|Advanced"),
         std::string::npos);
@@ -3663,7 +3669,7 @@ TEST_F(NativeControlsFixture, ComCtlTypedPropertiesRoundTripAndRejectStaleItems)
             "2002:Pinned:enabled+checked,2003:Disabled:disabled"),
         std::string::npos);
     EXPECT_NE(
-        summary.find("status(id=1012)=Ready|3 items|Idle"),
+        summary.find("status(id=1012)=Ready|3 items|Idle|<ownerdraw>"),
         std::string::npos);
     EXPECT_NE(
         summary.find(
@@ -3719,6 +3725,241 @@ TEST_F(NativeControlsFixture, ToolbarLongTextIsReadWithoutFixedBufferOverflow) {
         0);
 }
 
+TEST_F(NativeControlsFixture, OwnerDrawStatusPartNeverTreatsItemDataAsText) {
+    auto native = native_tree();
+    auto* status = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kStatusBarId));
+    ASSERT_NE(status, nullptr);
+    ASSERT_EQ(status->children.size(), 4u);
+    auto properties = snapshot(native, status->children[3]);
+    ASSERT_TRUE(properties.ok) << properties.error;
+    const auto* descriptor =
+        native_descriptor(properties, "Text");
+    const auto* value =
+        native_value(properties, "Text");
+    ASSERT_NE(descriptor, nullptr);
+    ASSERT_NE(value, nullptr);
+    EXPECT_FALSE(descriptor->writable);
+    EXPECT_NE(
+        value->readOnlyReason.find("Owner-drawn"),
+        std::string::npos);
+    EXPECT_NE(
+        value->unavailableReason.find("Owner-drawn"),
+        std::string::npos);
+
+    auto refused = set(
+        native, status->children[3], properties, "Text",
+        "must not replace item data");
+    EXPECT_FALSE(refused.ok);
+    EXPECT_TRUE(IsWindow(s_hwnd));
+
+    DWORD_PTR painted = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kValidateOwnerDrawStatusMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &painted),
+        0);
+    EXPECT_EQ(painted, 1u)
+        << "owner-draw item data or painting was corrupted";
+}
+
+TEST_F(NativeControlsFixture, TabCustomExtraIsNotReadAsGenericItemIdentity) {
+    DWORD_PTR changed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kSetTabItemExtraMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &changed),
+        0);
+
+    auto native = native_tree();
+    auto* tabs = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kTabControlId));
+    ASSERT_NE(tabs, nullptr);
+    ASSERT_EQ(tabs->children.size(), 3u);
+    EXPECT_EQ(tabs->children[0].text, "Overview");
+    EXPECT_EQ(tabs->children[1].text, "Overview");
+    auto properties = snapshot(native, tabs->children[0]);
+    ASSERT_TRUE(properties.ok) << properties.error;
+    const auto* descriptor =
+        native_descriptor(properties, "Text");
+    const auto* value =
+        native_value(properties, "Text");
+    ASSERT_NE(descriptor, nullptr);
+    ASSERT_NE(value, nullptr);
+    EXPECT_FALSE(descriptor->writable);
+    EXPECT_NE(
+        value->readOnlyReason.find("not unique"),
+        std::string::npos);
+
+    DWORD_PTR validExtra = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kValidateTabItemExtraMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &validExtra),
+        0);
+    EXPECT_EQ(validExtra, 1u)
+        << "generic TCITEM reads overwrote custom item-extra bytes";
+    EXPECT_TRUE(IsWindow(s_hwnd));
+
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreTabsMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &changed),
+        0);
+}
+
+TEST_F(NativeControlsFixture, DuplicateToolbarCommandsAreReadOnlyAndReordersAreStale) {
+    auto native = native_tree();
+    auto* toolbar = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kToolbarId));
+    ASSERT_NE(toolbar, nullptr);
+    auto* apply = find_native_element_by_text(
+        *toolbar, "ToolbarButton", "Apply");
+    ASSERT_NE(apply, nullptr);
+    auto baseline = snapshot(native, *apply);
+    ASSERT_TRUE(baseline.ok) << baseline.error;
+
+    DWORD_PTR changed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kDuplicateToolbarCommandsMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &changed),
+        0);
+    auto duplicate = snapshot(native, *apply);
+    ASSERT_TRUE(duplicate.ok) << duplicate.error;
+    for (const auto& descriptor : duplicate.schema->descriptors) {
+        EXPECT_FALSE(descriptor.writable);
+        const auto* value =
+            native_value(duplicate, descriptor.name);
+        ASSERT_NE(value, nullptr);
+        EXPECT_NE(
+            value->readOnlyReason.find("duplicated"),
+            std::string::npos);
+    }
+
+    auto dump = dump_tree();
+    const json* toolbarJson = find_element_by_hwnd(
+        dump["root"], control(native_fixture::kToolbarId));
+    ASSERT_NE(toolbarJson, nullptr);
+    int ambiguous = 0;
+    for (const auto& child :
+         toolbarJson->value("children", json::array())) {
+        ambiguous += child.value("properties", json::object())
+                         .value("ambiguousCommandId", "") == "true";
+    }
+    EXPECT_EQ(ambiguous, 2);
+
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreToolbarCommandsMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &changed),
+        0);
+    baseline = snapshot(native, *apply);
+    ASSERT_TRUE(baseline.ok) << baseline.error;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kMoveToolbarApplyMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &changed),
+        0);
+    auto stale = set(
+        native, *apply, baseline, "Text", "stale reorder");
+    EXPECT_FALSE(stale.ok);
+    EXPECT_NE(
+        stale.error.find("different command"),
+        std::string::npos);
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreToolbarOrderMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &changed),
+        0);
+}
+
+TEST_F(NativeControlsFixture, LongListAndTreeTextRoundTripsExactly) {
+    auto native = native_tree();
+    auto* listView = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kListViewId));
+    auto* treeView = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kTreeViewId));
+    ASSERT_NE(listView, nullptr);
+    ASSERT_NE(treeView, nullptr);
+    auto* beta = find_native_element_by_text(
+        *listView, "ListViewItem", "Beta row");
+    auto* grandchild = find_native_element_by_text(
+        *treeView, "TreeViewItem", "Fixture Grandchild");
+    ASSERT_NE(beta, nullptr);
+    ASSERT_NE(grandchild, nullptr);
+    auto betaProperties = snapshot(native, *beta);
+    auto treeProperties = snapshot(native, *grandchild);
+    ASSERT_TRUE(betaProperties.ok) << betaProperties.error;
+    ASSERT_TRUE(treeProperties.ok) << treeProperties.error;
+
+    const std::string longText(
+        native_fixture::kLongItemTextLength, 'L');
+    auto setList = set(
+        native, *beta, betaProperties, "Text", longText);
+    ASSERT_TRUE(setList.ok) << setList.error;
+    EXPECT_EQ(setList.value, longText);
+    auto readList = snapshot(native, *beta);
+    ASSERT_TRUE(readList.ok) << readList.error;
+    EXPECT_EQ(native_value(readList, "Text")->value, longText);
+    auto listDump = dump_tree();
+    const json* listJson = find_element_by_hwnd(
+        listDump["root"], control(native_fixture::kListViewId));
+    ASSERT_NE(listJson, nullptr);
+    const json* longListItem = find_element_by_type_property(
+        *listJson, "ListViewItem", "index", "1");
+    ASSERT_NE(longListItem, nullptr);
+    EXPECT_EQ(longListItem->value("text", ""), longText);
+    ASSERT_TRUE(set(
+        native, *beta, readList, "Text", "Beta row").ok);
+
+    auto setTree = set(
+        native, *grandchild, treeProperties, "Text", longText);
+    ASSERT_TRUE(setTree.ok) << setTree.error;
+    EXPECT_EQ(setTree.value, longText);
+    auto readTree = snapshot(native, *grandchild);
+    ASSERT_TRUE(readTree.ok) << readTree.error;
+    EXPECT_EQ(native_value(readTree, "Text")->value, longText);
+    auto treeDump = dump_tree();
+    const json* treeJson = find_element_by_hwnd(
+        treeDump["root"], control(native_fixture::kTreeViewId));
+    ASSERT_NE(treeJson, nullptr);
+    std::vector<const json*> treeItems;
+    collect_json_elements(*treeJson, treeItems);
+    const json* longTreeItem = nullptr;
+    for (const auto* candidate : treeItems) {
+        if (candidate->value("type", "") == "TreeViewItem" &&
+            candidate->value("text", "") == longText) {
+            longTreeItem = candidate;
+            break;
+        }
+    }
+    ASSERT_NE(longTreeItem, nullptr);
+    ASSERT_TRUE(set(
+        native, *grandchild, readTree, "Text",
+        "Fixture Grandchild").ok);
+
+    const std::string tooLong(
+        lvt::kMaximumNativePropertyTextChars + 1, 'Z');
+    auto beforeFailure = snapshot(native, *beta);
+    ASSERT_TRUE(beforeFailure.ok) << beforeFailure.error;
+    auto rejected = set(
+        native, *beta, beforeFailure, "Text", tooLong);
+    EXPECT_FALSE(rejected.ok);
+    auto afterFailure = snapshot(native, *beta);
+    ASSERT_TRUE(afterFailure.ok) << afterFailure.error;
+    EXPECT_EQ(native_value(afterFailure, "Text")->value, "Beta row")
+        << "a rejected oversized value still mutated the target";
+}
+
 TEST_F(NativeControlsFixture, NativeTargetsMustBelongToTheBuiltRootTree) {
     auto native = native_tree();
     DWORD_PTR siblingValue = 0;
@@ -3740,6 +3981,30 @@ TEST_F(NativeControlsFixture, NativeTargetsMustBelongToTheBuiltRootTree) {
         reinterpret_cast<uintptr_t>(sibling));
     EXPECT_FALSE(rejected.ok);
     EXPECT_EQ(rejected.hresult, HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+
+    auto* generic = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kGenericTextId));
+    ASSERT_NE(generic, nullptr);
+    auto baseline = snapshot(native, *generic);
+    ASSERT_TRUE(baseline.ok) << baseline.error;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kReparentGenericOutOfTreeMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &siblingValue),
+        0);
+    auto reparented =
+        native.win32->get_property_snapshot(generic->providerHandle);
+    EXPECT_FALSE(reparented.ok);
+    EXPECT_NE(
+        reparented.error.find("no longer in"),
+        std::string::npos);
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreGenericParentMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &siblingValue),
+        0);
 }
 
 TEST_F(NativeControlsFixture, NativePropertySafetyRejectsHungClosedAndOwnerDataTargets) {
@@ -3933,7 +4198,7 @@ TEST(NativeCrossBitness, PublicBuildTreeSkipsAbiSensitiveComCtlMessages) {
     EXPECT_EQ(listView->properties["viewMode"], "details");
     EXPECT_EQ(treeView->properties["itemCount"], "3");
     EXPECT_EQ(toolbar->properties["buttonCount"], "3");
-    EXPECT_EQ(status->properties["partCount"], "3");
+    EXPECT_EQ(status->properties["partCount"], "4");
     EXPECT_EQ(tabs->properties["selectedIndex"], "1");
     EXPECT_TRUE(no_logical_child_type(*listView, "ListViewItem"));
     EXPECT_TRUE(no_logical_child_type(*treeView, "TreeViewItem"));

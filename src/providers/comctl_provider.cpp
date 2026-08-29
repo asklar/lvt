@@ -4,6 +4,7 @@
 #include "native_property_connection.h"
 
 #include <CommCtrl.h>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -78,8 +79,6 @@ void enrich_tree_item(
     if (!itemHandle || added >= 100)
         return;
 
-    constexpr size_t itemSize = sizeof(TVITEMW);
-    constexpr size_t textChars = 512;
     Element item;
     item.type = "TreeViewItem";
     item.framework = "comctl";
@@ -89,26 +88,17 @@ void enrich_tree_item(
     }
 
     TVITEMW value{};
-    value.mask = TVIF_TEXT | TVIF_STATE | TVIF_CHILDREN;
+    value.mask = TVIF_STATE | TVIF_CHILDREN;
     value.hItem = itemHandle;
     value.stateMask = TVIS_SELECTED | TVIS_EXPANDED;
-    value.pszText = reinterpret_cast<wchar_t*>(
-        nullptr);
-    value.cchTextMax = static_cast<int>(textChars);
     NativeMessageResult native;
-    auto remote = allocate_remote(
-        identity, itemSize + textChars * sizeof(wchar_t), native);
-    if (remote) {
-        value.pszText = reinterpret_cast<wchar_t*>(
-            static_cast<std::byte*>(remote->address()) + itemSize);
-    }
+    auto remote = allocate_remote(identity, sizeof(TVITEMW), native);
     if (remote && remote->write(&value, sizeof(value), native)) {
         auto got = send_pointer(
             identity, TVM_GETITEMW, 0,
             reinterpret_cast<LPARAM>(remote->address()), remote);
         TVITEMW returned{};
         if (got && *got && read_remote(remote, returned)) {
-            read_remote_text(remote, itemSize, textChars, item.text);
             if (returned.state & TVIS_SELECTED)
                 item.properties["selected"] = "true";
             if (returned.state & TVIS_EXPANDED)
@@ -117,6 +107,8 @@ void enrich_tree_item(
                 item.properties["hasChildren"] = "true";
         }
     }
+    read_native_treeview_item_text(
+        identity, itemHandle, item.text);
     ++added;
 
     auto child = send(
@@ -218,9 +210,6 @@ void ComCtlProvider::enrich_listview(
     if (!pointerAllowed)
         return;
 
-    constexpr size_t itemSize = sizeof(LVITEMW);
-    constexpr size_t textChars = 512;
-
     const int maxItems = (std::min)(count, 50);
     for (int index = 0; index < maxItems; ++index) {
         Element item;
@@ -233,17 +222,14 @@ void ComCtlProvider::enrich_listview(
         }
 
         LVITEMW value{};
-        value.mask = LVIF_TEXT | LVIF_STATE;
+        value.mask = LVIF_STATE;
         value.iItem = index;
         value.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
         NativeMessageResult native;
         auto remote = allocate_remote(
-            identity, itemSize + textChars * sizeof(wchar_t), native);
+            identity, sizeof(LVITEMW), native);
         if (!remote)
             break;
-        value.pszText = reinterpret_cast<wchar_t*>(
-            static_cast<std::byte*>(remote->address()) + itemSize);
-        value.cchTextMax = static_cast<int>(textChars);
 
         if (remote->write(&value, sizeof(value), native)) {
             const auto got = send_pointer(
@@ -251,14 +237,13 @@ void ComCtlProvider::enrich_listview(
                 reinterpret_cast<LPARAM>(remote->address()), remote);
             LVITEMW returned{};
             if (got && *got && read_remote(remote, returned)) {
-                read_remote_text(
-                    remote, itemSize, textChars, item.text);
                 if (returned.state & LVIS_SELECTED)
                     item.properties["selected"] = "true";
                 if (returned.state & LVIS_FOCUSED)
                     item.properties["focused"] = "true";
             }
         }
+        read_native_listview_item_text(identity, index, item.text);
         el.children.push_back(std::move(item));
     }
     if (count > maxItems)
@@ -321,7 +306,11 @@ void ComCtlProvider::enrich_toolbar(
     if (!pointerAllowed)
         return;
 
-    for (int index = 0; index < count && index < 50; ++index) {
+    const int visibleCount = (std::min)(count, 50);
+    std::vector<std::optional<TBBUTTON>> buttons(
+        static_cast<size_t>(visibleCount));
+    std::map<int, int> commandCounts;
+    for (int index = 0; index < visibleCount; ++index) {
         NativeMessageResult native;
         auto buttonBuffer =
             allocate_remote(identity, sizeof(TBBUTTON), native);
@@ -334,6 +323,16 @@ void ComCtlProvider::enrich_toolbar(
         TBBUTTON button{};
         if (!got || !*got || !read_remote(buttonBuffer, button))
             continue;
+        buttons[static_cast<size_t>(index)] = button;
+        if (!(button.fsStyle & BTNS_SEP))
+            ++commandCounts[button.idCommand];
+    }
+
+    for (int index = 0; index < visibleCount; ++index) {
+        const auto& stored = buttons[static_cast<size_t>(index)];
+        if (!stored)
+            continue;
+        const auto& button = *stored;
 
         Element item;
         item.type =
@@ -349,9 +348,14 @@ void ComCtlProvider::enrich_toolbar(
                 hwnd, index, button.idCommand);
         }
 
-        if (!(button.fsStyle & BTNS_SEP)) {
+        const bool ambiguous =
+            !(button.fsStyle & BTNS_SEP) &&
+            commandCounts[button.idCommand] != 1;
+        if (ambiguous)
+            item.properties["ambiguousCommandId"] = "true";
+        if (!(button.fsStyle & BTNS_SEP) && !ambiguous) {
             read_native_toolbar_button_text(
-                identity, button.idCommand, item.text);
+                identity, index, button.idCommand, item.text);
         }
         if (button.fsState & TBSTATE_CHECKED)
             item.properties["checked"] = "true";
@@ -394,6 +398,12 @@ void ComCtlProvider::enrich_statusbar(
         const auto length =
             send(identity, SB_GETTEXTLENGTHW, index);
         if (length) {
+            const UINT style = HIWORD(*length);
+            if (style & SBT_OWNERDRAW) {
+                item.properties["ownerDraw"] = "true";
+                el.children.push_back(std::move(item));
+                continue;
+            }
             constexpr size_t chars = 0x10000;
             NativeMessageResult native;
             auto textBuffer = allocate_remote(
@@ -449,27 +459,7 @@ void ComCtlProvider::enrich_tabcontrol(
             item.providerHandle =
                 properties->register_tab_item(hwnd, index);
 
-        TCITEMW value{};
-        value.mask = TCIF_TEXT | TCIF_PARAM;
-        constexpr size_t itemSize = sizeof(TCITEMW);
-        constexpr size_t textChars = 256;
-        NativeMessageResult native;
-        auto remote = allocate_remote(
-            identity, itemSize + textChars * sizeof(wchar_t), native);
-        if (!remote)
-            break;
-        value.pszText = reinterpret_cast<wchar_t*>(
-            static_cast<std::byte*>(remote->address()) + itemSize);
-        value.cchTextMax = static_cast<int>(textChars);
-        if (remote->write(&value, sizeof(value), native)) {
-            const auto got = send_pointer(
-                identity, TCM_GETITEMW, index,
-                reinterpret_cast<LPARAM>(remote->address()), remote);
-            if (got && *got) {
-                read_remote_text(
-                    remote, itemSize, textChars, item.text);
-            }
-        }
+        read_native_tab_item_text(identity, index, item.text);
         el.children.push_back(std::move(item));
     }
 }

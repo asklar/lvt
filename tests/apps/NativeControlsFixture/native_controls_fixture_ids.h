@@ -47,7 +47,18 @@ inline constexpr UINT kGetOutOfTreeHwndMessage = WM_APP + 0x10B;
 inline constexpr UINT kDeleteFirstTabMessage = WM_APP + 0x10C;
 inline constexpr UINT kMakeDuplicateTabsMessage = WM_APP + 0x10D;
 inline constexpr UINT kRestoreTabsMessage = WM_APP + 0x10E;
+inline constexpr UINT kValidateOwnerDrawStatusMessage = WM_APP + 0x10F;
+inline constexpr UINT kSetTabItemExtraMessage = WM_APP + 0x110;
+inline constexpr UINT kValidateTabItemExtraMessage = WM_APP + 0x111;
+inline constexpr UINT kDuplicateToolbarCommandsMessage = WM_APP + 0x112;
+inline constexpr UINT kRestoreToolbarCommandsMessage = WM_APP + 0x113;
+inline constexpr UINT kMoveToolbarApplyMessage = WM_APP + 0x114;
+inline constexpr UINT kRestoreToolbarOrderMessage = WM_APP + 0x115;
+inline constexpr UINT kReparentGenericOutOfTreeMessage = WM_APP + 0x116;
+inline constexpr UINT kRestoreGenericParentMessage = WM_APP + 0x117;
 inline constexpr LRESULT kSummaryProtocolVersion = 2;
 inline constexpr size_t kLongToolbarTextLength = 6000;
+inline constexpr size_t kLongItemTextLength = 5000;
+inline constexpr ULONG_PTR kOwnerDrawStatusData = 0x1234ABCD;
 
 } // namespace lvt::native_fixture
