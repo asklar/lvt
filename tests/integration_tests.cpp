@@ -494,6 +494,43 @@ static WatchPluginResult run_plugin_watch(
     return result;
 }
 
+static std::string discover_plugin_node_key(
+    PluginTargetProcess& target, const fs::path& pluginDir,
+    const fs::path& statsPath, const std::string& option) {
+    ScopedEnvironmentVariable pluginPath(
+        "LVT_PLUGIN_DIR", pluginDir.string());
+    ScopedEnvironmentVariable enabled("LVT_FAKE_PLUGIN_ENABLE", "1");
+    ScopedEnvironmentVariable state(
+        "LVT_FAKE_PLUGIN_STATE", statsPath.string());
+    ScopedEnvironmentVariable fail(
+        "LVT_FAKE_PLUGIN_FAIL_GET_AT", "0");
+    ScopedEnvironmentVariable malformed(
+        "LVT_FAKE_PLUGIN_MALFORMED_GET_AT", "0");
+    ScopedEnvironmentVariable failOpen(
+        "LVT_FAKE_PLUGIN_FAIL_OPEN_AT", "0");
+
+    const auto output = run_command(make_cmd(
+        get_lvt_path(), target.hwnd_arg()));
+    const auto tree = json::parse(output, nullptr, false);
+    if (tree.is_discarded() || !tree.contains("root"))
+        return {};
+
+    std::function<const json*(const json&)> findPluginNode =
+        [&](const json& element) -> const json* {
+        if (element.value("type", "") == "FakePluginNode")
+            return &element;
+        if (element.contains("children") && element["children"].is_array()) {
+            for (const auto& child : element["children"]) {
+                if (const auto* found = findPluginNode(child))
+                    return found;
+            }
+        }
+        return nullptr;
+    };
+    const auto* pluginNode = findPluginNode(tree["root"]);
+    return pluginNode ? pluginNode->value("key", "") : std::string();
+}
+
 TEST(PluginPersistentWatch, ReusesPollsReconnectsAndClosesExactlyOnce) {
     PluginTargetProcess target;
     ASSERT_TRUE(target.start());
@@ -613,9 +650,9 @@ TEST(PluginPersistentWatch, ScopedPluginFailurePreservesPreviousSnapshot) {
     PluginTargetProcess target;
     ASSERT_TRUE(target.start());
     const auto statsPath = plugin_stats_path("watch-scoped");
-    const std::string pluginKey =
-        "win32|LvtNativePropertyFixtureWindow/"
-        "fake-persistent|FakePluginNode|name:fake-node";
+    const auto pluginKey = discover_plugin_node_key(
+        target, LVT_FAKE_PLUGIN_V2_DIR, statsPath, "scoped-filter");
+    ASSERT_FALSE(pluginKey.empty());
     const auto result = run_plugin_watch(
         target, LVT_FAKE_PLUGIN_V2_DIR, statsPath, "scoped-filter",
         "0", "0", 4, pluginKey, {}, {}, "2");
