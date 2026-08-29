@@ -40,11 +40,16 @@
         <Slider x:Name="LevelSlider" Grid.Row="7" Minimum="0" Maximum="100" Value="25" />
         <Slider x:Name="ReadOnlyRange" Grid.Row="8"
                 Minimum="0" Maximum="100" Value="40" IsEnabled="False" />
-        <ComboBox x:Name="ChoiceCombo" Grid.Row="9" SelectedIndex="0" Width="200">
-            <ComboBoxItem Content="Alpha" />
-            <ComboBoxItem Content="Beta" />
-            <ComboBoxItem Content="Gamma" />
-        </ComboBox>
+        <StackPanel Grid.Row="9" Orientation="Horizontal" Spacing="12">
+            <ComboBox x:Name="ChoiceCombo" SelectedIndex="0" Width="200">
+                <ComboBoxItem Content="Alpha" />
+                <ComboBoxItem Content="Beta" />
+                <ComboBoxItem Content="Gamma" />
+            </ComboBox>
+            <Button x:Name="ToggleListSizeButton"
+                    Content="Toggle list size"
+                    Click="OnToggleListSizeClick" />
+        </StackPanel>
         <ListView x:Name="ItemsList" Grid.Row="10" Height="220" SelectionMode="Multiple" />
     </Grid>
 </Window>

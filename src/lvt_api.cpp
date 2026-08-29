@@ -1030,6 +1030,7 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         // reported to a model as "this window cannot be read".
         std::optional<lvt::Element> result;
         bool wasTruncated = false;
+        bool usedPersistentConnection = false;
         std::shared_ptr<lvt::UiaConnection> connection;
         for (int attempt = 0; attempt < 3 && !result; ++attempt) {
             if (attempt > 0)
@@ -1042,6 +1043,7 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
                 if (connection->get_tree_with_options(connectedTree, options, &attemptTruncated)) {
                     result = std::move(connectedTree);
                     wasTruncated = attemptTruncated;
+                    usedPersistentConnection = true;
                     break;
                 }
             }
@@ -1064,7 +1066,9 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         // that get_editable_properties cannot resolve.
         if (!connection)
             connection = uia_connection_for_active_session(session);
-        if (connection && !connection->attach_property_identities(*result)) {
+        if (connection && !usedPersistentConnection &&
+            !connection->attach_property_identities(
+                *result, !wasTruncated)) {
             error =
                 "the UI Automation connection no longer matches this session's target window";
             return false;

@@ -4349,6 +4349,124 @@ TEST_F(McpSampleFixture, UiaTypedPropertiesPreserveOriginatingViewIdentity) {
         find_property_descriptor(contentProperties, "Value.Value"), nullptr);
 }
 
+TEST_F(McpSampleFixture, TypedScrollRejectsAStaleMissingScrollPattern) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto list = client.call_tool(
+        "find_elements",
+        json{{"session", session}, {"automationId", "ItemsList"}});
+    auto toggleSize = client.call_tool(
+        "find_elements",
+        json{{"session", session}, {"automationId", "ToggleListSizeButton"}});
+    ASSERT_EQ(list["elements"].size(), 1u) << list.dump(2);
+    ASSERT_EQ(toggleSize["elements"].size(), 1u) << toggleSize.dump(2);
+    const auto listKey = list["elements"][0].value("key", "");
+    const auto toggleKey = toggleSize["elements"][0].value("key", "");
+
+    bool isError = false;
+    auto before = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", listKey}}, &isError);
+    ASSERT_FALSE(isError) << before.dump(2);
+    const auto* scroll =
+        find_property_descriptor(before, "Scroll.Action");
+    ASSERT_NE(scroll, nullptr) << before.dump(2);
+    ASSERT_TRUE(scroll->value("writable", false));
+    const auto staleDescriptor = scroll->value("descriptorId", "");
+
+    auto shrink = client.call_tool(
+        "click",
+        json{{"session", session}, {"element", toggleKey}}, &isError);
+    ASSERT_FALSE(isError) << shrink.dump(2);
+
+    auto changed = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", listKey}}, &isError);
+    ASSERT_FALSE(isError) << changed.dump(2);
+    const auto* changedScroll =
+        find_property_descriptor(changed, "Scroll.Action");
+    if (changedScroll) {
+        EXPECT_FALSE(changedScroll->value("writable", true));
+        EXPECT_NE(changedScroll->value("descriptorId", ""), staleDescriptor);
+    }
+
+    auto stale = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", listKey},
+             {"descriptorId", staleDescriptor},
+             {"value", "down"}},
+        &isError);
+    EXPECT_TRUE(isError) << stale.dump(2);
+    EXPECT_NE(stale.dump().find("stale"), std::string::npos)
+        << stale.dump(2);
+    EXPECT_EQ(stale.dump().find("ScrollItemPattern"), std::string::npos)
+        << "typed directional scroll must not fall back to ScrollIntoView";
+
+    auto restore = client.call_tool(
+        "click",
+        json{{"session", session}, {"element", toggleKey}}, &isError);
+    EXPECT_FALSE(isError) << restore.dump(2);
+}
+
+TEST_F(McpSampleFixture, RangeValueMutationReturnsProviderReadback) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto slider = client.call_tool(
+        "find_elements",
+        json{{"session", session}, {"automationId", "LevelSlider"}});
+    ASSERT_EQ(slider["elements"].size(), 1u) << slider.dump(2);
+    const auto key = slider["elements"][0].value("key", "");
+    bool isError = false;
+    auto before = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
+    ASSERT_FALSE(isError) << before.dump(2);
+    const auto* range =
+        find_property_descriptor(before, "RangeValue.Value");
+    ASSERT_NE(range, nullptr) << before.dump(2);
+    const auto descriptorId = range->value("descriptorId", "");
+    const auto original = typed_property_value(before, "RangeValue.Value");
+
+    const auto requested = "075.1300";
+    auto mutation = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", requested}},
+        &isError);
+    ASSERT_FALSE(isError) << mutation.dump(2);
+    const auto readback = mutation.value("value", "");
+    ASSERT_FALSE(readback.empty()) << mutation.dump(2);
+    EXPECT_NE(readback, requested);
+
+    auto after = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
+    ASSERT_FALSE(isError) << after.dump(2);
+    EXPECT_EQ(typed_property_value(after, "RangeValue.Value"), readback);
+
+    auto restore = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", original}},
+        &isError);
+    EXPECT_FALSE(isError) << restore.dump(2);
+}
+
 TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
     SkipIfNotReady();
     McpClient client(true);
@@ -4478,12 +4596,11 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesUiaValueChange) {
     auto input = client.call_tool(
         "find_elements", json{{"session", session}, {"automationId", "InputBox"}});
     ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
-    const auto inputRef = input["elements"][0].value("ref", "");
     const auto inputKey = input["elements"][0].value("key", "");
     auto before = client.call_tool(
         "get_element_properties",
         json{{"session", session},
-             {"element", inputRef},
+             {"element", inputKey},
              {"properties", json::array({"Value.Value"})}});
     const auto originalValue = before["properties"].value("Value.Value", "");
 
@@ -4495,7 +4612,7 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesUiaValueChange) {
     const auto changedValue = "resource UIA mutation";
     auto changed = client.call_tool(
         "set_value",
-        json{{"session", session}, {"element", inputRef}, {"text", changedValue}},
+        json{{"session", session}, {"element", inputKey}, {"text", changedValue}},
         &isError);
     ASSERT_FALSE(isError) << changed.dump(2);
 
@@ -4530,7 +4647,7 @@ TEST_F(McpSampleFixture, ResourceSubscriptionPushesUiaValueChange) {
     EXPECT_TRUE(unsubscribed.contains("result")) << unsubscribed.dump(2);
     auto restored = client.call_tool(
         "set_value",
-        json{{"session", session}, {"element", inputRef}, {"text", originalValue}},
+        json{{"session", session}, {"element", inputKey}, {"text", originalValue}},
         &isError);
     EXPECT_FALSE(isError) << restored.dump(2);
 }

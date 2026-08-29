@@ -104,6 +104,12 @@ PropertyMutationResult perform_uia_property_action(
     const std::vector<int>& runtimeId,
     UiaPropertyAction action, const std::string& value);
 
+// Converts the mandatory RangeValue post-set readback into the generic
+// mutation contract. A failed/non-finite readback is an explicit failure with
+// no success-shaped value because the provider's actual value is unknown.
+PropertyMutationResult uia_range_readback_result(
+    HRESULT readbackResult, double currentValue);
+
 // Parse an action name as accepted on the command line.
 bool parse_action_kind(const std::string& name, ActionKind& out);
 const char* action_kind_name(ActionKind kind);

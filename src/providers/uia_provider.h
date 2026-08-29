@@ -38,20 +38,33 @@ struct UiaOptions {
 // handles—never live values or COM objects.
 class UiaPropertyIdentityCache {
 public:
-    void attach(Element& root);
+    static constexpr size_t kMaximumRuntimeIds = 16384;
+    static constexpr size_t kMaximumKeyAliases = 32768;
+
+    void attach(Element& root, bool completeSnapshot = true);
     void remember(const Element& root);
     std::optional<uint64_t> resolve(
         const std::string& reference, std::string& error);
     std::optional<std::string> runtime_id(uint64_t handle) const;
+    size_t runtime_id_count() const { return m_handlesByRuntimeId.size(); }
+    size_t key_alias_count() const;
 
 private:
+    struct RuntimeIdentity {
+        uint64_t handle = 0;
+        uint64_t lastSeenGeneration = 0;
+    };
+
     void attach_element(Element& element);
     void remember_element(const Element& element);
+    void prune();
 
     uint64_t m_nextHandle = 1;
-    std::unordered_map<std::string, uint64_t> m_handlesByRuntimeId;
+    uint64_t m_generation = 0;
+    std::unordered_map<std::string, RuntimeIdentity> m_handlesByRuntimeId;
     std::unordered_map<uint64_t, std::string> m_runtimeIdsByHandle;
-    std::unordered_map<std::string, std::set<std::string>> m_runtimeIdsByKey;
+    std::unordered_map<
+        std::string, std::unordered_map<std::string, uint64_t>> m_runtimeIdsByKey;
 };
 
 // Walks the target's UI Automation tree and returns it as a standard
@@ -88,7 +101,8 @@ public:
                   const std::string& providerOption = {}) override;
     bool get_tree_with_options(Element& root, const UiaOptions& options,
                                bool* truncated = nullptr);
-    bool attach_property_identities(Element& root);
+    bool attach_property_identities(
+        Element& root, bool completeSnapshot = true);
     void remember_property_references(const Element& root);
     std::optional<uint64_t> resolve_property_reference(
         const std::string& reference, std::string& error);

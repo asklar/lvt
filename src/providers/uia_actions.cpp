@@ -423,8 +423,9 @@ PatternAttempt try_select(IUIAutomationElement* element, std::string& method) {
     return attempt;
 }
 
-PatternAttempt try_scroll(IUIAutomationElement* element, const std::string& direction,
-                          int amount, std::string& method) {
+PatternAttempt try_scroll_pattern(
+    IUIAutomationElement* element, const std::string& direction,
+    int amount, std::string& method) {
     wil::com_ptr<IUIAutomationScrollPattern> scroll;
     if (SUCCEEDED(element->GetCurrentPatternAs(UIA_ScrollPatternId, IID_PPV_ARGS(&scroll))) &&
         scroll) {
@@ -446,6 +447,15 @@ PatternAttempt try_scroll(IUIAutomationElement* element, const std::string& dire
             method = "ScrollPattern";
         return attempt;
     }
+    return {};
+}
+
+PatternAttempt try_scroll(IUIAutomationElement* element, const std::string& direction,
+                          int amount, std::string& method) {
+    const auto scroll = try_scroll_pattern(
+        element, direction, amount, method);
+    if (scroll.supported)
+        return scroll;
 
     // Not scrollable itself, but it may be an item inside something that is.
     wil::com_ptr<IUIAutomationScrollItemPattern> scrollItem;
@@ -499,18 +509,13 @@ PatternAttempt try_set_range_value(IUIAutomationElement* element, const std::str
     return attempt;
 }
 
-bool read_current_range_value(
-    IUIAutomationElement* element, std::string& value) {
+HRESULT read_current_range_value(
+    IUIAutomationElement* element, double& value) {
     wil::com_ptr<IUIAutomationRangeValuePattern> range;
-    if (FAILED(element->GetCurrentPatternAs(
-            UIA_RangeValuePatternId, IID_PPV_ARGS(&range))) || !range) {
-        return false;
-    }
-    double current = 0;
-    if (FAILED(range->get_CurrentValue(&current)) || !std::isfinite(current))
-        return false;
-    value = format_uia_double(current);
-    return true;
+    RETURN_IF_FAILED(element->GetCurrentPatternAs(
+        UIA_RangeValuePatternId, IID_PPV_ARGS(&range)));
+    RETURN_HR_IF_NULL(static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE), range.get());
+    return range->get_CurrentValue(&value);
 }
 
 PatternAttempt try_change_selection(IUIAutomationElement* element, bool add,
@@ -607,6 +612,23 @@ std::string describe_decline(const PatternAttempt& attempt, const char* patternN
 
 } // namespace
 
+PropertyMutationResult uia_range_readback_result(
+    HRESULT readbackResult, double currentValue) {
+    PropertyMutationResult result;
+    if (FAILED(readbackResult) || !std::isfinite(currentValue)) {
+        result.hresult = FAILED(readbackResult) ? readbackResult : E_FAIL;
+        result.error =
+            "RangeValue was set, but provider readback failed; the actual value is unknown";
+        return result;
+    }
+    result.ok = true;
+    result.hresult = S_OK;
+    result.hasValue = true;
+    result.value = format_uia_double(currentValue);
+    result.error.clear();
+    return result;
+}
+
 PropertyMutationResult perform_uia_property_action(
     IUIAutomation* automation, HWND hwnd,
     const std::vector<int>& runtimeId,
@@ -662,7 +684,10 @@ PropertyMutationResult perform_uia_property_action(
         attempt = try_change_selection(element.get(), false, method);
         break;
     case UiaPropertyAction::scroll:
-        attempt = try_scroll(element.get(), value, 1, method);
+        // A directional typed descriptor is issued only for ScrollPattern.
+        // ScrollItem::ScrollIntoView has no directional semantics and must
+        // remain a fallback only for the legacy generic scroll action.
+        attempt = try_scroll_pattern(element.get(), value, 1, method);
         break;
     }
 
@@ -687,6 +712,13 @@ PropertyMutationResult perform_uia_property_action(
         return result;
     }
 
+    if (action == UiaPropertyAction::setRangeValue) {
+        double currentValue = 0;
+        const auto readbackResult =
+            read_current_range_value(element.get(), currentValue);
+        return uia_range_readback_result(readbackResult, currentValue);
+    }
+
     result.ok = true;
     result.hresult = S_OK;
     result.error.clear();
@@ -698,9 +730,6 @@ PropertyMutationResult perform_uia_property_action(
         result.value = value;
         break;
     case UiaPropertyAction::setRangeValue:
-        result.hasValue = true;
-        if (!read_current_range_value(element.get(), result.value))
-            result.value = value;
         break;
     default:
         break;

@@ -580,19 +580,32 @@ struct UiaConnection::State {
     UiaPropertySchemaCache schemaCache;
 };
 
-void UiaPropertyIdentityCache::attach(Element& root) {
+void UiaPropertyIdentityCache::attach(
+    Element& root, bool completeSnapshot) {
+    if (completeSnapshot)
+        ++m_generation;
+    else if (m_generation == 0)
+        m_generation = 1;
     attach_element(root);
+    if (completeSnapshot)
+        prune();
 }
 
 void UiaPropertyIdentityCache::attach_element(Element& element) {
     const auto runtime = element.properties.find("RuntimeId");
     if (runtime != element.properties.end() && !runtime->second.empty()) {
-        const auto found = m_handlesByRuntimeId.find(runtime->second);
+        auto found = m_handlesByRuntimeId.find(runtime->second);
         if (found != m_handlesByRuntimeId.end()) {
-            element.providerHandle = found->second;
+            found->second.lastSeenGeneration = m_generation;
+            element.providerHandle = found->second.handle;
         } else {
             const auto handle = m_nextHandle++;
-            m_handlesByRuntimeId.emplace(runtime->second, handle);
+            m_handlesByRuntimeId.emplace(
+                runtime->second,
+                RuntimeIdentity{
+                    .handle = handle,
+                    .lastSeenGeneration = m_generation,
+                });
             m_runtimeIdsByHandle.emplace(handle, runtime->second);
             element.providerHandle = handle;
         }
@@ -602,14 +615,17 @@ void UiaPropertyIdentityCache::attach_element(Element& element) {
 }
 
 void UiaPropertyIdentityCache::remember(const Element& root) {
+    if (m_generation == 0)
+        m_generation = 1;
     remember_element(root);
+    prune();
 }
 
 void UiaPropertyIdentityCache::remember_element(const Element& element) {
     const auto runtime = element.properties.find("RuntimeId");
     if (!element.key.empty() &&
         runtime != element.properties.end() && !runtime->second.empty()) {
-        m_runtimeIdsByKey[element.key].insert(runtime->second);
+        m_runtimeIdsByKey[element.key][runtime->second] = m_generation;
     }
     for (const auto& child : element.children)
         remember_element(child);
@@ -639,16 +655,22 @@ std::optional<uint64_t> UiaPropertyIdentityCache::resolve(
                 "refresh the originating tree and use uia:<RuntimeId>";
             return std::nullopt;
         }
-        runtimeId = *found->second.begin();
+        runtimeId = found->second.begin()->first;
     }
 
-    const auto existing = m_handlesByRuntimeId.find(runtimeId);
+    auto existing = m_handlesByRuntimeId.find(runtimeId);
     if (existing != m_handlesByRuntimeId.end())
-        return existing->second;
+        return existing->second.handle;
 
     const auto handle = m_nextHandle++;
-    m_handlesByRuntimeId.emplace(runtimeId, handle);
+    m_handlesByRuntimeId.emplace(
+        runtimeId,
+        RuntimeIdentity{
+            .handle = handle,
+            .lastSeenGeneration = m_generation,
+        });
     m_runtimeIdsByHandle.emplace(handle, runtimeId);
+    prune();
     return handle;
 }
 
@@ -658,6 +680,84 @@ std::optional<std::string> UiaPropertyIdentityCache::runtime_id(
     if (found == m_runtimeIdsByHandle.end())
         return std::nullopt;
     return found->second;
+}
+
+size_t UiaPropertyIdentityCache::key_alias_count() const {
+    size_t count = 0;
+    for (const auto& [_, aliases] : m_runtimeIdsByKey)
+        count += aliases.size();
+    return count;
+}
+
+void UiaPropertyIdentityCache::prune() {
+    const auto remove_runtime = [&](const std::string& runtimeId) {
+        const auto found = m_handlesByRuntimeId.find(runtimeId);
+        if (found == m_handlesByRuntimeId.end())
+            return;
+        m_runtimeIdsByHandle.erase(found->second.handle);
+        m_handlesByRuntimeId.erase(found);
+    };
+
+    std::vector<std::string> staleRuntimeIds;
+    for (const auto& [runtimeId, identity] : m_handlesByRuntimeId) {
+        if (identity.lastSeenGeneration + 1 < m_generation)
+            staleRuntimeIds.push_back(runtimeId);
+    }
+    for (const auto& runtimeId : staleRuntimeIds)
+        remove_runtime(runtimeId);
+
+    while (m_handlesByRuntimeId.size() > kMaximumRuntimeIds) {
+        auto oldest = m_handlesByRuntimeId.end();
+        for (auto it = m_handlesByRuntimeId.begin();
+             it != m_handlesByRuntimeId.end(); ++it) {
+            if (oldest == m_handlesByRuntimeId.end() ||
+                it->second.lastSeenGeneration <
+                    oldest->second.lastSeenGeneration) {
+                oldest = it;
+            }
+        }
+        if (oldest == m_handlesByRuntimeId.end())
+            break;
+        const auto runtimeId = oldest->first;
+        remove_runtime(runtimeId);
+    }
+
+    for (auto key = m_runtimeIdsByKey.begin();
+         key != m_runtimeIdsByKey.end();) {
+        for (auto alias = key->second.begin();
+             alias != key->second.end();) {
+            if (!m_handlesByRuntimeId.contains(alias->first))
+                alias = key->second.erase(alias);
+            else
+                ++alias;
+        }
+        if (key->second.empty())
+            key = m_runtimeIdsByKey.erase(key);
+        else
+            ++key;
+    }
+
+    while (key_alias_count() > kMaximumKeyAliases) {
+        auto oldestKey = m_runtimeIdsByKey.end();
+        std::unordered_map<std::string, uint64_t>::iterator oldestAlias;
+        uint64_t oldestGeneration = (std::numeric_limits<uint64_t>::max)();
+        for (auto key = m_runtimeIdsByKey.begin();
+             key != m_runtimeIdsByKey.end(); ++key) {
+            for (auto alias = key->second.begin();
+                 alias != key->second.end(); ++alias) {
+                if (alias->second < oldestGeneration) {
+                    oldestGeneration = alias->second;
+                    oldestKey = key;
+                    oldestAlias = alias;
+                }
+            }
+        }
+        if (oldestKey == m_runtimeIdsByKey.end())
+            break;
+        oldestKey->second.erase(oldestAlias);
+        if (oldestKey->second.empty())
+            m_runtimeIdsByKey.erase(oldestKey);
+    }
 }
 
 namespace {
@@ -856,7 +956,7 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
         return build_tree_with_automation(automation, hwnd, options, built, wasTruncated);
     });
     if (SUCCEEDED(hr))
-        m_state->identities.attach(built);
+        m_state->identities.attach(built, !wasTruncated);
     lock.unlock();
 
     if (truncated)
@@ -874,11 +974,12 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
     return true;
 }
 
-bool UiaConnection::attach_property_identities(Element& root) {
+bool UiaConnection::attach_property_identities(
+    Element& root, bool completeSnapshot) {
     std::lock_guard<std::mutex> lock(m_state->mutex);
     if (!m_state->automation || !matches_target(m_hwnd))
         return false;
-    m_state->identities.attach(root);
+    m_state->identities.attach(root, completeSnapshot);
     return true;
 }
 

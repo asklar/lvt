@@ -340,11 +340,30 @@ std::shared_ptr<const PropertySchema> UiaPropertySchemaCache::get_or_create(
     const auto facts = schema_facts(element, selection);
     const auto key = schema_key(facts);
     const auto found = m_schemas.find(key);
-    if (found != m_schemas.end())
-        return found->second;
+    if (found != m_schemas.end()) {
+        found->second.lastUsed = ++m_clock;
+        return found->second.schema;
+    }
     auto schema = build_schema(facts, key);
-    m_schemas.emplace(key, schema);
+    m_schemas.emplace(
+        key, CachedSchema{.schema = schema, .lastUsed = ++m_clock});
+    trim();
     return schema;
+}
+
+void UiaPropertySchemaCache::trim() {
+    while (m_schemas.size() > kMaximumSchemas) {
+        auto oldest = m_schemas.end();
+        for (auto it = m_schemas.begin(); it != m_schemas.end(); ++it) {
+            if (oldest == m_schemas.end() ||
+                it->second.lastUsed < oldest->second.lastUsed) {
+                oldest = it;
+            }
+        }
+        if (oldest == m_schemas.end())
+            break;
+        m_schemas.erase(oldest);
+    }
 }
 
 PropertySnapshotResult make_uia_property_snapshot(

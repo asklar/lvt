@@ -2547,6 +2547,26 @@ TEST(UiaProperties, DoubleFormattingRoundTripsAdjacentValues) {
     EXPECT_NE(firstText, secondText);
 }
 
+TEST(UiaProperties, RangeReadbackFailureHasNoSuccessShapedValue) {
+    const auto failed = uia_range_readback_result(E_FAIL, 0);
+    EXPECT_FALSE(failed.ok);
+    EXPECT_FALSE(failed.hasValue);
+    EXPECT_TRUE(failed.value.empty());
+    EXPECT_EQ(failed.hresult, E_FAIL);
+    EXPECT_NE(failed.error.find("actual value is unknown"), std::string::npos);
+
+    const auto nonFinite = uia_range_readback_result(
+        S_OK, std::numeric_limits<double>::infinity());
+    EXPECT_FALSE(nonFinite.ok);
+    EXPECT_FALSE(nonFinite.hasValue);
+
+    const auto succeeded =
+        uia_range_readback_result(S_OK, 12.345678901234567);
+    EXPECT_TRUE(succeeded.ok);
+    EXPECT_TRUE(succeeded.hasValue);
+    EXPECT_EQ(std::stod(succeeded.value), 12.345678901234567);
+}
+
 TEST(UiaProperties, OneShotFallbackTreeReceivesConnectionOwnedIdentities) {
     UiaPropertyIdentityCache identities;
     Element root;
@@ -2584,10 +2604,73 @@ TEST(UiaProperties, OneShotFallbackTreeReceivesConnectionOwnedIdentities) {
     Element conflicting = child;
     conflicting.key = root.children[0].key;
     conflicting.properties["RuntimeId"] = "42.100.8";
+    identities.attach(conflicting);
     identities.remember(conflicting);
     error.clear();
     EXPECT_FALSE(identities.resolve(conflicting.key, error).has_value());
     EXPECT_NE(error.find("ambiguous"), std::string::npos);
+}
+
+TEST(UiaProperties, IdentityCachePrunesVirtualizationChurnAndRejectsStaleAliases) {
+    UiaPropertyIdentityCache identities;
+    std::string firstKey;
+    uint64_t firstHandle = 0;
+    std::string previousKey;
+
+    for (int generation = 0; generation < 1000; ++generation) {
+        Element root;
+        root.type = "Window";
+        root.framework = "uia";
+        root.properties["RuntimeId"] = "42.500";
+        Element item;
+        item.type = "ListItem";
+        item.framework = "uia";
+        item.properties["AutomationId"] =
+            "item-" + std::to_string(generation);
+        item.properties["RuntimeId"] =
+            "42.500." + std::to_string(generation);
+        root.children.push_back(item);
+        identities.attach(root);
+        assign_element_keys(root);
+        identities.remember(root);
+        if (generation == 0) {
+            firstKey = root.children[0].key;
+            firstHandle = root.children[0].providerHandle;
+        }
+        if (generation == 998)
+            previousKey = root.children[0].key;
+        EXPECT_LE(identities.runtime_id_count(), 3u);
+        EXPECT_LE(identities.key_alias_count(), 3u);
+    }
+
+    std::string error;
+    EXPECT_TRUE(identities.resolve(previousKey, error).has_value())
+        << "the immediately previous snapshot alias should survive one patch: "
+        << error;
+    EXPECT_FALSE(identities.runtime_id(firstHandle).has_value());
+    error.clear();
+    EXPECT_FALSE(identities.resolve(firstKey, error).has_value());
+    EXPECT_NE(error.find("stale"), std::string::npos);
+}
+
+TEST(UiaProperties, TruncatedSnapshotsDoNotPruneKnownIdentities) {
+    UiaPropertyIdentityCache identities;
+    Element complete;
+    complete.type = "Edit";
+    complete.framework = "uia";
+    complete.properties["RuntimeId"] = "42.700.1";
+    identities.attach(complete);
+    const auto handle = complete.providerHandle;
+
+    for (int i = 0; i < 10; ++i) {
+        Element partial;
+        partial.type = "Edit";
+        partial.framework = "uia";
+        partial.properties["RuntimeId"] =
+            "42.700." + std::to_string(i + 2);
+        identities.attach(partial, false);
+    }
+    EXPECT_EQ(identities.runtime_id(handle), "42.700.1");
 }
 
 TEST(FindElementByRef, ResolvesUiaRuntimeIdReference) {
@@ -3318,6 +3401,37 @@ TEST(NativeTypedPropertyContract, PointerOperationsRequireMatchingArchitecture) 
         Architecture::x86, Architecture::x64));
     EXPECT_FALSE(native_pointer_operations_allowed(
         Architecture::unknown, Architecture::x64));
+}
+
+TEST(UiaTypedProperties, SchemaCacheIsBoundedUnderDynamicRangeChurn) {
+    UiaPropertySchemaCache cache;
+    std::string firstSchemaId;
+    for (size_t i = 0;
+         i < UiaPropertySchemaCache::kMaximumSchemas * 3;
+         ++i) {
+        auto slider = editable_uia_element(
+            "Slider", "RangeValue",
+            {{"RangeValue.Value", "1"},
+             {"RangeValue.Minimum", std::to_string(i) + ".125"},
+             {"RangeValue.Maximum", std::to_string(i + 1000) + ".875"},
+             {"RangeValue.IsReadOnly", "false"}});
+        auto snapshot = make_uia_property_snapshot(
+            slider, UiaSelectionCapabilities{}, cache);
+        if (i == 0)
+            firstSchemaId = snapshot.schema->schemaId;
+        EXPECT_LE(cache.size(), UiaPropertySchemaCache::kMaximumSchemas);
+    }
+
+    auto firstAgain = editable_uia_element(
+        "Slider", "RangeValue",
+        {{"RangeValue.Value", "1"},
+         {"RangeValue.Minimum", "0.125"},
+         {"RangeValue.Maximum", "1000.875"},
+         {"RangeValue.IsReadOnly", "false"}});
+    auto recreated = make_uia_property_snapshot(
+        firstAgain, UiaSelectionCapabilities{}, cache);
+    EXPECT_EQ(recreated.schema->schemaId, firstSchemaId);
+    EXPECT_LE(cache.size(), UiaPropertySchemaCache::kMaximumSchemas);
 }
 
 TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {
