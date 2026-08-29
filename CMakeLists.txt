@@ -271,7 +271,7 @@ if(LVT_BUILD_VIEWER)
 
     set(LVT_VIEWER_TEST_PROJECT
         "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer.Tests/LvtViewer.Tests.csproj")
-    add_custom_target(lvt_viewer_tests
+    add_custom_target(lvt_viewer_tests ALL
         COMMAND "${LVT_DOTNET_EXE}" build "${LVT_VIEWER_TEST_PROJECT}"
             -c Release -p:Platform=x64
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"

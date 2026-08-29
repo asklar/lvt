@@ -272,7 +272,7 @@ public sealed class ElementNodeViewModel : ObservableObject
             // replacing/removing the metadata-backed row.
             if (row.Value != value)
             {
-                row.Value = value;
+                row.UpdateProviderValue(value, preservePendingEdit: true);
                 PropertyVersion++;
             }
             NotifyIfIdentifyingProperty(name);
@@ -294,11 +294,21 @@ public sealed class ElementNodeViewModel : ObservableObject
         NotifyIfIdentifyingProperty(name);
     }
 
-    public void ReplaceTypedPropertyRows(IEnumerable<PropertyRowViewModel> rows)
+    public void ReplaceTypedPropertyRows(
+        IEnumerable<PropertyRowViewModel> rows,
+        bool preservePendingEdits = false)
     {
+        var existingTyped = PropertyRows
+            .Where(row => row.IsTypedProperty)
+            .ToDictionary(row => row.ProviderName, StringComparer.Ordinal);
         var merged = PropertyRows.Where(row => !row.IsTypedProperty).ToList();
         foreach (var row in rows)
         {
+            if (preservePendingEdits &&
+                existingTyped.TryGetValue(row.ProviderName, out var existing))
+            {
+                row.PreservePendingEditFrom(existing);
+            }
             var treeRow = merged.FirstOrDefault(
                 existing => existing.ProviderName == row.ProviderName);
             if (treeRow != null)

@@ -18,6 +18,8 @@ public sealed class PropertyRowViewModel : ObservableObject
     private string _editText = "";
     private string _validationError = "";
     private PropertyEditorKind _kind;
+    private bool _isDirty;
+    private bool _hasExternalConflict;
 
     public PropertyRowViewModel(string name, string value)
     {
@@ -45,6 +47,23 @@ public sealed class PropertyRowViewModel : ObservableObject
 
     public bool IsEditable => Kind != PropertyEditorKind.ReadOnly;
     public bool IsTypedProperty { get; private set; }
+    public bool IsDirty
+    {
+        get => _isDirty;
+        private set => SetField(ref _isDirty, value);
+    }
+    public bool HasExternalConflict
+    {
+        get => _hasExternalConflict;
+        private set
+        {
+            if (SetField(ref _hasExternalConflict, value))
+                OnPropertyChanged(nameof(ConflictMessage));
+        }
+    }
+    public string ConflictMessage => HasExternalConflict
+        ? $"Target changed to “{Value}” while your pending edit is “{EditText}”."
+        : "";
     public string DescriptorId { get; private set; } = "";
     public string PropertyType { get; private set; } = "";
     public string DeclaringType { get; private set; } = "";
@@ -76,11 +95,7 @@ public sealed class PropertyRowViewModel : ObservableObject
     public string Value
     {
         get => _value;
-        set
-        {
-            if (SetField(ref _value, value))
-                EditText = value;
-        }
+        set => UpdateProviderValue(value, preservePendingEdit: false);
     }
 
     /// <summary>The pending value in an editor, before Set is invoked.</summary>
@@ -90,7 +105,10 @@ public sealed class PropertyRowViewModel : ObservableObject
         set
         {
             if (SetField(ref _editText, value))
+            {
                 Validate();
+                UpdateDirtyState();
+            }
         }
     }
 
@@ -145,7 +163,7 @@ public sealed class PropertyRowViewModel : ObservableObject
                 ? "The provider did not supply enum choices."
                 : $"{Description} · The provider did not supply enum choices.";
         }
-        Value = value.Value;
+        UpdateProviderValue(value.Value, preservePendingEdit: false);
         if (Kind == PropertyEditorKind.Command && Choices.Count != 0)
             EditText = Choices[0].Value;
         Validate();
@@ -165,6 +183,41 @@ public sealed class PropertyRowViewModel : ObservableObject
         OnPropertyChanged(nameof(Step));
         OnPropertyChanged(nameof(Choices));
         OnPropertyChanged(nameof(CanApply));
+    }
+
+    public void UpdateProviderValue(string value, bool preservePendingEdit)
+    {
+        var wasDirty = IsDirty;
+        var pending = EditText;
+        var changed = SetField(ref _value, value, nameof(Value));
+
+        if (!preservePendingEdit || !wasDirty)
+        {
+            EditText = value;
+            HasExternalConflict = false;
+            return;
+        }
+
+        if (!changed)
+            return;
+
+        Validate();
+        UpdateDirtyState();
+        HasExternalConflict =
+            IsDirty &&
+            !string.Equals(pending, value, StringComparison.Ordinal);
+        OnPropertyChanged(nameof(ConflictMessage));
+    }
+
+    public void PreservePendingEditFrom(PropertyRowViewModel existing)
+    {
+        if (!existing.IsDirty)
+            return;
+        EditText = existing.EditText;
+        HasExternalConflict =
+            IsDirty &&
+            (existing.HasExternalConflict ||
+             !string.Equals(existing.Value, Value, StringComparison.Ordinal));
     }
 
     private void Validate()
@@ -208,6 +261,17 @@ public sealed class PropertyRowViewModel : ObservableObject
         if (Maximum is double maximum && number > maximum)
             return $"Maximum: {maximum.ToString(CultureInfo.InvariantCulture)}.";
         return "";
+    }
+
+    private void UpdateDirtyState()
+    {
+        IsDirty =
+            IsTypedProperty &&
+            Kind != PropertyEditorKind.Command &&
+            !string.Equals(EditText, Value, StringComparison.Ordinal);
+        if (!IsDirty)
+            HasExternalConflict = false;
+        OnPropertyChanged(nameof(ConflictMessage));
     }
 
 }

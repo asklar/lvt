@@ -309,6 +309,12 @@
                                             <TextBlock Text="{Binding ValidationError}" Foreground="#FFC42B1C"
                                                        FontSize="11" TextWrapping="Wrap"/>
                                         </StackPanel>
+                                        <TextBlock Text="{Binding ConflictMessage}"
+                                                   Foreground="#FF9D5D00"
+                                                   FontSize="11"
+                                                   FontWeight="SemiBold"
+                                                   TextWrapping="Wrap"
+                                                   Visibility="{Binding HasExternalConflict, Converter={StaticResource BoolToVisibility}}"/>
                                     </StackPanel>
                                 </Grid>
                             </DataTemplate>

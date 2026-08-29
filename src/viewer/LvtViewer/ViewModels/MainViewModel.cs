@@ -35,6 +35,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private IntPtr _currentHwnd;
     private int _connectionGeneration;
     private readonly DispatcherTimer _targetLivenessTimer;
+    private readonly DispatcherTimer _typedPropertyRefreshTimer;
     private bool _awaitingSnapshot;
     private bool _resourceProbeRunning;
     private int _resourceProbeFailures;
@@ -56,6 +57,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             _filterDebounceTimer.Stop();
             ApplyFrameworkFilter();
+        };
+        _typedPropertyRefreshTimer = new DispatcherTimer(
+            DispatcherPriority.Background, _dispatcher)
+        {
+            Interval = TimeSpan.FromMilliseconds(100),
+        };
+        _typedPropertyRefreshTimer.Tick += async (_, _) =>
+        {
+            _typedPropertyRefreshTimer.Stop();
+            var node = SelectedElement;
+            var generation = _connectionGeneration;
+            if (!UseUia || node == null)
+                return;
+            await RefreshTypedPropertiesAsync(
+                node, preservePendingEdits: true);
+            if (generation != _connectionGeneration)
+                return;
         };
 
         _mcp.PatchReceived += (generation, patch) =>
@@ -356,10 +374,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             "tree",
             $"Applying {patch.Tree} {(patch.Snapshot ? "snapshot" : "diff")} " +
             $"with {patch.Events.Count} event(s)");
+        bool refreshTypedSchema = false;
         foreach (var evt in patch.Events)
         {
             _liveTree.Apply(evt);
+            if (UseUia && SelectedElement != null &&
+                PatchAffectsTypedSchema(evt, SelectedElement))
+            {
+                refreshTypedSchema = true;
+            }
             DiscoverFrameworks(evt);
+        }
+        if (refreshTypedSchema)
+        {
+            _typedPropertyRefreshTimer.Stop();
+            _typedPropertyRefreshTimer.Start();
         }
         ScheduleFilterRefresh();
         _lastPatchUtc = DateTime.UtcNow;
@@ -618,7 +647,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         await RefreshTypedPropertiesAsync(node);
     }
 
-    private async System.Threading.Tasks.Task RefreshTypedPropertiesAsync(ElementNodeViewModel? node)
+    private async System.Threading.Tasks.Task RefreshTypedPropertiesAsync(
+        ElementNodeViewModel? node, bool preservePendingEdits = false)
     {
         if (node == null)
         {
@@ -673,7 +703,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             })
             .ToList();
 
-        node.ReplaceTypedPropertyRows(rows);
+        node.ReplaceTypedPropertyRows(rows, preservePendingEdits);
         IsPropertyPanelLoading = false;
         Logger.Log(
             "properties",
@@ -739,7 +769,55 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         _filterDebounceTimer.Stop();
+        _typedPropertyRefreshTimer.Stop();
         _targetLivenessTimer.Stop();
         _mcp.Dispose();
+    }
+
+    public static bool PatchAffectsTypedSchema(
+        TreeChangeEventDto evt, ElementNodeViewModel selected)
+    {
+        if (evt.Event != "changed" || evt.Fields == null)
+            return false;
+
+        bool isSelected = evt.Key == selected.Key;
+        bool isSelectionAncestor = false;
+        for (var ancestor = selected.Parent;
+             ancestor != null;
+             ancestor = ancestor.Parent)
+        {
+            if (ancestor.Key == evt.Key)
+            {
+                isSelectionAncestor = true;
+                break;
+            }
+        }
+
+        foreach (var field in evt.Fields.Keys)
+        {
+            if (!field.StartsWith("properties.", StringComparison.Ordinal))
+                continue;
+            var property = field["properties.".Length..];
+            if (isSelected && property is (
+                "IsEnabled" or
+                "SupportedPatterns" or
+                "Value.IsReadOnly" or
+                "RangeValue.IsReadOnly" or
+                "RangeValue.Minimum" or
+                "RangeValue.Maximum" or
+                "Scroll.HorizontallyScrollable" or
+                "Scroll.VerticallyScrollable"))
+            {
+                return true;
+            }
+            if (isSelectionAncestor && property is (
+                "SupportedPatterns" or
+                "Selection.CanSelectMultiple" or
+                "Selection.IsSelectionRequired"))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 }
