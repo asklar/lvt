@@ -41,6 +41,25 @@ struct PluginFrameworkInfo {
     const LoadedPlugin* plugin;
 };
 
+// The persistent tree path is an all-or-nothing lifetime contract. A plugin
+// missing any required export remains a one-shot v1 provider.
+bool plugin_supports_persistent_connections(const LoadedPlugin& plugin);
+
+// Polling is an independent optional pair. A persistent plugin without it
+// still refreshes through connection_get_tree().
+bool plugin_supports_event_polling(const LoadedPlugin& plugin);
+
+// Resolve a detected plugin framework back to its loaded plugin.
+PluginFrameworkInfo find_plugin_framework(const std::string& name,
+                                          const std::string& version = {});
+
+// Registry/lookup key for one plugin connection. Includes the loaded plugin
+// instance and target HWND so plugin providers cannot collide with built-in
+// labels, with another plugin reporting the same framework name, or with a
+// second window in the same process.
+std::string plugin_connection_label(const PluginFrameworkInfo& pluginFw,
+                                    HWND hwnd);
+
 // Ask all loaded plugins to detect frameworks in the given process.
 std::vector<PluginFrameworkInfo> detect_plugin_frameworks(HWND hwnd, DWORD pid);
 

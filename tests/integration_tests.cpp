@@ -251,6 +251,301 @@ static std::string read_text_file(const std::string& path) {
     return text;
 }
 
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(const char* name, const std::string& value)
+        : name_(name) {
+        const DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
+        if (needed > 0) {
+            previous_.resize(needed - 1);
+            GetEnvironmentVariableA(name, previous_.data(), needed);
+            hadPrevious_ = true;
+        }
+        SetEnvironmentVariableA(name, value.c_str());
+    }
+
+    ~ScopedEnvironmentVariable() {
+        SetEnvironmentVariableA(
+            name_.c_str(), hadPrevious_ ? previous_.c_str() : nullptr);
+    }
+
+private:
+    std::string name_;
+    std::string previous_;
+    bool hadPrevious_ = false;
+};
+
+class PluginTargetProcess {
+public:
+    bool start() {
+        const fs::path executable = NATIVE_CONTROLS_FIXTURE_EXE_PATH;
+        if (!fs::exists(executable))
+            return false;
+
+        STARTUPINFOA startup{sizeof(startup)};
+        PROCESS_INFORMATION info{};
+        std::string command = "\"" + executable.string() + "\"";
+        if (!CreateProcessA(
+                nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                executable.parent_path().string().c_str(), &startup, &info)) {
+            return false;
+        }
+        process_.reset(info.hProcess);
+        thread_.reset(info.hThread);
+        pid_ = info.dwProcessId;
+        WaitForInputIdle(process_.get(), 5000);
+
+        for (int attempt = 0; attempt < 50 && !hwnd_; ++attempt) {
+            EnumWindows([](HWND hwnd, LPARAM parameter) -> BOOL {
+                auto* self =
+                    reinterpret_cast<PluginTargetProcess*>(parameter);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(hwnd, &owner);
+                if (owner == self->pid_ && IsWindowVisible(hwnd)) {
+                    self->hwnd_ = hwnd;
+                    return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(this));
+            if (!hwnd_)
+                Sleep(100);
+        }
+        return hwnd_ != nullptr;
+    }
+
+    void stop() {
+        if (process_) {
+            TerminateProcess(process_.get(), 0);
+            WaitForSingleObject(process_.get(), 5000);
+            process_.reset();
+        }
+    }
+
+    ~PluginTargetProcess() {
+        stop();
+    }
+
+    HWND hwnd() const { return hwnd_; }
+
+    std::string hwnd_arg() const {
+        char text[64]{};
+        snprintf(text, sizeof(text), "--hwnd 0x%llX",
+                 static_cast<unsigned long long>(
+                     reinterpret_cast<uintptr_t>(hwnd_)));
+        return text;
+    }
+
+private:
+    wil::unique_process_handle process_;
+    wil::unique_handle thread_;
+    DWORD pid_ = 0;
+    HWND hwnd_ = nullptr;
+};
+
+static fs::path plugin_stats_path(const std::string& testName) {
+    return fs::path(get_lvt_path()).parent_path() /
+           ("fake-plugin-" + testName + "-" +
+            std::to_string(GetCurrentProcessId()) + ".log");
+}
+
+static std::vector<std::string> read_plugin_stats(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        lines.push_back(std::move(line));
+    }
+    return lines;
+}
+
+static size_t count_plugin_stats(
+    const std::vector<std::string>& lines, const std::string& prefix) {
+    return static_cast<size_t>(std::count_if(
+        lines.begin(), lines.end(), [&prefix](const std::string& line) {
+            return line.rfind(prefix, 0) == 0;
+        }));
+}
+
+struct WatchPluginResult {
+    std::string output;
+    std::vector<std::string> stats;
+    DWORD exitCode = STILL_ACTIVE;
+};
+
+static WatchPluginResult run_plugin_watch(
+    PluginTargetProcess& target, const fs::path& pluginDir,
+    const fs::path& statsPath, const std::string& option,
+    const std::string& failOpenAt, const std::string& failGetAt,
+    size_t desiredRefreshes) {
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    SECURITY_ATTRIBUTES attributes{sizeof(attributes), nullptr, TRUE};
+    wil::unique_handle readEnd;
+    wil::unique_handle writeEnd;
+    if (!CreatePipe(readEnd.put(), writeEnd.put(), &attributes, 0))
+        return {};
+    SetHandleInformation(readEnd.get(), HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = writeEnd.get();
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION info{};
+    std::string command =
+        make_cmd(
+            get_lvt_path(),
+            target.hwnd_arg() + " --title \"" + option +
+                "\" watch --interval 50");
+    {
+        ScopedEnvironmentVariable pluginPath(
+            "LVT_PLUGIN_DIR", pluginDir.string());
+        ScopedEnvironmentVariable enabled("LVT_FAKE_PLUGIN_ENABLE", "1");
+        ScopedEnvironmentVariable state(
+            "LVT_FAKE_PLUGIN_STATE", statsPath.string());
+        ScopedEnvironmentVariable fail(
+            "LVT_FAKE_PLUGIN_FAIL_GET_AT", failGetAt);
+        ScopedEnvironmentVariable failOpen(
+            "LVT_FAKE_PLUGIN_FAIL_OPEN_AT", failOpenAt);
+        ScopedEnvironmentVariable events(
+            "LVT_FAKE_PLUGIN_EMIT_EVENTS", "1");
+        ScopedEnvironmentVariable delay(
+            "LVT_FAKE_PLUGIN_GET_DELAY_MS", "0");
+        if (!CreateProcessA(
+                nullptr, command.data(), nullptr, nullptr, TRUE,
+                CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info)) {
+            return {};
+        }
+    }
+    wil::unique_process_handle process(info.hProcess);
+    wil::unique_handle thread(info.hThread);
+    writeEnd.reset();
+
+    WatchPluginResult result;
+    const auto deadline = GetTickCount64() + 15000;
+    while (GetTickCount64() < deadline) {
+        DWORD available = 0;
+        if (PeekNamedPipe(
+                readEnd.get(), nullptr, 0, nullptr, &available, nullptr) &&
+            available > 0) {
+            std::string chunk(available, '\0');
+            DWORD read = 0;
+            if (ReadFile(
+                    readEnd.get(), chunk.data(), available, &read, nullptr)) {
+                result.output.append(chunk, 0, read);
+            }
+        }
+        const auto stats = read_plugin_stats(statsPath);
+        const size_t refreshes =
+            count_plugin_stats(stats, "get ") +
+            count_plugin_stats(stats, "enrich ");
+        if (refreshes >= desiredRefreshes)
+            break;
+        if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0)
+            break;
+        Sleep(25);
+    }
+
+    target.stop();
+    if (WaitForSingleObject(process.get(), 10000) == WAIT_TIMEOUT)
+        TerminateProcess(process.get(), 1);
+    WaitForSingleObject(process.get(), 5000);
+    GetExitCodeProcess(process.get(), &result.exitCode);
+
+    for (;;) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(
+                readEnd.get(), nullptr, 0, nullptr, &available, nullptr) ||
+            available == 0) {
+            break;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!ReadFile(
+                readEnd.get(), chunk.data(), available, &read, nullptr) ||
+            read == 0) {
+            break;
+        }
+        result.output.append(chunk, 0, read);
+    }
+    result.stats = read_plugin_stats(statsPath);
+    fs::remove(statsPath, ec);
+    return result;
+}
+
+TEST(PluginPersistentWatch, ReusesPollsReconnectsAndClosesExactlyOnce) {
+    PluginTargetProcess target;
+    ASSERT_TRUE(target.start());
+    const auto statsPath = plugin_stats_path("watch-v2");
+    const auto result = run_plugin_watch(
+        target, LVT_FAKE_PLUGIN_V2_DIR, statsPath, "watch-filter",
+        "1", "2", 5);
+
+    EXPECT_EQ(result.exitCode, 0u);
+    EXPECT_NE(result.output.find("FakePluginNode"), std::string::npos);
+    EXPECT_EQ(count_plugin_stats(result.stats, "open "), 3u);
+    EXPECT_EQ(count_plugin_stats(result.stats, "open_failed "), 1u);
+    EXPECT_EQ(count_plugin_stats(result.stats, "close"), 2u);
+    EXPECT_EQ(count_plugin_stats(result.stats, "enrich "), 0u);
+
+    const auto gets = count_plugin_stats(result.stats, "get ");
+    const auto failed = count_plugin_stats(result.stats, "get_failed ");
+    const auto frees = count_plugin_stats(result.stats, "free");
+    EXPECT_GE(gets, 5u);
+    EXPECT_EQ(failed, 1u);
+    EXPECT_EQ(frees, gets - failed);
+
+    const auto polls = count_plugin_stats(result.stats, "poll");
+    EXPECT_GT(polls, 0u);
+    EXPECT_EQ(
+        count_plugin_stats(result.stats, "events_free"), polls);
+
+    for (const auto& line : result.stats) {
+        if (line.rfind("get ", 0) == 0)
+            EXPECT_NE(line.find("filter=watch-filter"), std::string::npos);
+    }
+}
+
+TEST(PluginPersistentWatch, V1AndPartialV2RemainOneShot) {
+    struct PluginCase {
+        const char* directory;
+        const char* name;
+    };
+    const PluginCase cases[] = {
+        {LVT_FAKE_PLUGIN_V1_DIR, "v1"},
+        {LVT_FAKE_PLUGIN_PARTIAL_DIR, "partial"},
+    };
+
+    for (const auto& pluginCase : cases) {
+        SCOPED_TRACE(pluginCase.name);
+        PluginTargetProcess target;
+        ASSERT_TRUE(target.start());
+        const auto statsPath =
+            plugin_stats_path(std::string("watch-") + pluginCase.name);
+        const auto result = run_plugin_watch(
+            target, pluginCase.directory, statsPath, "legacy-filter",
+            "0", "0", 3);
+
+        EXPECT_EQ(result.exitCode, 0u);
+        EXPECT_NE(result.output.find("FakePluginNode"), std::string::npos);
+        const auto enriches =
+            count_plugin_stats(result.stats, "enrich ");
+        EXPECT_GE(enriches, 3u);
+        EXPECT_EQ(count_plugin_stats(result.stats, "free"), enriches);
+        EXPECT_EQ(count_plugin_stats(result.stats, "open "), 0u);
+        EXPECT_EQ(count_plugin_stats(result.stats, "get "), 0u);
+        EXPECT_EQ(count_plugin_stats(result.stats, "poll"), 0u);
+        EXPECT_EQ(count_plugin_stats(result.stats, "close"), 0u);
+        for (const auto& line : result.stats) {
+            if (line.rfind("enrich ", 0) == 0)
+                EXPECT_NE(
+                    line.find("filter=legacy-filter"), std::string::npos);
+        }
+    }
+}
+
 // Launch a dedicated Notepad instance for testing
 class NotepadFixture : public ::testing::Test {
 protected:

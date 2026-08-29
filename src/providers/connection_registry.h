@@ -73,8 +73,9 @@ public:
     static ConnectionRegistry& instance();
 
     // Attempts to establish a NEW connection for (hwnd, pid). Returning
-    // nullptr means "could not connect"; the caller falls back to whatever
-    // one-shot path it used before this registry existed.
+    // nullptr means "could not connect". Long-running owners retain/retry a
+    // missing slot; providers that never support persistence keep using their
+    // one-shot path without entering the registry.
     using Factory = std::function<std::shared_ptr<IFrameworkConnection>(HWND hwnd, DWORD pid)>;
 
     // Returns the existing live connection for (pid, frameworkLabel) if one

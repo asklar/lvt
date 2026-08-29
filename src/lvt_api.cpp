@@ -7,6 +7,7 @@
 #include "input.h"
 #include "json_serializer.h"
 #include "lvt_config.h"
+#include "plugin_loader.h"
 #include "screenshot.h"
 #include "target.h"
 #include "tree_builder.h"
@@ -115,6 +116,10 @@ struct Session {
     DWORD pid = 0;
     std::string processName;
     lvt::Architecture architecture = lvt::Architecture::unknown;
+    // Provider-specific selector used by plugins (for example Chromium's
+    // tab title/URL filter). It is passed on every persistent get_tree call
+    // exactly as it is on the one-shot CLI path.
+    std::string pluginOption;
     // Which tree this session speaks, and therefore how it acts. UI Automation
     // knows what a control *is*, so it drives through patterns; the visual tree
     // knows where things *are*, so it drives through synthetic input. Keeping
@@ -152,7 +157,8 @@ struct TreeSnapshot {
 std::mutex g_treeSnapshotsMutex;
 std::map<TreeSnapshotKey, TreeSnapshot> g_treeSnapshots;
 
-std::string add_session(const lvt::TargetInfo& target, bool visualMode) {
+std::string add_session(const lvt::TargetInfo& target, bool visualMode,
+                        std::string pluginOption = {}) {
     Session session;
     session.id = "s" + std::to_string(g_nextSession.fetch_add(1));
     session.hwnd = target.hwnd;
@@ -160,6 +166,7 @@ std::string add_session(const lvt::TargetInfo& target, bool visualMode) {
     session.processName = target.processName;
     session.architecture = target.architecture;
     session.visualMode = visualMode;
+    session.pluginOption = std::move(pluginOption);
 
     std::lock_guard<std::mutex> lock(g_sessionsMutex);
     g_sessions[session.id] = session;
@@ -217,6 +224,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
     bool hasWpf = false, hasWinForms = false;
     bool hasComCtl = false;
     std::string comCtlVersion;
+    std::vector<lvt::PluginFrameworkInfo> persistentPlugins;
     for (auto& fi : frameworks) {
         if (fi.type == lvt::Framework::Xaml) hasXaml = true;
         if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
@@ -225,6 +233,13 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         if (fi.type == lvt::Framework::ComCtl) {
             hasComCtl = true;
             comCtlVersion = fi.version;
+        }
+        if (fi.type == lvt::Framework::Plugin) {
+            auto plugin = lvt::find_plugin_framework(fi.name, fi.version);
+            if (plugin.plugin &&
+                lvt::plugin_supports_persistent_connections(*plugin.plugin)) {
+                persistentPlugins.push_back(std::move(plugin));
+            }
         }
     }
 
@@ -252,7 +267,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         }
     }
 
-    const auto has_label = [&entry](const char* label) {
+    const auto has_label = [&entry](const std::string& label) {
         for (const auto& [existingLabel, handle] : entry) {
             if (existingLabel == label && handle)
                 return true;
@@ -266,8 +281,13 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
     const bool needWinForms = hasWinForms && !has_label("winforms");
     const bool needWin32 = !has_label("win32");
     const bool needComCtl = hasComCtl && !has_label("comctl");
+    std::vector<lvt::PluginFrameworkInfo> neededPlugins;
+    for (const auto& plugin : persistentPlugins) {
+        if (!has_label(lvt::plugin_connection_label(plugin, session.hwnd)))
+            neededPlugins.push_back(plugin);
+    }
     if (needWin32 || needComCtl || needXaml || needWinUI3 ||
-        needWpf || needWinForms) {
+        needWpf || needWinForms || !neededPlugins.empty()) {
         if (needWin32) {
             const auto registryKey =
                 native_connection_registry_key(
@@ -358,6 +378,18 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
                 entry.emplace_back("winforms", std::move(handle));
         }
 #endif
+        for (const auto& plugin : neededPlugins) {
+            const auto label =
+                lvt::plugin_connection_label(plugin, session.hwnd);
+            auto handle = lvt::ConnectionRegistry::instance().acquire(
+                session.pid, session.hwnd, label,
+                [plugin](HWND hwnd, DWORD pid)
+                    -> std::shared_ptr<lvt::IFrameworkConnection> {
+                    return lvt::open_plugin_connection(plugin, hwnd, pid);
+                });
+            if (handle)
+                entry.emplace_back(label, std::move(handle));
+        }
     }
 
     // Do not return raw pointers into g_sessionConnections. `disconnect`
@@ -401,6 +433,34 @@ void publish_native_property_targets(
     }
     for (const auto& connection : connections)
         connection->publish_targets(root);
+}
+
+void drain_session_connection_events(const std::string& sessionId) {
+    std::vector<std::pair<std::string, std::shared_ptr<lvt::IFrameworkConnection>>>
+        connections;
+    {
+        std::lock_guard<std::mutex> lock(g_connectionsMutex);
+        const auto found = g_sessionConnections.find(sessionId);
+        if (found == g_sessionConnections.end())
+            return;
+        connections.reserve(found->second.size());
+        for (const auto& [label, handle] : found->second) {
+            if (handle)
+                connections.emplace_back(label, handle.shared());
+        }
+    }
+
+    for (const auto& [label, connection] : connections) {
+        if (!connection->is_alive())
+            continue;
+        const auto events = connection->poll_events();
+        if (lvt::g_debug && !events.empty()) {
+            fprintf(
+                stderr,
+                "lvt: MCP %s connection reported %zu pushed change event(s)\n",
+                label.c_str(), events.size());
+        }
+    }
 }
 
 #ifdef LVT_ENABLE_UIA
@@ -922,9 +982,12 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
     for (int attempt = 0; attempt < 3; ++attempt) {
         auto connectionLookup = connection_lookup_for_session(session, frameworks);
         tree = lvt::build_tree(
-            session.hwnd, session.pid, frameworks, -1, {}, fastProperties, connectionLookup);
-        if (!missing_injected_framework_content(tree))
+            session.hwnd, session.pid, frameworks, -1,
+            session.pluginOption, fastProperties, connectionLookup);
+        if (!missing_injected_framework_content(tree)) {
+            drain_session_connection_events(session.id);
             return true;
+        }
 
         // A failed persistent refresh still yields a valid Win32 host
         // skeleton. Treating that as the new truth makes diff consumers
@@ -1069,7 +1132,10 @@ json method_connect(const json& params) {
         }
     }
 
-    const auto id = add_session(target, visualMode);
+    const bool hasNonTitleTarget =
+        !hwndText.empty() || pid != 0 || !name.empty();
+    const auto id = add_session(
+        target, visualMode, hasNonTitleTarget ? title : std::string());
     char hwndText2[32];
     snprintf(hwndText2, sizeof(hwndText2), "0x%p", static_cast<void*>(target.hwnd));
 

@@ -893,6 +893,36 @@ if(LVT_BUILD_TESTS)
 enable_testing()
 find_package(GTest CONFIG REQUIRED)
 
+# Deterministic plugin ABI fixtures. Each variant has its own directory but
+# the same file name so LVT_PLUGIN_DIR can select exactly one contract:
+# complete v2, legacy v1, or deliberately incomplete v2.
+function(lvt_add_fake_plugin target output_dir plugin_name api_version)
+    add_library(${target} SHARED tests/plugins/fake_plugin.cpp)
+    target_include_directories(${target} PRIVATE src)
+    target_compile_definitions(${target} PRIVATE
+        WIN32_LEAN_AND_MEAN NOMINMAX
+        "LVT_FAKE_PLUGIN_NAME=\"${plugin_name}\""
+        "LVT_FAKE_PLUGIN_API_VERSION=${api_version}"
+        ${ARGN}
+    )
+    set_target_properties(${target} PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "lvt_fake_plugin"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-plugins/${output_dir}"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-plugins/${output_dir}"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-plugins/${output_dir}"
+    )
+endfunction()
+
+lvt_add_fake_plugin(
+    lvt_fake_plugin_v2 persistent fake-persistent 2
+    LVT_FAKE_PLUGIN_PERSISTENT)
+lvt_add_fake_plugin(
+    lvt_fake_plugin_v1 legacy fake-v1 1)
+lvt_add_fake_plugin(
+    lvt_fake_plugin_partial partial fake-partial 2
+    LVT_FAKE_PLUGIN_PARTIAL)
+
 # Unit tests — pure logic, no live HWND needed
 add_executable(lvt_unit_tests
     tests/unit_tests.cpp
@@ -1089,6 +1119,9 @@ target_compile_definitions(lvt_integration_tests PRIVATE
     WINFORMS_NET48_SAMPLE_EXE_PATH="${WINFORMS_NET48_SAMPLE_EXE_ESCAPED}"
     "NATIVE_CONTROLS_FIXTURE_EXE_PATH=\"$<TARGET_FILE:lvt_native_controls_fixture>\""
     "MANAGED_PIPE_SPOOF_EXE_PATH=\"$<TARGET_FILE:lvt_managed_pipe_spoof>\""
+    "LVT_FAKE_PLUGIN_V2_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v2>\""
+    "LVT_FAKE_PLUGIN_V1_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v1>\""
+    "LVT_FAKE_PLUGIN_PARTIAL_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_partial>\""
     # Lets tests assert on repository files, e.g. that the packaged skill has
     # not drifted from the one this repo's own agent reads.
     "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
@@ -1109,6 +1142,9 @@ set(LVT_INTEGRATION_DEPS
     lvt_managed_pipe_spoof
     winforms_net6_sample_app
     winforms_net48_sample_app
+    lvt_fake_plugin_v2
+    lvt_fake_plugin_v1
+    lvt_fake_plugin_partial
 )
 if(LVT_BUILD_TOOL)
     list(APPEND LVT_INTEGRATION_DEPS lvt)
@@ -1141,13 +1177,18 @@ if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
         WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
         WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
         "NATIVE_CONTROLS_FIXTURE_EXE_PATH=\"$<TARGET_FILE:lvt_native_controls_fixture>\""
+        "LVT_FAKE_PLUGIN_V2_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v2>\""
+        "LVT_FAKE_PLUGIN_V1_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v1>\""
+        "LVT_FAKE_PLUGIN_PARTIAL_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_partial>\""
     )
     target_link_libraries(lvt_mcp_tests PRIVATE
         GTest::gtest GTest::gtest_main
         WIL::WIL
         nlohmann_json::nlohmann_json
     )
-    add_dependencies(lvt_mcp_tests lvt lvt_native_controls_fixture)
+    add_dependencies(
+        lvt_mcp_tests lvt lvt_native_controls_fixture
+        lvt_fake_plugin_v2 lvt_fake_plugin_v1 lvt_fake_plugin_partial)
     if(TARGET lvt_tap)
         add_dependencies(lvt_mcp_tests lvt_tap)
     endif()

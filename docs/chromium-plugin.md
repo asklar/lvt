@@ -202,14 +202,11 @@ lvt --name chrome
 - WebView2 support (Chrome embedded in Win32 apps)
 - Lazy loading for very large DOM trees
 - Chrome Web Store / Edge Add-ons publication
-- Persistent connections: `src/plugin.h`'s plugin ABI (v2) enables this path
-  only when `lvt_connection_open`, `lvt_connection_get_tree`,
-  `lvt_connection_close`, and the existing `lvt_plugin_free` are all
-  implemented. The optional `lvt_connection_poll_events`/
-  `lvt_connection_events_free` pair adds event draining. These let `watch` and MCP
-  sessions reuse one connection across many refreshes instead of
-  re-establishing the extension/native-messaging channel every time — see
-  that header and `docs/tap-dll-design.md`'s connection lifecycle for the
-  pattern the built-in XAML/WinUI3 providers already follow. This plugin
-  does not implement them yet; it still uses the one-shot `lvt_enrich_tree`
-  path, which continues to work unchanged either way.
+- Implement the plugin ABI v2 persistent lifetime group. Core already
+  acquires a complete `lvt_connection_open`/`lvt_connection_get_tree`/
+  `lvt_connection_close` implementation (plus `lvt_plugin_free`) once per
+  watch or MCP session, forwards the tab selector on every refresh,
+  reconnects dead handles, and drains the optional
+  `lvt_connection_poll_events`/`lvt_connection_events_free` pair. Chromium
+  currently exports only the v1 one-shot path, so existing behavior remains
+  unchanged until it adopts v2.

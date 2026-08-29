@@ -17,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,6 +41,56 @@ std::string read_text_file(const std::string& path) {
     if (!file)
         return {};
     return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(const char* name, const std::string& value)
+        : name_(name) {
+        const DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
+        if (needed > 0) {
+            previous_.resize(needed - 1);
+            GetEnvironmentVariableA(name, previous_.data(), needed);
+            hadPrevious_ = true;
+        }
+        SetEnvironmentVariableA(name, value.c_str());
+    }
+
+    ~ScopedEnvironmentVariable() {
+        SetEnvironmentVariableA(
+            name_.c_str(), hadPrevious_ ? previous_.c_str() : nullptr);
+    }
+
+private:
+    std::string name_;
+    std::string previous_;
+    bool hadPrevious_ = false;
+};
+
+fs::path plugin_stats_path(const std::string& testName) {
+    return fs::path(get_lvt_path()).parent_path() /
+           ("fake-plugin-mcp-" + testName + "-" +
+            std::to_string(GetCurrentProcessId()) + ".log");
+}
+
+std::vector<std::string> read_plugin_stats(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        lines.push_back(std::move(line));
+    }
+    return lines;
+}
+
+size_t count_plugin_stats(
+    const std::vector<std::string>& lines, const std::string& prefix) {
+    return static_cast<size_t>(std::count_if(
+        lines.begin(), lines.end(), [&prefix](const std::string& line) {
+            return line.rfind(prefix, 0) == 0;
+        }));
 }
 
 int count_tap_log_lines(const char* text, DWORD pid) {
@@ -536,6 +587,245 @@ private:
     DWORD pid_ = 0;
     HWND hwnd_ = nullptr;
 };
+
+const json* find_fake_plugin_node(const json& root) {
+    std::vector<const json*> elements;
+    collect_json_elements(root, elements);
+    for (const auto* element : elements) {
+        if (element->value("type", "") == "FakePluginNode")
+            return element;
+    }
+    return nullptr;
+}
+
+std::unique_ptr<McpClient> start_plugin_mcp(
+    const fs::path& pluginDirectory, const fs::path& statsPath,
+    const std::string& failOpenAt, const std::string& failGetAt,
+    const std::string& delayMs, const std::string& emitEvents) {
+    ScopedEnvironmentVariable pluginPath(
+        "LVT_PLUGIN_DIR", pluginDirectory.string());
+    ScopedEnvironmentVariable enabled("LVT_FAKE_PLUGIN_ENABLE", "1");
+    ScopedEnvironmentVariable state(
+        "LVT_FAKE_PLUGIN_STATE", statsPath.string());
+    ScopedEnvironmentVariable fail(
+        "LVT_FAKE_PLUGIN_FAIL_GET_AT", failGetAt);
+    ScopedEnvironmentVariable failOpen(
+        "LVT_FAKE_PLUGIN_FAIL_OPEN_AT", failOpenAt);
+    ScopedEnvironmentVariable delay(
+        "LVT_FAKE_PLUGIN_GET_DELAY_MS", delayMs);
+    ScopedEnvironmentVariable events(
+        "LVT_FAKE_PLUGIN_EMIT_EVENTS", emitEvents);
+    return std::make_unique<McpClient>(false);
+}
+
+TEST(McpPluginPersistent, ReusesPollsReconnectsAndDisconnectsConcurrently) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path("persistent");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_V2_DIR, statsPath, "1", "3", "250", "1");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+
+    auto connected = client->call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"title", "mcp-filter"},
+             {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    auto first =
+        client->call_tool("get_visual_tree", json{{"session", session}});
+    auto second =
+        client->call_tool("get_visual_tree", json{{"session", session}});
+    auto reconnected =
+        client->call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(first.contains("root")) << first.dump(2);
+    ASSERT_TRUE(second.contains("root")) << second.dump(2);
+    ASSERT_TRUE(reconnected.contains("root")) << reconnected.dump(2);
+    for (const auto* tree : {&first, &second, &reconnected}) {
+        const auto* node = find_fake_plugin_node((*tree)["root"]);
+        ASSERT_NE(node, nullptr);
+        EXPECT_EQ(
+            node->value("properties", json::object()).value("source", ""),
+            "persistent");
+        EXPECT_EQ(
+            node->value("properties", json::object()).value("filter", ""),
+            "mcp-filter");
+    }
+
+    const int readId = client->send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    const auto readStartedDeadline = GetTickCount64() + 5000;
+    while (GetTickCount64() < readStartedDeadline) {
+        if (count_plugin_stats(read_plugin_stats(statsPath), "get ") >= 5)
+            break;
+        Sleep(10);
+    }
+    ASSERT_GE(
+        count_plugin_stats(read_plugin_stats(statsPath), "get "), 5u);
+    const int disconnectId = client->send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+
+    const auto readResponse = client->await_response(readId);
+    const auto disconnectResponse = client->await_response(disconnectId);
+    ASSERT_TRUE(readResponse.contains("result")) << readResponse.dump(2);
+    ASSERT_TRUE(disconnectResponse.contains("result"))
+        << disconnectResponse.dump(2);
+    EXPECT_FALSE(readResponse["result"].value("isError", false));
+    EXPECT_FALSE(disconnectResponse["result"].value("isError", false));
+
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 3u);
+    EXPECT_EQ(count_plugin_stats(stats, "open_failed "), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "enrich "), 0u);
+    const auto gets = count_plugin_stats(stats, "get ");
+    const auto failures = count_plugin_stats(stats, "get_failed ");
+    EXPECT_EQ(gets, 5u);
+    EXPECT_EQ(failures, 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "free"), gets - failures);
+    EXPECT_EQ(count_plugin_stats(stats, "poll"), gets - failures);
+    EXPECT_EQ(
+        count_plugin_stats(stats, "events_free"), gets - failures);
+    for (const auto& line : stats) {
+        if (line.rfind("get ", 0) == 0)
+            EXPECT_NE(line.find("filter=mcp-filter"), std::string::npos);
+    }
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+TEST(McpPluginPersistent, SharesRegistryConnectionAcrossSessions) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path("shared");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_V2_DIR, statsPath, "0", "0", "0", "0");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+
+    const auto connect = [&](const char* filter) {
+        const auto result = client->call_tool(
+            "connect",
+            json{{"hwnd", sample.hwnd_string()},
+                 {"title", filter},
+                 {"mode", "visual"}});
+        return result.value("session", "");
+    };
+    const std::string firstSession = connect("first-filter");
+    const std::string secondSession = connect("second-filter");
+    ASSERT_FALSE(firstSession.empty());
+    ASSERT_FALSE(secondSession.empty());
+
+    const auto readAndCheck =
+        [&](const std::string& session, const char* expectedFilter) {
+            const auto tree = client->call_tool(
+                "get_visual_tree", json{{"session", session}});
+            ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+            const auto* node = find_fake_plugin_node(tree["root"]);
+            ASSERT_NE(node, nullptr);
+            EXPECT_EQ(
+                node->value("properties", json::object()).value("filter", ""),
+                expectedFilter);
+        };
+    readAndCheck(firstSession, "first-filter");
+    readAndCheck(secondSession, "second-filter");
+    EXPECT_EQ(
+        count_plugin_stats(read_plugin_stats(statsPath), "open "), 1u);
+
+    bool isError = false;
+    client->call_tool(
+        "disconnect", json{{"session", firstSession}}, &isError);
+    ASSERT_FALSE(isError);
+    EXPECT_EQ(
+        count_plugin_stats(read_plugin_stats(statsPath), "close"), 0u);
+
+    readAndCheck(secondSession, "second-filter");
+    client->call_tool(
+        "disconnect", json{{"session", secondSession}}, &isError);
+    ASSERT_FALSE(isError);
+
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "get "), 3u);
+    EXPECT_EQ(count_plugin_stats(stats, "free"), 3u);
+    EXPECT_EQ(count_plugin_stats(stats, "poll"), 3u);
+    EXPECT_EQ(count_plugin_stats(stats, "events_free"), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 1u);
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+void verify_legacy_plugin_mcp_fallback(
+    const fs::path& pluginDirectory, const std::string& variant) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path(variant);
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client =
+        start_plugin_mcp(pluginDirectory, statsPath, "0", "0", "0", "0");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+    const auto connected = client->call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"title", "legacy-filter"},
+             {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto tree = client->call_tool(
+            "get_visual_tree", json{{"session", session}});
+        ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+        const auto* node = find_fake_plugin_node(tree["root"]);
+        ASSERT_NE(node, nullptr);
+        EXPECT_EQ(
+            node->value("properties", json::object()).value("source", ""),
+            "one-shot");
+        EXPECT_EQ(
+            node->value("properties", json::object()).value("filter", ""),
+            "legacy-filter");
+    }
+
+    bool isError = false;
+    client->call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    EXPECT_FALSE(isError);
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "enrich "), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "free"), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "get "), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "poll"), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 0u);
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+TEST(McpPluginPersistent, V1AndPartialV2RemainOneShot) {
+    verify_legacy_plugin_mcp_fallback(
+        LVT_FAKE_PLUGIN_V1_DIR, "legacy");
+    verify_legacy_plugin_mcp_fallback(
+        LVT_FAKE_PLUGIN_PARTIAL_DIR, "partial");
+}
 
 class ManagedSampleUiBlock {
 public:

@@ -5,8 +5,11 @@
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <cmath>
 #include <functional>
+#include <mutex>
+#include <sstream>
 #include <set>
 #include <utility>
 #include <userenv.h>
@@ -19,6 +22,37 @@ using json = nlohmann::json;
 namespace lvt {
 
 static std::vector<LoadedPlugin> s_plugins;
+
+bool plugin_supports_persistent_connections(const LoadedPlugin& plugin) {
+    return plugin.connection_open && plugin.connection_get_tree &&
+           plugin.connection_close && plugin.free_fn;
+}
+
+bool plugin_supports_event_polling(const LoadedPlugin& plugin) {
+    return plugin.connection_poll_events && plugin.connection_events_free;
+}
+
+PluginFrameworkInfo find_plugin_framework(
+    const std::string& name, const std::string& version) {
+    for (const auto& plugin : s_plugins) {
+        if (plugin.info && plugin.info->name && name == plugin.info->name)
+            return {name, version, &plugin};
+    }
+    return {};
+}
+
+std::string plugin_connection_label(
+    const PluginFrameworkInfo& pluginFw, HWND hwnd) {
+    const auto pluginInstance =
+        pluginFw.plugin && pluginFw.plugin->module
+            ? reinterpret_cast<uintptr_t>(pluginFw.plugin->module.get())
+            : reinterpret_cast<uintptr_t>(pluginFw.plugin);
+    std::ostringstream label;
+    label << "plugin:0x" << std::hex << pluginInstance
+          << ":hwnd:0x" << reinterpret_cast<uintptr_t>(hwnd)
+          << ":" << pluginFw.name;
+    return label.str();
+}
 
 // Directories searched for plugins, in priority order:
 //   1. $LVT_PLUGIN_DIR
@@ -112,8 +146,7 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
         // export them, GetProcAddress returns nullptr, and every consumer
         // of LoadedPlugin already treats a null function pointer as "this
         // plugin doesn't support that" (open_plugin_connection below
-        // requires connection_open specifically to be non-null before
-        // trying to use any of the rest).
+        // requires the complete lifetime group before using any of it).
         lp.connection_open = reinterpret_cast<LvtConnectionOpenFn>(
             GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_OPEN_FUNC));
         lp.connection_get_tree = reinterpret_cast<LvtConnectionGetTreeFn>(
@@ -126,8 +159,7 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
             GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_CLOSE_FUNC));
 
         const bool supportsPersistentConnections =
-            lp.connection_open && lp.connection_get_tree &&
-            lp.connection_close && lp.free_fn;
+            plugin_supports_persistent_connections(lp);
         if (g_debug)
             fprintf(stderr, "lvt: loaded plugin '%s' (%s)%s\n",
                     info->name ? info->name : "?",
@@ -337,7 +369,8 @@ public:
         // LvtConnectionGetTreeFn. Accepting and ignoring the parameter here
         // (rather than omitting it) keeps this a drop-in IFrameworkConnection,
         // consistent with XamlDiagConnection's signature.
-        if (!m_handle || !m_plugin->connection_get_tree)
+        std::lock_guard<std::mutex> lock(m_operationMutex);
+        if (!m_handle || !m_plugin->connection_get_tree || !m_alive)
             return false;
 
         char* jsonOut = nullptr;
@@ -345,6 +378,8 @@ public:
         int ok = m_plugin->connection_get_tree(m_handle, filter, &jsonOut);
         if (!ok || !jsonOut) {
             m_alive = false;
+            if (jsonOut)
+                m_plugin->free_fn(jsonOut);
             return false;
         }
 
@@ -353,10 +388,11 @@ public:
             treeJson = json::parse(jsonOut);
         } catch (const json::parse_error& e) {
             fprintf(stderr, "lvt: failed to parse plugin connection JSON: %s\n", e.what());
-            if (m_plugin->free_fn) m_plugin->free_fn(jsonOut);
+            m_plugin->free_fn(jsonOut);
+            m_alive = false;
             return false;
         }
-        if (m_plugin->free_fn) m_plugin->free_fn(jsonOut);
+        m_plugin->free_fn(jsonOut);
 
         graft_plugin_tree_json(treeJson, root, m_frameworkName);
         return true;
@@ -364,14 +400,28 @@ public:
 
     std::vector<ConnectionEvent> poll_events() override {
         std::vector<ConnectionEvent> result;
-        if (!m_handle || !m_plugin->connection_poll_events ||
-            !m_plugin->connection_events_free)
+        std::lock_guard<std::mutex> lock(m_operationMutex);
+        if (!m_handle || !m_alive ||
+            !plugin_supports_event_polling(*m_plugin))
             return result;
 
         LvtConnectionEvent* events = nullptr;
         uint32_t count = 0;
-        if (!m_plugin->connection_poll_events(m_handle, &events, &count) || !events)
+        if (!m_plugin->connection_poll_events(m_handle, &events, &count)) {
+            if (events)
+                m_plugin->connection_events_free(events, count);
+            m_alive = false;
             return result;
+        }
+        if (count == 0) {
+            if (events)
+                m_plugin->connection_events_free(events, count);
+            return result;
+        }
+        if (!events) {
+            m_alive = false;
+            return result;
+        }
 
         result.reserve(count);
         for (uint32_t i = 0; i < count; i++) {
@@ -386,8 +436,7 @@ public:
             ev.name = events[i].name ? events[i].name : "";
             result.push_back(std::move(ev));
         }
-        if (m_plugin->connection_events_free)
-            m_plugin->connection_events_free(events, count);
+        m_plugin->connection_events_free(events, count);
         return result;
     }
 
@@ -397,16 +446,14 @@ private:
     const LoadedPlugin* m_plugin;
     void* m_handle;
     std::string m_frameworkName;
-    bool m_alive = true;
+    std::mutex m_operationMutex;
+    std::atomic_bool m_alive = true;
 };
 
 std::shared_ptr<IFrameworkConnection> open_plugin_connection(
     const PluginFrameworkInfo& pluginFw, HWND hwnd, DWORD pid) {
     if (!pluginFw.plugin ||
-        !pluginFw.plugin->connection_open ||
-        !pluginFw.plugin->connection_get_tree ||
-        !pluginFw.plugin->connection_close ||
-        !pluginFw.plugin->free_fn)
+        !plugin_supports_persistent_connections(*pluginFw.plugin))
         return nullptr;
 
     void* handle = pluginFw.plugin->connection_open(hwnd, pid);

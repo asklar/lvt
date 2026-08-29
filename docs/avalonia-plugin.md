@@ -103,12 +103,13 @@ $ lvt --name AvaloniaTestApp --format xml --depth 3
 `lvt_connection_close` (plus the existing `lvt_plugin_free`) must all be
 implemented before lvt enables the connection path. The optional
 `lvt_connection_poll_events`/`lvt_connection_events_free` pair adds push
-event draining. These functions let
-`watch` and MCP sessions reuse one connection across many tree refreshes instead of
-re-injecting every time — see that header's "Persistent connections" section and
-`docs/tap-dll-design.md`'s connection lifecycle for the pattern the built-in XAML/WinUI3
-providers already follow. This plugin does not implement them yet; it still uses the
-original one-shot `lvt_enrich_tree` path, which continues to work unchanged either way.
+event draining. Core automatically acquires and reuses a capable plugin in
+`watch` and MCP, forwards the same provider option/filter on every tree
+request, reconnects a dead handle, and closes it when the session ends. It
+does not silently switch a v2-capable session back to repeated one-shot
+injection after a connection failure. This plugin does not implement the
+group yet, so it continues to use `lvt_enrich_tree` on every refresh
+unchanged.
 
 ## Test app
 

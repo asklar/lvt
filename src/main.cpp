@@ -728,13 +728,22 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
 
     auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
     bool hasXaml = false, hasWinUI3 = false, hasWpf = false, hasWinForms = false;
+    std::vector<lvt::PluginFrameworkInfo> persistentPlugins;
     for (auto& fi : frameworks) {
         if (fi.type == lvt::Framework::Xaml) hasXaml = true;
         if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
         if (fi.type == lvt::Framework::Wpf) hasWpf = true;
         if (fi.type == lvt::Framework::WinForms) hasWinForms = true;
+        if (fi.type == lvt::Framework::Plugin) {
+            auto plugin = lvt::find_plugin_framework(fi.name, fi.version);
+            if (plugin.plugin &&
+                lvt::plugin_supports_persistent_connections(*plugin.plugin)) {
+                persistentPlugins.push_back(std::move(plugin));
+            }
+        }
     }
-    if (!hasXaml && !hasWinUI3 && !hasWpf && !hasWinForms)
+    if (!hasXaml && !hasWinUI3 && !hasWpf && !hasWinForms &&
+        persistentPlugins.empty())
         return connections;
 
     // XamlProvider::open_connection only needs the CoreWindow HWND from the
@@ -810,6 +819,19 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
         connections.emplace_back("winforms", std::move(handle));
     }
 #endif
+    for (const auto& plugin : persistentPlugins) {
+        const auto label =
+            lvt::plugin_connection_label(plugin, target.hwnd);
+        auto handle = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, label,
+            [plugin](HWND hwnd, DWORD pid)
+                -> std::shared_ptr<lvt::IFrameworkConnection> {
+                return lvt::open_plugin_connection(plugin, hwnd, pid);
+            });
+        // As with the built-in injectable providers, retain an empty slot
+        // after a transient open failure so the watch loop keeps retrying.
+        connections.emplace_back(label, std::move(handle));
+    }
     return connections;
 }
 
@@ -1251,7 +1273,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         args.hwnd = matches[0].hwnd;
-    } else if (!args.windowTitle.empty()) {
+    } else if (!args.windowTitle.empty() && !args.hwnd && !args.pid) {
         auto matches = lvt::find_by_title(args.windowTitle);
         if (matches.empty()) {
             fprintf(stderr, "lvt: no visible windows found with title containing '%s'\n",

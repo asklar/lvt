@@ -129,6 +129,12 @@ both a stable index and a unique command id. Status parts inspect the returned
 those parts are unavailable/read-only and their flag is never combined with a
 temporary text pointer.
 
+### Persistent plugin connections
+
+Plugin ABI v2 maps its optional `lvt_connection_open` / `lvt_connection_get_tree` / `lvt_connection_close` exports onto the same interface. Core enables that path only when the complete lifetime group and `lvt_plugin_free` are present; event polling is a separate complete pair (`lvt_connection_poll_events` + `lvt_connection_events_free`). Watch and MCP acquire capable plugins in the same registry as built-in providers, but with keys namespaced by loaded plugin instance and target HWND so a plugin cannot collide with `xaml`/`winui3` or share a window-scoped handle with another window in the same process. Provider options such as Chromium's tab selector are forwarded on every persistent `get_tree`.
+
+An explicitly persistent lookup never falls back to one-shot injection when its connection is missing or dies. The refresh is marked incomplete, the old generation is released, and watch/MCP reacquire through `ConnectionRegistry`; generation checks keep stale handles from releasing a replacement. Plugins that expose only ABI v1, or an incomplete v2 group, remain on `lvt_enrich_tree` for every refresh and therefore stay backward-compatible. Both watch and MCP drain the provider-neutral event queue after successful snapshots; a persistent plugin without the optional poll pair still refreshes normally through `get_tree`.
+
 ### Element ID assignment
 
 After the full tree is built, `assign_element_ids()` walks the tree in depth-first order and assigns IDs: `e0`, `e1`, `e2`, …. These IDs are:

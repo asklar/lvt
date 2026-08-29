@@ -84,9 +84,11 @@ typedef int (*LvtDetectFrameworkFn)(DWORD pid, HWND hwnd, LvtFrameworkDetection*
 //
 // This one-shot path always works and is what every v1 plugin implements.
 // A plugin that also implements the v2 functions below still needs this one:
-// it is the fallback lvt core uses whenever no persistent connection is
-// available (a lvt_connection_open failure, or a caller — a one-shot CLI
-// command — that never asked the registry for one at all).
+// it is used by one-shot CLI commands, and remains the watch/MCP fallback for
+// plugins that do not implement the complete persistent lifetime group.
+// Once a long-running caller explicitly selects v2 for a capable plugin, an
+// open/refresh failure is surfaced for reconnection instead of silently
+// reinjecting through this function on every refresh.
 typedef int (*LvtEnrichTreeFn)(HWND hwnd, DWORD pid, const char* element_class_filter, char** json_out);
 
 // Free memory allocated by the plugin (e.g. json_out from LvtEnrichTreeFn).
@@ -122,8 +124,9 @@ struct LvtConnectionEvent {
 
 // Establishes a persistent connection to (hwnd, pid). Returns an opaque,
 // plugin-owned handle, or NULL if unsupported or the connection could not
-// be established. lvt core treats NULL exactly like a v1 plugin that has no
-// lvt_connection_open at all: it falls back to lvt_enrich_tree.
+// be established. One-shot callers continue to use lvt_enrich_tree. Watch
+// and MCP retain a missing connection slot and retry open rather than
+// silently switching a v2-capable plugin to repeated one-shot enrichment.
 typedef void* (*LvtConnectionOpenFn)(HWND hwnd, DWORD pid);
 
 // Re-collects the current tree over `conn` (no re-injection) and yields it

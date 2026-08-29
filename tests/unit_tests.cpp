@@ -1679,6 +1679,191 @@ static PluginFrameworkInfo make_mock_fw(const LoadedPlugin* p) {
     return {"mock", "", p};
 }
 
+namespace {
+
+struct PersistentPluginMockState {
+    int opens = 0;
+    int gets = 0;
+    int polls = 0;
+    int frees = 0;
+    int eventFrees = 0;
+    int closes = 0;
+    int failGetAt = 0;
+    std::string filter;
+};
+
+PersistentPluginMockState s_persistentPlugin;
+
+void* persistent_mock_open(HWND, DWORD) {
+    ++s_persistentPlugin.opens;
+    return &s_persistentPlugin;
+}
+
+int persistent_mock_get_tree(void*, const char* filter, char** jsonOut) {
+    const int call = ++s_persistentPlugin.gets;
+    s_persistentPlugin.filter = filter ? filter : "";
+    if (call == s_persistentPlugin.failGetAt)
+        return 0;
+    *jsonOut = _strdup("[]");
+    return *jsonOut != nullptr;
+}
+
+int persistent_mock_poll(
+    void*, LvtConnectionEvent** eventsOut, uint32_t* countOut) {
+    ++s_persistentPlugin.polls;
+    auto* events = static_cast<LvtConnectionEvent*>(
+        malloc(sizeof(LvtConnectionEvent)));
+    if (!events)
+        return 0;
+    *events = {
+        sizeof(LvtConnectionEvent), "remove", 42, 7, 3, nullptr, nullptr};
+    *eventsOut = events;
+    *countOut = 1;
+    return 1;
+}
+
+void persistent_mock_free(void* pointer) {
+    ++s_persistentPlugin.frees;
+    free(pointer);
+}
+
+void persistent_mock_events_free(
+    LvtConnectionEvent* events, uint32_t) {
+    ++s_persistentPlugin.eventFrees;
+    free(events);
+}
+
+void persistent_mock_close(void*) {
+    ++s_persistentPlugin.closes;
+}
+
+LoadedPlugin make_persistent_mock_plugin() {
+    LoadedPlugin plugin{};
+    plugin.info = &s_mockInfo;
+    plugin.enrich = mock_enrich;
+    plugin.free_fn = persistent_mock_free;
+    plugin.connection_open = persistent_mock_open;
+    plugin.connection_get_tree = persistent_mock_get_tree;
+    plugin.connection_poll_events = persistent_mock_poll;
+    plugin.connection_events_free = persistent_mock_events_free;
+    plugin.connection_close = persistent_mock_close;
+    return plugin;
+}
+
+} // namespace
+
+TEST(PluginConnectionContract, RequiresCompleteLifetimeAndPollingGroups) {
+    auto plugin = make_persistent_mock_plugin();
+    EXPECT_TRUE(plugin_supports_persistent_connections(plugin));
+    EXPECT_TRUE(plugin_supports_event_polling(plugin));
+
+    plugin.connection_close = nullptr;
+    EXPECT_FALSE(plugin_supports_persistent_connections(plugin));
+    plugin.connection_close = persistent_mock_close;
+    plugin.free_fn = nullptr;
+    EXPECT_FALSE(plugin_supports_persistent_connections(plugin));
+
+    plugin = make_persistent_mock_plugin();
+    plugin.connection_events_free = nullptr;
+    EXPECT_FALSE(plugin_supports_event_polling(plugin));
+    EXPECT_TRUE(plugin_supports_persistent_connections(plugin));
+}
+
+TEST(PluginConnectionContract, AdapterReusesTreeOptionPollsAndClosesOnce) {
+    s_persistentPlugin = {};
+    auto plugin = make_persistent_mock_plugin();
+    auto connection =
+        open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+    ASSERT_NE(connection, nullptr);
+    EXPECT_EQ(s_persistentPlugin.opens, 1);
+
+    Element root;
+    EXPECT_TRUE(connection->get_tree(root, false, "title:Dashboard"));
+    EXPECT_TRUE(connection->get_tree(root, true, "url:*example*"));
+    EXPECT_EQ(s_persistentPlugin.gets, 2);
+    EXPECT_EQ(s_persistentPlugin.frees, 2);
+    EXPECT_EQ(s_persistentPlugin.filter, "url:*example*");
+
+    const auto events = connection->poll_events();
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].mutation, ConnectionEvent::Mutation::removed);
+    EXPECT_EQ(events[0].handle, 42u);
+    EXPECT_EQ(events[0].parentHandle, 7u);
+    EXPECT_EQ(events[0].childIndex, 3);
+    EXPECT_EQ(s_persistentPlugin.polls, 1);
+    EXPECT_EQ(s_persistentPlugin.eventFrees, 1);
+
+    connection.reset();
+    EXPECT_EQ(s_persistentPlugin.closes, 1);
+}
+
+TEST(PluginConnectionContract, FailedRefreshMarksConnectionDead) {
+    s_persistentPlugin = {};
+    s_persistentPlugin.failGetAt = 1;
+    auto plugin = make_persistent_mock_plugin();
+    auto connection =
+        open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+    ASSERT_NE(connection, nullptr);
+
+    Element root;
+    EXPECT_FALSE(connection->get_tree(root, false));
+    EXPECT_FALSE(connection->is_alive());
+    connection.reset();
+    EXPECT_EQ(s_persistentPlugin.closes, 1);
+}
+
+TEST(PluginConnectionContract, PersistentPluginWithoutPollStillRefreshes) {
+    s_persistentPlugin = {};
+    auto plugin = make_persistent_mock_plugin();
+    plugin.connection_poll_events = nullptr;
+    plugin.connection_events_free = nullptr;
+    ASSERT_TRUE(plugin_supports_persistent_connections(plugin));
+    ASSERT_FALSE(plugin_supports_event_polling(plugin));
+
+    auto connection =
+        open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+    ASSERT_NE(connection, nullptr);
+    Element root;
+    EXPECT_TRUE(connection->get_tree(root, false));
+    EXPECT_TRUE(connection->get_tree(root, false));
+    EXPECT_TRUE(connection->poll_events().empty());
+    EXPECT_EQ(s_persistentPlugin.gets, 2);
+    EXPECT_EQ(s_persistentPlugin.polls, 0);
+    EXPECT_EQ(s_persistentPlugin.frees, 2);
+    connection.reset();
+    EXPECT_EQ(s_persistentPlugin.closes, 1);
+}
+
+TEST(PluginConnectionContract, V1AndPartialV2StayOneShot) {
+    auto v1 = make_mock_plugin();
+    EXPECT_FALSE(plugin_supports_persistent_connections(v1));
+    EXPECT_EQ(open_plugin_connection(make_mock_fw(&v1), nullptr, 123), nullptr);
+
+    auto partial = make_persistent_mock_plugin();
+    partial.connection_close = nullptr;
+    EXPECT_FALSE(plugin_supports_persistent_connections(partial));
+    EXPECT_EQ(
+        open_plugin_connection(make_mock_fw(&partial), nullptr, 123), nullptr);
+}
+
+TEST(PluginConnectionContract, RegistryLabelsIsolatePluginAndWindowInstances) {
+    auto first = make_persistent_mock_plugin();
+    auto second = make_persistent_mock_plugin();
+    const PluginFrameworkInfo firstFramework{"mock", "", &first};
+    const PluginFrameworkInfo secondFramework{"mock", "", &second};
+    const auto firstLabel = plugin_connection_label(
+        firstFramework, reinterpret_cast<HWND>(0x101));
+    const auto otherPluginLabel = plugin_connection_label(
+        secondFramework, reinterpret_cast<HWND>(0x101));
+    const auto otherWindowLabel = plugin_connection_label(
+        firstFramework, reinterpret_cast<HWND>(0x202));
+
+    EXPECT_EQ(firstLabel.rfind("plugin:", 0), 0u);
+    EXPECT_NE(firstLabel, "xaml");
+    EXPECT_NE(firstLabel, otherPluginLabel);
+    EXPECT_NE(firstLabel, otherWindowLabel);
+}
+
 TEST(PluginGraft, GraftByTargetHwnd) {
     // Build a simple Win32 tree: root -> child (hwnd=0x1234)
     Element root;

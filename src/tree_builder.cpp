@@ -307,26 +307,27 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
             break;
         }
         case Framework::Plugin: {
-            // Look up the plugin by name and enrich
-            for (auto& p : get_plugins()) {
-                if (p.info && p.info->name && fi.name == p.info->name) {
-                    PluginFrameworkInfo pf;
-                    pf.name = fi.name;
-                    pf.version = fi.version;
-                    pf.plugin = &p;
-                    // A plugin's persistent connection (see plugin.h's
-                    // optional v2 functions) is looked up under its own
-                    // detected name, same as "xaml"/"winui3" - a caller
-                    // that acquired one via open_plugin_connection supplies
-                    // it through the same ConnectionLookup mechanism.
-                    auto connection = connectionLookup ? connectionLookup(fi.name) : nullptr;
-                    if (connection && connection->is_alive()) {
-                        connection->get_tree(root, fastProperties, pluginOption);
-                    } else {
-                        enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
-                    }
-                    break;
+            auto pf = find_plugin_framework(fi.name, fi.version);
+            if (!pf.plugin)
+                break;
+
+            const bool persistent =
+                plugin_supports_persistent_connections(*pf.plugin);
+            if (connectionLookup && persistent) {
+                // A long-running caller explicitly chose the persistent
+                // contract. A missing/dead/failed connection is surfaced as
+                // an incomplete refresh so the owner can reacquire it; never
+                // disguise that failure by one-shot reinjecting on this tick.
+                auto* connection =
+                    connectionLookup(plugin_connection_label(pf, hwnd));
+                if (!connection || !connection->is_alive() ||
+                    !connection->get_tree(root, fastProperties, pluginOption)) {
+                    mark_framework_refresh_incomplete(root, fi.name);
                 }
+            } else {
+                // One-shot CLI calls and plugins without the complete v2
+                // lifetime contract retain the v1 enrichment behavior.
+                enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
             }
             break;
         }

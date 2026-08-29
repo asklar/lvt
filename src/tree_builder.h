@@ -13,9 +13,12 @@ namespace lvt {
 // Looks up an already-established, reusable connection for a provider label
 // ("win32", "comctl", "xaml", "winui3", "wpf", "winforms", or a plugin
 // name). Diagnostics providers avoid reinjection; native providers use the
-// connection for typed-property identities and schema caches. Returning
-// nullptr (or leaving the lookup unset) keeps one-shot dump/query/screenshot
-// behavior unchanged.
+// connection for typed-property identities and schema caches. Leaving the
+// callback unset keeps one-shot dump/query/screenshot behavior. Supplying a
+// callback explicitly selects persistent behavior for capable providers: a
+// nullptr result is an incomplete refresh to reacquire, not permission to
+// silently one-shot reinject. Plugins without the complete v2 contract remain
+// one-shot for compatibility.
 //
 // Returns a raw pointer, not a shared_ptr: the callback is only ever used
 // synchronously within one build_tree call, and the caller supplying it
