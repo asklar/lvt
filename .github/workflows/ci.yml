@@ -98,6 +98,62 @@ jobs:
             build/LvtWinFormsTap.runtimeconfig.json
             build/plugins/
 
+  avalonia-x86:
+    name: Avalonia x86 integration
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_x86
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
+
+      - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
+        run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
+
+      - name: Configure x86 debug build
+        run: >
+          cmake --preset x86
+          -DCMAKE_BUILD_TYPE=Debug
+          -DLVT_ENABLE_MCP=OFF
+
+      - name: Build x86 Avalonia and compatibility tests
+        run: >
+          cmake --build build-x86 --target
+          lvt lvt_avalonia_plugin lvt_avalonia_tap
+          lvt_avalonia_tree_walker avalonia_test_app
+          lvt_integration_tests lvt_chromium_tests
+
+      - name: Avalonia x86 integration tests
+        run: >
+          build-x86\lvt_integration_tests.exe
+          --gtest_filter=AvaloniaFixture.*
+          --gtest_output=xml:build-x86\avalonia_x86_test_results.xml
+
+      - name: Chromium x86 compatibility tests
+        run: >
+          build-x86\lvt_chromium_tests.exe
+          --gtest_output=xml:build-x86\chromium_x86_test_results.xml
+
+      - name: Upload x86 test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: avalonia-x86-test-results
+          path: build-x86\*_test_results.xml
+
   # Covers what the vcpkg port does: a build with no .NET SDK involvement, the
   # install/export rules, and a separate project consuming the installed package
   # through find_package(). Also the only place the x86 and arm64 targets are

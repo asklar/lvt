@@ -53,10 +53,11 @@ flowchart BT
     WinUI3["WinUI3Provider\n<small>(inject TAP DLL)</small>"]
     WPF["WpfProvider\n<small>(persistent managed TAP)</small>"]
     WinForms["WinFormsProvider\n<small>(persistent managed TAP)</small>"]
+    Avalonia["Avalonia plugin\n<small>(managed TAP)</small>"]
     Tree["Unified Element Tree"]
 
-    Win32 --> ComCtl & XAML & WinUI3 & WPF & WinForms
-    ComCtl & XAML & WinUI3 & WPF & WinForms --> Tree
+    Win32 --> ComCtl & XAML & WinUI3 & WPF & WinForms & Avalonia
+    ComCtl & XAML & WinUI3 & WPF & WinForms & Avalonia --> Tree
 ```
 
 1. **Win32Provider** builds the base tree by recursively enumerating child windows (`EnumChildWindows`). Each HWND becomes an `Element` with class name, text, bounds, styles.
@@ -66,6 +67,12 @@ flowchart BT
 3. **XamlProvider / WinUI3Provider** inject the TAP DLL into the target process, receive the XAML visual tree as JSON over a persistent named pipe, and graft XAML subtrees into matching `DesktopChildSiteBridge` elements in the Win32 tree.
 
 4. **WpfProvider / WinFormsProvider** inject architecture-matched native CLR hosts once per session. The managed tree walker connects one duplex pipe and serves correlated tree and typed-property commands until `DISCONNECT` or target/pipe failure. WPF dependency-property operations run on `Application.Dispatcher`; WinForms `TypeDescriptor` operations run through the control's owning Form. Managed object IDs are weakly assigned and the per-connection reverse map is rebuilt on every snapshot, so refreshes preserve identity without retaining dead controls. See [Managed TAP connections](managed-tap-connections.md).
+
+5. **Avalonia plugin** injects an architecture-matched native TAP (`x86`,
+   `x64`, or `arm64`) and loads one AnyCPU managed walker through CoreCLR's
+   default component entry point. Its current ABI-v1 path is one-shot: each
+   enrichment unloads the native TAP before a later refresh reconnects.
+   CoreCLR 8 is the supported floor.
 
 ### Reusable connections (`providers/framework_connection.h`, `connection_registry.h`)
 

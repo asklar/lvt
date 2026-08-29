@@ -12,10 +12,8 @@ namespace LvtAvaloniaTreeWalker
 {
     public static class AvaloniaTreeWalker
     {
-        // Delegate type for .NET Core hosting interop
-        public delegate int CollectTreeDelegate(IntPtr pipeNamePtr, int pipeNameLength);
-
-        // Entry point for .NET Core hosting (load_assembly_and_get_function_pointer).
+        // Default component entry point returned by
+        // load_assembly_and_get_function_pointer when delegate_type_name is null.
         public static int CollectTree(IntPtr pipeNamePtr, int pipeNameLength)
         {
             try

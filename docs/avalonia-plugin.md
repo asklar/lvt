@@ -7,7 +7,7 @@ The Avalonia plugin adds visual tree inspection support for [Avalonia UI](https:
 The plugin follows the same DLL injection pattern as the built-in WPF provider:
 
 1. **Detection** — The plugin checks if `Avalonia.Base.dll` is loaded in the target process
-2. **Injection** — A native TAP DLL (`lvt_avalonia_tap_x64.dll`) is injected into the target process via `CreateRemoteThread` + `LoadLibraryW`
+2. **Injection** — The architecture-matched native TAP DLL (`lvt_avalonia_tap_x86.dll`, `lvt_avalonia_tap_x64.dll`, or `lvt_avalonia_tap_arm64.dll`) is injected into the target process via `CreateRemoteThread` + `LoadLibraryW`
 3. **CLR hosting** — The TAP DLL hosts the .NET runtime via `hostfxr` and loads the managed tree walker assembly (`LvtAvaloniaTreeWalker.dll`)
 4. **Tree walking** — The managed code walks the Avalonia visual tree using `Visual.VisualChildren` (via reflection), serializes each element's type, name, bounds, text content, and visibility to JSON
 5. **Communication** — The JSON tree is sent back to lvt over a named pipe
@@ -22,7 +22,7 @@ Copy the plugin files to `%USERPROFILE%\.lvt\plugins\`:
 %USERPROFILE%\.lvt\plugins\
 ├── lvt_avalonia_plugin.dll          # Plugin DLL (loaded by lvt)
 └── avalonia\                        # Subdirectory for TAP + managed DLLs
-    ├── lvt_avalonia_tap_x64.dll     # Native TAP DLL (injected into target)
+    ├── lvt_avalonia_tap_<arch>.dll  # Matching x86, x64, or ARM64 native TAP
     ├── LvtAvaloniaTreeWalker.dll    # Managed tree walker
     └── LvtAvaloniaTreeWalker.runtimeconfig.json
 ```
@@ -38,6 +38,10 @@ dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csp
 # Build native components (from VS Developer Command Prompt)
 cmake --preset default
 cmake --build build
+
+# Or build the x86 binaries from an x86 developer environment
+cmake --preset x86
+cmake --build build-x86
 ```
 
 The build outputs plugin files to `build/plugins/` which can be copied to `%USERPROFILE%\.lvt\plugins\`.
@@ -92,9 +96,14 @@ $ lvt --name AvaloniaTestApp --format xml --depth 3
 
 ## Requirements
 
-- Target Avalonia app must be .NET 6+ (Avalonia 11.x)
-- Target process must match lvt's architecture (x86, x64, or ARM64)
-- The .NET runtime (`hostfxr.dll`) must be installed on the system
+- Target Avalonia app must use CoreCLR 8 or newer (Avalonia 11.x)
+- Target process, `lvt.exe`, plugin DLL, and native TAP must all use the same
+  architecture: x86, x64, or ARM64
+- `LvtAvaloniaTreeWalker.dll` is AnyCPU and is shared unchanged by all three
+  native architectures
+- `hostfxr.dll` must already be loaded by the target (normal for Avalonia
+  apphosts, including self-contained apps), or an architecture-matched .NET
+  runtime must be installed for fallback discovery
 
 ## Persistent connections (optional)
 

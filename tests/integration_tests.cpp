@@ -9,6 +9,7 @@
 #include <wil/resource.h>
 #include <cstdio>
 #include <cwctype>
+#include <algorithm>
 #include <string>
 #include <array>
 #include <atomic>
@@ -1217,6 +1218,92 @@ static HWND visible_window_for_pid(DWORD pid) {
     return search.hwnd;
 }
 
+static std::wstring loaded_module_path(DWORD pid, const wchar_t* moduleName) {
+    const HANDLE raw = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (raw == INVALID_HANDLE_VALUE)
+        return {};
+    wil::unique_handle snapshot(raw);
+    MODULEENTRY32W module{sizeof(module)};
+    if (!Module32FirstW(snapshot.get(), &module))
+        return {};
+    do {
+        if (_wcsicmp(module.szModule, moduleName) == 0)
+            return module.szExePath;
+    } while (Module32NextW(snapshot.get(), &module));
+    return {};
+}
+
+static std::wstring loaded_module_path_until(
+    DWORD pid, const wchar_t* moduleName, int attempts = 20) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        auto path = loaded_module_path(pid, moduleName);
+        if (!path.empty())
+            return path;
+        Sleep(100);
+    }
+    return {};
+}
+
+static bool wait_for_module_unloaded(
+    DWORD pid, const wchar_t* moduleName, int attempts = 100) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        if (loaded_module_path(pid, moduleName).empty())
+            return true;
+        Sleep(50);
+    }
+    return false;
+}
+
+static int file_major_version(const std::wstring& path) {
+    DWORD ignored = 0;
+    const DWORD bytes = GetFileVersionInfoSizeW(path.c_str(), &ignored);
+    if (bytes == 0)
+        return 0;
+    std::vector<unsigned char> version(bytes);
+    if (!GetFileVersionInfoW(path.c_str(), 0, bytes, version.data()))
+        return 0;
+    VS_FIXEDFILEINFO* fixed = nullptr;
+    UINT fixedBytes = 0;
+    if (!VerQueryValueW(
+            version.data(), L"\\", reinterpret_cast<void**>(&fixed),
+            &fixedBytes) ||
+        !fixed || fixedBytes < sizeof(VS_FIXEDFILEINFO)) {
+        return 0;
+    }
+    return HIWORD(fixed->dwProductVersionMS);
+}
+
+struct RuntimeDialogSearch {
+    DWORD pid;
+    bool found;
+};
+
+static BOOL CALLBACK find_runtime_dialog(HWND hwnd, LPARAM parameter) {
+    auto* search = reinterpret_cast<RuntimeDialogSearch*>(parameter);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != search->pid || !IsWindowVisible(hwnd))
+        return TRUE;
+
+    wchar_t className[64]{};
+    wchar_t title[256]{};
+    GetClassNameW(hwnd, className, static_cast<int>(_countof(className)));
+    GetWindowTextW(hwnd, title, static_cast<int>(_countof(title)));
+    if (wcscmp(className, L"#32770") == 0 ||
+        wcsstr(title, L"Microsoft Visual C++ Runtime Library") != nullptr) {
+        search->found = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static bool has_runtime_error_dialog(DWORD pid) {
+    RuntimeDialogSearch search{pid, false};
+    EnumWindows(find_runtime_dialog, reinterpret_cast<LPARAM>(&search));
+    return search.found;
+}
+
 #if LVT_ENABLE_WPF || LVT_ENABLE_WINFORMS
 class ScopedSampleProcess {
 public:
@@ -1293,33 +1380,6 @@ private:
     wil::unique_handle release_;
     bool active_ = false;
 };
-
-static std::wstring loaded_module_path(DWORD pid, const wchar_t* moduleName) {
-    const HANDLE raw = CreateToolhelp32Snapshot(
-        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (raw == INVALID_HANDLE_VALUE)
-        return {};
-    wil::unique_handle snapshot(raw);
-    MODULEENTRY32W module{sizeof(module)};
-    if (!Module32FirstW(snapshot.get(), &module))
-        return {};
-    do {
-        if (_wcsicmp(module.szModule, moduleName) == 0)
-            return module.szExePath;
-    } while (Module32NextW(snapshot.get(), &module));
-    return {};
-}
-
-static std::wstring loaded_module_path_until(
-    DWORD pid, const wchar_t* moduleName, int attempts = 20) {
-    for (int attempt = 0; attempt < attempts; ++attempt) {
-        auto path = loaded_module_path(pid, moduleName);
-        if (!path.empty())
-            return path;
-        Sleep(100);
-    }
-    return {};
-}
 
 static const lvt::Element* find_named_element(
     const lvt::Element& element, const std::string& name) {
@@ -1413,6 +1473,7 @@ protected:
             GTEST_SKIP() << "Avalonia plugin output not found at " << builtPlugins.string()
                          << "; build lvt_avalonia_plugin first";
         }
+        tapDir_ = builtPlugins / "avalonia";
 
         wchar_t profile[MAX_PATH]{};
         DWORD profileLen = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
@@ -1442,22 +1503,38 @@ protected:
         if (pi_.hProcess)
             WaitForInputIdle(pi_.hProcess, 5000);
 
+        ASSERT_EQ(
+            lvt::detect_process_architecture(pi_.dwProcessId),
+            lvt::get_host_architecture())
+            << "the Avalonia fixture must match the integration test architecture";
+
         for (int attempt = 0; attempt < 10 && !has_visible_window_for_pid(pi_.dwProcessId); ++attempt)
             Sleep(500);
 
+        const auto coreClr =
+            loaded_module_path_until(pi_.dwProcessId, L"coreclr.dll");
+        ASSERT_FALSE(coreClr.empty())
+            << "the self-contained Avalonia fixture did not load CoreCLR";
+        ASSERT_EQ(file_major_version(coreClr), 8)
+            << "the Avalonia fixture must exercise the supported .NET 8 floor";
+
+        std::string lastOutput;
         for (int attempt = 0; attempt < 30; ++attempt) {
-            auto output = run_command(make_cmd(lvt, pid_arg()));
-            auto j = json::parse(output, nullptr, false);
+            lastOutput = run_command(make_cmd(lvt, pid_arg()));
+            auto j = json::parse(lastOutput, nullptr, false);
             if (!j.is_discarded() && frameworks_contain_avalonia(j) &&
                 j.contains("root") && has_avalonia_control(j["root"])) {
                 initialDump_ = std::move(j);
                 return;
             }
+            if (has_runtime_error_dialog(pi_.dwProcessId))
+                break;
             Sleep(1000);
         }
 
-        GTEST_SKIP() << "Avalonia app never became ready: lvt did not detect avalonia with controls. "
-                     << "Ensure build\\plugins was deployed and the Avalonia plugin/tree walker were built.";
+        FAIL() << "Avalonia app never became ready with a nontrivial tree; "
+               << "runtime dialog=" << has_runtime_error_dialog(pi_.dwProcessId)
+               << ", last output=" << lastOutput;
     }
 
     void TearDown() override {
@@ -1474,16 +1551,40 @@ protected:
         return "--pid " + std::to_string(pi_.dwProcessId);
     }
 
+    const wchar_t* tap_name() const {
+#if defined(_M_ARM64)
+        return L"lvt_avalonia_tap_arm64.dll";
+#elif defined(_M_IX86)
+        return L"lvt_avalonia_tap_x86.dll";
+#elif defined(_M_X64)
+        return L"lvt_avalonia_tap_x64.dll";
+#else
+#error Unsupported Avalonia integration test architecture
+#endif
+    }
+
+    fs::path sidecar_path() const {
+        return tapDir_ /
+            ("lvt_avalonia_pipe_" + std::to_string(pi_.dwProcessId) + ".txt");
+    }
+
     PROCESS_INFORMATION pi_{};
     wil::unique_handle process_;
     wil::unique_handle thread_;
+    fs::path tapDir_;
     json initialDump_;
 };
 
-TEST_F(AvaloniaFixture, DurableKeysAndQueryRoundTrip) {
+TEST_F(AvaloniaFixture, HostfxrAbiReturnsTreeAndReconnectsCleanly) {
     ASSERT_TRUE(initialDump_.contains("root"));
     ASSERT_TRUE(has_avalonia_under_host(initialDump_["root"]))
         << "Avalonia elements should be stitched under the Avalonia-* HWND";
+    EXPECT_EQ(WaitForSingleObject(process_.get(), 0), WAIT_TIMEOUT);
+    EXPECT_FALSE(has_runtime_error_dialog(pi_.dwProcessId));
+    EXPECT_TRUE(wait_for_module_unloaded(pi_.dwProcessId, tap_name()))
+        << "the first one-shot Avalonia TAP remained pinned";
+    EXPECT_FALSE(fs::exists(sidecar_path()))
+        << "the first one-shot Avalonia connection left a stale sidecar";
 
     auto lvt = get_lvt_path();
     auto avaloniaReady = [](const json& j) {
@@ -1493,10 +1594,25 @@ TEST_F(AvaloniaFixture, DurableKeysAndQueryRoundTrip) {
     };
     auto secondDump = dump_ready_tree(lvt, pid_arg(), avaloniaReady);
     ASSERT_FALSE(secondDump.is_discarded());
+    ASSERT_TRUE(avaloniaReady(secondDump));
+    EXPECT_EQ(WaitForSingleObject(process_.get(), 0), WAIT_TIMEOUT);
+    EXPECT_FALSE(has_runtime_error_dialog(pi_.dwProcessId));
+    EXPECT_TRUE(wait_for_module_unloaded(pi_.dwProcessId, tap_name()))
+        << "the reconnected Avalonia TAP remained pinned";
+    EXPECT_FALSE(fs::exists(sidecar_path()))
+        << "the reconnected Avalonia session left a stale sidecar";
 
     std::vector<const json*> elements;
     collect_json_elements(initialDump_["root"], elements);
-    ASSERT_GT(elements.size(), 0u);
+    const auto avaloniaElements = std::count_if(
+        elements.begin(), elements.end(), [](const json* element) {
+            return element->value("framework", "") == "avalonia";
+        });
+    ASSERT_GE(avaloniaElements, 5u)
+        << "the managed TAP must return a nontrivial Avalonia tree";
+    EXPECT_NE(find_named_control(initialDump_["root"], "HelloText"), nullptr);
+    EXPECT_NE(find_named_control(initialDump_["root"], "ClickButton"), nullptr);
+    EXPECT_NE(find_named_control(initialDump_["root"], "InputBox"), nullptr);
 
     std::set<std::string> keys;
     for (auto* el : elements) {
@@ -1520,6 +1636,12 @@ TEST_F(AvaloniaFixture, DurableKeysAndQueryRoundTrip) {
     ASSERT_FALSE(buttonKey.empty());
     auto queriedName = query_prop_until(lvt, pid_arg(), buttonKey, "name", "ClickButton");
     EXPECT_EQ(trim_crlf(queriedName), "ClickButton");
+    EXPECT_EQ(WaitForSingleObject(process_.get(), 0), WAIT_TIMEOUT);
+    EXPECT_FALSE(has_runtime_error_dialog(pi_.dwProcessId));
+    EXPECT_TRUE(wait_for_module_unloaded(pi_.dwProcessId, tap_name()))
+        << "the query reconnect left the Avalonia TAP pinned";
+    EXPECT_FALSE(fs::exists(sidecar_path()))
+        << "the query reconnect left a stale sidecar";
 }
 
 class WinFormsSampleFixture : public ::testing::Test {

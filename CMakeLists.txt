@@ -730,7 +730,8 @@ add_library(lvt_avalonia_tap SHARED
     src/plugin_avalonia/avalonia_tap_native.def
 )
 target_compile_definitions(lvt_avalonia_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(lvt_avalonia_tap PRIVATE WIL::WIL)
+target_include_directories(lvt_avalonia_tap PRIVATE src src/tap_managed)
+target_link_libraries(lvt_avalonia_tap PRIVATE WIL::WIL version)
 set_property(TARGET lvt_avalonia_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(lvt_avalonia_tap PROPERTIES
     OUTPUT_NAME "lvt_avalonia_tap_${TAP_ARCH_SUFFIX}"
@@ -1043,13 +1044,14 @@ set(AVALONIA_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/avalonia_test_app/Avaloni
 set(AVALONIA_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/avalonia_test_app")
 add_custom_target(avalonia_test_app ALL
     COMMAND dotnet publish "${AVALONIA_SAMPLE_PROJECT}" -c Release
-        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:CheckEolTargetFramework=false
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained true
         -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
         -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
-        -o "${AVALONIA_SAMPLE_OUTPUT_DIR}"
+        -o "${AVALONIA_SAMPLE_OUTPUT_DIR}" --nologo
     BYPRODUCTS "${AVALONIA_SAMPLE_OUTPUT_DIR}/AvaloniaTestApp.exe"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Building Avalonia integration test app"
+    COMMENT "Publishing architecture-matched Avalonia integration test app"
 )
 file(TO_NATIVE_PATH "${AVALONIA_SAMPLE_OUTPUT_DIR}/AvaloniaTestApp.exe" AVALONIA_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" AVALONIA_SAMPLE_EXE_ESCAPED "${AVALONIA_SAMPLE_EXE_NATIVE}")
@@ -1147,7 +1149,7 @@ target_link_libraries(lvt_integration_tests PRIVATE
     lvt_core
     GTest::gtest GTest::gtest_main
     WIL::WIL nlohmann_json::nlohmann_json
-    comctl32
+    comctl32 version
 )
 target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
 set(LVT_INTEGRATION_DEPS
