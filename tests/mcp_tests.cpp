@@ -36,6 +36,54 @@ std::string get_lvt_path() {
     return (fs::path(exePath).parent_path() / "lvt.exe").string();
 }
 
+USHORT pe_machine(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return IMAGE_FILE_MACHINE_UNKNOWN;
+
+    uint16_t dosMagic = 0;
+    file.read(reinterpret_cast<char*>(&dosMagic), sizeof(dosMagic));
+    if (!file || dosMagic != IMAGE_DOS_SIGNATURE)
+        return IMAGE_FILE_MACHINE_UNKNOWN;
+
+    file.seekg(0x3c);
+    uint32_t peOffset = 0;
+    file.read(reinterpret_cast<char*>(&peOffset), sizeof(peOffset));
+    file.seekg(peOffset);
+    uint32_t peSignature = 0;
+    USHORT machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    file.read(reinterpret_cast<char*>(&peSignature), sizeof(peSignature));
+    file.read(reinterpret_cast<char*>(&machine), sizeof(machine));
+    return file && peSignature == IMAGE_NT_SIGNATURE
+        ? machine
+        : IMAGE_FILE_MACHINE_UNKNOWN;
+}
+
+constexpr USHORT test_machine() {
+#if defined(_M_ARM64)
+    return IMAGE_FILE_MACHINE_ARM64;
+#elif defined(_M_IX86)
+    return IMAGE_FILE_MACHINE_I386;
+#elif defined(_M_X64)
+    return IMAGE_FILE_MACHINE_AMD64;
+#else
+    return IMAGE_FILE_MACHINE_UNKNOWN;
+#endif
+}
+
+const char* machine_name(USHORT machine) {
+    switch (machine) {
+    case IMAGE_FILE_MACHINE_ARM64:
+        return "arm64";
+    case IMAGE_FILE_MACHINE_I386:
+        return "x86";
+    case IMAGE_FILE_MACHINE_AMD64:
+        return "x64";
+    default:
+        return "unknown";
+    }
+}
+
 std::string read_text_file(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file)
@@ -1167,14 +1215,30 @@ class McpSampleFixture : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
         const fs::path exe = WINUI3_SAMPLE_EXE_PATH;
-        if (!fs::exists(exe))
+        if (!fs::exists(exe)) {
+            s_skip_reason = "the WinUI3 sample app is not available at " + exe.string();
             return;
+        }
+        const auto fixtureMachine = pe_machine(exe);
+        if (fixtureMachine != IMAGE_FILE_MACHINE_UNKNOWN &&
+            test_machine() != IMAGE_FILE_MACHINE_UNKNOWN &&
+            fixtureMachine != test_machine()) {
+            s_skip_reason =
+                "WinUI3 fixture architecture mismatch: tests are " +
+                std::string(machine_name(test_machine())) + ", fixture is " +
+                machine_name(fixtureMachine);
+            return;
+        }
         STARTUPINFOA si{sizeof(si)};
         PROCESS_INFORMATION pi{};
         std::string cmd = exe.string();
         if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
-                            exe.parent_path().string().c_str(), &si, &pi))
+                            exe.parent_path().string().c_str(), &si, &pi)) {
+            s_skip_reason =
+                "failed to launch the WinUI3 sample app (error " +
+                std::to_string(GetLastError()) + ")";
             return;
+        }
         s_process.reset(pi.hProcess);
         s_thread.reset(pi.hThread);
         WaitForInputIdle(s_process.get(), 10000);
@@ -1206,6 +1270,8 @@ protected:
             if (!s_hwnd)
                 Sleep(500);
         }
+        if (!s_hwnd)
+            s_skip_reason = "the WinUI3 sample app did not create its test window";
     }
 
     static void TearDownTestSuite() {
@@ -1216,9 +1282,20 @@ protected:
         s_hwnd = nullptr;
     }
 
+    void SetUp() override {
+        if (!s_hwnd)
+            GTEST_SKIP() << (s_skip_reason.empty()
+                ? "the WinUI3 sample app is not available"
+                : s_skip_reason);
+        if (!IsWindow(s_hwnd))
+            GTEST_SKIP() << "the WinUI3 sample app's window closed during the run";
+    }
+
     void SkipIfNotReady() {
         if (!s_hwnd)
-            GTEST_SKIP() << "the WinUI3 sample app is not available";
+            GTEST_SKIP() << (s_skip_reason.empty()
+                ? "the WinUI3 sample app is not available"
+                : s_skip_reason);
         // Every test in this fixture shares one app instance, so if it has gone
         // away the remaining tests would all fail with unrelated-looking
         // errors. Saying so once is far easier to act on.
@@ -1255,11 +1332,13 @@ protected:
     static wil::unique_process_handle s_process;
     static wil::unique_handle s_thread;
     static HWND s_hwnd;
+    static std::string s_skip_reason;
 };
 
 wil::unique_process_handle McpSampleFixture::s_process;
 wil::unique_handle McpSampleFixture::s_thread;
 HWND McpSampleFixture::s_hwnd = nullptr;
+std::string McpSampleFixture::s_skip_reason;
 
 class NativeMcpFixture : public ::testing::Test {
 protected:

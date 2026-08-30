@@ -2750,6 +2750,25 @@ protected:
         s_pid = s_pi.dwProcessId;
         s_process.reset(s_pi.hProcess);
         s_thread.reset(s_pi.hThread);
+        const auto fixtureArchitecture =
+            lvt::detect_process_architecture(s_pid);
+        const auto testArchitecture = lvt::get_host_architecture();
+        if (fixtureArchitecture != lvt::Architecture::unknown &&
+            testArchitecture != lvt::Architecture::unknown &&
+            fixtureArchitecture != testArchitecture) {
+            s_skip_reason =
+                "WinUI3 fixture architecture mismatch: tests are " +
+                std::string(lvt::architecture_name(testArchitecture)) +
+                ", fixture is " +
+                lvt::architecture_name(fixtureArchitecture);
+            TerminateProcess(s_process.get(), 0);
+            WaitForSingleObject(s_process.get(), 5000);
+            s_process.reset();
+            s_thread.reset();
+            s_pi.hProcess = nullptr;
+            s_pi.hThread = nullptr;
+            return;
+        }
         if (s_pi.hProcess) {
             WaitForInputIdle(s_pi.hProcess, 10000);
         }
@@ -2785,6 +2804,11 @@ protected:
             s_pi.hProcess = nullptr;
             s_pi.hThread = nullptr;
         }
+    }
+
+    void SetUp() override {
+        if (!s_ready)
+            GTEST_SKIP() << s_skip_reason;
     }
 
     static void SkipIfNotReady() {

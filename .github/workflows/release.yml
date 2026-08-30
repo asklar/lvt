@@ -26,6 +26,7 @@ jobs:
             preset: default
             build_dir: build
             build_tests: 'ON'
+            build_winui_fixture: 'ON'
             build_viewer: 'ON'
             rust_target: x86_64-pc-windows-msvc
           - arch: x86
@@ -33,6 +34,7 @@ jobs:
             preset: x86
             build_dir: build-x86
             build_tests: 'OFF'
+            build_winui_fixture: 'ON'
             build_viewer: 'OFF'
             rust_target: i686-pc-windows-msvc
           - arch: arm64
@@ -40,6 +42,7 @@ jobs:
             preset: arm64
             build_dir: build-arm64
             build_tests: 'OFF'
+            build_winui_fixture: 'ON'
             build_viewer: 'OFF'
             rust_target: aarch64-pc-windows-msvc
 
@@ -67,19 +70,20 @@ jobs:
       - name: Set up Rust (for the MCP server)
         run: rustup target add ${{ matrix.rust_target }}
 
-      - name: Set up .NET 10 (for the x64 viewer)
-        if: matrix.build_viewer == 'ON'
+      - name: Set up .NET 10
+        if: matrix.build_winui_fixture == 'ON'
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
-      # Tests only run on x64, and gtest now sits behind a vcpkg manifest
-      # feature, so the other legs can skip building it entirely.
+      # Runtime tests only run on x64, while every architecture still compiles
+      # and statically validates its matching WinUI fixture.
       - name: Configure
         run: >
           cmake --preset ${{ matrix.preset }}
           -DCMAKE_BUILD_TYPE=Release
           -DLVT_BUILD_TESTS=${{ matrix.build_tests }}
+          -DLVT_BUILD_WINUI3_TEST_FIXTURE=${{ matrix.build_winui_fixture }}
           -DLVT_BUILD_VIEWER=${{ matrix.build_viewer }}
           -DLVT_ENABLE_MCP=ON
 

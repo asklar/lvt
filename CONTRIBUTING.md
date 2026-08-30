@@ -18,6 +18,13 @@ cmake --build build
 
 This produces `build/lvt.exe` and `build/lvt_tap_x64.dll`.
 
+For x86:
+
+```powershell
+cmake --preset x86
+cmake --build build-x86
+```
+
 For ARM64:
 
 ```powershell
@@ -33,7 +40,17 @@ build\lvt_unit_tests.exe
 
 # Integration tests (launches Notepad)
 build\lvt_integration_tests.exe
+
+# MCP tests, including WinUI visual/resource/property coverage
+build\lvt_mcp_tests.exe
 ```
+
+The WinUI integration fixture always matches the configured vcpkg triplet.
+x64, x86, and ARM64 publishes use separate `bin`, `build`, and `obj`
+directories below the corresponding CMake build tree. ARM64 builds can compile
+and statically validate the fixture with
+`cmake --build build-arm64 --target winui3_sample_app`; runtime-only tests are
+not run on an x64 host.
 
 ## Project structure
 

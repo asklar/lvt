@@ -98,8 +98,8 @@ jobs:
             build/LvtWinFormsTap.runtimeconfig.json
             build/plugins/
 
-  avalonia-x86:
-    name: Avalonia x86 integration
+  x86-integration:
+    name: x86 integration
     runs-on: windows-latest
 
     steps:
@@ -123,24 +123,39 @@ jobs:
       - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
         run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
 
+      - name: Set up Rust (for the x86 MCP server)
+        run: rustup target add i686-pc-windows-msvc
+
       - name: Configure x86 debug build
         run: >
           cmake --preset x86
           -DCMAKE_BUILD_TYPE=Debug
-          -DLVT_ENABLE_MCP=OFF
+          -DLVT_ENABLE_MCP=ON
 
-      - name: Build x86 Avalonia and compatibility tests
+      - name: Build x86 integration tests
         run: >
           cmake --build build-x86 --target
           lvt lvt_avalonia_plugin lvt_avalonia_tap
           lvt_avalonia_tree_walker avalonia_test_app
-          lvt_integration_tests lvt_chromium_tests
+          lvt_integration_tests lvt_mcp_tests lvt_chromium_tests
 
       - name: Avalonia x86 integration tests
         run: >
           build-x86\lvt_integration_tests.exe
           --gtest_filter=AvaloniaFixture.*
           --gtest_output=xml:build-x86\avalonia_x86_test_results.xml
+
+      - name: WinUI x86 visual integration test
+        run: >
+          build-x86\lvt_integration_tests.exe
+          --gtest_filter=WinUI3SampleFixture.DurableKeysDeterministicAndQueryable
+          --gtest_output=xml:build-x86\winui_x86_integration_test_results.xml
+
+      - name: WinUI x86 MCP resource and property tests
+        run: >
+          build-x86\lvt_mcp_tests.exe
+          --gtest_filter=McpSampleFixture.VisualTreeIsAvailableAndDiffersFromTheUiaTree:McpSampleFixture.TypedPropertySchemasAndDiffsReuseOnePersistentInjection:McpSampleFixture.ResourcesMatchEachSessionsFixedTreeMode:McpSampleFixture.ResourceSubscriptionPushesVisualPropertyChange
+          --gtest_output=xml:build-x86\winui_x86_mcp_test_results.xml
 
       - name: Chromium x86 compatibility tests
         run: >
@@ -151,7 +166,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: avalonia-x86-test-results
+          name: x86-test-results
           path: build-x86\*_test_results.xml
 
   # Covers what the vcpkg port does: a build with no .NET SDK involvement, the
@@ -197,11 +212,16 @@ jobs:
         with:
           vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
-      # No Windows App SDK install step, no dotnet, and no Rust: this
-      # configuration must build from source alone, exactly as it does inside
-      # vcpkg — where the MCP server is off, so consumers of the port never
-      # need a Rust toolchain. Keeping this leg faithful is the point of it.
-      # The multi-architecture MCP build is covered by release.yml.
+      - name: Set up .NET 10 for ARM64 fixture compile coverage
+        if: matrix.arch == 'arm64'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # This configuration builds without managed helpers, tests, or Rust,
+      # exactly as it does inside vcpkg. The ARM64 leg uses dotnet only in a
+      # separate post-install step to compile the cross-architecture WinUI
+      # fixture; it is not part of the package build.
       - name: Configure (no managed, no tests)
         run: >
           cmake --preset ${{ matrix.preset }}
@@ -229,6 +249,20 @@ jobs:
       - name: Run consumer smoke test
         if: matrix.can_run
         run: ${{ matrix.build_dir }}\consumer\package_consumer.exe
+
+      # The x64 runner cannot execute ARM64 tests, but it can compile and
+      # statically validate the exact WinUI fixture that an ARM64 test binary
+      # would launch. Keep this after the package-only checks so those remain
+      # faithful to the no-.NET vcpkg build.
+      - name: Compile and validate ARM64 WinUI fixture
+        if: matrix.arch == 'arm64'
+        run: |
+          cmake --preset arm64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLVT_BUILD_MANAGED=OFF `
+            -DLVT_BUILD_TESTS=OFF `
+            -DLVT_BUILD_WINUI3_TEST_FIXTURE=ON
+          cmake --build build-arm64 --target winui3_sample_app
 
   # The registry is only usable if the port manifest is in vcpkg's canonical
   # format and the versions database matches the committed port tree. Both drift

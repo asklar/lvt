@@ -31,10 +31,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # can drop the pieces they can't build. Win32 and ComCtl are always present:
 # they are the base layer every other provider enriches.
 #
-# XAML and WinUI 3 are pure C++ and need no .NET SDK. WPF, WinForms and
-# Avalonia have a native half that always builds, plus a managed helper
-# assembly gated behind LVT_BUILD_MANAGED, which is the only thing here that
-# shells out to `dotnet`.
+# XAML and WinUI 3 providers are pure C++ and need no .NET SDK. WPF, WinForms
+# and Avalonia have a native half that always builds, plus a managed helper
+# assembly gated behind LVT_BUILD_MANAGED. The optional WinUI test fixture also
+# shells out to `dotnet`, independently of the provider itself.
 option(LVT_ENABLE_XAML     "System XAML (UWP / DesktopWindowXamlSource) support" ON)
 option(LVT_ENABLE_WINUI3   "WinUI 3 (Windows App SDK) support"                   ON)
 option(LVT_ENABLE_WPF      "WPF support"                                         ON)
@@ -48,6 +48,9 @@ option(LVT_ENABLE_MCP      "MCP server mode (lvt mcp); requires a Rust toolchain
 
 option(LVT_BUILD_TOOL    "Build the lvt command-line tool"                     ON)
 option(LVT_BUILD_MANAGED "Build managed .NET assemblies (requires .NET SDK)"   ON)
+option(LVT_BUILD_WINUI3_TEST_FIXTURE
+    "Publish the architecture-matched WinUI 3 integration-test fixture"
+    ${LVT_BUILD_TESTS})
 # Off by default: it's a separate WPF app built by its own `dotnet build`, not
 # something most contributors touching lvt_core need. See src/viewer/README.md
 # for the architecture (it drives lvt.exe as a subprocess; it never links
@@ -58,6 +61,12 @@ option(LVT_BUILD_VIEWER  "Build the lvt Viewer WPF app (requires .NET SDK)"    O
 if(LVT_BUILD_MANAGED AND NOT (LVT_ENABLE_WPF OR LVT_ENABLE_WINFORMS OR LVT_ENABLE_AVALONIA))
     message(STATUS "lvt: no managed-backed framework enabled; forcing LVT_BUILD_MANAGED=OFF")
     set(LVT_BUILD_MANAGED OFF)
+endif()
+
+if(LVT_BUILD_TESTS AND NOT LVT_BUILD_WINUI3_TEST_FIXTURE)
+    message(FATAL_ERROR
+        "LVT_BUILD_TESTS requires LVT_BUILD_WINUI3_TEST_FIXTURE so WinUI tests "
+        "cannot silently run against a missing or foreign-architecture app.")
 endif()
 
 set(LVT_WITH_MANAGED ${LVT_BUILD_MANAGED})
@@ -891,6 +900,88 @@ if(LVT_BUILD_VIEWER AND LVT_BUILD_TOOL)
     endif()
 endif()
 
+# The WinUI fixture is also buildable without the test executables. Release and
+# cross-compilation CI use that path to retain x86/ARM64 compile and packaging
+# coverage even when those binaries cannot be executed on the current runner.
+if(LVT_BUILD_WINUI3_TEST_FIXTURE)
+    if(VCPKG_TARGET_TRIPLET MATCHES "arm64")
+        set(LVT_WINUI3_SAMPLE_ARCH "arm64")
+        set(LVT_WINUI3_SAMPLE_PLATFORM "ARM64")
+        set(LVT_WINUI3_SAMPLE_RID "win-arm64")
+    elseif(VCPKG_TARGET_TRIPLET MATCHES "x86")
+        set(LVT_WINUI3_SAMPLE_ARCH "x86")
+        set(LVT_WINUI3_SAMPLE_PLATFORM "x86")
+        set(LVT_WINUI3_SAMPLE_RID "win-x86")
+    elseif(VCPKG_TARGET_TRIPLET MATCHES "x64" OR NOT VCPKG_TARGET_TRIPLET)
+        set(LVT_WINUI3_SAMPLE_ARCH "x64")
+        set(LVT_WINUI3_SAMPLE_PLATFORM "x64")
+        set(LVT_WINUI3_SAMPLE_RID "win-x64")
+    else()
+        message(FATAL_ERROR
+            "The WinUI 3 test fixture does not support target triplet "
+            "'${VCPKG_TARGET_TRIPLET}'. Supported architectures are x64, x86, and arm64.")
+    endif()
+
+    find_program(LVT_POWERSHELL_EXE NAMES pwsh powershell)
+    if(NOT LVT_POWERSHELL_EXE)
+        message(FATAL_ERROR
+            "The WinUI 3 test fixture requires PowerShell for its static "
+            "architecture and resource validation.")
+    endif()
+
+    set(WINUI3_SAMPLE_PROJECT
+        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/WinUI3Sample.csproj")
+    set(WINUI3_SAMPLE_ROOT
+        "${CMAKE_BINARY_DIR}/tests/apps/WinUI3Sample/${LVT_WINUI3_SAMPLE_ARCH}")
+    set(WINUI3_SAMPLE_OUTPUT_DIR "${WINUI3_SAMPLE_ROOT}/bin")
+    set(WINUI3_SAMPLE_BUILD_DIR "${WINUI3_SAMPLE_ROOT}/build")
+    set(WINUI3_SAMPLE_INTERMEDIATE_DIR "${WINUI3_SAMPLE_ROOT}/obj")
+    set(WINUI3_SAMPLE_MSBUILD_ARGS "")
+    if(DEFINED ENV{VSINSTALLDIR} AND EXISTS "$ENV{VSINSTALLDIR}/MSBuild/Microsoft/VisualStudio/v18.0/AppxPackage/Microsoft.Build.Packaging.Pri.Tasks.dll")
+        list(APPEND WINUI3_SAMPLE_MSBUILD_ARGS
+            "-p:MSBuildExtensionsPath=$ENV{VSINSTALLDIR}/MSBuild")
+    endif()
+    add_custom_target(winui3_sample_app ALL
+        COMMAND dotnet publish "${WINUI3_SAMPLE_PROJECT}"
+            -c Release
+            "-p:Platform=${LVT_WINUI3_SAMPLE_PLATFORM}"
+            "-p:PlatformTarget=${LVT_WINUI3_SAMPLE_PLATFORM}"
+            -r "${LVT_WINUI3_SAMPLE_RID}"
+            --self-contained true
+            -o "${WINUI3_SAMPLE_OUTPUT_DIR}"
+            "-p:BaseOutputPath=${WINUI3_SAMPLE_BUILD_DIR}/"
+            "-p:OutputPath=${WINUI3_SAMPLE_BUILD_DIR}/"
+            "-p:BaseIntermediateOutputPath=${WINUI3_SAMPLE_INTERMEDIATE_DIR}/"
+            "-p:IntermediateOutputPath=${WINUI3_SAMPLE_INTERMEDIATE_DIR}/"
+            "-p:MSBuildProjectExtensionsPath=${WINUI3_SAMPLE_INTERMEDIATE_DIR}/"
+            ${WINUI3_SAMPLE_MSBUILD_ARGS}
+            --nologo
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${WINUI3_SAMPLE_INTERMEDIATE_DIR}/App.xbf"
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/App.xbf"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${WINUI3_SAMPLE_INTERMEDIATE_DIR}/MainWindow.xbf"
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/MainWindow.xbf"
+        COMMAND "${LVT_POWERSHELL_EXE}" -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_SOURCE_DIR}/scripts/validate-winui3-test-fixture.ps1"
+            -Root "${WINUI3_SAMPLE_OUTPUT_DIR}"
+            -IntermediateRoot "${WINUI3_SAMPLE_INTERMEDIATE_DIR}"
+            -Architecture "${LVT_WINUI3_SAMPLE_ARCH}"
+        BYPRODUCTS
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe"
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/App.xbf"
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/MainWindow.xbf"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMENT "Publishing ${LVT_WINUI3_SAMPLE_ARCH} WinUI3 sample app"
+        VERBATIM
+    )
+    file(TO_NATIVE_PATH
+        "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe"
+        WINUI3_SAMPLE_EXE_NATIVE)
+    string(REPLACE "\\" "\\\\"
+        WINUI3_SAMPLE_EXE_ESCAPED "${WINUI3_SAMPLE_EXE_NATIVE}")
+endif()
+
 # --- Tests ---
 if(LVT_BUILD_TESTS)
 enable_testing()
@@ -1014,32 +1105,6 @@ add_custom_target(wpf_net48_sample_app ALL
 )
 file(TO_NATIVE_PATH "${WPF_NET48_SAMPLE_OUTPUT_DIR}/WpfSample.exe" WPF_NET48_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" WPF_NET48_SAMPLE_EXE_ESCAPED "${WPF_NET48_SAMPLE_EXE_NATIVE}")
-
-# WinUI3 sample app used by integration tests
-set(WINUI3_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/WinUI3Sample.csproj")
-set(WINUI3_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinUI3Sample")
-set(WINUI3_SAMPLE_MSBUILD_ARGS "")
-if(DEFINED ENV{VSINSTALLDIR} AND EXISTS "$ENV{VSINSTALLDIR}/MSBuild/Microsoft/VisualStudio/v18.0/AppxPackage/Microsoft.Build.Packaging.Pri.Tasks.dll")
-    list(APPEND WINUI3_SAMPLE_MSBUILD_ARGS
-        "-p:MSBuildExtensionsPath=$ENV{VSINSTALLDIR}/MSBuild")
-endif()
-add_custom_target(winui3_sample_app ALL
-    COMMAND dotnet publish "${WINUI3_SAMPLE_PROJECT}"
-        -c Release -p:Platform=x64 -r win-x64 --self-contained true
-        -o "${WINUI3_SAMPLE_OUTPUT_DIR}"
-        ${WINUI3_SAMPLE_MSBUILD_ARGS}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net10.0-windows10.0.19041.0/win-x64/App.xbf"
-        "${WINUI3_SAMPLE_OUTPUT_DIR}/App.xbf"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net10.0-windows10.0.19041.0/win-x64/MainWindow.xbf"
-        "${WINUI3_SAMPLE_OUTPUT_DIR}/MainWindow.xbf"
-    BYPRODUCTS "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe"
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Publishing WinUI3 sample app"
-)
-file(TO_NATIVE_PATH "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe" WINUI3_SAMPLE_EXE_NATIVE)
-string(REPLACE "\\" "\\\\" WINUI3_SAMPLE_EXE_ESCAPED "${WINUI3_SAMPLE_EXE_NATIVE}")
 
 # Avalonia sample app used by integration tests
 set(AVALONIA_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/avalonia_test_app/AvaloniaTestApp.csproj")
@@ -1196,6 +1261,13 @@ if(LVT_ENABLE_AVALONIA)
 endif()
 add_dependencies(lvt_integration_tests ${LVT_INTEGRATION_DEPS})
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
+add_test(
+    NAME winui3_fixture_static
+    COMMAND "${LVT_POWERSHELL_EXE}" -NoProfile -ExecutionPolicy Bypass
+        -File "${CMAKE_SOURCE_DIR}/scripts/validate-winui3-test-fixture.ps1"
+        -Root "${WINUI3_SAMPLE_OUTPUT_DIR}"
+        -IntermediateRoot "${WINUI3_SAMPLE_INTERMEDIATE_DIR}"
+        -Architecture "${LVT_WINUI3_SAMPLE_ARCH}")
 
 # --- MCP server tests ------------------------------------------------------
 # A separate binary because it needs a live JSON-RPC conversation over pipes

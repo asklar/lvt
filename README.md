@@ -53,6 +53,10 @@ This gives Copilot the ability to inspect any running Windows app's UI when you 
 cmake --preset default
 cmake --build build
 
+# x86 build
+cmake --preset x86
+cmake --build build-x86
+
 # ARM64 build
 cmake --preset arm64
 cmake --build build-arm64
@@ -81,8 +85,16 @@ Framework support is per-provider, so you can drop pieces you don't need. Win32 
 | `LVT_BUILD_TOOL` | ON | Build the `lvt` CLI as well as the library |
 | `LVT_BUILD_MANAGED` | ON | Build the managed .NET helper assemblies |
 | `LVT_BUILD_TESTS` | ON | Build the test executables |
+| `LVT_BUILD_WINUI3_TEST_FIXTURE` | same as `LVT_BUILD_TESTS` | Publish and statically validate the architecture-matched WinUI test app |
 
-`LVT_BUILD_MANAGED` is the only thing that requires the .NET SDK. WPF, WinForms and Avalonia each have a native half that hosts the CLR plus a managed tree-walker assembly; only the latter needs `dotnet`. With `-DLVT_BUILD_MANAGED=OFF` the whole native build still works, including those TAP DLLs — you just lose managed enrichment for those three frameworks. XAML and WinUI 3 are pure C++ either way.
+`LVT_BUILD_MANAGED` and `LVT_BUILD_WINUI3_TEST_FIXTURE` are the options that require the .NET SDK. WPF, WinForms and Avalonia each have a native half that hosts the CLR plus a managed tree-walker assembly; only the latter needs `dotnet`. With `-DLVT_BUILD_MANAGED=OFF` the whole native build still works, including those TAP DLLs — you just lose managed enrichment for those three frameworks. XAML and WinUI 3 provider code is pure C++ either way.
+
+Test builds publish `WinUI3Sample` for the active vcpkg triplet (`win-x64`,
+`win-x86`, or `win-arm64`). Its compile, intermediate, and publish directories
+live under the matching CMake build tree and architecture, so simultaneous x64
+and x86 builds never share XAML compiler state. ARM64 CI compiles the fixture
+and validates its PE machine, RID manifest, and XBF resources without trying to
+execute it on an x64 runner.
 
 The built-in WPF/WinForms managed TAP supports .NET Framework 4.8 targets and
 CoreCLR WindowsDesktop 6.0 or newer. Active CoreCLR 3.1/5 runtimes are rejected
