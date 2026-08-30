@@ -4228,9 +4228,7 @@ TEST_F(
     ASSERT_NE(target, nullptr) << output;
     const auto runtimeId =
         (*target)["properties"].value("RuntimeId", "");
-    const auto key = target->value("key", "");
     ASSERT_FALSE(runtimeId.empty());
-    ASSERT_FALSE(key.empty());
 
     auto result = capture_first_watch_event(make_cmd(
         get_lvt_path(),
@@ -4240,11 +4238,15 @@ TEST_F(
     ASSERT_TRUE(result.started);
     ASSERT_FALSE(result.event.is_null()) << result.output;
     EXPECT_EQ(result.event.value("event", ""), "added");
-    EXPECT_EQ(result.event.value("key", ""), key);
     ASSERT_TRUE(result.event.contains("element"));
     EXPECT_EQ(
         result.event["element"].value("text", ""),
         "Fixture action");
+    EXPECT_EQ(
+        result.event["element"]
+            .value("properties", json::object())
+            .value("RuntimeId", ""),
+        runtimeId);
     EXPECT_EQ(result.output.find("element '"), std::string::npos)
         << result.output;
 }
