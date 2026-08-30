@@ -150,12 +150,18 @@ removals.
 Each persistent `UiaConnection` creates its `IUIAutomation` client, root
 element, cache request, and event handlers on one connection-owned MTA thread.
 The subscriptions use `TreeScope_Subtree` from the exact `ElementFromHandle`
-root. `connect(hwnd, expectedPid)` treats the resolver/registry PID as
-authoritative: it rejects a numeric HWND currently owned by any other process
-before starting the worker, verifies the UIA root `ProcessId` during
-registration, and repeats the HWND/PID check before liveness, tree, property,
-and event operations. A stale registry key therefore cannot attach to a
-replacement process after Windows reuses an HWND. No desktop/global UIA
+root. `UiaTargetIdentity` treats the resolver/registry PID as authoritative:
+connection creation rejects a numeric HWND currently owned by any other process
+before starting the worker. Target resolution also captures the process
+creation timestamp and the root UIA `RuntimeId`. Persistent connections retain
+an open handle to that original process, while one-shot tree/action fallbacks
+carry the same immutable PID, creation identity, and root token captured by the
+CLI command or MCP session. Immediately after every `ElementFromHandle`, on the
+owning MTA, lvt rechecks the current HWND owner, retained process identity, UIA
+root `ProcessId`, and root `RuntimeId` before reading or acting. A stale
+registry key therefore cannot attach to a replacement process after Windows
+reuses a PID/HWND, and same-process HWND reuse cannot silently switch to a
+different automation root. No desktop/global UIA
 subscription is installed. Structure changes, UIA property changes affecting
 tree shape/identity/bounds/enabled/offscreen state, pattern availability and
 Value/RangeValue/Toggle/ExpandCollapse/Selection/Scroll state, plus relevant
@@ -180,6 +186,12 @@ exit, or final release it first stops accepting callback hints, calls
 all COM references there, and only then reports the connection dead. UIA
 remains architecture-neutral because no target-side code or pointer-sized
 payload is injected.
+
+Persistent tree failures may still fall back to a one-shot UIA client for
+ordinary transient provider contention, but the fallback receives the
+session's captured `UiaTargetIdentity`; it never re-derives ownership from the
+current numeric HWND. Identity mismatch returns `ownershipLost` and stops the
+walk/action rather than exposing a replacement process or root.
 
 ### Native typed-property safety (`native_message.*`,
 `native_property_connection.*`)

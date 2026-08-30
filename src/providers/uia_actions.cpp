@@ -60,8 +60,13 @@ HRESULT create_automation(const UiaOptions& options, IUIAutomation** out) {
     return S_OK;
 }
 
-std::optional<Element> build_tree_for_action(HWND hwnd, const UiaOptions& options,
-                                             UiaConnection* connection) {
+std::optional<Element> build_tree_for_action(
+    const UiaTargetIdentity& identity,
+    const UiaOptions& options,
+    UiaConnection* connection,
+    bool* ownershipLost = nullptr) {
+    if (ownershipLost)
+        *ownershipLost = false;
     // The live Invoke/Value/SendInput path below still uses its own automation
     // object because that code is not modelled as an IFrameworkConnection. The
     // surrounding tree reads, however, are ordinary UIA walks and can reuse a
@@ -73,7 +78,13 @@ std::optional<Element> build_tree_for_action(HWND hwnd, const UiaOptions& option
     }
 
     UiaProvider provider;
-    return provider.build(hwnd, options);
+    return provider.build(
+        identity, options, nullptr, ownershipLost);
+}
+
+bool is_ownership_lost(HRESULT hr) {
+    return hr == HRESULT_FROM_WIN32(ERROR_INVALID_OWNER) ||
+           hr == HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
 }
 
 // Compare a RuntimeId SAFEARRAY against the components we are looking for.
@@ -150,12 +161,15 @@ wil::com_ptr<IUIAutomationElement> find_in_cached_tree(IUIAutomationElement* nod
 // Re-find the live element by RuntimeId. The walk produces plain data, so
 // acting on an element means locating it again; RuntimeId is the handle UIA
 // provides for exactly this.
-HRESULT find_by_runtime_id(IUIAutomation* automation, HWND hwnd,
-                           const std::vector<int>& runtimeId,
-                           IUIAutomationElement** out) {
+HRESULT find_by_runtime_id(
+    IUIAutomation* automation,
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess,
+    const std::vector<int>& runtimeId,
+    IUIAutomationElement** out) {
     wil::com_ptr<IUIAutomationElement> root;
-    RETURN_IF_FAILED(automation->ElementFromHandle(hwnd, &root));
-    RETURN_HR_IF_NULL(E_FAIL, root.get());
+    RETURN_IF_FAILED(get_validated_uia_root(
+        automation, identity, retainedProcess, &root));
 
     wil::unique_variant condition;
     SAFEARRAY* array = SafeArrayCreateVector(VT_I4, 0, static_cast<ULONG>(runtimeId.size()));
@@ -630,7 +644,9 @@ PropertyMutationResult uia_range_readback_result(
 }
 
 PropertyMutationResult perform_uia_property_action(
-    IUIAutomation* automation, HWND hwnd,
+    IUIAutomation* automation,
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess,
     const std::vector<int>& runtimeId,
     UiaPropertyAction action, const std::string& value) {
     PropertyMutationResult result;
@@ -642,13 +658,16 @@ PropertyMutationResult perform_uia_property_action(
 
     wil::com_ptr<IUIAutomationElement> element;
     const HRESULT findHr =
-        find_by_runtime_id(automation, hwnd, runtimeId, &element);
+        find_by_runtime_id(
+            automation, identity, retainedProcess,
+            runtimeId, &element);
     if (FAILED(findHr) || !element) {
         result.hresult = FAILED(findHr)
             ? findHr
             : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-        result.error =
-            "The UI Automation element changed or disappeared after its properties were read";
+        result.error = is_ownership_lost(findHr)
+            ? "ownershipLost: the UI Automation target identity changed"
+            : "The UI Automation element changed or disappeared after its properties were read";
         return result;
     }
 
@@ -794,10 +813,18 @@ const char* action_kind_name(ActionKind kind) {
     return "unknown";
 }
 
-ActionResult perform_action(HWND hwnd, const UiaOptions& options,
-                            const ActionRequest& request,
-                            UiaConnection* connection) {
+ActionResult perform_action(
+    const UiaTargetIdentity& identity,
+    const UiaOptions& options,
+    const ActionRequest& request,
+    UiaConnection* connection) {
     ActionResult result;
+    const HWND hwnd = identity.hwnd;
+    if (!identity.valid()) {
+        result.message =
+            "ownershipLost: the target identity is unavailable";
+        return result;
+    }
 
     // Waiting is not an action on a live element: it re-walks until the tree
     // says what the caller is waiting for, so it is handled before the
@@ -828,7 +855,10 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
                 return result;
             }
 
-            if (auto tree = build_tree_for_action(hwnd, options, connection)) {
+            bool ownershipLost = false;
+            if (auto tree = build_tree_for_action(
+                    identity, options, connection,
+                    &ownershipLost)) {
                 assign_element_ids(*tree);
                 assign_element_keys(*tree);
                 const Element* found = find_element_by_ref(*tree, request.elementRef);
@@ -849,6 +879,10 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
                     }
                     return result;
                 }
+            } else if (ownershipLost) {
+                result.message =
+                    "ownershipLost: the UI Automation target identity changed";
+                return result;
             }
 
             if (std::chrono::steady_clock::now() >= deadline)
@@ -880,9 +914,13 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
     Element target;
     std::vector<int> runtimeId;
     if (needsElement) {
-        auto tree = build_tree_for_action(hwnd, options, connection);
+        bool ownershipLost = false;
+        auto tree = build_tree_for_action(
+            identity, options, connection, &ownershipLost);
         if (!tree) {
-            result.message = "could not read the UI Automation tree for this window";
+            result.message = ownershipLost
+                ? "ownershipLost: the UI Automation target identity changed"
+                : "could not read the UI Automation tree for this window";
             return result;
         }
         lvt::assign_element_ids(*tree);
@@ -910,13 +948,21 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
     const HRESULT hr = run_on_mta([&]() -> HRESULT {
         wil::com_ptr<IUIAutomation> automation;
         RETURN_IF_FAILED(create_automation(options, &automation));
+        wil::com_ptr<IUIAutomationElement> validatedRoot;
+        RETURN_IF_FAILED(get_validated_uia_root(
+            automation.get(), identity, nullptr,
+            &validatedRoot));
 
         wil::com_ptr<IUIAutomationElement> element;
         if (needsElement) {
-            const HRESULT found = find_by_runtime_id(automation.get(), hwnd, runtimeId, &element);
+            const HRESULT found = find_by_runtime_id(
+                automation.get(), identity, nullptr,
+                runtimeId, &element);
             if (FAILED(found)) {
-                failure = "element could not be located in the live tree; it may have "
-                          "changed or disappeared since the walk";
+                failure = is_ownership_lost(found)
+                    ? "ownershipLost: the UI Automation target identity changed"
+                    : "element could not be located in the live tree; it may have "
+                      "changed or disappeared since the walk";
                 RETURN_HR(found);
             }
             // Virtualized items have to be made real before anything can touch
@@ -951,6 +997,10 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
             // only path that needs the window on top and moves the cursor.
             POINT center{};
             RETURN_IF_FAILED(live_element_center(element.get(), target, center, failure));
+            validatedRoot.reset();
+            RETURN_IF_FAILED(get_validated_uia_root(
+                automation.get(), identity, nullptr,
+                &validatedRoot));
             if (!bring_to_foreground(hwnd)) {
                 failure = "no pattern would activate this element, and the window "
                           "could not be brought to the foreground, so a synthetic "
@@ -1148,7 +1198,8 @@ ActionResult perform_action(HWND hwnd, const UiaOptions& options,
     // effect without a second walk. Re-found by RuntimeId because ids shift
     // whenever the tree changes, which an action may well have caused.
     if (needsElement) {
-        if (auto after = build_tree_for_action(hwnd, options, connection)) {
+        if (auto after = build_tree_for_action(
+                identity, options, connection)) {
             lvt::assign_element_ids(*after);
             lvt::assign_element_keys(*after);
             const auto it = target.properties.find("RuntimeId");

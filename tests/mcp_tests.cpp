@@ -717,8 +717,18 @@ public:
     }
 
     ~ManagedSampleProcess() {
-        if (process_)
+        stop();
+    }
+
+    void stop() {
+        if (process_) {
             TerminateProcess(process_.get(), 0);
+            WaitForSingleObject(process_.get(), 5000);
+        }
+        process_.reset();
+        thread_.reset();
+        pid_ = 0;
+        hwnd_ = nullptr;
     }
 
     DWORD pid() const { return pid_; }
@@ -1030,6 +1040,86 @@ TEST(McpPluginPersistent, CorrelationScopesVisualAndUiaEventPolling) {
     client->shutdown();
     fs::remove(pluginStatsPath, ec);
     fs::remove(uiaStatsPath, ec);
+}
+
+TEST(McpUiaIdentity, TransientPersistentFailureUsesIdentityBoundFallback) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    ScopedEnvironmentVariable failConnected(
+        "LVT_TEST_UIA_FAIL_CONNECTED_TREE_ONCE", "1");
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    const auto tree = client.call_tool(
+        "get_uia_tree", json{{"session", session}});
+    EXPECT_TRUE(tree.contains("root"))
+        << "an unchanged target must preserve one-shot fallback: "
+        << tree.dump(2);
+}
+
+TEST(McpUiaIdentity, ReplacementDuringFallbackFailsOwnershipLost) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+
+    const std::string base =
+        "Local\\LvtMcpUiaFallback_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable failConnected(
+        "LVT_TEST_UIA_FAIL_CONNECTED_TREE_ONCE", "1");
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_UIA_ONE_SHOT_AFTER_ELEMENT_GATE", base);
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    const int request = client.send_request(
+        "tools/call",
+        json{{"name", "get_uia_tree"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0)
+        << "the MCP fallback did not reach ElementFromHandle";
+
+    sample.stop();
+    ManagedSampleProcess replacement;
+    ASSERT_TRUE(replacement.start(
+        NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    SetEvent(release.get());
+
+    const auto response = client.await_response(request);
+    ASSERT_TRUE(response.contains("result"))
+        << response.dump(2);
+    EXPECT_TRUE(response["result"].value("isError", false))
+        << response.dump(2);
+    EXPECT_NE(
+        response.dump().find("ownershipLost"),
+        std::string::npos)
+        << response.dump(2);
 }
 
 TEST(McpPluginPersistent, SharesRegistryConnectionAcrossSessions) {

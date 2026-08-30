@@ -186,6 +186,13 @@ polled exactly once in their existing phases. The resource scheduler
 remains interval-based rather than waiting directly on provider event handles,
 so UIA notification latency is bounded by the same roughly 500 ms cadence.
 
+At `connect`, MCP captures a UIA target identity containing the authoritative
+PID, process creation timestamp, and root `RuntimeId`, even for visual sessions
+that may later request correlation. UIA tree reads, correlation, resources,
+typed properties, and actions all reuse that identity. A transient persistent
+client failure can use a one-shot fallback only with the captured identity;
+PID/HWND/root replacement instead returns `ownershipLost`.
+
 Visual resources always poll `get_visual_tree_changes` with `fast: true`,
 matching the Viewer's former `watch --fast` path. The live stream still carries
 the bounds, text, content, and basic state needed to render and search the tree;

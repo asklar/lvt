@@ -536,6 +536,19 @@ static bool write_output(const std::string& outputFile, const std::string& conte
 // UIA support is compile-time optional (LVT_ENABLE_UIA). Keep the two entry
 // points behind a single seam so the rest of main.cpp does not need guards.
 #ifdef LVT_ENABLE_UIA
+static std::optional<lvt::UiaTargetIdentity> uia_identity_for_target(
+    const lvt::TargetInfo& target) {
+    lvt::UiaTargetIdentity identity;
+    identity.hwnd = target.hwnd;
+    identity.pid = target.pid;
+    identity.processCreationIdentity =
+        target.processCreationIdentity;
+    identity.rootRuntimeId = target.uiaRootRuntimeId;
+    if (!identity.valid())
+        return std::nullopt;
+    return identity;
+}
+
 static bool build_uia_tree(const lvt::TargetInfo& target, const Args& args,
                            lvt::Element& tree) {
     lvt::UiaOptions options;
@@ -547,9 +560,19 @@ static bool build_uia_tree(const lvt::TargetInfo& target, const Args& args,
     options.timeoutMs = args.uiaTimeoutMs;
 
     lvt::UiaProvider provider;
-    auto result = provider.build(target.hwnd, options);
+    const auto identity = uia_identity_for_target(target);
+    if (!identity) {
+        fprintf(stderr, "lvt: ownershipLost: target identity is unavailable\n");
+        return false;
+    }
+    bool ownershipLost = false;
+    auto result = provider.build(
+        *identity, options, nullptr, &ownershipLost);
     if (!result) {
-        fprintf(stderr, "lvt: could not read the UI Automation tree for this window");
+        fprintf(
+            stderr, ownershipLost
+                ? "lvt: ownershipLost: target window identity changed"
+                : "lvt: could not read the UI Automation tree for this window");
         if (options.timeoutMs > 0) {
             fprintf(stderr, " (a slow or busy target may need a larger "
                             "--uia-timeout than %d ms)", options.timeoutMs);
@@ -737,9 +760,12 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
                 reinterpret_cast<uintptr_t>(target.hwnd)));
         auto handle = lvt::ConnectionRegistry::instance().acquire(
             target.pid, target.hwnd, key,
-            [](HWND hwnd, DWORD pid)
+            [identity = uia_identity_for_target(target)](
+                HWND, DWORD)
                 -> std::shared_ptr<lvt::IFrameworkConnection> {
-                return lvt::UiaConnection::connect(hwnd, pid);
+                return identity
+                    ? lvt::UiaConnection::connect(*identity)
+                    : nullptr;
             });
         // Retain a slot after a transient registration failure so the normal
         // watch reconciliation path retries instead of permanently falling
@@ -1803,7 +1829,13 @@ static int run_action(const lvt::TargetInfo& target, const Args& args) {
     if (!build_action_request(args, request))
         return 1;
 
-    const auto result = lvt::perform_action(target.hwnd, options, request);
+    const auto identity = uia_identity_for_target(target);
+    if (!identity) {
+        fprintf(stderr, "lvt: ownershipLost: target identity is unavailable\n");
+        return 1;
+    }
+    const auto result = lvt::perform_action(
+        *identity, options, request);
 
     nlohmann::json out;
     out["action"] = lvt::action_kind_name(request.kind);
@@ -1931,6 +1963,21 @@ int main(int argc, char* argv[]) {
                 static_cast<void*>(target.hwnd));
         return 1;
     }
+
+#ifdef LVT_ENABLE_UIA
+    if (args.uia || verb_drives_app(args.verb)) {
+        const auto identity = lvt::capture_uia_target_identity(
+            target.hwnd, target.pid,
+            target.processCreationIdentity);
+        if (!identity) {
+            fprintf(
+                stderr,
+                "lvt: ownershipLost: target identity changed before UI Automation acquisition\n");
+            return 1;
+        }
+        target.uiaRootRuntimeId = identity->rootRuntimeId;
+    }
+#endif
 
     // Check architecture match. --uia is exempt: UI Automation is a cross-process,
     // cross-architecture client API, so an x64 lvt can read an ARM64 or x86

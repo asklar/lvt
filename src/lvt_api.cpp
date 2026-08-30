@@ -114,6 +114,8 @@ struct Session {
     std::string id;
     HWND hwnd = nullptr;
     DWORD pid = 0;
+    uint64_t processCreationIdentity = 0;
+    std::vector<int> uiaRootRuntimeId;
     std::string processName;
     lvt::Architecture architecture = lvt::Architecture::unknown;
     // Provider-specific selector used by plugins (for example Chromium's
@@ -164,6 +166,10 @@ std::string add_session(const lvt::TargetInfo& target, bool visualMode,
     session.id = "s" + std::to_string(g_nextSession.fetch_add(1));
     session.hwnd = target.hwnd;
     session.pid = target.pid;
+    session.processCreationIdentity =
+        target.processCreationIdentity;
+    session.uiaRootRuntimeId =
+        target.uiaRootRuntimeId;
     session.processName = target.processName;
     session.architecture = target.architecture;
     session.visualMode = visualMode;
@@ -188,6 +194,29 @@ bool session_is_active(const std::string& id) {
     const auto found = g_sessions.find(id);
     return found != g_sessions.end() && !found->second.disconnecting;
 }
+
+#ifdef LVT_ENABLE_UIA
+lvt::UiaTargetIdentity uia_identity_for_session(
+    const Session& session) {
+    return {
+        .hwnd = session.hwnd,
+        .pid = session.pid,
+        .processCreationIdentity =
+            session.processCreationIdentity,
+        .rootRuntimeId = session.uiaRootRuntimeId,
+    };
+}
+
+bool uia_identity_is_current(const Session& session) {
+    const auto expected = uia_identity_for_session(session);
+    const auto current = lvt::capture_uia_target_identity(
+        expected.hwnd, expected.pid,
+        expected.processCreationIdentity);
+    return current &&
+           current->rootRuntimeId ==
+               expected.rootRuntimeId;
+}
+#endif
 
 // --- per-session persistent connections ----------------------------------
 //
@@ -585,12 +614,13 @@ std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& se
         break;
     }
 
+    const auto identity = uia_identity_for_session(session);
     auto handle = lvt::ConnectionRegistry::instance().acquire(
         session.pid, session.hwnd,
         uia_connection_registry_key(session.hwnd),
-        [](HWND hwnd, DWORD pid)
+        [identity](HWND, DWORD)
             -> std::shared_ptr<lvt::IFrameworkConnection> {
-            return lvt::UiaConnection::connect(hwnd, pid);
+            return lvt::UiaConnection::connect(identity);
         });
     if (!handle)
         return nullptr;
@@ -1024,6 +1054,13 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
 #ifdef LVT_ENABLE_UIA
         lvt::UiaProvider provider;
         const auto options = uia_options_from(params);
+        const auto identity =
+            uia_identity_for_session(session);
+        if (!identity.valid()) {
+            error =
+                "ownershipLost: this session has no valid UI Automation target identity";
+            return false;
+        }
 
         // Prefer the session's persistent UIA client when one is available, so
         // repeated MCP reads reuse one IUIAutomation object instead of
@@ -1044,6 +1081,7 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         std::optional<lvt::Element> result;
         bool wasTruncated = false;
         bool usedPersistentConnection = false;
+        bool ownershipLost = false;
         std::shared_ptr<lvt::UiaConnection> connection;
         for (int attempt = 0; attempt < 3 && !result; ++attempt) {
             if (attempt > 0)
@@ -1061,12 +1099,21 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
                 }
             }
 
-            result = provider.build(session.hwnd, options, &attemptTruncated);
+            bool attemptOwnershipLost = false;
+            result = provider.build(
+                identity, options, &attemptTruncated,
+                &attemptOwnershipLost);
+            ownershipLost =
+                ownershipLost || attemptOwnershipLost;
             wasTruncated = attemptTruncated;
+            if (attemptOwnershipLost)
+                break;
         }
         if (!result) {
-            error = "could not read the UI Automation tree for this window; it may be busy "
-                    "or not responding";
+            error = ownershipLost
+                ? "ownershipLost: the session target window or process identity changed"
+                : "could not read the UI Automation tree for this window; it may be busy "
+                  "or not responding";
             return false;
         }
         if (!session_is_active(session.id)) {
@@ -1278,6 +1325,18 @@ json method_connect(const json& params) {
     if (mode != "uia" && mode != "visual")
         throw std::runtime_error("mode must be 'uia' or 'visual', not '" + mode + "'");
     const bool visualMode = mode == "visual";
+
+#ifdef LVT_ENABLE_UIA
+    const auto uiaIdentity = lvt::capture_uia_target_identity(
+        target.hwnd, target.pid,
+        target.processCreationIdentity);
+    if (!uiaIdentity) {
+        throw std::runtime_error(
+            "ownershipLost: the target identity changed while the session was being created");
+    }
+    target.uiaRootRuntimeId =
+        uiaIdentity->rootRuntimeId;
+#endif
 
     auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
     const bool nativeOnly = std::all_of(
@@ -1773,6 +1832,11 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
         auto connection = uia_connection_for_session(session);
         if (!connection || !connection->is_alive() ||
             !connection->matches_target(session.hwnd)) {
+            if (!uia_identity_is_current(session)) {
+                throw_typed_property_error(
+                    "ownershipLost", "terminal", false,
+                    "the UI Automation target window or process identity changed");
+            }
             throw_typed_property_error(
                 "typed_property_connection_unavailable", "transient", true,
                 "the UI Automation property connection is temporarily unavailable");
@@ -2886,10 +2950,9 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     }
 
     auto connection = uia_connection_for_active_session(session);
-    if (!connection)
-        throw std::runtime_error(
-            "this session was disconnected while the action request was waiting");
-    const auto result = lvt::perform_action(session.hwnd, options, request, connection.get());
+    const auto identity = uia_identity_for_session(session);
+    const auto result = lvt::perform_action(
+        identity, options, request, connection.get());
     auto out = action_result_to_json(result, actionName, get_string(params, "element"));
     if (!result.ok)
         throw std::runtime_error(out.dump());

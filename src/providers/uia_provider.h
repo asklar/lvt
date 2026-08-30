@@ -2,6 +2,7 @@
 #include "framework_connection.h"
 #include "provider.h"
 #include "uia_props.h"
+#include "../target.h"
 
 #include <atomic>
 #include <cstdint>
@@ -13,7 +14,33 @@
 #include <unordered_set>
 #include <vector>
 
+struct IUIAutomation;
+struct IUIAutomationElement;
+
 namespace lvt {
+
+struct UiaTargetIdentity {
+    HWND hwnd = nullptr;
+    DWORD pid = 0;
+    uint64_t processCreationIdentity = 0;
+    std::vector<int> rootRuntimeId;
+
+    bool valid() const {
+        return hwnd && pid && processCreationIdentity &&
+               !rootRuntimeId.empty();
+    }
+};
+
+std::optional<UiaTargetIdentity> capture_uia_target_identity(
+    HWND hwnd, DWORD expectedPid,
+    uint64_t expectedProcessCreationIdentity = 0);
+
+HRESULT get_validated_uia_root(
+    IUIAutomation* automation,
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess,
+    IUIAutomationElement** root,
+    const char* testGateEnvironment = nullptr);
 
 namespace uia_eventing_detail {
 
@@ -167,7 +194,11 @@ public:
     // When the deadline cuts the traversal short, `truncated` is set and the
     // returned root carries a "Truncated" property, so a consumer reading only
     // the document can still tell the tree is incomplete.
-    std::optional<Element> build(HWND hwnd, const UiaOptions& options, bool* truncated = nullptr);
+    std::optional<Element> build(
+        const UiaTargetIdentity& identity,
+        const UiaOptions& options,
+        bool* truncated = nullptr,
+        bool* ownershipLost = nullptr);
 };
 
 // Reusable UIA client for callers that read the same target repeatedly (watch,
@@ -178,7 +209,10 @@ public:
 class UiaConnection : public IFrameworkConnection {
 public:
     static std::shared_ptr<UiaConnection> connect(
-        HWND hwnd, DWORD expectedPid);
+        const UiaTargetIdentity& identity);
+    static std::shared_ptr<UiaConnection> connect(
+        HWND hwnd, DWORD expectedPid,
+        uint64_t expectedProcessCreationIdentity = 0);
     ~UiaConnection() override;
 
     bool get_tree(Element& root, bool fastProperties,
@@ -195,6 +229,9 @@ public:
     std::optional<uint64_t> resolve_property_reference(
         const std::string& reference, std::string& error);
     HWND target_hwnd() const { return m_hwnd; }
+    const UiaTargetIdentity& target_identity() const {
+        return m_identity;
+    }
     bool matches_target(HWND hwnd) const;
     PropertySnapshotResult get_property_snapshot(uint64_t handle) override;
     PropertyMutationResult set_property(
@@ -205,14 +242,17 @@ public:
     bool refresh_events() override;
     std::vector<ConnectionEvent> poll_events() override;
     bool is_alive() const override;
+    void fail_next_tree_for_testing();
 
 private:
-    UiaConnection(HWND hwnd, DWORD expectedPid);
+    explicit UiaConnection(UiaTargetIdentity identity);
+    bool validate_target_identity_locked() const;
 
     struct State;
 
     HWND m_hwnd = nullptr;
     DWORD m_pid = 0;
+    UiaTargetIdentity m_identity;
     std::unique_ptr<State> m_state;
 };
 

@@ -44,6 +44,7 @@
 #include "providers/native_win_event.h"
 #include "providers/connection_registry.h"
 #ifdef LVT_ENABLE_UIA
+#include "providers/uia_actions.h"
 #include "providers/uia_provider.h"
 #endif
 #include "tree_builder.h"
@@ -4251,6 +4252,136 @@ TEST(UiaEventLifecycle, RejectsReplacementProcessWithStaleExpectedPid) {
         lvt::UiaConnection::connect(
             replacement.hwnd, replacement.pid),
         nullptr);
+}
+
+TEST_F(
+    NativeControlsFixture,
+    SameProcessReplacementRootRuntimeIdIsRejected) {
+    const auto identity = lvt::capture_uia_target_identity(
+        s_hwnd, s_pid, lvt::process_creation_identity(s_pid));
+    ASSERT_TRUE(identity.has_value());
+    const HWND other = reinterpret_cast<HWND>(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kGetOutOfTreeHwndMessage));
+    ASSERT_TRUE(IsWindow(other));
+
+    auto replacement = *identity;
+    replacement.hwnd = other;
+    lvt::UiaProvider provider;
+    bool ownershipLost = false;
+    EXPECT_FALSE(provider.build(
+        replacement, lvt::UiaOptions{}, nullptr,
+        &ownershipLost));
+    EXPECT_TRUE(ownershipLost);
+    EXPECT_EQ(
+        lvt::UiaConnection::connect(replacement),
+        nullptr)
+        << "same-process HWND reuse must not adopt a different UIA root";
+
+    lvt::ActionRequest request;
+    request.kind = lvt::ActionKind::windowMinimize;
+    request.elementRef =
+        "uia:" + lvt::format_runtime_id(
+            replacement.rootRuntimeId);
+    const auto action = lvt::perform_action(
+        replacement, lvt::UiaOptions{}, request);
+    EXPECT_FALSE(action.ok);
+    EXPECT_NE(
+        action.message.find("ownershipLost"),
+        std::string::npos);
+}
+
+TEST(UiaTargetIdentity, ProcessCreationMismatchRejectsPidReuse) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto captured = lvt::capture_uia_target_identity(
+        fixture.hwnd, fixture.pid,
+        lvt::process_creation_identity(fixture.pid));
+    ASSERT_TRUE(captured.has_value());
+
+    auto recycledPid = *captured;
+    ++recycledPid.processCreationIdentity;
+    lvt::UiaProvider provider;
+    bool ownershipLost = false;
+    EXPECT_FALSE(provider.build(
+        recycledPid, lvt::UiaOptions{}, nullptr,
+        &ownershipLost));
+    EXPECT_TRUE(ownershipLost);
+    EXPECT_EQ(
+        lvt::UiaConnection::connect(recycledPid),
+        nullptr);
+}
+
+TEST(UiaTargetIdentity, OneShotFallbackKeepsOriginalIdentity) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto identity = lvt::capture_uia_target_identity(
+        fixture.hwnd, fixture.pid,
+        lvt::process_creation_identity(fixture.pid));
+    ASSERT_TRUE(identity.has_value());
+    auto connection = lvt::UiaConnection::connect(*identity);
+    ASSERT_NE(connection, nullptr);
+
+    connection->fail_next_tree_for_testing();
+    lvt::Element connectedTree;
+    EXPECT_FALSE(connection->get_tree(
+        connectedTree, false));
+
+    lvt::UiaProvider provider;
+    bool ownershipLost = false;
+    const auto fallback = provider.build(
+        *identity, lvt::UiaOptions{}, nullptr,
+        &ownershipLost);
+    EXPECT_TRUE(fallback.has_value())
+        << "an unchanged target must retain ordinary transient fallback";
+    EXPECT_FALSE(ownershipLost);
+}
+
+TEST(UiaTargetIdentity, ReplacementAfterElementFromHandleIsRejected) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto identity = lvt::capture_uia_target_identity(
+        fixture.hwnd, fixture.pid,
+        lvt::process_creation_identity(fixture.pid));
+    ASSERT_TRUE(identity.has_value());
+
+    const std::string base =
+        "Local\\LvtUiaAfterElement_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_UIA_ONE_SHOT_AFTER_ELEMENT_GATE", base);
+
+    auto pending = std::async(
+        std::launch::async, [identity] {
+            lvt::UiaProvider provider;
+            bool ownershipLost = false;
+            auto tree = provider.build(
+                *identity, lvt::UiaOptions{}, nullptr,
+                &ownershipLost);
+            return std::make_pair(
+                tree.has_value(), ownershipLost);
+        });
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 5000),
+        WAIT_OBJECT_0)
+        << "the one-shot fallback did not reach ElementFromHandle";
+
+    fixture.stop();
+    SetEvent(release.get());
+    const auto result = pending.get();
+    EXPECT_FALSE(result.first);
+    EXPECT_TRUE(result.second)
+        << "replacement between precheck and ElementFromHandle validation "
+           "must fail ownership";
 }
 #endif
 
