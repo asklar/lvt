@@ -30,7 +30,11 @@ void collect_index(const Element& el, const std::string& path, std::vector<Index
 }
 
 std::vector<IndexedElement> index_tree(Element& root) {
-    assign_element_keys(root);
+    // A scoped watch tree already carries the key assigned while it was still
+    // attached to the complete tree. Preserve that root identity; recomputing
+    // it in isolation would discard the ancestor-qualified durable key that
+    // the caller used to select the scope.
+    assign_element_keys(root, true);
     std::vector<IndexedElement> elements;
     collect_index(root, "0", elements);
     return elements;
@@ -169,7 +173,7 @@ void reconcile_children(const Element& prevParent, Element& currParent,
         const auto& p = prevChildren[i];
         if (global.prevToCurr.find(&p) != global.prevToCurr.end())
             continue;
-        if (p.providerHandle != 0)
+        if (has_durable_provider_identity(p))
             prevByProviderHandle.emplace(p.providerHandle, i);
         if (p.nativeHandle != 0)
             prevByNativeHandle.emplace(p.nativeHandle, i);
@@ -208,7 +212,7 @@ void reconcile_children(const Element& prevParent, Element& currParent,
             continue;
         }
         std::optional<size_t> matchIdx;
-        if (c.providerHandle != 0) {
+        if (has_durable_provider_identity(c)) {
             auto it = prevByProviderHandle.find(c.providerHandle);
             if (it != prevByProviderHandle.end() && !prevUsed[it->second] &&
                 base_identity_key(prevChildren[it->second]) == base_identity_key(c))
@@ -421,6 +425,7 @@ static Element element_without_children(const Element& el) {
     flat.properties = el.properties;
     flat.nativeHandle = el.nativeHandle;
     flat.providerHandle = el.providerHandle;
+    flat.durableIdentity = el.durableIdentity;
     return flat;
 }
 
@@ -565,8 +570,8 @@ std::vector<ChangeEvent> diff_trees(Element& before, Element& after) {
     // once established, survives for as long as it keeps being recognized.
     // Only a node that is genuinely new this tick keeps the key assigned
     // here.
-    assign_element_keys(before);
-    assign_element_keys(after);
+    assign_element_keys(before, true);
+    assign_element_keys(after, true);
 
     auto global = build_global_reconciliation(before, after);
     global.processedCurr.insert(&after);

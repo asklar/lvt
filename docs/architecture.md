@@ -164,6 +164,17 @@ snapshot replaces, rather than accumulates, the session allow-list.
 Connection lookup rechecks session liveness under the connection-map lock so a
 disconnect cannot recreate an erased session entry.
 
+Native durable keys are deliberately independent of those mutation handles.
+Every HWND-backed Win32/common-control node uses the same compact
+`win32:0x…`/`comctl:0x…` key in one-shot and persistent trees, derived from its
+HWND. Logical common-control children use public-safe identities: unique
+list/tab text fingerprints, a fingerprint of the documented tree-item handle,
+unique toolbar command ids, and status-part indices. Duplicate/unsafe
+identities fall back to parent-local structural slots. The provider's opaque
+session handle remains in `Element::providerHandle` only for property routing
+and is never substituted into the public key. Parsing an HWND key identifies a
+candidate; the connection's published-root allow-list still authorizes it.
+
 List-view, tree-view, and tab text reads grow their capacity and retry up to the
 provider safety limit; setters reject values beyond that same readback limit
 before mutation. Tab reads request `TCIF_TEXT` only: `TCIF_PARAM` is
@@ -189,7 +200,11 @@ After the full tree is built, `assign_element_ids()` walks the tree in depth-fir
 - Deterministic (same tree structure → same IDs)
 - Used by `--element` for subtree scoping and by screenshot annotations
 
-Durable `key` identity is separate. XAML/WinUI instance handles and managed WPF/WinForms handles use compact framework-qualified keys (`wpf:0x…`, `winforms:0x…`, and so on), remaining stable across refreshes on the same live target.
+Durable `key` identity is separate. XAML/WinUI instance handles and managed
+WPF/WinForms handles use compact framework-qualified keys (`wpf:0x…`,
+`winforms:0x…`, and so on), remaining stable across refreshes on the same live
+target. Native HWND keys are also compact and connection-independent; only
+XAML/WinUI identities opt into process-wide reparent reconciliation.
 
 ### Bridge-to-XAML matching
 

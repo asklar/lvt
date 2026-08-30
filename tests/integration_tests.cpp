@@ -662,6 +662,8 @@ TEST(PluginPersistentWatch, ScopedPluginFailurePreservesPreviousSnapshot) {
 
     EXPECT_EQ(result.exitCode, 0u);
     EXPECT_NE(result.output.find("FakePluginNode"), std::string::npos);
+    EXPECT_NE(result.output.find(pluginKey), std::string::npos)
+        << "the one-shot plugin key must remain the scoped watch root key";
     EXPECT_EQ(result.output.find("\"event\":\"removed\""), std::string::npos)
         << result.output;
     EXPECT_EQ(count_plugin_stats(result.stats, "get_malformed "), 1u);
@@ -3836,6 +3838,92 @@ TEST_F(NativeControlsFixture, NativeWinEventsSignalCreateDestroyReorderAndBurst)
         << "EVENT_OBJECT_DESTROY did not request a native snapshot";
 }
 
+TEST_F(NativeControlsFixture, DumpKeyScopesWatchAndWatchKeyQueriesOneShot) {
+    auto dump = dump_tree();
+    auto* listView = find_element_by_hwnd(
+        dump["root"], control(native_fixture::kListViewId));
+    ASSERT_NE(listView, nullptr);
+    auto* beta = find_element_by_type_property(
+        *listView, "ListViewItem", "index", "1");
+    ASSERT_NE(beta, nullptr);
+    const auto dumpKey = beta->value("key", "");
+    ASSERT_FALSE(dumpKey.empty());
+
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    wil::unique_handle readEnd;
+    wil::unique_handle writeEnd;
+    ASSERT_TRUE(CreatePipe(
+        readEnd.put(), writeEnd.put(), &security, 0));
+    ASSERT_TRUE(SetHandleInformation(
+        readEnd.get(), HANDLE_FLAG_INHERIT, 0));
+
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = writeEnd.get();
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION processInfo{};
+    std::string command = make_cmd(
+        get_lvt_path(),
+        get_hwnd_arg() + " watch --interval 50 --element \"" +
+            dumpKey + "\"");
+    ASSERT_TRUE(CreateProcessA(
+        nullptr, command.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &processInfo));
+    wil::unique_handle process(processInfo.hProcess);
+    wil::unique_handle thread(processInfo.hThread);
+    writeEnd.reset();
+
+    std::string output;
+    const auto deadline = GetTickCount64() + 10000;
+    while (GetTickCount64() < deadline &&
+           output.find('\n') == std::string::npos) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(
+                readEnd.get(), nullptr, 0, nullptr,
+                &available, nullptr)) {
+            break;
+        }
+        if (available == 0) {
+            if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0)
+                break;
+            Sleep(20);
+            continue;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!ReadFile(
+                readEnd.get(), chunk.data(), available,
+                &read, nullptr) ||
+            read == 0) {
+            break;
+        }
+        output.append(chunk, 0, read);
+    }
+
+    TerminateProcess(process.get(), 0);
+    WaitForSingleObject(process.get(), 5000);
+
+    const auto newline = output.find('\n');
+    ASSERT_NE(newline, std::string::npos)
+        << "scoped watch emitted no complete event";
+    const auto event = json::parse(
+        output.substr(0, newline), nullptr, false);
+    ASSERT_FALSE(event.is_discarded()) << output;
+    EXPECT_EQ(event.value("event", ""), "added");
+    const auto watchKey = event.value("key", "");
+    EXPECT_EQ(watchKey, dumpKey)
+        << "the one-shot key must resolve in persistent watch";
+    ASSERT_TRUE(event.contains("element"));
+    EXPECT_EQ(event["element"].value("text", ""), "Beta row");
+
+    const auto queried = run_command(make_cmd(
+        get_lvt_path(),
+        get_hwnd_arg() + " query " +
+            cmd_escape_arg(watchKey) + " index"));
+    EXPECT_EQ(trim_crlf(queried), "1")
+        << "a key emitted by watch must resolve in one-shot query";
+}
+
 TEST_F(NativeControlsFixture, NativeWatchDoesNotDuplicateStructuralDiffs) {
     send_native_fixture_message(
         s_hwnd, native_fixture::kDestroyEventChildMessage);
@@ -4320,6 +4408,228 @@ TEST_F(NativeControlsFixture, ProviderDumpExposesAllControlsAndBaselineValues) {
     EXPECT_EQ((*tabs)["children"][1]["properties"].value("index", ""), "1");
     EXPECT_EQ((*tabs)["children"][1]["properties"].value("selected", ""), "true");
     EXPECT_EQ((*tabs)["children"][2]["properties"].value("index", ""), "2");
+}
+
+TEST_F(NativeControlsFixture, NativeDurableKeysMatchOneShotAndPersistentTrees) {
+    const auto frameworks = lvt::detect_frameworks(s_hwnd, s_pid);
+    auto oneShot = lvt::build_tree(s_hwnd, s_pid, frameworks);
+    auto persistent = native_tree();
+
+    EXPECT_EQ(oneShot.key, persistent.root.key);
+    EXPECT_EQ(oneShot.key.rfind("win32:0x", 0), 0u);
+    EXPECT_EQ(oneShot.providerHandle, 0u);
+    EXPECT_NE(persistent.root.providerHandle, 0u);
+
+    for (const int id : {
+             native_fixture::kCheckboxId,
+             native_fixture::kComboBoxId,
+             native_fixture::kListViewId,
+             native_fixture::kTreeViewId,
+             native_fixture::kToolbarId,
+             native_fixture::kStatusBarId,
+             native_fixture::kTabControlId,
+             native_fixture::kGenericTextId,
+         }) {
+        const HWND hwnd = control(id);
+        auto* oneShotElement =
+            find_native_element_by_hwnd(oneShot, hwnd);
+        auto* persistentElement =
+            find_native_element_by_hwnd(persistent.root, hwnd);
+        ASSERT_NE(oneShotElement, nullptr) << "control " << id;
+        ASSERT_NE(persistentElement, nullptr) << "control " << id;
+        EXPECT_EQ(oneShotElement->key, persistentElement->key)
+            << "control " << id;
+        EXPECT_EQ(oneShotElement->providerHandle, 0u)
+            << "one-shot controls do not acquire mutation handles";
+        EXPECT_NE(persistentElement->providerHandle, 0u)
+            << "persistent controls retain mutation handles";
+        EXPECT_EQ(
+            oneShotElement->key.rfind(
+                oneShotElement->framework + ":0x", 0),
+            0u);
+    }
+
+    const auto compareLogical =
+        [](const lvt::Element* oneShotElement,
+           const lvt::Element* persistentElement,
+           const char* label) {
+        ASSERT_NE(oneShotElement, nullptr) << label;
+        ASSERT_NE(persistentElement, nullptr) << label;
+        EXPECT_EQ(oneShotElement->key, persistentElement->key)
+            << label;
+        EXPECT_EQ(oneShotElement->providerHandle, 0u)
+            << label;
+        EXPECT_NE(persistentElement->providerHandle, 0u)
+            << label;
+        EXPECT_EQ(
+            persistentElement->key.find("800000000000"),
+            std::string::npos)
+            << "the public key must not expose a session mutation handle";
+    };
+
+    auto* oneShotList = find_native_element_by_hwnd(
+        oneShot, control(native_fixture::kListViewId));
+    auto* persistentList = find_native_element_by_hwnd(
+        persistent.root, control(native_fixture::kListViewId));
+    compareLogical(
+        find_native_element_by_text(
+            *oneShotList, "ListViewItem", "Beta row"),
+        find_native_element_by_text(
+            *persistentList, "ListViewItem", "Beta row"),
+        "list-view item");
+
+    auto* oneShotTree = find_native_element_by_hwnd(
+        oneShot, control(native_fixture::kTreeViewId));
+    auto* persistentTree = find_native_element_by_hwnd(
+        persistent.root, control(native_fixture::kTreeViewId));
+    compareLogical(
+        find_native_element_by_text(
+            *oneShotTree, "TreeViewItem", "Fixture Grandchild"),
+        find_native_element_by_text(
+            *persistentTree, "TreeViewItem", "Fixture Grandchild"),
+        "tree-view item");
+
+    auto* oneShotToolbar = find_native_element_by_hwnd(
+        oneShot, control(native_fixture::kToolbarId));
+    auto* persistentToolbar = find_native_element_by_hwnd(
+        persistent.root, control(native_fixture::kToolbarId));
+    compareLogical(
+        find_native_element_by_text(
+            *oneShotToolbar, "ToolbarButton", "Apply"),
+        find_native_element_by_text(
+            *persistentToolbar, "ToolbarButton", "Apply"),
+        "toolbar button");
+
+    auto* oneShotStatus = find_native_element_by_hwnd(
+        oneShot, control(native_fixture::kStatusBarId));
+    auto* persistentStatus = find_native_element_by_hwnd(
+        persistent.root, control(native_fixture::kStatusBarId));
+    ASSERT_GE(oneShotStatus->children.size(), 2u);
+    ASSERT_GE(persistentStatus->children.size(), 2u);
+    compareLogical(
+        &oneShotStatus->children[1],
+        &persistentStatus->children[1],
+        "status-bar part");
+
+    auto* oneShotTabs = find_native_element_by_hwnd(
+        oneShot, control(native_fixture::kTabControlId));
+    auto* persistentTabs = find_native_element_by_hwnd(
+        persistent.root, control(native_fixture::kTabControlId));
+    compareLogical(
+        find_native_element_by_text(
+            *oneShotTabs, "Tab", "Details"),
+        find_native_element_by_text(
+            *persistentTabs, "Tab", "Details"),
+        "tab item");
+}
+
+TEST_F(NativeControlsFixture, LogicalNativeKeysTrackSafeIdentityRules) {
+    auto before = dump_tree();
+    auto* beforeToolbar = find_element_by_hwnd(
+        before["root"], control(native_fixture::kToolbarId));
+    ASSERT_NE(beforeToolbar, nullptr);
+    auto* beforeApply = find_element_by_type_property(
+        *beforeToolbar, "ToolbarButton", "commandId", "2001");
+    ASSERT_NE(beforeApply, nullptr);
+    const auto applyKey = beforeApply->value("key", "");
+    ASSERT_FALSE(applyKey.empty());
+
+    DWORD_PTR changed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kMoveToolbarApplyMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &changed),
+        0);
+    auto restoreToolbar = wil::scope_exit([&] {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreToolbarOrderMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored);
+    });
+    auto reordered = dump_tree();
+    auto* reorderedToolbar = find_element_by_hwnd(
+        reordered["root"], control(native_fixture::kToolbarId));
+    ASSERT_NE(reorderedToolbar, nullptr);
+    auto* reorderedApply = find_element_by_type_property(
+        *reorderedToolbar, "ToolbarButton", "commandId", "2001");
+    ASSERT_NE(reorderedApply, nullptr);
+    EXPECT_EQ(reorderedApply->value("key", ""), applyKey)
+        << "a unique documented toolbar command survives reordering";
+    restoreToolbar.reset();
+
+    before = dump_tree();
+    auto* beforeList = find_element_by_hwnd(
+        before["root"], control(native_fixture::kListViewId));
+    ASSERT_NE(beforeList, nullptr);
+    auto* beforeAlpha = find_element_by_type_property(
+        *beforeList, "ListViewItem", "index", "0");
+    ASSERT_NE(beforeAlpha, nullptr);
+    const auto alphaKey = beforeAlpha->value("key", "");
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kMutateListViewIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &changed),
+        0);
+    auto restoreList = wil::scope_exit([&] {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreListViewIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored);
+    });
+    auto replaced = dump_tree();
+    auto* replacedList = find_element_by_hwnd(
+        replaced["root"], control(native_fixture::kListViewId));
+    ASSERT_NE(replacedList, nullptr);
+    auto* replacement = find_element_by_type_property(
+        *replacedList, "ListViewItem", "index", "0");
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_NE(replacement->value("key", ""), alphaKey)
+        << "text is only a safe item identity while that identity remains";
+    restoreList.reset();
+
+    before = dump_tree();
+    auto* beforeTabs = find_element_by_hwnd(
+        before["root"], control(native_fixture::kTabControlId));
+    ASSERT_NE(beforeTabs, nullptr);
+    const json* overview = nullptr;
+    for (const auto& child : (*beforeTabs)["children"]) {
+        if (child.value("text", "") == "Overview") {
+            overview = &child;
+            break;
+        }
+    }
+    ASSERT_NE(overview, nullptr);
+    const auto overviewKey = overview->value("key", "");
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kMakeDuplicateTabsMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &changed),
+        0);
+    auto restoreTabs = wil::scope_exit([&] {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreTabsMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored);
+    });
+    auto duplicated = dump_tree();
+    auto* duplicatedTabs = find_element_by_hwnd(
+        duplicated["root"], control(native_fixture::kTabControlId));
+    ASSERT_NE(duplicatedTabs, nullptr);
+    int overviewCount = 0;
+    for (const auto& child : (*duplicatedTabs)["children"]) {
+        if (child.value("text", "") != "Overview")
+            continue;
+        ++overviewCount;
+        EXPECT_NE(child.value("key", ""), overviewKey)
+            << "duplicate labels must fall back to positional identity";
+    }
+    EXPECT_EQ(overviewCount, 2);
 }
 
 TEST_F(NativeControlsFixture, ReadOnlySummaryReportsCompleteNativeState) {

@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -83,6 +84,38 @@ const char* machine_name(USHORT machine) {
     default:
         return "unknown";
     }
+}
+
+std::string run_command(const std::string& command) {
+    std::string output;
+    char buffer[4096]{};
+    FILE* pipe = _popen(command.c_str(), "r");
+    if (!pipe)
+        return {};
+    while (fgets(buffer, static_cast<int>(sizeof(buffer)), pipe))
+        output += buffer;
+    _pclose(pipe);
+    return output;
+}
+
+std::string cmd_escape_arg(const std::string& argument) {
+    std::string escaped;
+    escaped.reserve(argument.size() * 2);
+    for (const char value : argument) {
+        if (value == '|' || value == '&' || value == '<' ||
+            value == '>' || value == '^') {
+            escaped += '^';
+        }
+        escaped += value;
+    }
+    return escaped;
+}
+
+std::string trim_crlf(const std::string& value) {
+    const auto end = value.find_last_not_of("\r\n");
+    return end == std::string::npos
+        ? std::string()
+        : value.substr(0, end + 1);
 }
 
 std::string read_text_file(const std::string& path) {
@@ -3678,6 +3711,73 @@ TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
         json{{"session", scopedSession}, {"element", comboKey}},
         &isError);
     EXPECT_FALSE(isError) << underlyingSibling.dump(2);
+}
+
+TEST_F(NativeMcpFixture, NativeKeysRoundTripBetweenOneShotAndMcp) {
+    const auto oneShotOutput = run_command(
+        "\"" + get_lvt_path() + "\" --hwnd " + hwnd_string());
+    const auto oneShot = json::parse(
+        oneShotOutput, nullptr, false);
+    ASSERT_FALSE(oneShot.is_discarded()) << oneShotOutput;
+    ASSERT_TRUE(oneShot.contains("root"));
+    const auto* oneShotGeneric = find_by_class(
+        oneShot["root"], "LvtNativePropertyFixtureText");
+    const auto* oneShotList = find_by_class(
+        oneShot["root"], "SysListView32");
+    ASSERT_NE(oneShotGeneric, nullptr);
+    ASSERT_NE(oneShotList, nullptr);
+    const auto* oneShotBeta = find_child(
+        *oneShotList, "ListViewItem", "Beta row");
+    ASSERT_NE(oneShotBeta, nullptr);
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    const auto persistent = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << persistent.dump(2);
+    ASSERT_TRUE(persistent.contains("root"));
+    const auto* persistentGeneric = find_by_class(
+        persistent["root"], "LvtNativePropertyFixtureText");
+    const auto* persistentList = find_by_class(
+        persistent["root"], "SysListView32");
+    ASSERT_NE(persistentGeneric, nullptr);
+    ASSERT_NE(persistentList, nullptr);
+    const auto* persistentBeta = find_child(
+        *persistentList, "ListViewItem", "Beta row");
+    ASSERT_NE(persistentBeta, nullptr);
+
+    EXPECT_EQ(
+        persistent["root"].value("key", ""),
+        oneShot["root"].value("key", ""));
+    EXPECT_EQ(
+        persistentGeneric->value("key", ""),
+        oneShotGeneric->value("key", ""));
+    EXPECT_EQ(
+        persistentBeta->value("key", ""),
+        oneShotBeta->value("key", ""));
+
+    const auto dumpKey = oneShotBeta->value("key", "");
+    const auto scoped = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}, {"element", dumpKey}},
+        &isError);
+    ASSERT_FALSE(isError) << scoped.dump(2);
+    ASSERT_TRUE(scoped.contains("root"));
+    EXPECT_EQ(scoped["root"].value("key", ""), dumpKey);
+    EXPECT_EQ(scoped["root"].value("text", ""), "Beta row");
+
+    const auto mcpKey = persistentBeta->value("key", "");
+    const auto queried = run_command(
+        "\"" + get_lvt_path() + "\" --hwnd " + hwnd_string() +
+        " query " + cmd_escape_arg(mcpKey) + " index");
+    EXPECT_EQ(trim_crlf(queried), "1")
+        << "a persistent MCP key must resolve in a one-shot query";
 }
 
 TEST_F(

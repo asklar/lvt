@@ -297,12 +297,19 @@ full, lvt refuses another pointer message instead of leaking without limit.
 Toolbar text is length-queried, safety-capped, and retrieved through a
 capacity-bearing `TB_GETBUTTONINFO` buffer with bounded growth rechecks.
 
-Native compact keys are valid only after that exact target was registered while
+Native HWND keys are stable across one-shot commands and persistent sessions:
+`win32:0x…` and `comctl:0x…` always come from the HWND, never from whether a
+property adapter happened to be connected. Logical common-control item keys
+similarly use public-safe text/handle fingerprints, toolbar command ids, or
+documented indices; opaque mutation handles remain private to the provider.
+
+Those compact keys identify but do not authorize. They are valid for native
+properties only after that exact target was registered and published while
 building the session's root tree. A guessed same-process HWND, a sibling
 top-level window, a reparented child that left the root, or a key from a
-reconnected session before its first tree refresh is rejected. Each published
-snapshot replaces the native allow-list, so narrowing to a subtree prunes
-siblings. Tab identity never requests `TCIF_PARAM`, because
+reconnected session before its first tree refresh is rejected. Each complete
+published snapshot replaces the native allow-list. Tab identity never requests
+`TCIF_PARAM`, because
 `TCM_SETITEMEXTRA` changes that ABI; it instead requires unique text and
 revalidates the complete ordered label fingerprint. Duplicate toolbar command
 ids similarly make affected buttons read-only.

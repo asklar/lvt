@@ -4,8 +4,10 @@
 #include "native_property_connection.h"
 
 #include <CommCtrl.h>
+#include <cstdio>
 #include <map>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace lvt {
@@ -72,6 +74,26 @@ std::shared_ptr<RemoteBuffer> allocate_remote(
     return allocate_remote(identity, size, result);
 }
 
+uint64_t stable_identity_hash(std::string_view value) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char byte : value) {
+        hash ^= byte;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+std::string hashed_identity(
+    const char* kind, std::string_view value) {
+    char buffer[80]{};
+    snprintf(
+        buffer, sizeof(buffer), "%s:%zu:0x%016llX",
+        kind, value.size(),
+        static_cast<unsigned long long>(
+            stable_identity_hash(value)));
+    return buffer;
+}
+
 void enrich_tree_item(
     Element& parent, const NativeWindowIdentity& identity,
     HTREEITEM itemHandle, NativePropertyConnection* properties,
@@ -82,6 +104,15 @@ void enrich_tree_item(
     Element item;
     item.type = "TreeViewItem";
     item.framework = "comctl";
+    {
+        const uint64_t itemValue = static_cast<uint64_t>(
+            reinterpret_cast<uintptr_t>(itemHandle));
+        item.durableIdentity = hashed_identity(
+            "tree-item",
+            std::string_view(
+                reinterpret_cast<const char*>(&itemValue),
+                sizeof(itemValue)));
+    }
     if (properties) {
         item.providerHandle = properties->register_treeview_item(
             identity.hwnd, itemHandle);
@@ -244,6 +275,9 @@ void ComCtlProvider::enrich_listview(
             }
         }
         read_native_listview_item_text(identity, index, item.text);
+        if (!item.text.empty())
+            item.durableIdentity =
+                hashed_identity("item-text", item.text);
         el.children.push_back(std::move(item));
     }
     if (count > maxItems)
@@ -343,6 +377,10 @@ void ComCtlProvider::enrich_toolbar(
         item.properties["index"] = std::to_string(index);
         item.properties["commandId"] =
             std::to_string(button.idCommand);
+        item.durableIdentity =
+            (button.fsStyle & BTNS_SEP)
+                ? "separator-index:" + std::to_string(index)
+                : "command-id:" + std::to_string(button.idCommand);
         if (properties && !(button.fsStyle & BTNS_SEP)) {
             item.providerHandle = properties->register_toolbar_button(
                 hwnd, index, button.idCommand);
@@ -390,6 +428,7 @@ void ComCtlProvider::enrich_statusbar(
         item.type = "StatusBarPart";
         item.framework = "comctl";
         item.properties["index"] = std::to_string(index);
+        item.durableIdentity = "part-index:" + std::to_string(index);
         if (properties) {
             item.providerHandle =
                 properties->register_statusbar_part(hwnd, index);
@@ -460,6 +499,9 @@ void ComCtlProvider::enrich_tabcontrol(
                 properties->register_tab_item(hwnd, index);
 
         read_native_tab_item_text(identity, index, item.text);
+        if (!item.text.empty())
+            item.durableIdentity =
+                hashed_identity("item-text", item.text);
         el.children.push_back(std::move(item));
     }
 }

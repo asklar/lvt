@@ -31,6 +31,12 @@ struct Element {
     // providers use fixed-width wire handles that are wider than uintptr_t on
     // x86 (XAML InstanceHandle is MIDL_uhyper).
     uint64_t providerHandle = 0;
+
+    // Provider-supplied, public-safe logical identity used only for durable
+    // key construction. This is deliberately separate from providerHandle:
+    // native property adapters may need opaque, session-local mutation
+    // handles that must never make the public key connection-dependent.
+    std::string durableIdentity;
 };
 
 } // namespace lvt

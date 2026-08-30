@@ -390,6 +390,7 @@ TEST(Element, DefaultValues) {
     EXPECT_TRUE(el.properties.empty());
     EXPECT_TRUE(el.children.empty());
     EXPECT_EQ(el.nativeHandle, 0u);
+    EXPECT_TRUE(el.durableIdentity.empty());
 }
 
 namespace {
@@ -597,6 +598,25 @@ TEST(ElementKeys, ProcessWideProviderIdentityIsExplicitOptIn) {
     EXPECT_FALSE(has_process_wide_provider_identity(xaml));
 }
 
+TEST(ElementKeys, NativeMutationHandlesAreNotDurableIdentity) {
+    Element win32;
+    win32.framework = "win32";
+    win32.providerHandle = 0x101;
+    EXPECT_FALSE(has_durable_provider_identity(win32));
+
+    Element comctl = win32;
+    comctl.framework = "comctl";
+    EXPECT_FALSE(has_durable_provider_identity(comctl));
+
+    Element wpf = win32;
+    wpf.framework = "wpf";
+    EXPECT_TRUE(has_durable_provider_identity(wpf));
+
+    Element plugin = win32;
+    plugin.framework = "fake-plugin";
+    EXPECT_TRUE(has_durable_provider_identity(plugin));
+}
+
 TEST(ElementKeys, ManagedFrameworkHandlesUseCompactSessionKeys) {
     Element root = key_el("Window");
 
@@ -641,24 +661,79 @@ TEST(ElementKeys, WinFormsManagedIdentitySurvivesHwndRecreation) {
     EXPECT_NE(reusedHwnd.key, original.key);
 }
 
-TEST(ElementKeys, NativePropertyHandlesUseCompactProviderKeys) {
-    Element root;
-    root.type = "Window";
-    root.className = "FixtureWindow";
-    root.framework = "win32";
-    root.nativeHandle = 0x1234;
-    root.providerHandle = UINT64_C(0x1234);
+TEST(ElementKeys, NativeKeysDoNotDependOnPropertyConnection) {
+    Element oneShot;
+    oneShot.type = "Window";
+    oneShot.className = "FixtureWindow";
+    oneShot.framework = "win32";
+    oneShot.nativeHandle = 0x1234;
+
+    Element list;
+    list.type = "ListView";
+    list.className = "SysListView32";
+    list.framework = "comctl";
+    list.nativeHandle = 0x5678;
 
     Element item;
     item.type = "ListViewItem";
     item.framework = "comctl";
-    item.providerHandle = UINT64_C(0x8000000000000042);
-    root.children.push_back(std::move(item));
+    item.text = "Alpha row";
+    item.durableIdentity = "item-text:Alpha row";
+    list.children.push_back(std::move(item));
+    oneShot.children.push_back(std::move(list));
 
-    assign_element_keys(root);
+    Element persistent = oneShot;
+    persistent.providerHandle = UINT64_C(0x1234);
+    persistent.children[0].providerHandle = UINT64_C(0x5678);
+    persistent.children[0].children[0].providerHandle =
+        UINT64_C(0x8000000000000042);
 
-    EXPECT_EQ(root.key, "win32:0x1234");
-    EXPECT_EQ(root.children[0].key, "comctl:0x8000000000000042");
+    assign_element_keys(oneShot);
+    assign_element_keys(persistent);
+
+    EXPECT_EQ(oneShot.key, "win32:0x1234");
+    EXPECT_EQ(oneShot.children[0].key, "comctl:0x5678");
+    EXPECT_EQ(persistent.key, oneShot.key);
+    EXPECT_EQ(persistent.children[0].key, oneShot.children[0].key);
+    EXPECT_EQ(
+        persistent.children[0].children[0].key,
+        oneShot.children[0].children[0].key);
+    EXPECT_EQ(
+        oneShot.children[0].children[0].key.find("8000000000000042"),
+        std::string::npos);
+}
+
+TEST(ElementKeys, LogicalNativeIdentitySurvivesReorderButNotReplacement) {
+    Element list;
+    list.type = "ListView";
+    list.className = "SysListView32";
+    list.framework = "comctl";
+    list.nativeHandle = 0x5678;
+
+    Element alpha;
+    alpha.type = "ListViewItem";
+    alpha.framework = "comctl";
+    alpha.durableIdentity = "item-text:Alpha";
+    alpha.providerHandle = UINT64_C(0x8000000000000001);
+    Element beta = alpha;
+    beta.durableIdentity = "item-text:Beta";
+    beta.providerHandle = UINT64_C(0x8000000000000002);
+    list.children.push_back(alpha);
+    list.children.push_back(beta);
+    assign_element_keys(list);
+    const auto alphaKey = list.children[0].key;
+    const auto betaKey = list.children[1].key;
+
+    std::swap(list.children[0], list.children[1]);
+    list.children[0].providerHandle = UINT64_C(0x8000000000000001);
+    list.children[1].providerHandle = UINT64_C(0x8000000000000002);
+    assign_element_keys(list);
+    EXPECT_EQ(list.children[0].key, betaKey);
+    EXPECT_EQ(list.children[1].key, alphaKey);
+
+    list.children[1].durableIdentity = "item-text:Replacement";
+    assign_element_keys(list);
+    EXPECT_NE(list.children[1].key, alphaKey);
 }
 
 TEST(ElementKeys, ParsesOnlyCompactXamlInstanceKeys) {
@@ -1001,6 +1076,17 @@ TEST(WatchDiff, AddedElement) {
     EXPECT_EQ(events[0].type, ChangeEvent::Type::Added);
     EXPECT_EQ(events[0].path, "0.0");
     EXPECT_EQ(events[0].element.text, "OK");
+}
+
+TEST(WatchDiff, SnapshotPreservesAncestorQualifiedScopedRootKey) {
+    Element scoped = diff_el("Item", "Item", "Scoped");
+    scoped.key =
+        "win32:0x1234/fake-provider|Item|identity:scoped";
+
+    const auto events = snapshot_added_events(scoped);
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].key, scoped.key);
+    EXPECT_EQ(events[0].element.key, scoped.key);
 }
 
 TEST(WatchDiff, RemovedElement) {
@@ -1406,10 +1492,12 @@ TEST(WatchDiff, AncestorSiblingChurnDoesNotDestabilizeStableDescendants) {
 
 TEST(WatchDiff, ProviderHandlesAbove32BitsSurviveSiblingReordering) {
     Element before = diff_el("Window", "Root");
-    Element first = diff_el("Item", "Item", "First");
-    first.providerHandle = UINT64_C(0x100000001);
-    Element second = diff_el("Item", "Item", "Second");
-    second.providerHandle = UINT64_C(0x200000001);
+    Element first = diff_provider_el(
+        "fake-provider", "Item", "Item",
+        UINT64_C(0x100000001), "First");
+    Element second = diff_provider_el(
+        "fake-provider", "Item", "Item",
+        UINT64_C(0x200000001), "Second");
     before.children = {first, second};
 
     Element after = diff_el("Window", "Root");
