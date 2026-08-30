@@ -67,6 +67,55 @@ private:
     bool hadPrevious_ = false;
 };
 
+class NativePublicationGate {
+public:
+    explicit NativePublicationGate(const char* method) {
+        const auto serial = nextSerial_.fetch_add(1);
+        base_ =
+            "Local\\lvt-native-publication-" +
+            std::to_string(GetCurrentProcessId()) + "-" +
+            std::to_string(serial);
+        entered_.reset(CreateEventA(
+            nullptr, TRUE, FALSE, (base_ + "-entered").c_str()));
+        release_.reset(CreateEventA(
+            nullptr, TRUE, FALSE, (base_ + "-release").c_str()));
+        if (entered_ && release_) {
+            gateVariable_ = std::make_unique<ScopedEnvironmentVariable>(
+                "LVT_TEST_NATIVE_PUBLICATION_GATE", base_);
+            methodVariable_ = std::make_unique<ScopedEnvironmentVariable>(
+                "LVT_TEST_NATIVE_PUBLICATION_METHOD", method);
+        }
+    }
+
+    ~NativePublicationGate() {
+        release();
+    }
+
+    bool valid() const {
+        return entered_ && release_ &&
+               gateVariable_ && methodVariable_;
+    }
+
+    bool wait_until_entered() const {
+        return entered_ &&
+               WaitForSingleObject(entered_.get(), 10000) ==
+                   WAIT_OBJECT_0;
+    }
+
+    void release() {
+        if (release_)
+            SetEvent(release_.get());
+    }
+
+private:
+    inline static std::atomic<uint64_t> nextSerial_{1};
+    std::string base_;
+    wil::unique_handle entered_;
+    wil::unique_handle release_;
+    std::unique_ptr<ScopedEnvironmentVariable> gateVariable_;
+    std::unique_ptr<ScopedEnvironmentVariable> methodVariable_;
+};
+
 fs::path plugin_stats_path(const std::string& testName) {
     return fs::path(get_lvt_path()).parent_path() /
            ("fake-plugin-mcp-" + testName + "-" +
@@ -1278,6 +1327,18 @@ protected:
             "connect",
             json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
         return connected.value("session", "");
+    }
+
+    static std::string control_key(int id) {
+        const HWND hwnd = GetDlgItem(s_hwnd, id);
+        if (!hwnd)
+            return {};
+        char value[64]{};
+        snprintf(
+            value, sizeof(value), "win32:0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(hwnd)));
+        return value;
     }
 
     static const json* find_by_class(
@@ -2980,11 +3041,11 @@ TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
         json{{"session", parallelSession}, {"element", genericKey}},
         &isError);
     ASSERT_FALSE(isError) << narrowedParallelTree.dump(2);
-    auto prunedParallelSibling = client.call_tool(
+    auto retainedParallelSibling = client.call_tool(
         "get_editable_properties",
         json{{"session", parallelSession}, {"element", comboKey}},
         &isError);
-    EXPECT_TRUE(isError) << prunedParallelSibling.dump(2);
+    EXPECT_FALSE(isError) << retainedParallelSibling.dump(2);
 
     const auto scopedSession = connect(client);
     ASSERT_FALSE(scopedSession.empty());
@@ -2998,11 +3059,348 @@ TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
         json{{"session", scopedSession}, {"element", genericKey}},
         &isError);
     EXPECT_FALSE(isError) << scopedGenericProperties.dump(2);
-    auto unpublishedSibling = client.call_tool(
+    auto underlyingSibling = client.call_tool(
         "get_editable_properties",
         json{{"session", scopedSession}, {"element", comboKey}},
         &isError);
-    EXPECT_TRUE(isError) << unpublishedSibling.dump(2);
+    EXPECT_FALSE(isError) << underlyingSibling.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    OverlappingScopedTreeCannotInvalidateTargetsInLaterFullResponse) {
+    NativePublicationGate gate("get_visual_tree");
+    ASSERT_TRUE(gate.valid());
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    const auto comboKey = control_key(native_fixture::kComboBoxId);
+    ASSERT_FALSE(genericKey.empty());
+    ASSERT_FALSE(comboKey.empty());
+
+    const int full = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_TRUE(gate.wait_until_entered())
+        << "the full response did not reach the post-publication gate";
+
+    const int scoped = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments",
+              json{{"session", session}, {"element", genericKey}}}});
+    const auto scopedResponse = client.await_response(scoped);
+    ASSERT_TRUE(scopedResponse.contains("result"))
+        << scopedResponse.dump(2);
+    ASSERT_FALSE(scopedResponse["result"].value("isError", true))
+        << scopedResponse.dump(2);
+
+    gate.release();
+    const auto fullResponse = client.await_response(full);
+    ASSERT_TRUE(fullResponse.contains("result"))
+        << fullResponse.dump(2);
+    ASSERT_FALSE(fullResponse["result"].value("isError", true))
+        << fullResponse.dump(2);
+    const auto fullTree = json::parse(
+        fullResponse["result"]["content"][0].value("text", "{}"),
+        nullptr, false);
+    ASSERT_FALSE(fullTree.is_discarded())
+        << fullResponse.dump(2);
+    ASSERT_NE(find_by_class(fullTree["root"], "ComboBox"), nullptr)
+        << fullTree.dump(2);
+
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", comboKey}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "a key in the later-delivered full response was revoked by "
+           "the overlapping scoped response: "
+        << properties.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    OverlappingScopedTreeCannotInvalidateTargetsInLaterTreeChangeResponse) {
+    NativePublicationGate gate("get_visual_tree_changes");
+    ASSERT_TRUE(gate.valid());
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    const auto comboKey = control_key(native_fixture::kComboBoxId);
+    ASSERT_FALSE(genericKey.empty());
+    ASSERT_FALSE(comboKey.empty());
+
+    const int changes = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree_changes"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_TRUE(gate.wait_until_entered())
+        << "the tree-change response did not reach the publication gate";
+
+    const int scoped = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments",
+              json{{"session", session}, {"element", genericKey}}}});
+    const auto scopedResponse = client.await_response(scoped);
+    ASSERT_TRUE(scopedResponse.contains("result"))
+        << scopedResponse.dump(2);
+    ASSERT_FALSE(scopedResponse["result"].value("isError", true))
+        << scopedResponse.dump(2);
+
+    gate.release();
+    const auto changesResponse = client.await_response(changes);
+    ASSERT_TRUE(changesResponse.contains("result"))
+        << changesResponse.dump(2);
+    ASSERT_FALSE(changesResponse["result"].value("isError", true))
+        << changesResponse.dump(2);
+    const auto patch = json::parse(
+        changesResponse["result"]["content"][0].value("text", "{}"),
+        nullptr, false);
+    ASSERT_FALSE(patch.is_discarded())
+        << changesResponse.dump(2);
+    ASSERT_TRUE(patch.value("snapshot", false))
+        << patch.dump(2);
+    const auto events =
+        patch.value("events", json::array());
+    const bool returnedCombo = std::any_of(
+        events.begin(), events.end(),
+        [&comboKey](const json& event) {
+            return event.value("key", "") == comboKey;
+        });
+    ASSERT_TRUE(returnedCombo) << patch.dump(2);
+
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", comboKey}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "a key in the later-delivered tree-change response was revoked "
+           "by the overlapping scoped response: "
+        << properties.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    OverlappingScopedTreeCannotInvalidateTargetsInLaterResourceSnapshot) {
+    NativePublicationGate gate("get_visual_tree_changes");
+    ASSERT_TRUE(gate.valid());
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    const auto comboKey = control_key(native_fixture::kComboBoxId);
+    ASSERT_FALSE(genericKey.empty());
+    ASSERT_FALSE(comboKey.empty());
+    const auto uri =
+        "lvt://session/" + session + "/visual-tree";
+
+    const int resourceRead = client.send_request(
+        "resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(gate.wait_until_entered())
+        << "the resource snapshot did not reach the publication gate";
+
+    const int scoped = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments",
+              json{{"session", session}, {"element", genericKey}}}});
+    const auto scopedResponse = client.await_response(scoped);
+    ASSERT_TRUE(scopedResponse.contains("result"))
+        << scopedResponse.dump(2);
+    ASSERT_FALSE(scopedResponse["result"].value("isError", true))
+        << scopedResponse.dump(2);
+
+    gate.release();
+    const auto resourceResponse =
+        client.await_response(resourceRead);
+    ASSERT_TRUE(resourceResponse.contains("result"))
+        << resourceResponse.dump(2);
+    ASSERT_FALSE(
+        resourceResponse["result"]
+            .value("contents", json::array())
+            .empty())
+        << resourceResponse.dump(2);
+    const auto patch = json::parse(
+        resourceResponse["result"]["contents"][0]
+            .value("text", "{}"),
+        nullptr, false);
+    ASSERT_FALSE(patch.is_discarded())
+        << resourceResponse.dump(2);
+    const auto events =
+        patch.value("events", json::array());
+    const bool returnedCombo = std::any_of(
+        events.begin(), events.end(),
+        [&comboKey](const json& event) {
+            return event.value("key", "") == comboKey;
+        });
+    ASSERT_TRUE(returnedCombo) << patch.dump(2);
+
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", comboKey}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "a key in the later-delivered resource snapshot was revoked by "
+           "the overlapping scoped response: "
+        << properties.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    CompleteSnapshotInvalidatesTargetReparentedOutOfSessionRoot) {
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    ASSERT_FALSE(genericKey.empty());
+
+    bool isError = false;
+    const auto initial = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << initial.dump(2);
+    const auto baseline = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+
+    DWORD_PTR oldParent = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kReparentGenericOutOfTreeMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &oldParent),
+        0);
+    auto restore = wil::scope_exit([&] {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kRestoreGenericParentMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored);
+    });
+
+    const auto promptlyRejected = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError)
+        << "a target that moved out of the session root remained usable "
+           "until the next snapshot: "
+        << promptlyRejected.dump(2);
+
+    const auto withoutGeneric = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << withoutGeneric.dump(2);
+    EXPECT_EQ(
+        find_by_class(
+            withoutGeneric["root"],
+            "LvtNativePropertyFixtureText"),
+        nullptr)
+        << withoutGeneric.dump(2);
+    const auto rejected = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError)
+        << "a complete root snapshot retained a target that moved out "
+           "of the session root: "
+        << rejected.dump(2);
+
+    DWORD_PTR ignored = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kRestoreGenericParentMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored),
+        0);
+    restore.release();
+    const auto restoredTree = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << restoredTree.dump(2);
+    const auto restoredProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_FALSE(isError) << restoredProperties.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    DisconnectClearsTargetsWhilePublishedResponseAwaitsDelivery) {
+    NativePublicationGate gate("get_visual_tree");
+    ASSERT_TRUE(gate.valid());
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    ASSERT_FALSE(genericKey.empty());
+
+    const int tree = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_TRUE(gate.wait_until_entered())
+        << "the tree response did not reach the publication gate";
+
+    const int disconnect = client.send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+    const auto disconnectResponse =
+        client.await_response(disconnect);
+    ASSERT_TRUE(disconnectResponse.contains("result"))
+        << disconnectResponse.dump(2);
+    ASSERT_FALSE(
+        disconnectResponse["result"].value("isError", true))
+        << disconnectResponse.dump(2);
+
+    gate.release();
+    const auto treeResponse = client.await_response(tree);
+    ASSERT_TRUE(treeResponse.contains("result"))
+        << treeResponse.dump(2);
+    ASSERT_FALSE(treeResponse["result"].value("isError", true))
+        << treeResponse.dump(2);
+
+    bool isError = false;
+    const auto disconnected = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError) << disconnected.dump(2);
+
+    const auto replacement = connect(client);
+    ASSERT_FALSE(replacement.empty());
+    const auto unpublished = client.call_tool(
+        "get_editable_properties",
+        json{{"session", replacement}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError)
+        << "disconnect leaked published targets into a replacement session: "
+        << unpublished.dump(2);
 }
 
 TEST_F(NativeMcpFixture, DisconnectRacingNativePropertyReadDoesNotRecreateSession) {

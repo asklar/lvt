@@ -436,6 +436,49 @@ void publish_native_property_targets(
         connection->publish_targets(root);
 }
 
+// Deterministic MCP concurrency tests pause a completed native publication
+// before its response crosses the C ABI. The named events are created by the
+// test process and inherited only through these explicitly-set environment
+// variables; normal builds do no extra work.
+void wait_for_native_publication_test_gate(
+    const char* method, const json& params) {
+    char configuredMethod[64]{};
+    const DWORD methodLength = GetEnvironmentVariableA(
+        "LVT_TEST_NATIVE_PUBLICATION_METHOD",
+        configuredMethod, static_cast<DWORD>(_countof(configuredMethod)));
+    if (methodLength == 0 ||
+        methodLength >= _countof(configuredMethod) ||
+        strcmp(configuredMethod, method) != 0) {
+        return;
+    }
+    if (strcmp(method, "get_visual_tree") == 0) {
+        const auto scope = params.find("element");
+        if (scope != params.end() && scope->is_string() &&
+            !scope->get_ref<const std::string&>().empty()) {
+            return;
+        }
+    }
+
+    char base[256]{};
+    const DWORD baseLength = GetEnvironmentVariableA(
+        "LVT_TEST_NATIVE_PUBLICATION_GATE",
+        base, static_cast<DWORD>(_countof(base)));
+    if (baseLength == 0 || baseLength >= _countof(base))
+        return;
+
+    const std::string enteredName = std::string(base) + "-entered";
+    const std::string releaseName = std::string(base) + "-release";
+    wil::unique_handle entered(OpenEventA(
+        EVENT_MODIFY_STATE, FALSE, enteredName.c_str()));
+    wil::unique_handle release(OpenEventA(
+        SYNCHRONIZE, FALSE, releaseName.c_str()));
+    if (!entered || !release)
+        return;
+
+    SetEvent(entered.get());
+    WaitForSingleObject(release.get(), 10000);
+}
+
 void drain_session_connection_events(const std::string& sessionId) {
     std::vector<std::pair<std::string, std::shared_ptr<lvt::IFrameworkConnection>>>
         connections;
@@ -986,6 +1029,12 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             session.hwnd, session.pid, frameworks, -1,
             session.pluginOption, fastProperties, connectionLookup);
         if (!missing_injected_framework_content(tree)) {
+            // Publish the complete unscoped snapshot while the same target
+            // guard that ordered the walk is still held. Response scoping,
+            // depth trimming, correlation, diffing, and MCP delivery all
+            // happen later and must never replace authorization with only the
+            // subset one response happened to expose.
+            publish_native_property_targets(session, tree);
             drain_session_connection_events(session.id);
             return true;
         }
@@ -1355,8 +1404,6 @@ json method_get_tree(const json& params, bool uia) {
     const int depth = get_int(params, "depth", -1);
     if (depth >= 0)
         lvt::trim_to_depth(*root, depth);
-    if (!uia)
-        publish_native_property_targets(session, *root);
 
     // Correlating needs the other tree too, so it costs a second walk and is
     // asked for rather than assumed. It answers the question a caller
@@ -1411,6 +1458,9 @@ json method_get_tree(const json& params, bool uia) {
     }
     if (truncated)
         out["truncated"] = truncation_note();
+    if (!uia)
+        wait_for_native_publication_test_gate(
+            "get_visual_tree", params);
     return out;
 }
 
@@ -1723,8 +1773,6 @@ json method_get_tree_changes(const json& params, bool uia) {
         throw std::runtime_error(
             "cannot diff a truncated UI Automation tree; increase timeoutMs and try again");
     }
-    if (!uia)
-        publish_native_property_targets(session, current);
 
     const TreeSnapshotKey key{
         session.id,
@@ -1770,9 +1818,13 @@ json method_get_tree_changes(const json& params, bool uia) {
         if (!event.is_discarded())
             events.push_back(std::move(event));
     }
-    return json{{"tree", uia ? "uia" : "visual"},
-                {"snapshot", snapshot},
-                {"events", std::move(events)}};
+    json out{{"tree", uia ? "uia" : "visual"},
+             {"snapshot", snapshot},
+             {"events", std::move(events)}};
+    if (!uia)
+        wait_for_native_publication_test_gate(
+            "get_visual_tree_changes", params);
+    return out;
 }
 
 json method_get_frameworks(const json& params) {
