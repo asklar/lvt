@@ -453,13 +453,12 @@ void ComCtlProvider::enrich_toolbar(
             !(button.fsStyle & BTNS_SEP) &&
             identityScanComplete &&
             commandCounts[button.idCommand] != 1;
-        if (button.fsStyle & BTNS_SEP) {
-            item.durableIdentity =
-                "separator-index:" + std::to_string(index);
-        } else if (identityScanComplete && !ambiguous) {
+        if (!(button.fsStyle & BTNS_SEP) &&
+            identityScanComplete && !ambiguous) {
             item.durableIdentity =
                 "command-id:" + std::to_string(button.idCommand);
-        } else if (!identityScanComplete) {
+        } else if (!(button.fsStyle & BTNS_SEP) &&
+                   !identityScanComplete) {
             item.properties["commandIdentityUnverified"] = "true";
         }
         if (ambiguous)
@@ -502,9 +501,6 @@ void ComCtlProvider::enrich_statusbar(
         item.type = "StatusBarPart";
         item.framework = "comctl";
         item.properties["index"] = std::to_string(index);
-        // Status-bar parts are addressed by their documented slot index and
-        // every slot is emitted, so no separate uniqueness scan is needed.
-        item.durableIdentity = "part-index:" + std::to_string(index);
         if (properties) {
             item.providerHandle =
                 properties->register_statusbar_part(hwnd, index);

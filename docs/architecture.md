@@ -186,18 +186,21 @@ Every HWND-backed Win32/common-control node uses the same compact
 `win32:0x…`/`comctl:0x…` key in one-shot and persistent trees, derived from its
 HWND. Logical common-control children use public-safe identities: unique
 list/tab text fingerprints, a fingerprint of the documented tree-item handle,
-unique toolbar command ids, and status-part indices. Duplicate/unsafe
-identities fall back to parent-local structural slots. The provider's opaque
-session handle remains in `Element::providerHandle` only for property routing
-and is never substituted into the public key. Parsing an HWND key identifies a
-candidate; the connection's published-root allow-list still authorizes it.
+and unique toolbar command ids. Duplicate/unsafe identities, toolbar
+separators, and status-bar parts fall back to parent-local structural slots;
+their mutable indices are never promoted to durable identity. The provider's
+opaque session handle remains in `Element::providerHandle` only for property
+routing and is never substituted into the public key. Parsing an HWND key
+identifies a candidate; the connection's published-root allow-list still
+authorizes it.
 List and toolbar uniqueness scans cover the complete control, not only the
 first 50 children emitted in a dump. The scan is safety-bounded at 256 items;
 failure, timeout, or a larger control suppresses the durable logical identity
 and keeps property mutation read-only rather than claiming false uniqueness.
-Tabs apply the same bound while scanning every label. Tree item handles and
-status part indices are intrinsically unique within their owning control, so
-their output truncation does not weaken identity proof.
+Tabs apply the same bound while scanning every label. Tree item handles are
+intrinsically unique within their owning control, so output truncation does
+not weaken their identity proof. Status-part mutation safety remains separately
+guarded by index/count/text snapshot validation despite its structural key.
 
 Watch reconciliation treats a provider-supplied `durableIdentity` as
 authoritative. It is inherited only when equal and unique in both snapshots;

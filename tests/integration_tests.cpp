@@ -4552,6 +4552,100 @@ TEST_F(
         << watch.output();
 }
 
+TEST_F(
+    NativeControlsFixture,
+    ToolbarSeparatorScopeDoesNotAdoptShiftedSeparator) {
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kPopulateAdjacentToolbarSeparatorsMessage),
+        0);
+    auto restore = wil::scope_exit([&] {
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kRestoreDefaultToolbarMessage);
+    });
+
+    auto tree = dump_tree();
+    auto* toolbar = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kToolbarId));
+    ASSERT_NE(toolbar, nullptr);
+    std::vector<const json*> separators;
+    for (const auto& child : (*toolbar)["children"]) {
+        if (child.value("type", "") == "ToolbarSeparator")
+            separators.push_back(&child);
+    }
+    ASSERT_EQ(separators.size(), 2u);
+    const auto firstKey = separators[0]->value("key", "");
+    ASSERT_FALSE(firstKey.empty());
+    EXPECT_EQ(firstKey.find("identity:"), std::string::npos);
+    EXPECT_EQ(separators[1]->value("key", "").find("identity:"),
+              std::string::npos);
+
+    auto persistent = native_tree();
+    auto* persistentToolbar = find_native_element_by_hwnd(
+        persistent.root, control(native_fixture::kToolbarId));
+    ASSERT_NE(persistentToolbar, nullptr);
+    int persistentSeparators = 0;
+    for (const auto& child : persistentToolbar->children) {
+        if (child.type != "ToolbarSeparator")
+            continue;
+        ++persistentSeparators;
+        EXPECT_EQ(child.providerHandle, 0u)
+            << "separators must not expose a mutation target";
+        EXPECT_TRUE(child.durableIdentity.empty())
+            << "positional separator indices are not durable identity";
+    }
+    EXPECT_EQ(persistentSeparators, 2);
+
+    LiveWatchCapture watch;
+    ASSERT_TRUE(watch.start(make_cmd(
+        get_lvt_path(),
+        get_hwnd_arg() + " watch --interval 50 --element \"" +
+            firstKey + "\"")));
+    ASSERT_TRUE(watch.wait_for_event(
+        0, "added", firstKey, 10000))
+        << watch.output();
+
+    const auto removedAt = watch.mark();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kDeleteFirstToolbarSeparatorMessage),
+        0);
+    ASSERT_TRUE(watch.wait_for_event(
+        removedAt, "removed", firstKey, 10000))
+        << watch.output();
+    Sleep(250);
+    watch.drain();
+    EXPECT_FALSE(watch.event_seen(removedAt, "added"))
+        << "the second separator shifted into the deleted separator's scope:\n"
+        << watch.output();
+    EXPECT_TRUE(watch.running());
+
+    auto fresh = dump_tree();
+    toolbar = find_element_by_hwnd(
+        fresh["root"], control(native_fixture::kToolbarId));
+    ASSERT_NE(toolbar, nullptr);
+    const json* remaining = nullptr;
+    for (const auto& child : (*toolbar)["children"]) {
+        if (child.value("type", "") == "ToolbarSeparator") {
+            remaining = &child;
+            break;
+        }
+    }
+    ASSERT_NE(remaining, nullptr);
+    const auto freshKey = remaining->value("key", "");
+    EXPECT_NE(freshKey, firstKey);
+    EXPECT_EQ(freshKey.find("identity:"), std::string::npos);
+    EXPECT_EQ(
+        trim_crlf(run_command(make_cmd(
+            get_lvt_path(),
+            get_hwnd_arg() + " query " +
+                cmd_escape_arg(freshKey) + " index"))),
+        "0");
+}
+
 TEST_F(NativeControlsFixture, NativeWatchDoesNotDuplicateStructuralDiffs) {
     send_native_fixture_message(
         s_hwnd, native_fixture::kDestroyEventChildMessage);
@@ -5138,6 +5232,11 @@ TEST_F(NativeControlsFixture, NativeDurableKeysMatchOneShotAndPersistentTrees) {
         &oneShotStatus->children[1],
         &persistentStatus->children[1],
         "status-bar part");
+    EXPECT_TRUE(
+        oneShotStatus->children[1].durableIdentity.empty());
+    EXPECT_TRUE(
+        persistentStatus->children[1].durableIdentity.empty())
+        << "mutable status-part indices must remain structural";
 
     auto* oneShotTabs = find_native_element_by_hwnd(
         oneShot, control(native_fixture::kTabControlId));

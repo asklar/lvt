@@ -490,6 +490,22 @@ void populate_oversized_toolbar() {
     SendMessageW(g_controls.toolbar, TB_AUTOSIZE, 0, 0);
 }
 
+void populate_adjacent_toolbar_separators() {
+    delete_all_toolbar_buttons();
+    TBBUTTON separators[2]{};
+    for (auto& separator : separators) {
+        separator.iBitmap = 12;
+        separator.fsState = TBSTATE_ENABLED;
+        separator.fsStyle = BTNS_SEP;
+        separator.iString = -1;
+    }
+    SendMessageW(
+        g_controls.toolbar, TB_ADDBUTTONS,
+        static_cast<WPARAM>(_countof(separators)),
+        reinterpret_cast<LPARAM>(separators));
+    SendMessageW(g_controls.toolbar, TB_AUTOSIZE, 0, 0);
+}
+
 void restore_default_toolbar() {
     delete_all_toolbar_buttons();
     populate_toolbar();
@@ -841,6 +857,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return ListView_InsertItem(
             g_controls.listView, &item) == 0;
     }
+    case fixture::kPopulateAdjacentToolbarSeparatorsMessage:
+        populate_adjacent_toolbar_separators();
+        return TRUE;
+    case fixture::kDeleteFirstToolbarSeparatorMessage:
+        return SendMessageW(
+            g_controls.toolbar, TB_DELETEBUTTON, 0, 0);
     case fixture::kReparentGenericOutOfTreeMessage: {
         const HWND oldParent = SetParent(
             g_controls.genericText, g_controls.outOfTree);
