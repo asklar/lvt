@@ -20,6 +20,7 @@ public sealed class PropertyRowViewModel : ObservableObject
     private PropertyEditorKind _kind;
     private bool _isDirty;
     private bool _hasExternalConflict;
+    private bool _hasPendingAction;
     private long _editRevision;
 
     public PropertyRowViewModel(string name, string value)
@@ -62,6 +63,11 @@ public sealed class PropertyRowViewModel : ObservableObject
             if (SetField(ref _hasExternalConflict, value))
                 OnPropertyChanged(nameof(ConflictMessage));
         }
+    }
+    public bool HasPendingAction
+    {
+        get => _hasPendingAction;
+        private set => SetField(ref _hasPendingAction, value);
     }
     public string ConflictMessage => HasExternalConflict
         ? $"Target changed to “{Value}” while your pending edit is “{EditText}”."
@@ -180,13 +186,18 @@ public sealed class PropertyRowViewModel : ObservableObject
         OnPropertyChanged(nameof(CanApply));
     }
 
-    public void UpdateProviderValue(string value, bool preservePendingEdit)
+    public void UpdateProviderValue(
+        string value,
+        bool preservePendingEdit,
+        bool preserveCurrentAction = false)
     {
         var wasDirty = IsDirty;
         var pending = EditText;
         var changed = SetField(ref _value, value, nameof(Value));
+        var shouldPreserve =
+            preservePendingEdit && (wasDirty || preserveCurrentAction);
 
-        if (!preservePendingEdit || !wasDirty)
+        if (!shouldPreserve)
         {
             SetEditText(value, incrementRevision: false);
             if (changed)
@@ -194,6 +205,7 @@ public sealed class PropertyRowViewModel : ObservableObject
                 Validate();
                 UpdateDirtyState();
             }
+            HasPendingAction = false;
             HasExternalConflict = false;
             return;
         }
@@ -214,6 +226,7 @@ public sealed class PropertyRowViewModel : ObservableObject
         _editRevision = existing.EditRevision;
         OnPropertyChanged(nameof(EditRevision));
         SetEditText(existing.EditText, incrementRevision: false);
+        HasPendingAction = existing.HasPendingAction;
         HasExternalConflict =
             IsDirty &&
             (existing.HasExternalConflict ||
@@ -237,6 +250,7 @@ public sealed class PropertyRowViewModel : ObservableObject
     public void DiscardPendingEdit()
     {
         SetEditText(Value, incrementRevision: false);
+        HasPendingAction = false;
         HasExternalConflict = false;
     }
 
@@ -251,10 +265,12 @@ public sealed class PropertyRowViewModel : ObservableObject
 
         var newerEditText = EditText;
         var newerEditRevision = EditRevision;
+        var hasPendingAction = HasPendingAction;
         UpdateProviderValue(value, preservePendingEdit: false);
         _editRevision = newerEditRevision;
         OnPropertyChanged(nameof(EditRevision));
         SetEditText(newerEditText, incrementRevision: false);
+        HasPendingAction = hasPendingAction;
         if (IsDirty)
             HasExternalConflict = true;
     }
@@ -333,6 +349,8 @@ public sealed class PropertyRowViewModel : ObservableObject
         {
             ++_editRevision;
             OnPropertyChanged(nameof(EditRevision));
+            if (Kind == PropertyEditorKind.Command)
+                HasPendingAction = true;
         }
         Validate();
         UpdateDirtyState();

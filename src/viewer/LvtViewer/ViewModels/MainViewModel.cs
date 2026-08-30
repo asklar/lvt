@@ -39,8 +39,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private int _typedPropertyRefreshDelayMs = 100;
     private bool _typedRefreshNeedsFullUiaLoad;
     private bool _typedRefreshPreservePendingEdits;
-    private string? _typedRefreshAcceptedProviderName;
-    private long? _typedRefreshAcceptedEditRevision;
     private bool _awaitingSnapshot;
     private bool _resourceProbeRunning;
     private int _resourceProbeFailures;
@@ -77,12 +75,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var generation = _connectionGeneration;
             var fullUiaLoad = _typedRefreshNeedsFullUiaLoad;
             var preservePendingEdits = _typedRefreshPreservePendingEdits;
-            var acceptedProviderName = _typedRefreshAcceptedProviderName;
-            var acceptedEditRevision = _typedRefreshAcceptedEditRevision;
             _typedRefreshNeedsFullUiaLoad = false;
             _typedRefreshPreservePendingEdits = false;
-            _typedRefreshAcceptedProviderName = null;
-            _typedRefreshAcceptedEditRevision = null;
             bool applied = false;
             try
             {
@@ -90,16 +84,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 {
                     applied = fullUiaLoad
                         ? await RefreshUiaPropertiesAsync(
-                            node, preservePendingEdits,
-                            acceptedProviderName, acceptedEditRevision,
-                            refreshToken)
+                            node, preservePendingEdits, refreshToken)
                         : await RefreshTypedPropertiesAsync(
-                            node, preservePendingEdits,
-                            acceptedProviderName, acceptedEditRevision,
-                            refreshToken);
+                            node, preservePendingEdits, refreshToken);
                     applied = applied &&
                               generation == _connectionGeneration &&
                               SelectedElement == node;
+                    if (applied)
+                        node.SettleCompletedPropertyMutations();
                 }
             }
             finally
@@ -111,11 +103,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 {
                     _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
                     _typedRefreshPreservePendingEdits |= preservePendingEdits;
-                    if (!_typedRefreshAcceptedEditRevision.HasValue)
-                    {
-                        _typedRefreshAcceptedProviderName = acceptedProviderName;
-                        _typedRefreshAcceptedEditRevision = acceptedEditRevision;
-                    }
                 }
                 if (completionAccepted)
                     _typedPropertyRefreshDelayMs = applied
@@ -303,8 +290,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _typedPropertyRefreshState.Reset();
             _typedRefreshNeedsFullUiaLoad = false;
             _typedRefreshPreservePendingEdits = false;
-            _typedRefreshAcceptedProviderName = null;
-            _typedRefreshAcceptedEditRevision = null;
             IsPropertyPanelLoading = value != null;
             if (UseUia)
             {
@@ -675,8 +660,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async System.Threading.Tasks.Task<bool> RefreshUiaPropertiesAsync(
         ElementNodeViewModel? node,
         bool preservePendingEdits = false,
-        string? acceptedProviderName = null,
-        long? acceptedEditRevision = null,
         TypedPropertyRefreshState.Token? refreshToken = null)
     {
         if (node == null)
@@ -725,31 +708,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             {
                 return false;
             }
-            node.ReplacePropertyRows(rows);
+            node.ReplacePropertyRows(
+                rows, preserveTypedRows: preservePendingEdits);
         }
         Logger.Log("properties", $"Loaded UIA properties in {stopwatch.ElapsedMilliseconds} ms");
         return await RefreshTypedPropertiesAsync(
             node,
             preservePendingEdits,
-            acceptedProviderName,
-            acceptedEditRevision,
             refreshToken: refreshToken,
             clearLoadingOnCompletion: false);
     }
 
     private void RequestTypedPropertySchemaRefresh(
         bool fullUiaLoad = false,
-        bool preservePendingEdits = true,
-        string? acceptedProviderName = null,
-        long? acceptedEditRevision = null)
+        bool preservePendingEdits = true)
     {
         _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
         _typedRefreshPreservePendingEdits |= preservePendingEdits;
-        if (acceptedProviderName != null && acceptedEditRevision.HasValue)
-        {
-            _typedRefreshAcceptedProviderName = acceptedProviderName;
-            _typedRefreshAcceptedEditRevision = acceptedEditRevision;
-        }
         _typedPropertyRefreshState.Request();
         if (_typedPropertyRefreshState.IsRunning)
             return;
@@ -762,8 +737,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async System.Threading.Tasks.Task<bool> RefreshTypedPropertiesAsync(
         ElementNodeViewModel? node, bool preservePendingEdits = false,
-        string? acceptedProviderName = null,
-        long? acceptedEditRevision = null,
         TypedPropertyRefreshState.Token? refreshToken = null,
         bool clearLoadingOnCompletion = true)
     {
@@ -829,9 +802,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             })
             .ToList();
 
-        node.ReplaceTypedPropertyRows(
-            rows, preservePendingEdits,
-            acceptedProviderName, acceptedEditRevision);
+        node.ReplaceTypedPropertyRows(rows, preservePendingEdits);
         if (clearLoadingOnCompletion)
             IsPropertyPanelLoading = false;
         Logger.Log(
@@ -850,16 +821,25 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var submittedProviderName = row.ProviderName;
         var submittedRevision = row.EditRevision;
         var submittedValue = row.EditText;
+        var mutation = node.BeginPropertyMutation(
+            submittedProviderName, submittedRevision);
+        RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
         StatusText = $"Setting {row.Name}…";
         var result = await _mcp.SetPropertyAsync(
             node.Key, row.DescriptorId, submittedValue);
         if (SelectedElement != node)
-            return;
-        if (!result.Ok)
         {
-            StatusText = $"Set failed: {result.Error}";
+            node.CancelPropertyMutation(mutation);
             return;
         }
+        if (!result.Ok)
+        {
+            if (node.CancelPropertyMutation(mutation))
+                StatusText = $"Set failed: {result.Error}";
+            return;
+        }
+        if (!node.TryCompletePropertyMutation(mutation))
+            return;
         var acceptedValue = submittedValue;
         if (result.Payload.TryGetProperty("value", out var returnedValue) &&
             returnedValue.ValueKind == System.Text.Json.JsonValueKind.String)
@@ -869,12 +849,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var currentRow = node.FindProperty(submittedProviderName);
         currentRow?.ApplyMutationValue(
             acceptedValue, submittedRevision);
-        node.InvalidatePropertySnapshots();
         StatusText = $"{row.Name} updated.";
-        RequestTypedPropertySchemaRefresh(
-            preservePendingEdits: true,
-            acceptedProviderName: submittedProviderName,
-            acceptedEditRevision: submittedRevision);
+        RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
     }
 
     private async System.Threading.Tasks.Task ClearPropertyAsync(PropertyRowViewModel? row)
@@ -885,23 +861,28 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         var submittedProviderName = row.ProviderName;
         var submittedRevision = row.EditRevision;
+        var mutation = node.BeginPropertyMutation(
+            submittedProviderName, submittedRevision);
+        RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
         StatusText = $"Clearing {row.Name}…";
         var result = await _mcp.ClearPropertyAsync(node.Key, row.DescriptorId);
         if (SelectedElement != node)
-            return;
-        if (!result.Ok)
         {
-            StatusText = $"Clear failed: {result.Error}";
+            node.CancelPropertyMutation(mutation);
             return;
         }
+        if (!result.Ok)
+        {
+            if (node.CancelPropertyMutation(mutation))
+                StatusText = $"Clear failed: {result.Error}";
+            return;
+        }
+        if (!node.TryCompletePropertyMutation(mutation))
+            return;
         var currentRow = node.FindProperty(submittedProviderName);
         currentRow?.TryDiscardSubmittedEdit(submittedRevision);
-        node.InvalidatePropertySnapshots();
         StatusText = $"{row.Name} restored.";
-        RequestTypedPropertySchemaRefresh(
-            preservePendingEdits: true,
-            acceptedProviderName: submittedProviderName,
-            acceptedEditRevision: submittedRevision);
+        RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
     }
 
     private async System.Threading.Tasks.Task HandleTargetClosedAsync()

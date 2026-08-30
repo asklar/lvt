@@ -16,6 +16,18 @@ namespace LvtViewer.ViewModels;
 /// </summary>
 public sealed class ElementNodeViewModel : ObservableObject
 {
+    public readonly record struct PropertyMutationToken(
+        long OperationId,
+        string ProviderName,
+        long SubmittedRevision);
+
+    private sealed class PropertyMutationContext(
+        PropertyMutationToken token)
+    {
+        public PropertyMutationToken Token { get; } = token;
+        public bool IsCompleted { get; set; }
+    }
+
     private string _id = "";
     private string _type = "";
     private string _framework = "";
@@ -154,6 +166,10 @@ public sealed class ElementNodeViewModel : ObservableObject
     }
 
     private ObservableCollection<PropertyRowViewModel> _propertyRows = new();
+    private readonly Dictionary<string, PropertyMutationContext>
+        _propertyMutations = new(StringComparer.Ordinal);
+    private long _nextPropertyMutationId;
+
     public ObservableCollection<PropertyRowViewModel> PropertyRows
     {
         get => _propertyRows;
@@ -272,7 +288,12 @@ public sealed class ElementNodeViewModel : ObservableObject
             // replacing/removing the metadata-backed row.
             if (row.Value != value)
             {
-                row.UpdateProviderValue(value, preservePendingEdit: true);
+                row.UpdateProviderValue(
+                    value,
+                    preservePendingEdit: true,
+                    preserveCurrentAction:
+                        row.HasPendingAction ||
+                        _propertyMutations.ContainsKey(row.ProviderName));
                 PropertyVersion++;
             }
             NotifyIfIdentifyingProperty(name);
@@ -296,9 +317,7 @@ public sealed class ElementNodeViewModel : ObservableObject
 
     public void ReplaceTypedPropertyRows(
         IEnumerable<PropertyRowViewModel> rows,
-        bool preservePendingEdits = false,
-        string? acceptedProviderName = null,
-        long? acceptedEditRevision = null)
+        bool preservePendingEdits = false)
     {
         var incoming = rows.ToList();
         var existingTyped = PropertyRows
@@ -308,20 +327,18 @@ public sealed class ElementNodeViewModel : ObservableObject
         foreach (var row in incoming)
         {
             existingTyped.TryGetValue(row.ProviderName, out var existing);
-            bool isExactAcceptedEdit =
+            bool isExactAcceptedAction =
                 existing != null &&
-                row.ProviderName == acceptedProviderName &&
-                acceptedEditRevision.HasValue &&
-                existing.EditRevision == acceptedEditRevision.Value;
-            bool hasNewerAcceptedAction =
+                IsExactCompletedMutation(existing);
+            bool preserveMutationAction =
                 existing != null &&
-                row.ProviderName == acceptedProviderName &&
-                acceptedEditRevision.HasValue &&
-                existing.EditRevision != acceptedEditRevision.Value;
+                ShouldPreserveMutationAction(existing);
             if (preservePendingEdits &&
                 existing != null &&
-                !isExactAcceptedEdit &&
-                (existing.IsDirty || hasNewerAcceptedAction))
+                !isExactAcceptedAction &&
+                (existing.IsDirty ||
+                 existing.HasPendingAction ||
+                 preserveMutationAction))
             {
                 row.PreservePendingEditFrom(existing);
             }
@@ -338,14 +355,14 @@ public sealed class ElementNodeViewModel : ObservableObject
                 .ToHashSet(StringComparer.Ordinal);
             foreach (var existing in existingTyped.Values)
             {
-                bool hasNewerAcceptedAction =
-                    existing.ProviderName == acceptedProviderName &&
-                    acceptedEditRevision.HasValue &&
-                    existing.EditRevision != acceptedEditRevision.Value;
-                if ((!existing.IsDirty && !hasNewerAcceptedAction) ||
-                    (existing.ProviderName == acceptedProviderName &&
-                     acceptedEditRevision.HasValue &&
-                     existing.EditRevision == acceptedEditRevision.Value) ||
+                bool isExactAcceptedAction =
+                    IsExactCompletedMutation(existing);
+                bool preserveMutationAction =
+                    ShouldPreserveMutationAction(existing);
+                if ((!existing.IsDirty &&
+                     !existing.HasPendingAction &&
+                     !preserveMutationAction) ||
+                    isExactAcceptedAction ||
                     incomingNames.Contains(existing.ProviderName))
                 {
                     continue;
@@ -365,14 +382,93 @@ public sealed class ElementNodeViewModel : ObservableObject
         OnPropertyChanged(nameof(DisplayName));
     }
 
-    public void InvalidatePropertySnapshots()
+    public PropertyMutationToken BeginPropertyMutation(
+        string providerName,
+        long submittedRevision)
     {
+        var token = new PropertyMutationToken(
+            ++_nextPropertyMutationId,
+            providerName,
+            submittedRevision);
+        _propertyMutations[providerName] = new PropertyMutationContext(token);
         PropertyVersion++;
+        return token;
     }
 
-    public void ReplacePropertyRows(IEnumerable<PropertyRowViewModel> rows)
+    public bool TryCompletePropertyMutation(PropertyMutationToken token)
     {
-        PropertyRows = new ObservableCollection<PropertyRowViewModel>(rows);
+        if (!TryGetCurrentPropertyMutation(token, out var context))
+            return false;
+        context.IsCompleted = true;
+        PropertyVersion++;
+        return true;
+    }
+
+    public bool CancelPropertyMutation(PropertyMutationToken token)
+    {
+        if (!TryGetCurrentPropertyMutation(token, out _))
+            return false;
+        _propertyMutations.Remove(token.ProviderName);
+        PropertyVersion++;
+        return true;
+    }
+
+    public void SettleCompletedPropertyMutations()
+    {
+        foreach (var providerName in _propertyMutations
+                     .Where(pair => pair.Value.IsCompleted)
+                     .Select(pair => pair.Key)
+                     .ToList())
+        {
+            _propertyMutations.Remove(providerName);
+        }
+    }
+
+    private bool IsExactCompletedMutation(PropertyRowViewModel row)
+    {
+        return _propertyMutations.TryGetValue(
+                   row.ProviderName, out var context) &&
+               context.IsCompleted &&
+               row.EditRevision == context.Token.SubmittedRevision;
+    }
+
+    private bool ShouldPreserveMutationAction(PropertyRowViewModel row)
+    {
+        if (!_propertyMutations.TryGetValue(
+                row.ProviderName, out var context))
+        {
+            return false;
+        }
+        return !context.IsCompleted ||
+               row.EditRevision != context.Token.SubmittedRevision;
+    }
+
+    private bool TryGetCurrentPropertyMutation(
+        PropertyMutationToken token,
+        out PropertyMutationContext context)
+    {
+        return _propertyMutations.TryGetValue(
+                   token.ProviderName, out context!) &&
+               context.Token.OperationId == token.OperationId;
+    }
+
+    public void ReplacePropertyRows(
+        IEnumerable<PropertyRowViewModel> rows,
+        bool preserveTypedRows = false)
+    {
+        var replacement = rows.ToList();
+        if (preserveTypedRows)
+        {
+            foreach (var typedRow in PropertyRows.Where(
+                         row => row.IsTypedProperty))
+            {
+                replacement.RemoveAll(
+                    row => row.ProviderName == typedRow.ProviderName);
+                replacement.Add(typedRow);
+            }
+        }
+        PropertyRows = new ObservableCollection<PropertyRowViewModel>(
+            replacement);
         PropertyVersion++;
         OnPropertyChanged(nameof(DisplayName));
     }
