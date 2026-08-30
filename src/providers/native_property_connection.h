@@ -11,6 +11,7 @@
 namespace lvt {
 
 inline constexpr size_t kMaximumNativePropertyTextChars = 1024 * 1024;
+inline constexpr size_t kMaximumNativeIdentityScanItems = 256;
 
 namespace native_eventing_detail {
 struct NativeWinEventDiagnostics;

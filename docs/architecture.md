@@ -174,6 +174,19 @@ identities fall back to parent-local structural slots. The provider's opaque
 session handle remains in `Element::providerHandle` only for property routing
 and is never substituted into the public key. Parsing an HWND key identifies a
 candidate; the connection's published-root allow-list still authorizes it.
+List and toolbar uniqueness scans cover the complete control, not only the
+first 50 children emitted in a dump. The scan is safety-bounded at 256 items;
+failure, timeout, or a larger control suppresses the durable logical identity
+and keeps property mutation read-only rather than claiming false uniqueness.
+Tabs apply the same bound while scanning every label. Tree item handles and
+status part indices are intrinsically unique within their owning control, so
+their output truncation does not weaken identity proof.
+
+Watch reconciliation treats a provider-supplied `durableIdentity` as
+authoritative. It is inherited only when equal and unique in both snapshots;
+change, loss, or ambiguity emits removal of the old key and addition of the
+freshly assigned key (including the corresponding subtree), rather than
+falling back to shape or position and silently retaining stale identity.
 
 List-view, tree-view, and tab text reads grow their capacity and retry up to the
 provider safety limit; setters reject values beyond that same readback limit

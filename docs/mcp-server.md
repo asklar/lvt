@@ -302,6 +302,11 @@ Native HWND keys are stable across one-shot commands and persistent sessions:
 property adapter happened to be connected. Logical common-control item keys
 similarly use public-safe text/handle fingerprints, toolbar command ids, or
 documented indices; opaque mutation handles remain private to the provider.
+List and toolbar uniqueness is checked across the full control rather than the
+50-item output window. Scans above the 256-item safety bound, or scans that
+fail, suppress that logical identity and expose the item read-only. Tab labels
+use the same bounded full-control proof; tree handles and status indices are
+already unique within their owning control.
 
 Those compact keys identify but do not authorize. They are valid for native
 properties only after that exact target was registered and published while

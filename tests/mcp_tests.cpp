@@ -3782,6 +3782,106 @@ TEST_F(NativeMcpFixture, NativeKeysRoundTripBetweenOneShotAndMcp) {
 
 TEST_F(
     NativeMcpFixture,
+    DurableIdentityChangeRemovesOldKeyAndAddsOneShotKey) {
+    auto restore = wil::scope_exit([&] {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreListViewIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored);
+    });
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto initialTree = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << initialTree.dump(2);
+    const auto* initialList = find_by_class(
+        initialTree["root"], "SysListView32");
+    ASSERT_NE(initialList, nullptr);
+    const auto* alpha = find_child(
+        *initialList, "ListViewItem", "Alpha row");
+    ASSERT_NE(alpha, nullptr);
+    const auto oldKey = alpha->value("key", "");
+    ASSERT_FALSE(oldKey.empty());
+
+    auto baseline = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+    ASSERT_TRUE(baseline.value("snapshot", false));
+
+    DWORD_PTR changed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kMutateListViewIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &changed),
+        0);
+
+    const auto oneShotOutput = run_command(
+        "\"" + get_lvt_path() + "\" --hwnd " + hwnd_string());
+    const auto oneShot = json::parse(
+        oneShotOutput, nullptr, false);
+    ASSERT_FALSE(oneShot.is_discarded()) << oneShotOutput;
+    const auto* oneShotList = find_by_class(
+        oneShot["root"], "SysListView32");
+    ASSERT_NE(oneShotList, nullptr);
+    const auto* replacement = find_child(
+        *oneShotList, "ListViewItem", "External replacement");
+    ASSERT_NE(replacement, nullptr);
+    const auto freshKey = replacement->value("key", "");
+    ASSERT_FALSE(freshKey.empty());
+    ASSERT_NE(freshKey, oldKey);
+
+    auto changes = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << changes.dump(2);
+    ASSERT_FALSE(changes.value("snapshot", true))
+        << changes.dump(2);
+    bool removedOld = false;
+    bool addedFresh = false;
+    bool reusedOld = false;
+    for (const auto& event :
+         changes.value("events", json::array())) {
+        const auto key = event.value("key", "");
+        const auto type = event.value("event", "");
+        removedOld =
+            removedOld || (type == "removed" && key == oldKey);
+        addedFresh =
+            addedFresh || (type == "added" && key == freshKey);
+        reusedOld =
+            reusedOld || (type != "removed" && key == oldKey);
+    }
+    EXPECT_TRUE(removedOld) << changes.dump(2);
+    EXPECT_TRUE(addedFresh) << changes.dump(2);
+    EXPECT_FALSE(reusedOld) << changes.dump(2);
+
+    auto scoped = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}, {"element", freshKey}},
+        &isError);
+    ASSERT_FALSE(isError) << scoped.dump(2);
+    EXPECT_EQ(
+        scoped["root"].value("text", ""),
+        "External replacement");
+
+    const auto queried = run_command(
+        "\"" + get_lvt_path() + "\" --hwnd " + hwnd_string() +
+        " query " + cmd_escape_arg(freshKey) + " index");
+    EXPECT_EQ(trim_crlf(queried), "0");
+}
+
+TEST_F(
+    NativeMcpFixture,
     OverlappingScopedTreeCannotInvalidateTargetsInLaterFullResponse) {
     NativePublicationGate gate("get_visual_tree");
     ASSERT_TRUE(gate.valid());

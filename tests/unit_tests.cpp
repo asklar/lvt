@@ -1089,6 +1089,189 @@ TEST(WatchDiff, SnapshotPreservesAncestorQualifiedScopedRootKey) {
     EXPECT_EQ(events[0].element.key, scoped.key);
 }
 
+TEST(WatchDiff, DurableIdentityChangeReplacesSubtreeWithFreshKeys) {
+    Element before = diff_el("Window", "Root");
+    Element alpha = diff_el("ListViewItem", "ListViewItem", "Alpha");
+    alpha.framework = "comctl";
+    alpha.durableIdentity = "item-text:alpha";
+    alpha.children.push_back(
+        diff_el("Text", "Text", "alpha child"));
+    before.children.push_back(alpha);
+    assign_element_keys(before);
+    const auto oldItemKey = before.children[0].key;
+    const auto oldChildKey = before.children[0].children[0].key;
+
+    Element after = diff_el("Window", "Root");
+    Element replacement =
+        diff_el("ListViewItem", "ListViewItem", "External replacement");
+    replacement.framework = "comctl";
+    replacement.durableIdentity = "item-text:replacement";
+    replacement.children.push_back(
+        diff_el("Text", "Text", "replacement child"));
+    after.children.push_back(replacement);
+
+    const auto events = diff_trees(before, after);
+    const auto freshItemKey = after.children[0].key;
+    const auto freshChildKey = after.children[0].children[0].key;
+    EXPECT_NE(freshItemKey, oldItemKey);
+    EXPECT_NE(freshChildKey, oldChildKey);
+
+    const auto hasEvent =
+        [&events](ChangeEvent::Type type, const std::string& key) {
+        return std::any_of(
+            events.begin(), events.end(),
+            [&](const ChangeEvent& event) {
+                return event.type == type && event.key == key;
+            });
+    };
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Removed, oldItemKey));
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Removed, oldChildKey));
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Added, freshItemKey));
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Added, freshChildKey));
+    EXPECT_FALSE(hasEvent(ChangeEvent::Type::Changed, oldItemKey));
+}
+
+TEST(WatchDiff, ScopedRootDurableIdentityChangeReplacesWholeTree) {
+    Element before =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    before.framework = "comctl";
+    before.durableIdentity = "item-text:alpha";
+    before.children.push_back(
+        diff_el("Text", "Text", "old child"));
+    assign_element_keys(before);
+    const auto oldRootKey = before.key;
+    const auto oldChildKey = before.children[0].key;
+
+    Element after =
+        diff_el("ListViewItem", "ListViewItem", "Replacement");
+    after.framework = "comctl";
+    after.durableIdentity = "item-text:replacement";
+    after.children.push_back(
+        diff_el("Text", "Text", "new child"));
+
+    const auto events = diff_trees(before, after);
+    ASSERT_EQ(events.size(), 4u);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Removed);
+    EXPECT_EQ(events[0].key, oldRootKey);
+    EXPECT_EQ(events[1].type, ChangeEvent::Type::Removed);
+    EXPECT_EQ(events[1].key, oldChildKey);
+    EXPECT_EQ(events[2].type, ChangeEvent::Type::Added);
+    EXPECT_EQ(events[2].key, after.key);
+    EXPECT_EQ(events[3].type, ChangeEvent::Type::Added);
+    EXPECT_EQ(events[3].key, after.children[0].key);
+}
+
+TEST(WatchDiff, DurableIdentityAmbiguityDoesNotFallBackToSlots) {
+    Element before = diff_el("Window", "Root");
+    Element original =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    original.framework = "comctl";
+    original.durableIdentity = "item-text:alpha";
+    before.children.push_back(original);
+    assign_element_keys(before);
+    const auto oldKey = before.children[0].key;
+
+    Element after = diff_el("Window", "Root");
+    Element first = original;
+    first.key.clear();
+    Element second = first;
+    after.children = {first, second};
+
+    const auto events = diff_trees(before, after);
+    ASSERT_EQ(after.children.size(), 2u);
+    EXPECT_NE(after.children[0].key, oldKey);
+    EXPECT_NE(after.children[1].key, oldKey);
+    EXPECT_NE(after.children[0].key, after.children[1].key);
+
+    const auto removedOld = std::count_if(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Removed &&
+                   event.key == oldKey;
+        });
+    const auto addedFresh = std::count_if(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Added &&
+                   (event.key == after.children[0].key ||
+                    event.key == after.children[1].key);
+        });
+    EXPECT_EQ(removedOld, 1);
+    EXPECT_EQ(addedFresh, 2);
+}
+
+TEST(WatchDiff, DuplicateTransitionWithholdsOldDurableKey) {
+    Element before = diff_el("Window", "Root");
+    Element original =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    original.framework = "comctl";
+    original.durableIdentity = "item-text:alpha";
+    before.children.push_back(original);
+    assign_element_keys(before);
+    const auto oldKey = before.children[0].key;
+
+    Element after = diff_el("Window", "Root");
+    Element first =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    first.framework = "comctl";
+    Element second = first;
+    after.children = {first, second};
+
+    const auto events = diff_trees(before, after);
+    EXPECT_TRUE(std::any_of(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Removed &&
+                   event.key == oldKey;
+        }));
+    EXPECT_EQ(
+        std::count_if(
+            events.begin(), events.end(),
+            [&](const ChangeEvent& event) {
+                return event.type == ChangeEvent::Type::Added &&
+                       event.key != oldKey;
+            }),
+        2);
+    EXPECT_TRUE(std::none_of(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type != ChangeEvent::Type::Removed &&
+                   event.key == oldKey;
+        }));
+}
+
+TEST(WatchDiff, MissingDurableIdentityDoesNotInheritOldKey) {
+    Element before = diff_el("Window", "Root");
+    Element original =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    original.framework = "comctl";
+    original.durableIdentity = "item-text:alpha";
+    before.children.push_back(original);
+    assign_element_keys(before);
+    const auto oldKey = before.children[0].key;
+
+    Element after = diff_el("Window", "Root");
+    Element unverified =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    unverified.framework = "comctl";
+    after.children.push_back(unverified);
+
+    const auto events = diff_trees(before, after);
+    EXPECT_NE(after.children[0].key, oldKey);
+    EXPECT_TRUE(std::any_of(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Removed &&
+                   event.key == oldKey;
+        }));
+    EXPECT_TRUE(std::any_of(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Added &&
+                   event.key == after.children[0].key;
+        }));
+}
+
 TEST(WatchDiff, RemovedElement) {
     auto before = diff_el("Window", "Root");
     before.children.push_back(diff_el("Button", "Button", "OK"));

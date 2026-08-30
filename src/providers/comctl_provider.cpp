@@ -94,6 +94,21 @@ std::string hashed_identity(
     return buffer;
 }
 
+bool read_toolbar_button(
+    const NativeWindowIdentity& identity, int index,
+    TBBUTTON& button) {
+    NativeMessageResult native;
+    auto buttonBuffer =
+        allocate_remote(identity, sizeof(TBBUTTON), native);
+    if (!buttonBuffer)
+        return false;
+    const auto got = send_pointer(
+        identity, TB_GETBUTTON, index,
+        reinterpret_cast<LPARAM>(buttonBuffer->address()),
+        buttonBuffer);
+    return got && *got && read_remote(buttonBuffer, button);
+}
+
 void enrich_tree_item(
     Element& parent, const NativeWindowIdentity& identity,
     HTREEITEM itemHandle, NativePropertyConnection* properties,
@@ -105,6 +120,10 @@ void enrich_tree_item(
     item.type = "TreeViewItem";
     item.framework = "comctl";
     {
+        // HTREEITEM is the documented, control-owned item identity and is
+        // unique within the live tree control. Fingerprinting it keeps the
+        // pointer-shaped value private; the 100-node display cap cannot hide
+        // another item with the same handle.
         const uint64_t itemValue = static_cast<uint64_t>(
             reinterpret_cast<uintptr_t>(itemHandle));
         item.durableIdentity = hashed_identity(
@@ -210,7 +229,9 @@ void ComCtlProvider::enrich_listview(
 
     const auto countResult = send(identity, LVM_GETITEMCOUNT);
     const int count =
-        countResult ? static_cast<int>(*countResult) : 0;
+        countResult && *countResult > 0
+            ? static_cast<int>(*countResult)
+            : 0;
     el.properties["itemCount"] = std::to_string(count);
 
     const auto viewMode = send(identity, LVM_GETVIEW);
@@ -242,6 +263,31 @@ void ComCtlProvider::enrich_listview(
         return;
 
     const int maxItems = (std::min)(count, 50);
+    // Identity proof is independent of display truncation. Either inspect the
+    // complete control or assign no text identity at all.
+    bool identityScanComplete =
+        static_cast<size_t>(count) <=
+        kMaximumNativeIdentityScanItems;
+    std::map<std::string, int> textCounts;
+    std::vector<std::optional<std::string>> scannedTexts(
+        static_cast<size_t>(maxItems));
+    if (identityScanComplete) {
+        for (int index = 0; index < count; ++index) {
+            std::string text;
+            const auto read = read_native_listview_item_text(
+                identity, index, text);
+            if (!read.ok) {
+                identityScanComplete = false;
+                textCounts.clear();
+                break;
+            }
+            if (index < maxItems)
+                scannedTexts[static_cast<size_t>(index)] = text;
+            if (!text.empty())
+                ++textCounts[text];
+        }
+    }
+
     for (int index = 0; index < maxItems; ++index) {
         Element item;
         item.type = "ListViewItem";
@@ -274,10 +320,19 @@ void ComCtlProvider::enrich_listview(
                     item.properties["focused"] = "true";
             }
         }
-        read_native_listview_item_text(identity, index, item.text);
-        if (!item.text.empty())
+        const auto& scanned =
+            scannedTexts[static_cast<size_t>(index)];
+        if (scanned) {
+            item.text = *scanned;
+        } else {
+            read_native_listview_item_text(
+                identity, index, item.text);
+        }
+        if (identityScanComplete && !item.text.empty() &&
+            textCounts[item.text] == 1) {
             item.durableIdentity =
                 hashed_identity("item-text", item.text);
+        }
         el.children.push_back(std::move(item));
     }
     if (count > maxItems)
@@ -334,7 +389,9 @@ void ComCtlProvider::enrich_toolbar(
 
     const auto countResult = send(identity, TB_BUTTONCOUNT);
     const int count =
-        countResult ? static_cast<int>(*countResult) : 0;
+        countResult && *countResult > 0
+            ? static_cast<int>(*countResult)
+            : 0;
     el.properties["buttonCount"] = std::to_string(count);
 
     if (!pointerAllowed)
@@ -344,22 +401,32 @@ void ComCtlProvider::enrich_toolbar(
     std::vector<std::optional<TBBUTTON>> buttons(
         static_cast<size_t>(visibleCount));
     std::map<int, int> commandCounts;
+    // As with list items, the first 50 buttons are only the display budget.
+    // Command uniqueness is proven over the complete toolbar.
+    bool identityScanComplete =
+        static_cast<size_t>(count) <=
+        kMaximumNativeIdentityScanItems;
     for (int index = 0; index < visibleCount; ++index) {
-        NativeMessageResult native;
-        auto buttonBuffer =
-            allocate_remote(identity, sizeof(TBBUTTON), native);
-        if (!buttonBuffer)
-            break;
-        const auto got = send_pointer(
-            identity, TB_GETBUTTON, index,
-            reinterpret_cast<LPARAM>(buttonBuffer->address()),
-            buttonBuffer);
         TBBUTTON button{};
-        if (!got || !*got || !read_remote(buttonBuffer, button))
+        if (!read_toolbar_button(identity, index, button)) {
+            identityScanComplete = false;
             continue;
+        }
         buttons[static_cast<size_t>(index)] = button;
         if (!(button.fsStyle & BTNS_SEP))
             ++commandCounts[button.idCommand];
+    }
+    if (identityScanComplete) {
+        for (int index = visibleCount; index < count; ++index) {
+            TBBUTTON button{};
+            if (!read_toolbar_button(identity, index, button)) {
+                identityScanComplete = false;
+                commandCounts.clear();
+                break;
+            }
+            if (!(button.fsStyle & BTNS_SEP))
+                ++commandCounts[button.idCommand];
+        }
     }
 
     for (int index = 0; index < visibleCount; ++index) {
@@ -377,10 +444,6 @@ void ComCtlProvider::enrich_toolbar(
         item.properties["index"] = std::to_string(index);
         item.properties["commandId"] =
             std::to_string(button.idCommand);
-        item.durableIdentity =
-            (button.fsStyle & BTNS_SEP)
-                ? "separator-index:" + std::to_string(index)
-                : "command-id:" + std::to_string(button.idCommand);
         if (properties && !(button.fsStyle & BTNS_SEP)) {
             item.providerHandle = properties->register_toolbar_button(
                 hwnd, index, button.idCommand);
@@ -388,10 +451,21 @@ void ComCtlProvider::enrich_toolbar(
 
         const bool ambiguous =
             !(button.fsStyle & BTNS_SEP) &&
+            identityScanComplete &&
             commandCounts[button.idCommand] != 1;
+        if (button.fsStyle & BTNS_SEP) {
+            item.durableIdentity =
+                "separator-index:" + std::to_string(index);
+        } else if (identityScanComplete && !ambiguous) {
+            item.durableIdentity =
+                "command-id:" + std::to_string(button.idCommand);
+        } else if (!identityScanComplete) {
+            item.properties["commandIdentityUnverified"] = "true";
+        }
         if (ambiguous)
             item.properties["ambiguousCommandId"] = "true";
-        if (!(button.fsStyle & BTNS_SEP) && !ambiguous) {
+        if (!(button.fsStyle & BTNS_SEP) &&
+            identityScanComplete && !ambiguous) {
             read_native_toolbar_button_text(
                 identity, index, button.idCommand, item.text);
         }
@@ -428,6 +502,8 @@ void ComCtlProvider::enrich_statusbar(
         item.type = "StatusBarPart";
         item.framework = "comctl";
         item.properties["index"] = std::to_string(index);
+        // Status-bar parts are addressed by their documented slot index and
+        // every slot is emitted, so no separate uniqueness scan is needed.
         item.durableIdentity = "part-index:" + std::to_string(index);
         if (properties) {
             item.providerHandle =
@@ -478,7 +554,9 @@ void ComCtlProvider::enrich_tabcontrol(
     const auto countResult = send(identity, TCM_GETITEMCOUNT);
     const auto selectedResult = send(identity, TCM_GETCURSEL);
     const int count =
-        countResult ? static_cast<int>(*countResult) : 0;
+        countResult && *countResult > 0
+            ? static_cast<int>(*countResult)
+            : 0;
     const int selected =
         selectedResult ? static_cast<int>(*selectedResult) : -1;
     el.properties["tabCount"] = std::to_string(count);
@@ -486,6 +564,31 @@ void ComCtlProvider::enrich_tabcontrol(
 
     if (!pointerAllowed)
         return;
+
+    bool identityScanComplete =
+        static_cast<size_t>(count) <=
+        kMaximumNativeIdentityScanItems;
+    // Tab item data is application-defined when TCM_SETITEMEXTRA is used, so
+    // text is the only generic safe identity. Prove it across every tab.
+    std::map<std::string, int> textCounts;
+    std::vector<std::optional<std::string>> texts(
+        static_cast<size_t>(count));
+    for (int index = 0; index < count; ++index) {
+        std::string text;
+        const auto read =
+            read_native_tab_item_text(identity, index, text);
+        if (!read.ok) {
+            identityScanComplete = false;
+            continue;
+        }
+        texts[static_cast<size_t>(index)] = std::move(text);
+        if (identityScanComplete &&
+            !texts[static_cast<size_t>(index)]->empty()) {
+            ++textCounts[*texts[static_cast<size_t>(index)]];
+        }
+    }
+    if (!identityScanComplete)
+        textCounts.clear();
 
     for (int index = 0; index < count; ++index) {
         Element item;
@@ -498,10 +601,14 @@ void ComCtlProvider::enrich_tabcontrol(
             item.providerHandle =
                 properties->register_tab_item(hwnd, index);
 
-        read_native_tab_item_text(identity, index, item.text);
-        if (!item.text.empty())
+        const auto& text = texts[static_cast<size_t>(index)];
+        if (text)
+            item.text = *text;
+        if (identityScanComplete && !item.text.empty() &&
+            textCounts[item.text] == 1) {
             item.durableIdentity =
                 hashed_identity("item-text", item.text);
+        }
         el.children.push_back(std::move(item));
     }
 }

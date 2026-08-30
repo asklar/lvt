@@ -318,6 +318,68 @@ void set_default_font(HWND parent) {
         reinterpret_cast<LPARAM>(font));
 }
 
+void populate_default_listview_items() {
+    const wchar_t* names[] = {L"Alpha row", L"Beta row", L"Gamma row"};
+    const wchar_t* values[] = {L"One", L"Two", L"Three"};
+    for (int index = 0; index < 3; ++index) {
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = index;
+        item.pszText = const_cast<LPWSTR>(names[index]);
+        ListView_InsertItem(g_controls.listView, &item);
+        ListView_SetItemText(
+            g_controls.listView, index, 1,
+            const_cast<LPWSTR>(values[index]));
+    }
+    ListView_SetItemState(
+        g_controls.listView, 1, LVIS_SELECTED, LVIS_SELECTED);
+}
+
+void restore_default_listview_items() {
+    ListView_DeleteAllItems(g_controls.listView);
+    populate_default_listview_items();
+}
+
+void populate_large_listview_with_hidden_duplicate() {
+    ListView_DeleteAllItems(g_controls.listView);
+    for (int index = 0; index < 52; ++index) {
+        std::wstring text =
+            (index == 0 || index == 51)
+                ? L"Shared row"
+                : L"Unique row " + std::to_wstring(index);
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = index;
+        item.pszText = text.data();
+        ListView_InsertItem(g_controls.listView, &item);
+    }
+}
+
+void populate_oversized_listview() {
+    ListView_DeleteAllItems(g_controls.listView);
+    for (int index = 0; index < 257; ++index) {
+        std::wstring text =
+            L"Oversized row " + std::to_wstring(index);
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = index;
+        item.pszText = text.data();
+        ListView_InsertItem(g_controls.listView, &item);
+    }
+}
+
+bool reorder_large_listview() {
+    if (ListView_GetItemCount(g_controls.listView) < 2)
+        return false;
+    if (!ListView_DeleteItem(g_controls.listView, 0))
+        return false;
+    LVITEMW item{};
+    item.mask = LVIF_TEXT;
+    item.iItem = 1;
+    item.pszText = const_cast<LPWSTR>(L"Shared row");
+    return ListView_InsertItem(g_controls.listView, &item) == 1;
+}
+
 void populate_listview() {
     ListView_SetExtendedListViewStyle(
         g_controls.listView, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
@@ -333,19 +395,7 @@ void populate_listview() {
     column.pszText = const_cast<LPWSTR>(L"Value");
     ListView_InsertColumn(g_controls.listView, 1, &column);
 
-    const wchar_t* names[] = {L"Alpha row", L"Beta row", L"Gamma row"};
-    const wchar_t* values[] = {L"One", L"Two", L"Three"};
-    for (int index = 0; index < 3; ++index) {
-        LVITEMW item{};
-        item.mask = LVIF_TEXT;
-        item.iItem = index;
-        item.pszText = const_cast<LPWSTR>(names[index]);
-        ListView_InsertItem(g_controls.listView, &item);
-        ListView_SetItemText(
-            g_controls.listView, index, 1, const_cast<LPWSTR>(values[index]));
-    }
-    ListView_SetItemState(
-        g_controls.listView, 1, LVIS_SELECTED, LVIS_SELECTED);
+    populate_default_listview_items();
 }
 
 void populate_treeview() {
@@ -396,6 +446,53 @@ void populate_toolbar() {
         static_cast<WPARAM>(_countof(buttons)),
         reinterpret_cast<LPARAM>(buttons));
     SendMessageW(g_controls.toolbar, TB_AUTOSIZE, 0, 0);
+}
+
+void delete_all_toolbar_buttons() {
+    while (SendMessageW(g_controls.toolbar, TB_BUTTONCOUNT, 0, 0) > 0)
+        SendMessageW(g_controls.toolbar, TB_DELETEBUTTON, 0, 0);
+}
+
+void populate_large_toolbar_with_hidden_duplicate() {
+    delete_all_toolbar_buttons();
+    std::vector<TBBUTTON> buttons(52);
+    for (int index = 0; index < 52; ++index) {
+        auto& button = buttons[static_cast<size_t>(index)];
+        button.iBitmap = I_IMAGENONE;
+        button.idCommand =
+            index == 51 ? 3000 : 3000 + index;
+        button.fsState = TBSTATE_ENABLED;
+        button.fsStyle = BTNS_BUTTON;
+        button.iString = -1;
+    }
+    SendMessageW(
+        g_controls.toolbar, TB_ADDBUTTONS,
+        static_cast<WPARAM>(buttons.size()),
+        reinterpret_cast<LPARAM>(buttons.data()));
+    SendMessageW(g_controls.toolbar, TB_AUTOSIZE, 0, 0);
+}
+
+void populate_oversized_toolbar() {
+    delete_all_toolbar_buttons();
+    std::vector<TBBUTTON> buttons(257);
+    for (int index = 0; index < 257; ++index) {
+        auto& button = buttons[static_cast<size_t>(index)];
+        button.iBitmap = I_IMAGENONE;
+        button.idCommand = 4000 + index;
+        button.fsState = TBSTATE_ENABLED;
+        button.fsStyle = BTNS_BUTTON;
+        button.iString = -1;
+    }
+    SendMessageW(
+        g_controls.toolbar, TB_ADDBUTTONS,
+        static_cast<WPARAM>(buttons.size()),
+        reinterpret_cast<LPARAM>(buttons.data()));
+    SendMessageW(g_controls.toolbar, TB_AUTOSIZE, 0, 0);
+}
+
+void restore_default_toolbar() {
+    delete_all_toolbar_buttons();
+    populate_toolbar();
 }
 
 void populate_statusbar() {
@@ -690,6 +787,31 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return SendMessageW(g_controls.toolbar, TB_MOVEBUTTON, 0, 2);
     case fixture::kRestoreToolbarOrderMessage:
         return SendMessageW(g_controls.toolbar, TB_MOVEBUTTON, 2, 0);
+    case fixture::kPopulateLargeListHiddenDuplicateMessage:
+        populate_large_listview_with_hidden_duplicate();
+        return TRUE;
+    case fixture::kDeleteHiddenListDuplicateMessage:
+        return ListView_DeleteItem(g_controls.listView, 51);
+    case fixture::kReorderLargeListMessage:
+        return reorder_large_listview();
+    case fixture::kRestoreDefaultListMessage:
+        restore_default_listview_items();
+        return TRUE;
+    case fixture::kPopulateLargeToolbarHiddenDuplicateMessage:
+        populate_large_toolbar_with_hidden_duplicate();
+        return TRUE;
+    case fixture::kDeleteHiddenToolbarDuplicateMessage:
+        return SendMessageW(
+            g_controls.toolbar, TB_DELETEBUTTON, 51, 0);
+    case fixture::kRestoreDefaultToolbarMessage:
+        restore_default_toolbar();
+        return TRUE;
+    case fixture::kPopulateOversizedListMessage:
+        populate_oversized_listview();
+        return TRUE;
+    case fixture::kPopulateOversizedToolbarMessage:
+        populate_oversized_toolbar();
+        return TRUE;
     case fixture::kReparentGenericOutOfTreeMessage: {
         const HWND oldParent = SetParent(
             g_controls.genericText, g_controls.outOfTree);

@@ -96,6 +96,18 @@ struct GlobalReconciliation {
     std::unordered_set<const Element*> processedCurr;
 };
 
+std::string authoritative_identity_key(const Element& el) {
+    return base_identity_key(el) + '\0' + el.durableIdentity;
+}
+
+void collect_authoritative_identity_counts(
+    const Element& el, std::map<std::string, size_t>& counts) {
+    if (!el.durableIdentity.empty())
+        ++counts[authoritative_identity_key(el)];
+    for (const auto& child : el.children)
+        collect_authoritative_identity_counts(child, counts);
+}
+
 void collect_prev_candidates(
     const Element& el, const Element* parent, const std::string& path,
     std::map<ProcessWideProviderIdentity, GlobalCandidate<const Element*>>& candidates,
@@ -136,6 +148,10 @@ GlobalReconciliation build_global_reconciliation(Element& before, Element& after
     GlobalReconciliation result;
     collect_prev_candidates(before, nullptr, "0", prevCandidates, result);
     collect_curr_candidates(after, nullptr, "0", currCandidates, result);
+    std::map<std::string, size_t> prevDurableCounts;
+    std::map<std::string, size_t> currDurableCounts;
+    collect_authoritative_identity_counts(before, prevDurableCounts);
+    collect_authoritative_identity_counts(after, currDurableCounts);
 
     for (const auto& [identity, prevCandidate] : prevCandidates) {
         auto currIt = currCandidates.find(identity);
@@ -147,6 +163,20 @@ GlobalReconciliation build_global_reconciliation(Element& before, Element& after
         auto* curr = currIt->second.element;
         if (base_identity_key(*prev) != base_identity_key(*curr))
             continue;
+        if (!prev->durableIdentity.empty() ||
+            !curr->durableIdentity.empty()) {
+            if (prev->durableIdentity.empty() ||
+                curr->durableIdentity.empty() ||
+                prev->durableIdentity != curr->durableIdentity) {
+                continue;
+            }
+            const auto durableKey =
+                authoritative_identity_key(*prev);
+            if (prevDurableCounts[durableKey] != 1 ||
+                currDurableCounts[durableKey] != 1) {
+                continue;
+            }
+        }
 
         result.prevToCurr.emplace(prev, curr);
         result.currToPrev.emplace(curr, prev);
@@ -169,10 +199,23 @@ void reconcile_children(const Element& prevParent, Element& currParent,
     std::unordered_map<uint64_t, size_t> prevByProviderHandle;
     std::unordered_map<uintptr_t, size_t> prevByNativeHandle;
     std::unordered_map<std::string, size_t> prevByName;
+    struct DurableCandidate {
+        size_t index = 0;
+        size_t count = 0;
+    };
+    std::map<std::string, DurableCandidate> prevByDurableIdentity;
+    std::map<std::string, DurableCandidate> currByDurableIdentity;
     for (size_t i = 0; i < prevChildren.size(); i++) {
         const auto& p = prevChildren[i];
         if (global.prevToCurr.find(&p) != global.prevToCurr.end())
             continue;
+        if (!p.durableIdentity.empty()) {
+            auto& candidate =
+                prevByDurableIdentity[authoritative_identity_key(p)];
+            candidate.index = i;
+            ++candidate.count;
+            continue;
+        }
         if (has_durable_provider_identity(p))
             prevByProviderHandle.emplace(p.providerHandle, i);
         if (p.nativeHandle != 0)
@@ -180,6 +223,17 @@ void reconcile_children(const Element& prevParent, Element& currParent,
         auto name = stable_name_key(p);
         if (!name.empty())
             prevByName.emplace(base_identity_key(p) + "|" + name, i);
+    }
+    for (size_t i = 0; i < currChildren.size(); ++i) {
+        const auto& c = currChildren[i];
+        if (global.currToPrev.find(&c) != global.currToPrev.end() ||
+            c.durableIdentity.empty()) {
+            continue;
+        }
+        auto& candidate =
+            currByDurableIdentity[authoritative_identity_key(c)];
+        candidate.index = i;
+        ++candidate.count;
     }
 
     std::vector<bool> prevUsed(prevChildren.size(), false);
@@ -209,6 +263,25 @@ void reconcile_children(const Element& prevParent, Element& currParent,
                 movedIn.push_back({globalIt->second, &currChildren[ci]});
             }
             currUsed[ci] = true;
+            continue;
+        }
+        if (!c.durableIdentity.empty()) {
+            const auto key = authoritative_identity_key(c);
+            const auto currIdentity = currByDurableIdentity.find(key);
+            const auto prevIdentity = prevByDurableIdentity.find(key);
+            if (currIdentity != currByDurableIdentity.end() &&
+                prevIdentity != prevByDurableIdentity.end() &&
+                currIdentity->second.count == 1 &&
+                prevIdentity->second.count == 1 &&
+                !prevUsed[prevIdentity->second.index]) {
+                matched.push_back(
+                    {prevIdentity->second.index, ci});
+                prevUsed[prevIdentity->second.index] = true;
+                currUsed[ci] = true;
+            }
+            // A provider-supplied durable identity is authoritative. If it
+            // changed, disappeared, or is ambiguous on either side, do not
+            // let provider/native/name/shape fallback preserve the old key.
             continue;
         }
         std::optional<size_t> matchIdx;
@@ -247,10 +320,12 @@ void reconcile_children(const Element& prevParent, Element& currParent,
     std::map<std::string, std::vector<size_t>> prevGroups, currGroups;
     for (size_t i = 0; i < prevChildren.size(); i++)
         if (!prevUsed[i] &&
+            prevChildren[i].durableIdentity.empty() &&
             global.prevToCurr.find(&prevChildren[i]) == global.prevToCurr.end())
             prevGroups[base_identity_key(prevChildren[i])].push_back(i);
     for (size_t i = 0; i < currChildren.size(); i++)
         if (!currUsed[i] &&
+            currChildren[i].durableIdentity.empty() &&
             global.currToPrev.find(&currChildren[i]) == global.currToPrev.end())
             currGroups[base_identity_key(currChildren[i])].push_back(i);
 
@@ -572,6 +647,16 @@ std::vector<ChangeEvent> diff_trees(Element& before, Element& after) {
     // here.
     assign_element_keys(before, true);
     assign_element_keys(after, true);
+
+    if ((!before.durableIdentity.empty() ||
+         !after.durableIdentity.empty()) &&
+        before.durableIdentity != after.durableIdentity) {
+        GlobalReconciliation none;
+        std::vector<ChangeEvent> replaced;
+        collect_removed_events(before, "0", none, replaced);
+        collect_added_events(after, "0", none, replaced);
+        return replaced;
+    }
 
     auto global = build_global_reconciliation(before, after);
     global.processedCurr.insert(&after);

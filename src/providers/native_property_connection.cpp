@@ -26,7 +26,6 @@ namespace {
 
 constexpr size_t kMaximumNativeTextChars =
     kMaximumNativePropertyTextChars;
-constexpr size_t kMaximumIdentityScanItems = 256;
 constexpr size_t kControlTextChars = 4096;
 constexpr size_t kMaximumStatusTextChars = 0xFFFF;
 constexpr uint64_t kSyntheticHandleBase = UINT64_C(0x8000000000000000);
@@ -969,7 +968,8 @@ struct NativePropertyConnection::Impl {
                 error = native.error;
                 return false;
             }
-            if (count.value > static_cast<LRESULT>(kMaximumIdentityScanItems)) {
+            if (count.value >
+                static_cast<LRESULT>(kMaximumNativeIdentityScanItems)) {
                 live.identityVerified = false;
                 live.identityReason =
                     "The list view is too large to prove that this item's "
@@ -1065,6 +1065,17 @@ struct NativePropertyConnection::Impl {
                 hresult = HRESULT_FROM_WIN32(ERROR_INVALID_INDEX);
                 error = "The toolbar button index is no longer valid";
                 return false;
+            }
+            if (count.value >
+                static_cast<LRESULT>(kMaximumNativeIdentityScanItems)) {
+                live.identityVerified = false;
+                live.identityReason =
+                    "The toolbar is too large to prove that this command id "
+                    "is unique";
+                live.identity =
+                    "index:" + std::to_string(target.index) +
+                    "|command:" + std::to_string(target.commandId);
+                return true;
             }
             TBBUTTON button{};
             NativeMessageResult native;
@@ -1166,7 +1177,7 @@ struct NativePropertyConnection::Impl {
             }
 
             if (count.value >
-                static_cast<LRESULT>(kMaximumIdentityScanItems)) {
+                static_cast<LRESULT>(kMaximumNativeIdentityScanItems)) {
                 live.identityVerified = false;
                 live.identityReason =
                     "The tab control is too large to prove that this item's "

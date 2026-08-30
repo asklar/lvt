@@ -4632,6 +4632,195 @@ TEST_F(NativeControlsFixture, LogicalNativeKeysTrackSafeIdentityRules) {
     EXPECT_EQ(overviewCount, 2);
 }
 
+TEST_F(
+    NativeControlsFixture,
+    LogicalIdentityScansIncludeHiddenItemsAndRespectSafetyBound) {
+    auto restore = wil::scope_exit([&] {
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kRestoreDefaultListMessage);
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kRestoreDefaultToolbarMessage);
+    });
+    const auto findText =
+        [](const json& root, const std::string& type,
+           const std::string& text) -> const json* {
+        std::vector<const json*> elements;
+        collect_json_elements(root, elements);
+        for (const auto* element : elements) {
+            if (element->value("type", "") == type &&
+                element->value("text", "") == text) {
+                return element;
+            }
+        }
+        return nullptr;
+    };
+    const auto countType =
+        [](const json& root, const std::string& type) {
+        std::vector<const json*> elements;
+        collect_json_elements(root, elements);
+        return std::count_if(
+            elements.begin(), elements.end(),
+            [&](const json* element) {
+                return element->value("type", "") == type;
+            });
+    };
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kPopulateLargeListHiddenDuplicateMessage),
+        0);
+    auto tree = dump_tree();
+    auto* listView = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kListViewId));
+    ASSERT_NE(listView, nullptr);
+    EXPECT_EQ((*listView)["properties"].value("itemCount", ""), "52");
+    ASSERT_EQ(countType(*listView, "ListViewItem"), 50);
+    auto* shared = findText(
+        *listView, "ListViewItem", "Shared row");
+    ASSERT_NE(shared, nullptr);
+    EXPECT_EQ(shared->value("key", "").find("identity:"),
+              std::string::npos)
+        << "an off-screen duplicate must prevent a durable text identity";
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kDeleteHiddenListDuplicateMessage),
+        0);
+    tree = dump_tree();
+    listView = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kListViewId));
+    shared = findText(*listView, "ListViewItem", "Shared row");
+    ASSERT_NE(shared, nullptr);
+    const auto uniqueListKey = shared->value("key", "");
+    EXPECT_NE(uniqueListKey.find("identity:"), std::string::npos);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kReorderLargeListMessage),
+        0);
+    tree = dump_tree();
+    listView = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kListViewId));
+    shared = findText(*listView, "ListViewItem", "Shared row");
+    ASSERT_NE(shared, nullptr);
+    EXPECT_EQ(shared->value("key", ""), uniqueListKey);
+    EXPECT_EQ(
+        (*shared)["properties"].value("index", ""), "1");
+    EXPECT_EQ(
+        trim_crlf(run_command(make_cmd(
+            get_lvt_path(),
+            get_hwnd_arg() + " query " +
+                cmd_escape_arg(uniqueListKey) + " index"))),
+        "1");
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kRestoreDefaultListMessage),
+        0);
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kPopulateLargeToolbarHiddenDuplicateMessage),
+        0);
+    tree = dump_tree();
+    auto* toolbar = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kToolbarId));
+    ASSERT_NE(toolbar, nullptr);
+    EXPECT_EQ((*toolbar)["properties"].value("buttonCount", ""), "52");
+    ASSERT_EQ(countType(*toolbar, "ToolbarButton"), 50);
+    auto* command = find_element_by_type_property(
+        *toolbar, "ToolbarButton", "commandId", "3000");
+    ASSERT_NE(command, nullptr);
+    EXPECT_EQ(command->value("key", "").find("identity:"),
+              std::string::npos)
+        << "a duplicate beyond the display limit must be observed";
+    EXPECT_EQ(
+        (*command)["properties"].value(
+            "ambiguousCommandId", ""),
+        "true");
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kDeleteHiddenToolbarDuplicateMessage),
+        0);
+    tree = dump_tree();
+    toolbar = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kToolbarId));
+    command = find_element_by_type_property(
+        *toolbar, "ToolbarButton", "commandId", "3000");
+    ASSERT_NE(command, nullptr);
+    EXPECT_NE(command->value("key", "").find("identity:"),
+              std::string::npos);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kRestoreDefaultToolbarMessage),
+        0);
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kPopulateOversizedListMessage),
+        0);
+    tree = dump_tree();
+    listView = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kListViewId));
+    auto* oversizedListItem = find_element_by_type_property(
+        *listView, "ListViewItem", "index", "0");
+    ASSERT_NE(oversizedListItem, nullptr);
+    EXPECT_EQ(
+        oversizedListItem->value("key", "").find("identity:"),
+        std::string::npos);
+
+    auto persistent = native_tree();
+    auto* persistentList = find_native_element_by_hwnd(
+        persistent.root, control(native_fixture::kListViewId));
+    ASSERT_NE(persistentList, nullptr);
+    auto* persistentListItem = find_native_element_by_text(
+        *persistentList, "ListViewItem", "Oversized row 0");
+    ASSERT_NE(persistentListItem, nullptr);
+    auto listProperties =
+        snapshot(persistent, *persistentListItem);
+    ASSERT_TRUE(listProperties.ok) << listProperties.error;
+    for (const auto& descriptor : listProperties.schema->descriptors)
+        EXPECT_FALSE(descriptor.writable);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kRestoreDefaultListMessage),
+        0);
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kPopulateOversizedToolbarMessage),
+        0);
+    tree = dump_tree();
+    toolbar = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kToolbarId));
+    command = find_element_by_type_property(
+        *toolbar, "ToolbarButton", "commandId", "4000");
+    ASSERT_NE(command, nullptr);
+    EXPECT_EQ(command->value("key", "").find("identity:"),
+              std::string::npos);
+    EXPECT_EQ(
+        (*command)["properties"].value(
+            "commandIdentityUnverified", ""),
+        "true");
+
+    persistent = native_tree();
+    auto* persistentToolbar = find_native_element_by_hwnd(
+        persistent.root, control(native_fixture::kToolbarId));
+    ASSERT_NE(persistentToolbar, nullptr);
+    ASSERT_FALSE(persistentToolbar->children.empty());
+    auto toolbarProperties =
+        snapshot(persistent, persistentToolbar->children[0]);
+    ASSERT_TRUE(toolbarProperties.ok) << toolbarProperties.error;
+    for (const auto& descriptor :
+         toolbarProperties.schema->descriptors) {
+        EXPECT_FALSE(descriptor.writable);
+    }
+}
+
 TEST_F(NativeControlsFixture, ReadOnlySummaryReportsCompleteNativeState) {
     const LONG_PTR windowExStyle = GetWindowLongPtrW(s_hwnd, GWL_EXSTYLE);
     EXPECT_NE(windowExStyle & WS_EX_NOACTIVATE, 0);
