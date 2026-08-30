@@ -479,7 +479,14 @@ void wait_for_native_publication_test_gate(
     WaitForSingleObject(release.get(), 10000);
 }
 
-void drain_session_connection_events(const std::string& sessionId) {
+enum class ConnectionEventDrainPhase {
+    nativeBeforeBuild,
+    nonNativeAfterSuccess,
+};
+
+void drain_session_connection_events(
+    const std::string& sessionId,
+    ConnectionEventDrainPhase phase) {
     std::vector<std::pair<std::string, std::shared_ptr<lvt::IFrameworkConnection>>>
         connections;
     {
@@ -496,7 +503,14 @@ void drain_session_connection_events(const std::string& sessionId) {
 
     size_t count = 0;
     bool snapshotRequired = false;
-    for (const auto& [_, connection] : connections) {
+    for (const auto& [label, connection] : connections) {
+        const bool native =
+            label == "win32" ||
+            label == "comctl" ||
+            dynamic_cast<lvt::NativePropertyConnection*>(
+                connection.get()) != nullptr;
+        if ((phase == ConnectionEventDrainPhase::nativeBeforeBuild) != native)
+            continue;
         if (!connection->is_alive())
             continue;
         const auto events = connection->poll_events();
@@ -513,9 +527,13 @@ void drain_session_connection_events(const std::string& sessionId) {
     if (lvt::g_debug && count != 0) {
         fprintf(
             stderr,
-            "lvt: MCP drained %zu pushed connection event(s)%s; "
+            "lvt: MCP drained %zu %s connection event(s)%s; "
             "this request's authoritative tree refresh will consume the signal\n",
-            count, snapshotRequired ? " including snapshotRequired" : "");
+            count,
+            phase == ConnectionEventDrainPhase::nativeBeforeBuild
+                ? "pre-build native"
+                : "post-success",
+            snapshotRequired ? " including snapshotRequired" : "");
     }
 }
 
@@ -1037,7 +1055,15 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
     const bool fastProperties = get_bool(params, "fast", false);
     for (int attempt = 0; attempt < 3; ++attempt) {
         auto connectionLookup = connection_lookup_for_session(session, frameworks);
-        drain_session_connection_events(session.id);
+        // Native WinEvents are snapshot hints, so discard only those already
+        // queued immediately before the authoritative native walk. Plugins
+        // and injected frameworks are polled exactly once, after a successful
+        // snapshot; failed attempts never consume their events. Native events
+        // arriving during the walk stay queued for the next request instead
+        // of being discarded by a second poll of the same connection.
+        drain_session_connection_events(
+            session.id,
+            ConnectionEventDrainPhase::nativeBeforeBuild);
         tree = lvt::build_tree(
             session.hwnd, session.pid, frameworks, -1,
             session.pluginOption, fastProperties, connectionLookup);
@@ -1048,7 +1074,9 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             // happen later and must never replace authorization with only the
             // subset one response happened to expose.
             publish_native_property_targets(session, tree);
-            drain_session_connection_events(session.id);
+            drain_session_connection_events(
+                session.id,
+                ConnectionEventDrainPhase::nonNativeAfterSuccess);
             return true;
         }
 

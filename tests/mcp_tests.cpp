@@ -752,9 +752,10 @@ TEST(McpPluginPersistent, ReusesPollsReconnectsAndDisconnectsConcurrently) {
     EXPECT_EQ(gets, 5u);
     EXPECT_EQ(failures, 1u);
     EXPECT_EQ(count_plugin_stats(stats, "free"), gets - failures);
-    EXPECT_EQ(count_plugin_stats(stats, "poll"), gets - failures);
-    EXPECT_EQ(
-        count_plugin_stats(stats, "events_free"), gets - failures);
+    EXPECT_EQ(count_plugin_stats(stats, "poll"), 4u)
+        << "five tree attempts with one failed build must poll only the four "
+           "successful plugin snapshots";
+    EXPECT_EQ(count_plugin_stats(stats, "events_free"), 4u);
     for (const auto& line : stats) {
         if (line.rfind("get ", 0) == 0)
             EXPECT_NE(line.find("filter=mcp-filter"), std::string::npos);
@@ -821,7 +822,8 @@ TEST(McpPluginPersistent, SharesRegistryConnectionAcrossSessions) {
     EXPECT_EQ(count_plugin_stats(stats, "open "), 1u);
     EXPECT_EQ(count_plugin_stats(stats, "get "), 3u);
     EXPECT_EQ(count_plugin_stats(stats, "free"), 3u);
-    EXPECT_EQ(count_plugin_stats(stats, "poll"), 3u);
+    EXPECT_EQ(count_plugin_stats(stats, "poll"), 3u)
+        << "each successful plugin snapshot must have one post-success poll";
     EXPECT_EQ(count_plugin_stats(stats, "events_free"), 0u);
     EXPECT_EQ(count_plugin_stats(stats, "close"), 1u);
 
