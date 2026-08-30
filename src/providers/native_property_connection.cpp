@@ -92,6 +92,7 @@ struct LiveTarget {
 struct Mutation {
     std::string schemaId;
     Operation operation = Operation::text;
+    std::string propertyType;
     bool writable = false;
     bool supportsClear = false;
 };
@@ -130,10 +131,38 @@ uint64_t stable_hash(std::string_view value) {
 
 PropertyMutationResult mutation_failure(
     HRESULT hresult, std::string error) {
-    PropertyMutationResult result;
-    result.hresult = hresult;
-    result.error = std::move(error);
-    return result;
+    if (hresult == HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE)) {
+        return property_mutation_failure(
+            hresult, std::move(error),
+            "typed_property_stale_element",
+            PropertyErrorDisposition::terminal);
+    }
+    const auto message = lower(error);
+    std::string code;
+    if (message.find("descriptor") != std::string::npos) {
+        code = "typed_property_invalid_descriptor";
+    } else if (
+        message.find("read-only") != std::string::npos ||
+        message.find("read only") != std::string::npos) {
+        code = "typed_property_read_only";
+    } else if (
+        message.find("does not support") != std::string::npos ||
+        message.find("unsupported") != std::string::npos) {
+        code = "typed_property_unsupported";
+    } else if (
+        message.find("outside") != std::string::npos ||
+        message.find("exceed") != std::string::npos) {
+        code = "typed_property_out_of_bounds";
+    } else if (
+        message.find("stale") != std::string::npos ||
+        message.find("changed since") != std::string::npos ||
+        message.find("no longer") != std::string::npos ||
+        message.find("unknown or closed") != std::string::npos ||
+        message.find("no property schema") != std::string::npos) {
+        code = "typed_property_stale_element";
+    }
+    return property_mutation_failure(
+        hresult, std::move(error), std::move(code));
 }
 
 PropertyMutationResult mutation_failure(
@@ -1484,7 +1513,8 @@ struct NativePropertyConnection::Impl {
             mutationsByDescriptor.emplace(
                 descriptor.descriptorId,
                 Mutation{
-                    schema->schemaId, spec.operation, descriptor.writable,
+                    schema->schemaId, spec.operation, descriptor.propertyType,
+                    descriptor.writable,
                     descriptor.supportsClear});
             schema->descriptors.push_back(std::move(descriptor));
         }
@@ -1851,9 +1881,7 @@ struct NativePropertyConnection::Impl {
         };
 
         PropertyMutationResult write{.ok = true, .hresult = S_OK};
-        std::string expected;
         if (!requested) {
-            expected = "-1";
             const UINT message =
                 live.target.window.normalizedClass == "combobox"
                     ? CB_SETCURSEL
@@ -1869,7 +1897,6 @@ struct NativePropertyConnection::Impl {
                     "The control did not clear its selected index");
             }
         } else {
-            expected = *requested;
             switch (mutation.operation) {
             case Operation::text:
                 write = set_window_text(live, *requested);
@@ -1880,7 +1907,6 @@ struct NativePropertyConnection::Impl {
                         *requested, enabled)) {
                     return invalidBoolean();
                 }
-                expected = enabled ? "true" : "false";
                 auto valid = validate_native_window(live.target.window);
                 if (!valid.ok)
                     return mutation_failure(valid);
@@ -1920,7 +1946,6 @@ struct NativePropertyConnection::Impl {
                         E_INVALIDARG,
                         "The check state is not valid for this Button style");
                 }
-                expected = normalized;
                 auto result = send_native_message(
                     live.target.window, BM_SETCHECK,
                     static_cast<WPARAM>(state));
@@ -1968,7 +1993,6 @@ struct NativePropertyConnection::Impl {
                     static_cast<LPARAM>(selectionEnd));
                 if (!result.ok)
                     return mutation_failure(result);
-                expected = std::to_string(changed);
                 break;
             }
             case Operation::editReadOnly: {
@@ -1977,7 +2001,6 @@ struct NativePropertyConnection::Impl {
                         *requested, readOnly)) {
                     return invalidBoolean();
                 }
-                expected = readOnly ? "true" : "false";
                 auto result = send_native_message(
                     live.target.window, EM_SETREADONLY,
                     readOnly ? TRUE : FALSE);
@@ -2020,7 +2043,6 @@ struct NativePropertyConnection::Impl {
                         HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
                         "The control rejected the selected index");
                 }
-                expected = std::to_string(index);
                 break;
             }
             case Operation::scrollMinimum:
@@ -2059,7 +2081,6 @@ struct NativePropertyConnection::Impl {
                         ? SIF_POS
                         : SIF_RANGE;
                 write = write_scroll_info(live, info);
-                expected = std::to_string(changed);
                 break;
             }
             case Operation::scrollPageSize:
@@ -2082,8 +2103,6 @@ struct NativePropertyConnection::Impl {
                 else
                     return mutation_failure(
                         E_INVALIDARG, "Unknown list-view mode");
-                expected =
-                    mode == LV_VIEW_SMALLICON ? "smallIcon" : normalized;
                 auto result = send_native_message(
                     live.target.window, LVM_SETVIEW,
                     static_cast<WPARAM>(mode));
@@ -2103,7 +2122,6 @@ struct NativePropertyConnection::Impl {
                         *requested, state)) {
                     return invalidBoolean();
                 }
-                expected = state ? "true" : "false";
                 write = write_listview_item_state(
                     live,
                     mutation.operation == Operation::listviewItemSelected
@@ -2143,7 +2161,6 @@ struct NativePropertyConnection::Impl {
                         *requested, selected)) {
                     return invalidBoolean();
                 }
-                expected = selected ? "true" : "false";
                 auto current = send_native_message(
                     live.target.window, TVM_GETNEXTITEM,
                     TVGN_CARET, 0);
@@ -2175,7 +2192,6 @@ struct NativePropertyConnection::Impl {
                         *requested, expanded)) {
                     return invalidBoolean();
                 }
-                expected = expanded ? "true" : "false";
                 auto result = send_native_message(
                     live.target.window, TVM_EXPAND,
                     expanded ? TVE_EXPAND : TVE_COLLAPSE,
@@ -2199,7 +2215,6 @@ struct NativePropertyConnection::Impl {
                         *requested, state)) {
                     return invalidBoolean();
                 }
-                expected = state ? "true" : "false";
                 auto result = send_native_message(
                     live.target.window,
                     mutation.operation == Operation::toolbarButtonChecked
@@ -2242,7 +2257,6 @@ struct NativePropertyConnection::Impl {
                     static_cast<WPARAM>(static_cast<INT_PTR>(index)));
                 if (!result.ok)
                     return mutation_failure(result);
-                expected = std::to_string(index);
                 break;
             }
             case Operation::tabItemText:
@@ -2283,10 +2297,14 @@ struct NativePropertyConnection::Impl {
         auto readback = read_operation(mutation.operation, after);
         if (!readback.ok)
             return mutation_failure(readback.hresult, readback.error);
-        if (!readback.available || readback.value != expected) {
-            return mutation_failure(
-                HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
-                "The native control did not retain the requested value");
+        if (!readback.available) {
+            return property_mutation_failure(
+                E_FAIL,
+                readback.error.empty()
+                    ? "The native property readback is unavailable"
+                    : readback.error,
+                "typed_property_readback_failed",
+                PropertyErrorDisposition::terminal);
         }
 
         {
@@ -2301,9 +2319,15 @@ struct NativePropertyConnection::Impl {
         PropertyMutationResult result;
         result.ok = true;
         result.hresult = S_OK;
-        result.hasValue = requested.has_value();
+        result.hasValue = true;
         result.value = readback.value;
+        result.runtimeType = mutation.propertyType;
+        result.source = "native";
+        result.canClear =
+            mutation.supportsClear && readback.value != "-1";
+        result.overridden = result.canClear;
         result.cleared = !requested.has_value();
+        result.error.clear();
         return result;
     }
 };

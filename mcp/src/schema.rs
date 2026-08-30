@@ -57,6 +57,35 @@ fn result(success: Value) -> Arc<JsonObject> {
     }))
 }
 
+fn property_mutation_failure() -> Value {
+    json!({
+        "type": "object",
+        "description": "A typed-property mutation failure with a stable disposition.",
+        "properties": {
+            "ok": { "const": false },
+            "errorCode": { "type": "string" },
+            "errorDisposition": {
+                "type": "string",
+                "enum": ["terminal", "transient", "ownershipLost"]
+            },
+            "retryable": { "type": "boolean" },
+            "error": { "type": "string" },
+            "hresult": { "type": "string" }
+        },
+        "required": [
+            "ok", "errorCode", "errorDisposition", "retryable", "error",
+            "hresult"
+        ]
+    })
+}
+
+fn property_mutation_result(success: Value) -> Arc<JsonObject> {
+    object(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [success, property_mutation_failure()]
+    }))
+}
+
 /// One element, as every tool that returns elements spells it.
 ///
 /// `children` appears only in tree responses and `properties` only when the
@@ -341,8 +370,8 @@ cached!(editable_properties, {
     }))
 });
 
-cached!(property_mutation, {
-    result(json!({
+cached!(property_set_mutation, {
+    property_mutation_result(json!({
         "type": "object",
         "properties": {
             "ok": { "const": true },
@@ -355,7 +384,31 @@ cached!(property_mutation, {
             "source": { "type": "string" },
             "cleared": { "type": "boolean" }
         },
-        "required": ["ok", "element", "descriptorId"]
+        "required": [
+            "ok", "element", "descriptorId", "value", "runtimeType",
+            "canClear", "overridden", "source"
+        ]
+    }))
+});
+
+cached!(property_clear_mutation, {
+    property_mutation_result(json!({
+        "type": "object",
+        "properties": {
+            "ok": { "const": true },
+            "element": { "type": "string" },
+            "descriptorId": { "type": "string" },
+            "value": { "type": "string" },
+            "runtimeType": { "type": "string" },
+            "canClear": { "type": "boolean" },
+            "overridden": { "type": "boolean" },
+            "source": { "type": "string" },
+            "cleared": { "const": true }
+        },
+        "required": [
+            "ok", "element", "descriptorId", "value", "runtimeType",
+            "canClear", "overridden", "source", "cleared"
+        ]
     }))
 });
 

@@ -21,6 +21,7 @@ public sealed class PropertyRowViewModel : ObservableObject
     private bool _isDirty;
     private bool _hasExternalConflict;
     private bool _hasPendingAction;
+    private bool _supportsClear;
     private long _editRevision;
 
     public PropertyRowViewModel(string name, string value)
@@ -74,8 +75,10 @@ public sealed class PropertyRowViewModel : ObservableObject
         : "";
     public string DescriptorId { get; private set; } = "";
     public string PropertyType { get; private set; } = "";
+    public string RuntimeType { get; private set; } = "";
     public string DeclaringType { get; private set; } = "";
     public string Source { get; private set; } = "";
+    public bool Overridden { get; private set; }
     public string Description { get; private set; } = "";
     public bool CanClear { get; private set; }
     public double? Minimum { get; private set; }
@@ -138,14 +141,17 @@ public sealed class PropertyRowViewModel : ObservableObject
             : descriptor.DisplayName;
         DescriptorId = descriptor.DescriptorId;
         PropertyType = descriptor.PropertyType;
+        RuntimeType = value.RuntimeType;
         DeclaringType = descriptor.DeclaringType;
         Source = value.Source;
+        Overridden = value.Overridden;
         Description = value.UnavailableReason.Length != 0
             ? value.UnavailableReason
             : value.ReadOnlyReason.Length != 0
                 ? value.ReadOnlyReason
                 : descriptor.Description;
-        CanClear = descriptor.SupportsClear && value.CanClear;
+        _supportsClear = descriptor.SupportsClear;
+        CanClear = _supportsClear && value.CanClear;
         Minimum = descriptor.Minimum;
         Maximum = descriptor.Maximum;
         Step = descriptor.Step;
@@ -174,8 +180,10 @@ public sealed class PropertyRowViewModel : ObservableObject
         OnPropertyChanged(nameof(IsTypedProperty));
         OnPropertyChanged(nameof(DescriptorId));
         OnPropertyChanged(nameof(PropertyType));
+        OnPropertyChanged(nameof(RuntimeType));
         OnPropertyChanged(nameof(DeclaringType));
         OnPropertyChanged(nameof(Source));
+        OnPropertyChanged(nameof(Overridden));
         OnPropertyChanged(nameof(Description));
         OnPropertyChanged(nameof(Details));
         OnPropertyChanged(nameof(CanClear));
@@ -273,6 +281,29 @@ public sealed class PropertyRowViewModel : ObservableObject
         HasPendingAction = hasPendingAction;
         if (IsDirty)
             HasExternalConflict = true;
+    }
+
+    public void ApplyMutationResult(
+        string value, string runtimeType, string source,
+        bool canClear, bool overridden, long submittedRevision)
+    {
+        RuntimeType = runtimeType;
+        Source = source;
+        Overridden = overridden;
+        CanClear = _supportsClear && canClear;
+        OnPropertyChanged(nameof(RuntimeType));
+        OnPropertyChanged(nameof(Source));
+        OnPropertyChanged(nameof(Overridden));
+        OnPropertyChanged(nameof(CanClear));
+        OnPropertyChanged(nameof(Details));
+        ApplyMutationValue(value, submittedRevision);
+        if (Kind == PropertyEditorKind.Command &&
+            EditRevision == submittedRevision &&
+            Choices.Count != 0)
+        {
+            SetEditText(Choices[0].Value, incrementRevision: false);
+            HasPendingAction = false;
+        }
     }
 
     public bool TryDiscardSubmittedEdit(long submittedRevision)

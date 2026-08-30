@@ -340,7 +340,12 @@ public:
         return m_pipe && m_readEvent && m_writeEvent;
     }
 
+    DWORD last_error() const {
+        return m_lastError;
+    }
+
     bool read_line(DWORD timeoutMs, std::string& line) {
+        m_lastError = ERROR_SUCCESS;
         const ULONGLONG deadline = GetTickCount64() + timeoutMs;
         for (;;) {
             const auto newline = m_buffer.find('\n');
@@ -351,12 +356,16 @@ public:
                     line.pop_back();
                 return true;
             }
-            if (m_buffer.size() >= kMaximumLineBytes)
+            if (m_buffer.size() >= kMaximumLineBytes) {
+                m_lastError = ERROR_BUFFER_OVERFLOW;
                 return false;
+            }
 
             const ULONGLONG now = GetTickCount64();
-            if (now >= deadline)
+            if (now >= deadline) {
+                m_lastError = ERROR_TIMEOUT;
                 return false;
+            }
             const DWORD remaining = static_cast<DWORD>(
                 std::min<ULONGLONG>(deadline - now, std::numeric_limits<DWORD>::max()));
 
@@ -369,31 +378,46 @@ public:
                 m_pipe, chunk, static_cast<DWORD>(sizeof(chunk)), &bytesRead, &overlapped);
             if (!ok) {
                 const DWORD error = GetLastError();
-                if (error != ERROR_IO_PENDING)
+                if (error != ERROR_IO_PENDING) {
+                    m_lastError = error;
                     return false;
+                }
                 const auto wait = wait_for_io(m_readEvent.get(), m_process, remaining);
                 if (wait != IoWaitResult::completed) {
                     detail::cancel_and_complete_overlapped(m_pipe, overlapped);
+                    m_lastError =
+                        wait == IoWaitResult::targetExited
+                            ? ERROR_INVALID_OWNER
+                            : wait == IoWaitResult::timedOut
+                                ? ERROR_TIMEOUT
+                                : ERROR_GEN_FAILURE;
                     return false;
                 }
-                if (!GetOverlappedResult(m_pipe, &overlapped, &bytesRead, FALSE))
+                if (!GetOverlappedResult(m_pipe, &overlapped, &bytesRead, FALSE)) {
+                    m_lastError = GetLastError();
                     return false;
+                }
             }
-            if (bytesRead == 0)
+            if (bytesRead == 0) {
+                m_lastError = ERROR_BROKEN_PIPE;
                 return false;
+            }
             m_buffer.append(chunk, bytesRead);
         }
     }
 
     bool write_line(const std::string& line, DWORD timeoutMs) {
+        m_lastError = ERROR_SUCCESS;
         std::string message = line;
         message.push_back('\n');
         const ULONGLONG deadline = GetTickCount64() + timeoutMs;
         size_t offset = 0;
         while (offset < message.size()) {
             const ULONGLONG now = GetTickCount64();
-            if (now >= deadline)
+            if (now >= deadline) {
+                m_lastError = ERROR_TIMEOUT;
                 return false;
+            }
             const DWORD remaining = static_cast<DWORD>(
                 std::min<ULONGLONG>(deadline - now, std::numeric_limits<DWORD>::max()));
             const DWORD requested = static_cast<DWORD>(
@@ -407,18 +431,30 @@ public:
                 m_pipe, message.data() + offset, requested, &bytesWritten, &overlapped);
             if (!ok) {
                 const DWORD error = GetLastError();
-                if (error != ERROR_IO_PENDING)
+                if (error != ERROR_IO_PENDING) {
+                    m_lastError = error;
                     return false;
+                }
                 const auto wait = wait_for_io(m_writeEvent.get(), m_process, remaining);
                 if (wait != IoWaitResult::completed) {
                     detail::cancel_and_complete_overlapped(m_pipe, overlapped);
+                    m_lastError =
+                        wait == IoWaitResult::targetExited
+                            ? ERROR_INVALID_OWNER
+                            : wait == IoWaitResult::timedOut
+                                ? ERROR_TIMEOUT
+                                : ERROR_GEN_FAILURE;
                     return false;
                 }
-                if (!GetOverlappedResult(m_pipe, &overlapped, &bytesWritten, FALSE))
+                if (!GetOverlappedResult(m_pipe, &overlapped, &bytesWritten, FALSE)) {
+                    m_lastError = GetLastError();
                     return false;
+                }
             }
-            if (bytesWritten == 0)
+            if (bytesWritten == 0) {
+                m_lastError = ERROR_BROKEN_PIPE;
                 return false;
+            }
             offset += bytesWritten;
         }
         return true;
@@ -430,6 +466,7 @@ private:
     wil::unique_event m_readEvent;
     wil::unique_event m_writeEvent;
     std::string m_buffer;
+    DWORD m_lastError = ERROR_SUCCESS;
 };
 
 bool wait_for_pipe_connection(
@@ -499,6 +536,7 @@ struct ManagedCommandResponse {
     bool completed = false;
     bool success = false;
     std::string payload;
+    HRESULT hresult = E_FAIL;
 };
 
 class ManagedFrameworkConnection final : public IFrameworkConnection {
@@ -758,7 +796,7 @@ public:
             }
         }
         if (!response.completed) {
-            set_transport_error(result);
+            set_transport_error(response, result);
             return result;
         }
         if (!response.success) {
@@ -826,12 +864,12 @@ public:
         const std::string& value,
         const PropertyOperationContext& context) override {
         std::lock_guard<std::mutex> lock(m_commandMutex);
-        PropertyMutationResult result;
         if (!supports_command("SET_PROPERTY")) {
-            result.hresult = E_NOTIMPL;
-            result.error =
-                "This managed TAP does not advertise typed property mutation";
-            return result;
+            return property_mutation_failure(
+                E_NOTIMPL,
+                "This managed TAP does not advertise typed property mutation",
+                "typed_property_unsupported",
+                PropertyErrorDisposition::terminal);
         }
         const std::string arguments =
             std::to_string(handle) + " " +
@@ -850,12 +888,12 @@ public:
         uint64_t handle, const std::string& descriptorId,
         const PropertyOperationContext& context) override {
         std::lock_guard<std::mutex> lock(m_commandMutex);
-        PropertyMutationResult result;
         if (!supports_command("CLEAR_PROPERTY")) {
-            result.hresult = E_NOTIMPL;
-            result.error =
-                "This managed TAP does not advertise typed property clearing";
-            return result;
+            return property_mutation_failure(
+                E_NOTIMPL,
+                "This managed TAP does not advertise typed property clearing",
+                "typed_property_unsupported",
+                PropertyErrorDisposition::terminal);
         }
         const std::string arguments =
             std::to_string(handle) + " " +
@@ -1007,15 +1045,21 @@ private:
     }
 
     template <typename Result>
-    void set_transport_error(Result& result) const {
-        result.hresult = HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE);
+    void set_transport_error(
+        const ManagedCommandResponse& response, Result& result) const {
+        result.hresult = FAILED(response.hresult)
+            ? response.hresult
+            : HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE);
         result.error =
-            "The " + m_options.frameworkLabel +
-            " managed property connection is no longer available";
+            result.hresult == HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                ? "The " + m_options.frameworkLabel +
+                    " managed property command timed out"
+                : "The " + m_options.frameworkLabel +
+                    " managed property connection is no longer available";
     }
 
     template <typename Result>
-    static void set_command_error(
+    void set_command_error(
         const std::string& payloadText, Result& result) {
         const json payload = json::parse(payloadText, nullptr, false);
         if (payload.is_discarded() || !payload.is_object()) {
@@ -1026,32 +1070,104 @@ private:
             return;
         }
         result.hresult = parse_hresult(payload);
-        result.error = payload.value("message", "The managed property command failed");
+        result.error =
+            payload.value("message", "The managed property command failed");
+    }
+
+    void set_mutation_command_error(
+        const std::string& payloadText, PropertyMutationResult& result) {
+        const json payload = json::parse(payloadText, nullptr, false);
+        if (payload.is_discarded() || !payload.is_object()) {
+            result = property_mutation_failure(
+                E_FAIL,
+                payloadText.empty()
+                    ? "The managed property command failed"
+                    : payloadText,
+                "typed_property_mutation_failed",
+                PropertyErrorDisposition::transient);
+            return;
+        }
+        const auto hresult = parse_hresult(payload);
+        const auto message = payload.value(
+            "message", "The managed property command failed");
+        const bool timeout =
+            message.find("did not complete") != std::string::npos ||
+            message.find("before execution") != std::string::npos;
+        const bool descriptor =
+            message.find("descriptor") != std::string::npos;
+        result = property_mutation_failure(
+            hresult, message,
+            timeout
+                ? "typed_property_timeout"
+                : descriptor
+                    ? "typed_property_invalid_descriptor"
+                    : std::string{},
+            timeout
+                ? PropertyErrorDisposition::transient
+                : PropertyErrorDisposition::unspecified);
     }
 
     PropertyMutationResult parse_mutation_response(
         ManagedCommandResponse response, bool clearing) {
         PropertyMutationResult result;
         if (!response.completed) {
-            set_transport_error(result);
-            return result;
+            const auto hresult = FAILED(response.hresult)
+                ? response.hresult
+                : HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE);
+            const auto disposition =
+                hresult == HRESULT_FROM_WIN32(ERROR_INVALID_OWNER)
+                    ? PropertyErrorDisposition::ownershipLost
+                    : PropertyErrorDisposition::transient;
+            return property_mutation_failure(
+                hresult,
+                hresult == HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                    ? "The " + m_options.frameworkLabel +
+                        " managed property command timed out"
+                    : "The " + m_options.frameworkLabel +
+                        " managed property connection is no longer available",
+                hresult == HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                    ? "typed_property_timeout"
+                    : disposition == PropertyErrorDisposition::ownershipLost
+                        ? "typed_property_ownership_lost"
+                        : "typed_property_transport_error",
+                disposition);
         }
         if (!response.success) {
-            set_command_error(response.payload, result);
+            set_mutation_command_error(response.payload, result);
             return result;
         }
         const json payload = json::parse(response.payload, nullptr, false);
         if (payload.is_discarded() || !payload.is_object()) {
-            result.hresult = E_FAIL;
-            result.error = "The managed TAP returned an invalid mutation result";
-            return result;
+            return property_mutation_failure(
+                E_FAIL,
+                "The managed TAP returned an invalid mutation result",
+                "typed_property_readback_failed",
+                PropertyErrorDisposition::transient);
         }
-        if (auto value = payload.find("value");
-            value != payload.end() && value->is_string()) {
-            result.hasValue = true;
-            result.value = value->get<std::string>();
+        const auto value = payload.find("value");
+        const auto runtimeType = payload.find("runtimeType");
+        const auto canClear = payload.find("canClear");
+        const auto overridden = payload.find("overridden");
+        const auto source = payload.find("source");
+        if (value == payload.end() || !value->is_string() ||
+            runtimeType == payload.end() || !runtimeType->is_string() ||
+            canClear == payload.end() || !canClear->is_boolean() ||
+            overridden == payload.end() || !overridden->is_boolean() ||
+            source == payload.end() || !source->is_string() ||
+            (clearing && !payload.value("cleared", false))) {
+            return property_mutation_failure(
+                E_FAIL,
+                "The managed TAP returned a mutation result without complete effective-value metadata",
+                "typed_property_readback_failed",
+                PropertyErrorDisposition::transient);
         }
-        result.cleared = clearing && payload.value("cleared", false);
+        result.hasValue = true;
+        result.value = value->get<std::string>();
+        result.runtimeType = runtimeType->get<std::string>();
+        result.canClear = canClear->get<bool>();
+        result.overridden = overridden->get<bool>();
+        result.source = source->get<std::string>();
+        result.cleared = clearing;
         result.ok = true;
         result.hresult = S_OK;
         result.error.clear();
@@ -1062,19 +1178,34 @@ private:
         const std::string& command, const std::string& arguments,
         DWORD timeoutMs) {
         ManagedCommandResponse result;
-        if (!connection_alive() || !m_io)
+        if (!connection_alive() || !m_io) {
+            result.hresult =
+                m_process &&
+                        WaitForSingleObject(m_process.get(), 0) ==
+                            WAIT_OBJECT_0
+                    ? HRESULT_FROM_WIN32(ERROR_INVALID_OWNER)
+                    : HRESULT_FROM_WIN32(ERROR_BROKEN_PIPE);
             return result;
+        }
 
         const uint64_t commandId = m_nextCommandId++;
         const std::string id = std::to_string(commandId);
         if (!m_io->write_line(
                 "REQUEST\t" + id + "\t" + command + "\t" + arguments, timeoutMs)) {
+            result.hresult = HRESULT_FROM_WIN32(
+                m_io->last_error() == ERROR_SUCCESS
+                    ? ERROR_BROKEN_PIPE
+                    : m_io->last_error());
             m_alive.store(false);
             return result;
         }
 
         std::string response;
         if (!m_io->read_line(timeoutMs, response)) {
+            result.hresult = HRESULT_FROM_WIN32(
+                m_io->last_error() == ERROR_SUCCESS
+                    ? ERROR_BROKEN_PIPE
+                    : m_io->last_error());
             m_alive.store(false);
             return result;
         }
@@ -1083,6 +1214,7 @@ private:
         if (response.rfind(prefix, 0) != 0) {
             fprintf(stderr, "lvt: %s TAP DLL returned an uncorrelated response\n",
                     m_options.frameworkLabel.c_str());
+            result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
             m_alive.store(false);
             return result;
         }
@@ -1095,6 +1227,7 @@ private:
             response.substr(prefix.size(), statusEnd - prefix.size());
         result.payload = response.substr(statusEnd + 1);
         result.completed = true;
+        result.hresult = S_OK;
         if (status == "OK") {
             result.success = true;
             return result;

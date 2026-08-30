@@ -96,20 +96,20 @@ expanded nodes stay expanded.
 
 All editing uses tools on the same MCP session:
 
-- UIA mode offers `toggle` and `set_value` for properties backed by those
-  UI Automation patterns.
-- Visual mode calls `get_editable_properties` and renders only the generic
+- Both UIA and visual modes call `get_editable_properties` and render only the generic
   descriptor metadata returned by the provider: read-only text, strings,
   booleans, integers, numbers, and enums. `set_property` and `clear_property`
   use opaque descriptor ids; the Viewer never sends a framework property
   index or runtime type.
 
 Schemas are cached by `schemaId` while values are refreshed for the selected
-element, so controls sharing a schema reuse editor presentation. UIA's existing
-Toggle/Value rows remain temporary legacy templates until its provider exposes
-the same descriptor contract. The same generic editors render XAML/WinUI3 and
-the curated Win32/Common Controls descriptors; no framework-specific Viewer
-template is required. Elements are addressed by durable keys.
+element, so controls sharing a schema reuse editor presentation. The same
+generic editors render UIA, XAML/WinUI3, WPF, WinForms, and curated
+Win32/Common Controls descriptors; no framework-specific Viewer template is
+required. Successful mutations update rows from provider effective readback
+metadata rather than submitted text. Structured terminal, transient, and
+ownership-lost failures feed the same bounded refresh policy. Elements are
+addressed by durable keys.
 
 ## Crosshair targeting
 

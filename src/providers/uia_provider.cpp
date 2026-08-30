@@ -2392,41 +2392,48 @@ PropertyMutationResult UiaConnection::set_property(
     const auto snapshot =
         get_property_snapshot(handle, context);
     if (!snapshot.ok || !snapshot.schema) {
-        PropertyMutationResult result;
-        result.hresult = snapshot.hresult;
-        result.error = snapshot.error;
-        return result;
+        return property_mutation_failure(
+            snapshot.hresult, snapshot.error,
+            snapshot.hresult == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+                ? "typed_property_stale_element"
+                : std::string{});
     }
 
     const auto* descriptor =
         find_descriptor(*snapshot.schema, descriptorId);
     if (!descriptor) {
-        PropertyMutationResult result;
-        result.hresult = E_INVALIDARG;
-        result.error =
-            "The property descriptor is unknown, stale, or belongs to a different UI Automation element";
-        return result;
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The property descriptor is unknown, stale, or belongs to a different UI Automation element",
+            "typed_property_invalid_descriptor",
+            PropertyErrorDisposition::terminal);
     }
     if (!descriptor->writable) {
-        PropertyMutationResult result;
-        result.hresult = E_ACCESSDENIED;
-        result.error = "The UI Automation property descriptor is read-only";
-        return result;
+        return property_mutation_failure(
+            E_ACCESSDENIED,
+            "The UI Automation property descriptor is read-only",
+            "typed_property_read_only",
+            PropertyErrorDisposition::terminal);
     }
     if (!descriptor->choices.empty() && !is_choice(*descriptor, value)) {
-        PropertyMutationResult result;
-        result.hresult = E_INVALIDARG;
-        result.error =
-            "The selected value is not one of the provider-supplied choices";
-        return result;
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The selected value is not one of the provider-supplied choices",
+            "typed_property_invalid_value",
+            PropertyErrorDisposition::terminal);
     }
     if (descriptor->kind == PropertyEditorKind::number) {
         std::string error;
         if (!validate_number(*descriptor, value, error)) {
-            PropertyMutationResult result;
-            result.hresult = E_INVALIDARG;
-            result.error = std::move(error);
-            return result;
+            const bool bounds =
+                error.find("minimum") != std::string::npos ||
+                error.find("maximum") != std::string::npos;
+            return property_mutation_failure(
+                E_INVALIDARG, std::move(error),
+                bounds
+                    ? "typed_property_out_of_bounds"
+                    : "typed_property_invalid_value",
+                PropertyErrorDisposition::terminal);
         }
     }
 
@@ -2449,11 +2456,11 @@ PropertyMutationResult UiaConnection::set_property(
     } else if (descriptor->name == "Scroll.Action") {
         action = UiaPropertyAction::scroll;
     } else {
-        PropertyMutationResult result;
-        result.hresult = E_INVALIDARG;
-        result.error =
-            "The property descriptor has no UI Automation mutation adapter";
-        return result;
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The property descriptor has no UI Automation mutation adapter",
+            "typed_property_unsupported",
+            PropertyErrorDisposition::terminal);
     }
 
     wait_after_element_from_handle_test_gate(
@@ -2462,28 +2469,33 @@ PropertyMutationResult UiaConnection::set_property(
     const HRESULT validationHr =
         validate_target_identity_locked();
     if (FAILED(validationHr)) {
-        PropertyMutationResult result;
-        result.hresult = validationHr;
-        result.error =
+        return property_mutation_failure(
+            validationHr,
             is_uia_target_ownership_failure(validationHr)
                 ? "The UI Automation connection no longer matches this session's target window"
-                : "The UI Automation target identity could not be validated";
-        return result;
+                : "The UI Automation target identity could not be validated",
+            is_uia_target_ownership_failure(validationHr)
+                ? "typed_property_ownership_lost"
+                : "typed_property_identity_validation_failed",
+            is_uia_target_ownership_failure(validationHr)
+                ? PropertyErrorDisposition::ownershipLost
+                : PropertyErrorDisposition::transient);
     }
     const auto runtime = m_state->identities.runtime_id(handle);
     if (!runtime) {
-        PropertyMutationResult result;
-        result.hresult = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-        result.error =
-            "The UI Automation element or session is no longer available";
-        return result;
+        return property_mutation_failure(
+            HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+            "The UI Automation element is no longer available",
+            "typed_property_stale_element",
+            PropertyErrorDisposition::terminal);
     }
     std::vector<int> runtimeId;
     if (!parse_runtime_id(*runtime, runtimeId)) {
-        PropertyMutationResult result;
-        result.hresult = E_INVALIDARG;
-        result.error = "The UI Automation element has an invalid RuntimeId";
-        return result;
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The UI Automation element has an invalid RuntimeId",
+            "typed_property_stale_element",
+            PropertyErrorDisposition::terminal);
     }
 
     PropertyMutationResult result;
@@ -2495,9 +2507,24 @@ PropertyMutationResult UiaConnection::set_property(
         return S_OK;
     });
     if (FAILED(hr)) {
-        result.ok = false;
-        result.hresult = hr;
-        result.error = "The UI Automation property action could not run";
+        result = property_mutation_failure(
+            hr,
+            "The UI Automation property action could not run",
+            "typed_property_provider_busy",
+            PropertyErrorDisposition::transient);
+    }
+    if (result.ok) {
+        if (!result.hasValue) {
+            return property_mutation_failure(
+                E_FAIL,
+                "The UI Automation property action completed without an effective-state readback",
+                "typed_property_readback_failed",
+                PropertyErrorDisposition::transient);
+        }
+        result.runtimeType = descriptor->propertyType;
+        result.canClear = false;
+        result.overridden = false;
+        result.source = descriptor->declaringType;
     }
     return result;
 }
@@ -2508,17 +2535,18 @@ PropertyMutationResult UiaConnection::clear_property(
     const auto snapshot =
         get_property_snapshot(handle, context);
     if (!snapshot.ok || !snapshot.schema) {
-        PropertyMutationResult result;
-        result.hresult = snapshot.hresult;
-        result.error = snapshot.error;
-        return result;
+        return property_mutation_failure(
+            snapshot.hresult, snapshot.error,
+            snapshot.hresult == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+                ? "typed_property_stale_element"
+                : std::string{});
     }
     if (!find_descriptor(*snapshot.schema, descriptorId)) {
-        PropertyMutationResult result;
-        result.hresult = E_INVALIDARG;
-        result.error =
-            "The property descriptor is unknown, stale, or belongs to a different UI Automation element";
-        return result;
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The property descriptor is unknown, stale, or belongs to a different UI Automation element",
+            "typed_property_invalid_descriptor",
+            PropertyErrorDisposition::terminal);
     }
 
     wait_after_element_from_handle_test_gate(
@@ -2529,21 +2557,25 @@ PropertyMutationResult UiaConnection::clear_property(
         const HRESULT validationHr =
             validate_target_identity_locked();
         if (FAILED(validationHr)) {
-            PropertyMutationResult result;
-            result.hresult = validationHr;
-            result.error =
+            return property_mutation_failure(
+                validationHr,
                 is_uia_target_ownership_failure(validationHr)
                     ? "ownershipLost: the UI Automation target identity changed"
-                    : "The UI Automation target identity could not be validated";
-            return result;
+                    : "The UI Automation target identity could not be validated",
+                is_uia_target_ownership_failure(validationHr)
+                    ? "typed_property_ownership_lost"
+                    : "typed_property_identity_validation_failed",
+                is_uia_target_ownership_failure(validationHr)
+                    ? PropertyErrorDisposition::ownershipLost
+                    : PropertyErrorDisposition::transient);
         }
     }
 
-    PropertyMutationResult result;
-    result.hresult = E_NOTIMPL;
-    result.error =
-        "UI Automation does not expose a generic clear/reset operation for this property";
-    return result;
+    return property_mutation_failure(
+        E_NOTIMPL,
+        "UI Automation does not expose a generic clear/reset operation for this property",
+        "typed_property_unsupported",
+        PropertyErrorDisposition::terminal);
 }
 
 std::vector<ConnectionEvent> UiaConnection::poll_events() {

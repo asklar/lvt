@@ -638,6 +638,21 @@ void expect_typed_property_session_disconnected(const json& result) {
     EXPECT_EQ(result.value("errorDisposition", ""), "ownershipLost")
         << result.dump(2);
     EXPECT_FALSE(result.value("retryable", true)) << result.dump(2);
+    EXPECT_FALSE(result.value("hresult", "").empty()) << result.dump(2);
+}
+
+void expect_typed_property_failure(
+    const json& result, const std::string& code,
+    const std::string& disposition, bool retryable) {
+    EXPECT_FALSE(result.value("ok", true)) << result.dump(2);
+    EXPECT_EQ(result.value("errorCode", ""), code) << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorDisposition", ""), disposition)
+        << result.dump(2);
+    EXPECT_EQ(result.value("retryable", !retryable), retryable)
+        << result.dump(2);
+    EXPECT_FALSE(result.value("error", "").empty()) << result.dump(2);
+    EXPECT_FALSE(result.value("hresult", "").empty()) << result.dump(2);
 }
 
 void expect_typed_property_target_not_authorized(
@@ -1426,7 +1441,7 @@ TEST(McpUiaIdentity, ReplacementDuringFallbackFailsOwnershipLost) {
         json{{"name", "get_uia_tree"},
              {"arguments", json{{"session", session}}}});
     ASSERT_EQ(
-        WaitForSingleObject(entered.get(), 10000),
+        WaitForSingleObject(entered.get(), 20000),
         WAIT_OBJECT_0)
         << "the MCP fallback did not reach ElementFromHandle";
 
@@ -1803,6 +1818,7 @@ TEST(McpUiaIdentity, ElementlessKeyboardActionsReturnStructuredOwnershipLost) {
 
 TEST(McpUiaIdentity, TypedMutationsDetectOwnershipLossAfterInitialCheck) {
     const auto runMutation = [](const std::string& tool) {
+        SCOPED_TRACE(tool);
         ManagedSampleProcess sample;
         ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
         struct FixtureWindow {
@@ -4091,6 +4107,10 @@ TEST(McpManagedFrameworks, WpfTypedDependencyProperties) {
         &isError);
     ASSERT_FALSE(isError) << setOpacity.dump(2);
     EXPECT_NEAR(std::stod(setOpacity.value("value", "")), 0.4, 0.001);
+    EXPECT_EQ(setOpacity.value("runtimeType", ""), "System.Double");
+    EXPECT_EQ(setOpacity.value("source", ""), "Local");
+    EXPECT_TRUE(setOpacity.value("canClear", false));
+    EXPECT_TRUE(setOpacity.value("overridden", false));
     auto changedButton = client.call_tool(
         "get_editable_properties",
         json{{"session", session}, {"element", buttonKey}}, &isError);
@@ -4109,6 +4129,10 @@ TEST(McpManagedFrameworks, WpfTypedDependencyProperties) {
     ASSERT_FALSE(isError) << clearOpacity.dump(2);
     EXPECT_TRUE(clearOpacity.value("cleared", false));
     EXPECT_NEAR(std::stod(clearOpacity.value("value", "")), 0.75, 0.001);
+    EXPECT_EQ(clearOpacity.value("runtimeType", ""), "System.Double");
+    EXPECT_NE(clearOpacity.value("source", ""), "Local");
+    EXPECT_FALSE(clearOpacity.value("canClear", true));
+    EXPECT_FALSE(clearOpacity.value("overridden", true));
     auto restoredButton = client.call_tool(
         "get_editable_properties",
         json{{"session", session}, {"element", buttonKey}}, &isError);
@@ -4222,6 +4246,9 @@ TEST(McpManagedFrameworks, WpfTypedDependencyProperties) {
              {"value", "0.5"}},
         &isError);
     EXPECT_TRUE(isError) << staleDescriptor.dump(2);
+    expect_typed_property_failure(
+        staleDescriptor, "typed_property_invalid_descriptor",
+        "terminal", false);
     EXPECT_NE(
         staleDescriptor.value("error", "").find("stale"),
         std::string::npos);
@@ -4414,6 +4441,10 @@ TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
         &isError);
     ASSERT_FALSE(isError) << setText.dump(2);
     EXPECT_EQ(setText.value("value", ""), "Changed text");
+    EXPECT_EQ(setText.value("runtimeType", ""), "System.String");
+    EXPECT_EQ(setText.value("source", ""), "Modified");
+    EXPECT_TRUE(setText.value("canClear", false));
+    EXPECT_TRUE(setText.value("overridden", false));
     auto changed = client.call_tool(
         "get_editable_properties",
         json{{"session", session}, {"element", formKey}}, &isError);
@@ -4431,6 +4462,10 @@ TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
     ASSERT_FALSE(isError) << clearText.dump(2);
     EXPECT_TRUE(clearText.value("cleared", false));
     EXPECT_EQ(clearText.value("value", ""), "Default text");
+    EXPECT_EQ(clearText.value("runtimeType", ""), "System.String");
+    EXPECT_EQ(clearText.value("source", ""), "Default");
+    EXPECT_FALSE(clearText.value("canClear", true));
+    EXPECT_FALSE(clearText.value("overridden", true));
     auto resetSnapshot = client.call_tool(
         "get_editable_properties",
         json{{"session", session}, {"element", formKey}}, &isError);
@@ -4503,6 +4538,9 @@ TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
              {"descriptorId", retryId}, {"value", "9.5"}},
         &isError);
     EXPECT_TRUE(isError) << invalidNumber.dump(2);
+    expect_typed_property_failure(
+        invalidNumber, "typed_property_invalid_value",
+        "terminal", false);
 
     auto deadIdentity = client.call_tool(
         "get_editable_properties",
@@ -4554,6 +4592,9 @@ TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
              {"value", "stale"}},
         &isError);
     EXPECT_TRUE(isError) << staleDescriptor.dump(2);
+    expect_typed_property_failure(
+        staleDescriptor, "typed_property_invalid_descriptor",
+        "terminal", false);
     EXPECT_NE(
         staleDescriptor.value("error", "").find("stale"),
         std::string::npos);
@@ -5155,6 +5196,13 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                  {"value", changedText}},
             &isError);
         ASSERT_FALSE(isError) << setValue.dump(2);
+        EXPECT_EQ(setValue.value("value", ""), changedText);
+        EXPECT_EQ(setValue.value("runtimeType", ""), "String");
+        EXPECT_EQ(
+            setValue.value("source", ""),
+            "UIAutomation.ValuePattern");
+        EXPECT_FALSE(setValue.value("canClear", true));
+        EXPECT_FALSE(setValue.value("overridden", true));
         auto changedInput = client.call_tool(
             "get_editable_properties",
             json{{"session", session}, {"element", inputKey}}, &isError);
@@ -5175,6 +5223,18 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         ASSERT_NE(readOnlyValue, nullptr);
         EXPECT_EQ(readOnlyValue->value("kind", ""), "readonly");
         EXPECT_FALSE(readOnlyValue->value("writable", true));
+        auto refusedReadOnly = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", readOnly["elements"][0].value("key", "")},
+                 {"descriptorId",
+                  readOnlyValue->value("descriptorId", "")},
+                 {"value", "must not change"}},
+            &isError);
+        EXPECT_TRUE(isError) << refusedReadOnly.dump(2);
+        expect_typed_property_failure(
+            refusedReadOnly, "typed_property_read_only",
+            "terminal", false);
 
         auto slider = client.call_tool(
             "find_elements", json{{"session", session}, {"automationId", "LevelSlider"}});
@@ -5194,6 +5254,17 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         const auto rangeDescriptorId = range->value("descriptorId", "");
         const auto originalRange =
             typed_property_value(sliderProperties, "RangeValue.Value");
+        auto outOfBounds = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", sliderKey},
+                 {"descriptorId", rangeDescriptorId},
+                 {"value", "101"}},
+            &isError);
+        EXPECT_TRUE(isError) << outOfBounds.dump(2);
+        expect_typed_property_failure(
+            outOfBounds, "typed_property_out_of_bounds",
+            "terminal", false);
 
         auto readOnlyRange = client.call_tool(
             "find_elements",
@@ -5228,6 +5299,12 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
         ASSERT_FALSE(isError) << setRange.dump(2);
         const auto providerRange = setRange.value("value", "");
         ASSERT_FALSE(providerRange.empty()) << setRange.dump(2);
+        EXPECT_EQ(setRange.value("runtimeType", ""), "Double");
+        EXPECT_EQ(
+            setRange.value("source", ""),
+            "UIAutomation.RangeValuePattern");
+        EXPECT_FALSE(setRange.value("canClear", true));
+        EXPECT_FALSE(setRange.value("overridden", true));
         EXPECT_NE(providerRange, requestedRange)
             << "RangeValue mutation returned the caller's spelling instead of provider readback";
         auto rangeAfter = client.call_tool(
@@ -5266,6 +5343,12 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                      {"value", wantedToggle}},
                 &isError);
             ASSERT_FALSE(isError) << setToggle.dump(2);
+            EXPECT_EQ(setToggle.value("value", ""), wantedToggle);
+            EXPECT_EQ(
+                setToggle.value("runtimeType", ""), "ToggleState");
+            EXPECT_EQ(
+                setToggle.value("source", ""),
+                "UIAutomation.TogglePattern");
         }
         auto toggleAfter = client.call_tool(
             "get_editable_properties",
@@ -5298,6 +5381,10 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                  {"value", "Expanded"}},
             &isError);
         ASSERT_FALSE(isError) << setExpanded.dump(2);
+        EXPECT_EQ(setExpanded.value("value", ""), "Expanded");
+        EXPECT_EQ(
+            setExpanded.value("runtimeType", ""),
+            "ExpandCollapseState");
         auto expandedCombo = client.call_tool(
             "find_elements", json{{"session", session}, {"automationId", "ChoiceCombo"}});
         ASSERT_FALSE(expandedCombo["elements"].empty());
@@ -5321,6 +5408,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                  {"value", "Collapsed"}},
             &isError);
         ASSERT_FALSE(isError) << setCollapsed.dump(2);
+        EXPECT_EQ(setCollapsed.value("value", ""), "Collapsed");
 
         auto item = client.call_tool(
             "find_elements",
@@ -5346,6 +5434,11 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                      {"value", "add"}},
                 &isError);
             ASSERT_FALSE(isError) << add.dump(2);
+            EXPECT_EQ(add.value("value", ""), "Selected");
+            EXPECT_EQ(add.value("runtimeType", ""), "Command");
+            EXPECT_EQ(
+                add.value("source", ""),
+                "UIAutomation.SelectionItemPattern");
 
             auto currentItem = client.call_tool(
                 "find_elements",
@@ -5371,6 +5464,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                      {"value", "remove"}},
                 &isError);
             ASSERT_FALSE(isError) << removed.dump(2);
+            EXPECT_EQ(removed.value("value", ""), "Not selected");
 
             auto replacementItem = client.call_tool(
                 "find_elements",
@@ -5393,6 +5487,7 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                      {"value", "select"}},
                 &isError);
             ASSERT_FALSE(isError) << selected.dump(2);
+            EXPECT_EQ(selected.value("value", ""), "Selected");
 
             auto selectedItem = client.call_tool(
                 "find_elements",
@@ -5415,6 +5510,8 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                      {"value", "remove"}},
                 &isError);
             EXPECT_FALSE(isError) << finalRemove.dump(2);
+            EXPECT_EQ(
+                finalRemove.value("value", ""), "Not selected");
         }
 
         auto list = client.call_tool(
@@ -5442,6 +5539,11 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                  {"value", "down"}},
             &isError);
         ASSERT_FALSE(isError) << scrolled.dump(2);
+        EXPECT_EQ(scrolled.value("runtimeType", ""), "Command");
+        EXPECT_EQ(
+            scrolled.value("source", ""),
+            "UIAutomation.ScrollPattern");
+        EXPECT_FALSE(scrolled.value("value", "").empty());
         auto afterScroll = client.call_tool(
             "get_editable_properties",
             json{{"session", session}, {"element", listKey}}, &isError);
@@ -5456,6 +5558,13 @@ TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection
                  {"descriptorId", rangeDescriptorId}},
             &isError);
         EXPECT_TRUE(isError) << clear.dump(2);
+        expect_typed_property_failure(
+            clear, "typed_property_unsupported",
+            "terminal", false);
+        schemaError.clear();
+        EXPECT_TRUE(schema_allows(
+            schemas.at("clear_property"), clear, schemaError))
+            << schemaError << "\n" << clear.dump(2);
         EXPECT_NE(clear.dump().find("does not expose a generic clear"), std::string::npos)
             << clear.dump(2);
 
@@ -6087,6 +6196,10 @@ TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
         &isError);
     ASSERT_FALSE(isError) << changed.dump(2);
     EXPECT_EQ(changed.value("value", ""), changedText);
+    EXPECT_EQ(changed.value("runtimeType", ""), "String");
+    EXPECT_EQ(changed.value("source", ""), "native");
+    EXPECT_FALSE(changed.value("canClear", true));
+    EXPECT_FALSE(changed.value("overridden", true));
     schemaError.clear();
     EXPECT_TRUE(schema_allows(
         schemas.at("set_property"), changed, schemaError))
@@ -6120,6 +6233,13 @@ TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
              {"value", "value"}},
         &isError);
     EXPECT_TRUE(isError) << unknown.dump(2);
+    expect_typed_property_failure(
+        unknown, "typed_property_invalid_descriptor",
+        "terminal", false);
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("set_property"), unknown, schemaError))
+        << schemaError << "\n" << unknown.dump(2);
 
     DWORD_PTR siblingValue = 0;
     ASSERT_NE(
@@ -6159,6 +6279,11 @@ TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
         &isError);
     ASSERT_FALSE(isError) << cleared.dump(2);
     EXPECT_TRUE(cleared.value("cleared", false));
+    EXPECT_EQ(cleared.value("value", ""), "-1");
+    EXPECT_EQ(cleared.value("runtimeType", ""), "Int32");
+    EXPECT_EQ(cleared.value("source", ""), "native");
+    EXPECT_FALSE(cleared.value("canClear", true));
+    EXPECT_FALSE(cleared.value("overridden", true));
     schemaError.clear();
     EXPECT_TRUE(schema_allows(
         schemas.at("clear_property"), cleared, schemaError))
@@ -7768,6 +7893,12 @@ TEST_F(McpSampleFixture, TypedScrollRejectsAStaleMissingScrollPattern) {
              {"value", "down"}},
         &isError);
     EXPECT_TRUE(isError) << stale.dump(2);
+    EXPECT_EQ(stale.value("errorDisposition", ""), "terminal")
+        << stale.dump(2);
+    EXPECT_FALSE(stale.value("retryable", true))
+        << stale.dump(2);
+    EXPECT_FALSE(stale.value("hresult", "").empty())
+        << stale.dump(2);
     EXPECT_NE(stale.dump().find("stale"), std::string::npos)
         << stale.dump(2);
     EXPECT_EQ(stale.dump().find("ScrollItemPattern"), std::string::npos)

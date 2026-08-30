@@ -304,6 +304,14 @@ descriptor ids are rejected. Successful mutations include provider readback of t
 returned value is never the caller's input echoed back; a failed readback is
 reported as an explicit mutation failure.
 
+Every `set_property`/`clear_property` failure has the same structured shape:
+`errorCode`, `errorDisposition`, `retryable`, provider error text in `error`,
+and `hresult`. Invalid values/descriptors, read-only or unsupported operations,
+bounds failures, and stale ordinary elements are `terminal`. Broken transports,
+provider-busy responses, and timeouts are `transient` and retryable. A lost
+session, target process, or root-window identity is `ownershipLost` and is not
+retryable.
+
 The provider-neutral contract is implemented by XAML/WinUI3, UI Automation,
 WPF, WinForms, and curated Win32/Common Controls adapters. WPF exposes writable scalar
 dependency properties and preserves local value precedence through

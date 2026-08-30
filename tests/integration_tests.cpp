@@ -2375,11 +2375,19 @@ TEST_F(WinFormsSampleFixture, PersistentConnectionReusesServerAndStableIdentity)
         form->providerHandle, editableText->descriptorId, "integration value");
     ASSERT_TRUE(setText.ok) << setText.error;
     EXPECT_EQ(setText.value, "integration value");
+    EXPECT_EQ(setText.runtimeType, "System.String");
+    EXPECT_EQ(setText.source, "Modified");
+    EXPECT_TRUE(setText.canClear);
+    EXPECT_TRUE(setText.overridden);
     auto clearText = connection->clear_property(
         form->providerHandle, editableText->descriptorId);
     ASSERT_TRUE(clearText.ok) << clearText.error;
     EXPECT_TRUE(clearText.cleared);
     EXPECT_EQ(clearText.value, "Default text");
+    EXPECT_EQ(clearText.runtimeType, "System.String");
+    EXPECT_EQ(clearText.source, "Default");
+    EXPECT_FALSE(clearText.canClear);
+    EXPECT_FALSE(clearText.overridden);
 
     auto afterReads = lvt::managed_connection_capabilities(*connection);
     ASSERT_TRUE(afterReads.has_value());
@@ -2466,6 +2474,11 @@ TEST_F(WinFormsSampleFixture, QueuedClearTimeoutCannotMutateLater) {
     auto clear = connection->clear_property(
         form->providerHandle, property->descriptorId);
     EXPECT_FALSE(clear.ok);
+    EXPECT_EQ(clear.errorCode, "typed_property_timeout");
+    EXPECT_EQ(
+        clear.errorDisposition,
+        lvt::PropertyErrorDisposition::transient);
+    EXPECT_TRUE(clear.retryable);
     EXPECT_NE(clear.error.find("before execution"), std::string::npos)
         << clear.error;
     block.release();
@@ -2720,11 +2733,19 @@ TEST_F(WpfSampleFixture, PersistentConnectionReusesServerAndStableIdentity) {
         firstButton->providerHandle, opacity->descriptorId, "0.4");
     ASSERT_TRUE(setOpacity.ok) << setOpacity.error;
     EXPECT_NEAR(std::stod(setOpacity.value), 0.4, 0.001);
+    EXPECT_EQ(setOpacity.runtimeType, "System.Double");
+    EXPECT_EQ(setOpacity.source, "Local");
+    EXPECT_TRUE(setOpacity.canClear);
+    EXPECT_TRUE(setOpacity.overridden);
     auto clearOpacity = connection->clear_property(
         firstButton->providerHandle, opacity->descriptorId);
     ASSERT_TRUE(clearOpacity.ok) << clearOpacity.error;
     EXPECT_TRUE(clearOpacity.cleared);
     EXPECT_NEAR(std::stod(clearOpacity.value), 0.75, 0.001);
+    EXPECT_EQ(clearOpacity.runtimeType, "System.Double");
+    EXPECT_NE(clearOpacity.source, "Local");
+    EXPECT_FALSE(clearOpacity.canClear);
+    EXPECT_FALSE(clearOpacity.overridden);
 
     auto afterReads = lvt::managed_connection_capabilities(*connection);
     ASSERT_TRUE(afterReads.has_value());
@@ -2808,6 +2829,11 @@ TEST_F(WpfSampleFixture, QueuedSetTimeoutCannotMutateLater) {
     auto set = connection->set_property(
         button->providerHandle, property->descriptorId, "0.4");
     EXPECT_FALSE(set.ok);
+    EXPECT_EQ(set.errorCode, "typed_property_timeout");
+    EXPECT_EQ(
+        set.errorDisposition,
+        lvt::PropertyErrorDisposition::transient);
+    EXPECT_TRUE(set.retryable);
     EXPECT_NE(set.error.find("before execution"), std::string::npos)
         << set.error;
     block.release();
@@ -2932,7 +2958,20 @@ TEST(ManagedCoreClrFloor, Net6WinFormsTreeAndProperties) {
     auto snapshot =
         connection->get_property_snapshot(form->providerHandle);
     ASSERT_TRUE(snapshot.ok) << snapshot.error;
-    EXPECT_NE(find_property_descriptor(snapshot, "EditableText"), nullptr);
+    const auto* property =
+        find_property_descriptor(snapshot, "EditableText");
+    ASSERT_NE(property, nullptr);
+    auto set = connection->set_property(
+        form->providerHandle, property->descriptorId, "net6");
+    ASSERT_TRUE(set.ok) << set.error;
+    EXPECT_EQ(set.value, "net6");
+    EXPECT_EQ(set.source, "Modified");
+    EXPECT_TRUE(set.canClear);
+    auto clear = connection->clear_property(
+        form->providerHandle, property->descriptorId);
+    ASSERT_TRUE(clear.ok) << clear.error;
+    EXPECT_EQ(clear.value, "Default text");
+    EXPECT_EQ(clear.source, "Default");
 }
 #endif
 
@@ -2959,7 +2998,20 @@ TEST(ManagedCoreClrFloor, Net6WpfTreeAndProperties) {
     auto snapshot =
         connection->get_property_snapshot(button->providerHandle);
     ASSERT_TRUE(snapshot.ok) << snapshot.error;
-    EXPECT_NE(find_property_descriptor(snapshot, "Opacity"), nullptr);
+    const auto* property =
+        find_property_descriptor(snapshot, "Opacity");
+    ASSERT_NE(property, nullptr);
+    auto set = connection->set_property(
+        button->providerHandle, property->descriptorId, "0.4");
+    ASSERT_TRUE(set.ok) << set.error;
+    EXPECT_NEAR(std::stod(set.value), 0.4, 0.001);
+    EXPECT_EQ(set.source, "Local");
+    EXPECT_TRUE(set.canClear);
+    auto clear = connection->clear_property(
+        button->providerHandle, property->descriptorId);
+    ASSERT_TRUE(clear.ok) << clear.error;
+    EXPECT_NEAR(std::stod(clear.value), 0.75, 0.001);
+    EXPECT_NE(clear.source, "Local");
 }
 #endif
 
@@ -2980,7 +3032,19 @@ TEST(ManagedClrCompatibility, Net48WinFormsTreeAndProperties) {
     auto snapshot =
         connection->get_property_snapshot(form->providerHandle);
     ASSERT_TRUE(snapshot.ok) << snapshot.error;
-    EXPECT_NE(find_property_descriptor(snapshot, "EditableText"), nullptr);
+    const auto* property =
+        find_property_descriptor(snapshot, "EditableText");
+    ASSERT_NE(property, nullptr);
+    auto set = connection->set_property(
+        form->providerHandle, property->descriptorId, "net48");
+    ASSERT_TRUE(set.ok) << set.error;
+    EXPECT_EQ(set.value, "net48");
+    EXPECT_EQ(set.source, "Modified");
+    auto clear = connection->clear_property(
+        form->providerHandle, property->descriptorId);
+    ASSERT_TRUE(clear.ok) << clear.error;
+    EXPECT_EQ(clear.value, "Default text");
+    EXPECT_EQ(clear.source, "Default");
 }
 #endif
 
@@ -3001,7 +3065,19 @@ TEST(ManagedClrCompatibility, Net48WpfTreeAndProperties) {
     auto snapshot =
         connection->get_property_snapshot(button->providerHandle);
     ASSERT_TRUE(snapshot.ok) << snapshot.error;
-    EXPECT_NE(find_property_descriptor(snapshot, "Opacity"), nullptr);
+    const auto* property =
+        find_property_descriptor(snapshot, "Opacity");
+    ASSERT_NE(property, nullptr);
+    auto set = connection->set_property(
+        button->providerHandle, property->descriptorId, "0.4");
+    ASSERT_TRUE(set.ok) << set.error;
+    EXPECT_NEAR(std::stod(set.value), 0.4, 0.001);
+    EXPECT_EQ(set.source, "Local");
+    auto clear = connection->clear_property(
+        button->providerHandle, property->descriptorId);
+    ASSERT_TRUE(clear.ok) << clear.error;
+    EXPECT_NEAR(std::stod(clear.value), 0.75, 0.001);
+    EXPECT_NE(clear.source, "Local");
 }
 #endif
 
@@ -6693,6 +6769,10 @@ TEST_F(NativeControlsFixture, Win32TypedPropertiesRoundTripAndValidate) {
         utf8(u8"Unicode ✓ 東京"));
     ASSERT_TRUE(changedText.ok) << changedText.error;
     EXPECT_EQ(changedText.value, utf8(u8"Unicode ✓ 東京"));
+    EXPECT_EQ(changedText.runtimeType, "String");
+    EXPECT_EQ(changedText.source, "native");
+    EXPECT_FALSE(changedText.canClear);
+    EXPECT_FALSE(changedText.overridden);
     auto emptyText =
         set(native, *generic, genericProperties, "Text", "");
     ASSERT_TRUE(emptyText.ok) << emptyText.error;
@@ -6770,6 +6850,13 @@ TEST_F(NativeControlsFixture, Win32TypedPropertiesRoundTripAndValidate) {
         native, *edit, editProperties, "SelectionStart", "9");
     EXPECT_FALSE(invalidSelection.ok);
     EXPECT_EQ(invalidSelection.hresult, E_INVALIDARG);
+    EXPECT_EQ(
+        invalidSelection.errorCode,
+        "typed_property_out_of_bounds");
+    EXPECT_EQ(
+        invalidSelection.errorDisposition,
+        lvt::PropertyErrorDisposition::terminal);
+    EXPECT_FALSE(invalidSelection.retryable);
     ASSERT_TRUE(set(
         native, *edit, editProperties, "ReadOnly", "false").ok);
     ASSERT_TRUE(set(
@@ -6801,6 +6888,11 @@ TEST_F(NativeControlsFixture, Win32TypedPropertiesRoundTripAndValidate) {
         clear(native, *combo, comboProperties, "SelectedIndex");
     ASSERT_TRUE(clearedCombo.ok) << clearedCombo.error;
     EXPECT_TRUE(clearedCombo.cleared);
+    EXPECT_EQ(clearedCombo.value, "-1");
+    EXPECT_EQ(clearedCombo.runtimeType, "Int32");
+    EXPECT_EQ(clearedCombo.source, "native");
+    EXPECT_FALSE(clearedCombo.canClear);
+    EXPECT_FALSE(clearedCombo.overridden);
     ASSERT_TRUE(set(
         native, *combo, comboProperties, "SelectedIndex", "1").ok);
     auto invalidCombo = set(
@@ -6920,6 +7012,11 @@ TEST_F(NativeControlsFixture, ComCtlTypedPropertiesRoundTripAndRejectStaleItems)
     auto stale = set(
         native, *alpha, alphaProperties, "Selected", "true");
     EXPECT_FALSE(stale.ok);
+    EXPECT_EQ(stale.errorCode, "typed_property_stale_element");
+    EXPECT_EQ(
+        stale.errorDisposition,
+        lvt::PropertyErrorDisposition::terminal);
+    EXPECT_FALSE(stale.retryable);
     EXPECT_NE(
         stale.error.find("changed since"), std::string::npos);
     ASSERT_NE(
@@ -7467,8 +7564,35 @@ TEST_F(NativeControlsFixture, NativeTargetsMustBelongToTheBuiltRootTree) {
 TEST_F(NativeControlsFixture, NativePropertySafetyRejectsHungClosedAndOwnerDataTargets) {
     auto native = native_tree();
     ASSERT_NE(native.win32, nullptr);
+    auto* generic = find_native_element_by_hwnd(
+        native.root, control(native_fixture::kGenericTextId));
+    ASSERT_NE(generic, nullptr);
+    auto genericProperties = snapshot(native, *generic);
+    ASSERT_TRUE(genericProperties.ok) << genericProperties.error;
 
     DWORD_PTR ignored = 0;
+    ASSERT_TRUE(PostMessageW(
+        s_hwnd, native_fixture::kHangMessage, 0, 0));
+    Sleep(100);
+    const auto mutationStarted = std::chrono::steady_clock::now();
+    auto hungMutation = set(
+        native, *generic, genericProperties, "Text", "blocked");
+    EXPECT_FALSE(hungMutation.ok);
+    EXPECT_EQ(
+        hungMutation.hresult,
+        HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    EXPECT_EQ(
+        hungMutation.errorDisposition,
+        lvt::PropertyErrorDisposition::transient);
+    EXPECT_TRUE(hungMutation.retryable);
+    EXPECT_EQ(
+        hungMutation.errorCode,
+        "typed_property_timeout");
+    EXPECT_LT(
+        std::chrono::steady_clock::now() - mutationStarted,
+        std::chrono::seconds(2));
+    Sleep(1600);
+
     ASSERT_TRUE(PostMessageW(
         s_hwnd, native_fixture::kHangMessage, 0, 0));
     Sleep(100);

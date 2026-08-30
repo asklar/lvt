@@ -1041,17 +1041,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         if (!node.TryCompletePropertyMutation(mutation))
             return;
-        var acceptedValue = submittedValue;
-        if (result.Payload.ValueKind ==
-                System.Text.Json.JsonValueKind.Object &&
-            result.Payload.TryGetProperty("value", out var returnedValue) &&
-            returnedValue.ValueKind == System.Text.Json.JsonValueKind.String)
+        if (!TypedPropertyRefreshPolicy.TryValidateMutationPayload(
+                result.Payload, requireCleared: false,
+                out var validationError))
         {
-            acceptedValue = returnedValue.GetString() ?? acceptedValue;
+            node.CancelPropertyMutation(mutation);
+            StatusText = $"Set failed: {validationError}";
+            RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
+            return;
         }
         var currentRow = node.FindProperty(submittedProviderName);
-        currentRow?.ApplyMutationValue(
-            acceptedValue, submittedRevision);
+        currentRow?.ApplyMutationResult(
+            result.Payload.GetProperty("value").GetString() ?? "",
+            result.Payload.GetProperty("runtimeType").GetString() ?? "",
+            result.Payload.GetProperty("source").GetString() ?? "",
+            result.Payload.GetProperty("canClear").GetBoolean(),
+            result.Payload.GetProperty("overridden").GetBoolean(),
+            submittedRevision);
         StatusText = $"{row.Name} updated.";
         RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
     }
@@ -1096,8 +1102,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         if (!node.TryCompletePropertyMutation(mutation))
             return;
+        if (!TypedPropertyRefreshPolicy.TryValidateMutationPayload(
+                result.Payload, requireCleared: true,
+                out var validationError))
+        {
+            node.CancelPropertyMutation(mutation);
+            StatusText = $"Clear failed: {validationError}";
+            RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
+            return;
+        }
         var currentRow = node.FindProperty(submittedProviderName);
-        currentRow?.TryDiscardSubmittedEdit(submittedRevision);
+        currentRow?.ApplyMutationResult(
+            result.Payload.GetProperty("value").GetString() ?? "",
+            result.Payload.GetProperty("runtimeType").GetString() ?? "",
+            result.Payload.GetProperty("source").GetString() ?? "",
+            result.Payload.GetProperty("canClear").GetBoolean(),
+            result.Payload.GetProperty("overridden").GetBoolean(),
+            submittedRevision);
         StatusText = $"{row.Name} restored.";
         RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
     }

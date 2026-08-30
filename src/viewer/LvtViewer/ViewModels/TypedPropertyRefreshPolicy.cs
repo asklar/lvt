@@ -166,4 +166,35 @@ public static class TypedPropertyRefreshPolicy
         error = "";
         return true;
     }
+
+    public static bool TryValidateMutationPayload(
+        JsonElement payload,
+        bool requireCleared,
+        out string error)
+    {
+        if (payload.ValueKind != JsonValueKind.Object ||
+            !payload.TryGetProperty("value", out var value) ||
+            value.ValueKind != JsonValueKind.String ||
+            !payload.TryGetProperty("runtimeType", out var runtimeType) ||
+            runtimeType.ValueKind != JsonValueKind.String ||
+            !payload.TryGetProperty("source", out var source) ||
+            source.ValueKind != JsonValueKind.String ||
+            !payload.TryGetProperty("canClear", out var canClear) ||
+            canClear.ValueKind is not
+                (JsonValueKind.True or JsonValueKind.False) ||
+            !payload.TryGetProperty("overridden", out var overridden) ||
+            overridden.ValueKind is not
+                (JsonValueKind.True or JsonValueKind.False) ||
+            (requireCleared &&
+             (!payload.TryGetProperty("cleared", out var cleared) ||
+              cleared.ValueKind != JsonValueKind.True)))
+        {
+            error =
+                "typed property mutation omitted effective readback metadata";
+            return false;
+        }
+
+        error = "";
+        return true;
+    }
 }

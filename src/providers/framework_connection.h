@@ -28,6 +28,16 @@ const char* property_editor_kind_name(PropertyEditorKind kind);
 PropertyEditorKind classify_property_editor(
     std::string_view declaredType, bool writable);
 
+enum class PropertyErrorDisposition {
+    unspecified,
+    terminal,
+    transient,
+    ownershipLost,
+};
+
+const char* property_error_disposition_name(
+    PropertyErrorDisposition disposition);
+
 struct PropertyChoice {
     std::string value;
     std::string label;
@@ -87,6 +97,10 @@ struct PropertyMutationResult {
     HRESULT hresult = E_NOTIMPL;
     std::string error =
         "Typed property mutation is not supported by this framework connection";
+    std::string errorCode;
+    PropertyErrorDisposition errorDisposition =
+        PropertyErrorDisposition::unspecified;
+    bool retryable = false;
     bool hasValue = false;
     std::string value;
     std::string runtimeType;
@@ -100,6 +114,12 @@ struct PropertyOperationContext {
     HWND expectedRootHwnd = nullptr;
     std::vector<uint64_t> allowedProviderRoots;
 };
+
+PropertyMutationResult property_mutation_failure(
+    HRESULT hresult, std::string error,
+    std::string errorCode = {},
+    PropertyErrorDisposition disposition =
+        PropertyErrorDisposition::unspecified);
 
 // A live, reusable connection to one framework "island" (e.g. one XAML or
 // WinUI3 diagnostics session) inside a target process.
@@ -170,12 +190,20 @@ public:
     virtual PropertyMutationResult set_property(
         uint64_t, const std::string&, const std::string&,
         const PropertyOperationContext& = {}) {
-        return {};
+        return property_mutation_failure(
+            E_NOTIMPL,
+            "Typed property mutation is not supported by this framework connection",
+            "typed_property_unsupported",
+            PropertyErrorDisposition::terminal);
     }
     virtual PropertyMutationResult clear_property(
         uint64_t, const std::string&,
         const PropertyOperationContext& = {}) {
-        return {};
+        return property_mutation_failure(
+            E_NOTIMPL,
+            "Typed property clearing is not supported by this framework connection",
+            "typed_property_unsupported",
+            PropertyErrorDisposition::terminal);
     }
 
     // False once the underlying connection is known to be gone (pipe

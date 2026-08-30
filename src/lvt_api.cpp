@@ -2316,12 +2316,15 @@ json method_get_tree(const json& params, bool uia) {
 }
 
 [[noreturn]] void throw_typed_property_session_disconnected(
-    const std::string& message) {
+    const std::string& message,
+    HRESULT hresult =
+        HRESULT_FROM_WIN32(ERROR_INVALID_OWNER)) {
     throw_typed_property_error(
         "typed_property_session_disconnected",
         "ownershipLost",
         false,
-        message);
+        message,
+        hresult);
 }
 
 void ensure_typed_property_target_identity_current(
@@ -2383,35 +2386,46 @@ PropertyTarget require_property_target(
     const Session& session, const json& params,
     bool targetAlreadyLocked = false) {
     const auto elementRef = get_string(params, "element");
-    if (elementRef.empty())
-        throw std::runtime_error("'element' must be a non-empty string");
+    if (elementRef.empty()) {
+        throw_typed_property_error(
+            "typed_property_invalid_target", "terminal", false,
+            "'element' must be a non-empty string", E_INVALIDARG);
+    }
 
     const auto parsedRef = parse_ref(elementRef);
     const bool uia = !session.visualMode;
     if (uia && parsedRef.tree == RefTree::visual) {
-        throw std::runtime_error(
+        throw_typed_property_error(
+            "typed_property_invalid_target", "terminal", false,
             "'" + elementRef +
-            "' is a visual-tree reference, but this session exposes UI Automation properties");
+                "' is a visual-tree reference, but this session exposes UI Automation properties",
+            E_INVALIDARG);
     }
     if (!uia && parsedRef.tree == RefTree::uia) {
-        throw std::runtime_error(
+        throw_typed_property_error(
+            "typed_property_invalid_target", "terminal", false,
             "'" + elementRef +
-            "' is a UI Automation reference, but this session exposes visual-tree properties");
+                "' is a UI Automation reference, but this session exposes visual-tree properties",
+            E_INVALIDARG);
     }
 
     PropertyTarget target;
     if (uia) {
         if (is_element_id(parsedRef.ref)) {
-            throw std::runtime_error(
+            throw_typed_property_error(
+                "typed_property_invalid_target", "terminal", false,
                 "positional UI Automation references such as '" + elementRef +
                 "' do not carry their originating raw/control/content view; "
-                "refresh that tree and use the element's durable key or uia:<RuntimeId>");
+                "refresh that tree and use the element's durable key or uia:<RuntimeId>",
+                E_INVALIDARG);
         }
         if (parsedRef.ref.rfind("uia:", 0) != 0 &&
             parsedRef.ref.rfind("uia|", 0) != 0) {
-            throw std::runtime_error(
+            throw_typed_property_error(
+                "typed_property_invalid_target", "terminal", false,
                 "'" + elementRef +
-                "' is not a durable UI Automation key or RuntimeId reference");
+                    "' is not a durable UI Automation key or RuntimeId reference",
+                E_INVALIDARG);
         }
         target.provider = "uia";
         target.reference = parsedRef.ref;
@@ -2445,19 +2459,35 @@ PropertyTarget require_property_target(
     StagedPropertyAuthorization stagedAuthorization;
     if (!build_tree_for(
             session, treeParams, uia, tree, error, nullptr,
-            targetAlreadyLocked, &stagedAuthorization))
-        throw std::runtime_error(error);
+            targetAlreadyLocked, &stagedAuthorization)) {
+        if (!session_is_active(session.id)) {
+            throw_typed_property_session_disconnected(
+                error.empty()
+                    ? "the typed-property session disconnected while resolving the element"
+                    : error);
+        }
+        ensure_typed_property_target_identity_current(
+            session, "while resolving the property target");
+        throw_typed_property_error(
+            "typed_property_read_failed", "transient", true,
+            error.empty()
+                ? "could not refresh the visual tree while resolving the property target"
+                : error,
+            E_FAIL);
+    }
     const auto* element = lvt::find_element_by_ref(tree, parsedRef.ref);
-    if (!element)
-        throw std::runtime_error("element '" + elementRef + "' not found");
+    if (!element) {
+        throw_typed_property_error(
+            "typed_property_stale_element", "terminal", false,
+            "element '" + elementRef + "' not found",
+            HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+    }
     if (element->framework.empty() || element->providerHandle == 0) {
-        throw std::runtime_error(json{
-            {"error", "element '" + elementRef +
-                "' has no provider-owned property identity"},
-            {"errorCode", "typed_property_provider_unsupported"},
-            {"errorDisposition", "terminal"},
-            {"retryable", false},
-        }.dump());
+        throw_typed_property_error(
+            "typed_property_provider_unsupported", "terminal", false,
+            "element '" + elementRef +
+                "' has no provider-owned property identity",
+            E_NOTIMPL);
     }
     target.provider = element->framework;
     target.handle = element->providerHandle;
@@ -2524,7 +2554,8 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
         if (session.visualMode) {
             throw_typed_property_error(
                 "typed_property_wrong_mode", "terminal", false,
-                "UI Automation properties require a session connected in uia mode");
+                "UI Automation properties require a session connected in uia mode",
+                E_INVALIDARG);
         }
         auto connection = uia_connection_for_session(session);
         if (!connection || !connection->is_alive() ||
@@ -2533,20 +2564,23 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
                 session, "while acquiring the UI Automation connection");
             throw_typed_property_error(
                 "typed_property_connection_unavailable", "transient", true,
-                "the UI Automation property connection is temporarily unavailable");
+                "the UI Automation property connection is temporarily unavailable",
+                HRESULT_FROM_WIN32(ERROR_RETRY));
         }
         return connection;
 #else
         throw_typed_property_error(
             "typed_property_provider_unsupported", "terminal", false,
-            "this build has UI Automation support compiled out");
+            "this build has UI Automation support compiled out",
+            E_NOTIMPL);
 #endif
     }
 
     if (!session.visualMode) {
         throw_typed_property_error(
             "typed_property_wrong_mode", "terminal", false,
-            "visual typed properties require a session connected in visual mode");
+            "visual typed properties require a session connected in visual mode",
+            E_INVALIDARG);
     }
     const auto hostArch = lvt::get_host_architecture();
     const bool nativeProvider =
@@ -2560,7 +2594,8 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
             std::string(
                 "native visual properties cannot be read across architectures: this lvt is ") +
                 lvt::architecture_name(hostArch) + " and the target is " +
-                lvt::architecture_name(session.architecture));
+                lvt::architecture_name(session.architecture),
+            HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
     }
 
     ensure_typed_property_session_active(session);
@@ -2602,7 +2637,10 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
                 ? "provider '" + target.provider +
                     "' has no live typed-property connection yet"
                 : "provider '" + target.provider +
-                    "' does not support typed properties");
+                    "' does not support typed properties",
+            supported
+                ? HRESULT_FROM_WIN32(ERROR_RETRY)
+                : E_NOTIMPL);
     }
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
     const auto entry = g_sessionConnections.find(session.id);
@@ -2616,7 +2654,8 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
     throw_typed_property_error(
         "typed_property_connection_unavailable", "transient", true,
         "provider '" + target.provider +
-            "' temporarily lost its typed-property connection for this session");
+            "' temporarily lost its typed-property connection for this session",
+        HRESULT_FROM_WIN32(ERROR_RETRY));
 }
 
 std::shared_ptr<lvt::IFrameworkConnection> active_typed_property_connection(
@@ -2671,8 +2710,10 @@ uint64_t resolve_property_handle(
     if (!uia || !uia->matches_target(session.hwnd)) {
         ensure_typed_property_target_identity_current(
             session, "while resolving a UI Automation property reference");
-        throw std::runtime_error(
-            "the UI Automation property connection does not match this session's target window");
+        throw_typed_property_error(
+            "typed_property_connection_unavailable", "transient", true,
+            "the UI Automation property connection does not match this session's target window",
+            E_FAIL);
     }
     wait_for_property_reference_test_gate();
     ensure_typed_property_session_active(session);
@@ -2682,12 +2723,18 @@ uint64_t resolve_property_handle(
     if (!handle) {
         ensure_typed_property_target_identity_current(
             session, "while resolving a UI Automation property reference");
-        throw std::runtime_error(error);
+        throw_typed_property_error(
+            "typed_property_stale_element", "terminal", false,
+            error.empty()
+                ? "the UI Automation element is stale or unavailable"
+                : error,
+            HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
     }
     return *handle;
 #else
-    throw std::runtime_error(
-        "this build has UI Automation support compiled out");
+    throw_typed_property_error(
+        "typed_property_provider_unsupported", "terminal", false,
+        "this build has UI Automation support compiled out", E_NOTIMPL);
 #endif
 }
 
@@ -2704,6 +2751,96 @@ bool typed_property_ownership_lost(
         session_target_identity_status(session);
     return FAILED(status) &&
            session_target_ownership_lost(status);
+}
+
+bool typed_property_mutation_ownership_lost(
+    const Session& session, const std::string& provider,
+    const lvt::PropertyMutationResult& result) {
+    if (result.errorDisposition ==
+            lvt::PropertyErrorDisposition::ownershipLost ||
+        !session_is_active(session.id)) {
+        return true;
+    }
+    return typed_property_ownership_lost(
+        session, provider, result.hresult);
+}
+
+lvt::PropertyMutationResult normalize_property_mutation_failure(
+    const lvt::PropertyMutationResult& result) {
+    auto normalized = result;
+    std::string lowerError = normalized.error;
+    std::transform(
+        lowerError.begin(), lowerError.end(), lowerError.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+    auto code = normalized.errorCode;
+    auto disposition = normalized.errorDisposition;
+    if (lowerError.find("read-only") != std::string::npos ||
+        lowerError.find("readonly") != std::string::npos) {
+        code = "typed_property_read_only";
+    } else if (lowerError.find("descriptor") != std::string::npos) {
+        code = "typed_property_invalid_descriptor";
+    } else if (
+        lowerError.find("does not support") != std::string::npos ||
+        lowerError.find("not supported") != std::string::npos ||
+        lowerError.find("does not expose") != std::string::npos) {
+        code = "typed_property_unsupported";
+    } else if (
+        lowerError.find("outside") != std::string::npos ||
+        lowerError.find("exceed") != std::string::npos ||
+        lowerError.find("out of bounds") != std::string::npos) {
+        code = "typed_property_out_of_bounds";
+    }
+    if (disposition == lvt::PropertyErrorDisposition::unspecified) {
+        if (lowerError.find("readback") != std::string::npos ||
+            lowerError.find("actual value is unknown") != std::string::npos) {
+            code = code.empty()
+                ? "typed_property_readback_failed"
+                : code;
+            disposition = lvt::PropertyErrorDisposition::transient;
+        } else if (
+            lowerError.find("timeout") != std::string::npos ||
+            lowerError.find("timed out") != std::string::npos ||
+            lowerError.find("did not complete") != std::string::npos ||
+            lowerError.find("before execution") != std::string::npos) {
+            code = "typed_property_timeout";
+            disposition = lvt::PropertyErrorDisposition::transient;
+        } else if (
+            lowerError.find("broken pipe") != std::string::npos ||
+            lowerError.find("connection is no longer available") !=
+                std::string::npos ||
+            lowerError.find("could not send") != std::string::npos) {
+            code = code.empty()
+                ? "typed_property_transport_error"
+                : code;
+            disposition = lvt::PropertyErrorDisposition::transient;
+        } else if (
+            code == "typed_property_invalid_descriptor" ||
+            code == "typed_property_read_only" ||
+            code == "typed_property_unsupported" ||
+            code == "typed_property_out_of_bounds") {
+            disposition = lvt::PropertyErrorDisposition::terminal;
+        } else if (
+            lowerError.find("stale") != std::string::npos ||
+            lowerError.find("changed since") != std::string::npos ||
+            lowerError.find("disappeared") != std::string::npos ||
+            lowerError.find("not found") != std::string::npos ||
+            lowerError.find("unknown or closed") != std::string::npos ||
+            lowerError.find("no property schema") != std::string::npos) {
+            code = "typed_property_stale_element";
+            disposition = lvt::PropertyErrorDisposition::terminal;
+        }
+    }
+
+    auto classified = lvt::property_mutation_failure(
+        normalized.hresult,
+        normalized.error.empty()
+            ? "typed property mutation failed"
+            : normalized.error,
+        std::move(code), disposition);
+    return classified;
 }
 
 json property_snapshot_result(
@@ -2806,12 +2943,15 @@ json property_mutation_result(
     const std::string& element, const std::string& descriptorId,
     const lvt::PropertyMutationResult& result) {
     if (!result.ok) {
-        if (typed_property_ownership_lost(
-                session, provider, result.hresult)) {
+        if (typed_property_mutation_ownership_lost(
+                session, provider, result)) {
             throw_typed_property_session_disconnected(
                 result.error.empty()
                     ? "the typed-property target identity changed during mutation"
-                    : result.error);
+                    : result.error,
+                FAILED(result.hresult)
+                    ? result.hresult
+                    : HRESULT_FROM_WIN32(ERROR_INVALID_OWNER));
         }
         if (result.hresult ==
             lvt::LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION) {
@@ -2823,27 +2963,32 @@ json property_mutation_result(
                     : result.error,
                 result.hresult);
         }
+        const auto failure =
+            normalize_property_mutation_failure(result);
         throw_typed_property_error(
-            "typed_property_mutation_failed",
-            "transient", true,
-            result.error.empty()
-                ? "typed property mutation failed"
-                : result.error,
-            result.hresult);
+            failure.errorCode,
+            lvt::property_error_disposition_name(
+                failure.errorDisposition),
+            failure.retryable,
+            failure.error,
+            failure.hresult);
+    }
+    if (!result.hasValue) {
+        throw_typed_property_error(
+            "typed_property_readback_failed", "transient", true,
+            "typed property mutation completed without an effective-value readback",
+            E_FAIL);
     }
     json out{
         {"ok", true},
         {"element", element},
         {"descriptorId", descriptorId},
+        {"value", result.value},
+        {"runtimeType", result.runtimeType},
+        {"canClear", result.canClear},
+        {"overridden", result.overridden},
+        {"source", result.source},
     };
-    if (result.hasValue)
-        out["value"] = result.value;
-    if (result.hasValue) {
-        out["runtimeType"] = result.runtimeType;
-        out["canClear"] = result.canClear;
-        out["overridden"] = result.overridden;
-        out["source"] = result.source;
-    }
     if (result.cleared)
         out["cleared"] = true;
     return out;
@@ -2901,21 +3046,31 @@ json method_get_editable_properties(const json& params) {
 
 json method_set_property(const json& params, bool allowInput) {
     if (!allowInput) {
-        throw std::runtime_error(
-            "'set_property' changes the target application, which needs --allow-input");
+        throw_typed_property_error(
+            "typed_property_input_disabled", "terminal", false,
+            "'set_property' changes the target application, which needs --allow-input",
+            E_ACCESSDENIED);
     }
     if (params.contains("propertyIndex") || params.contains("valueType")) {
-        throw std::runtime_error(
+        throw_typed_property_error(
+            "typed_property_invalid_descriptor", "terminal", false,
             "set_property accepts only a provider-owned 'descriptorId'; "
-            "client-supplied propertyIndex/valueType fields are not allowed");
+            "client-supplied propertyIndex/valueType fields are not allowed",
+            E_INVALIDARG);
     }
     const auto session = require_typed_property_session(params);
     const auto descriptorId = get_string(params, "descriptorId");
-    if (descriptorId.empty())
-        throw std::runtime_error("'descriptorId' must be a non-empty string");
+    if (descriptorId.empty()) {
+        throw_typed_property_error(
+            "typed_property_invalid_descriptor", "terminal", false,
+            "'descriptorId' must be a non-empty string", E_INVALIDARG);
+    }
     auto valueIt = params.find("value");
-    if (valueIt == params.end() || !valueIt->is_string())
-        throw std::runtime_error("'value' must be a string");
+    if (valueIt == params.end() || !valueIt->is_string()) {
+        throw_typed_property_error(
+            "typed_property_invalid_value", "terminal", false,
+            "'value' must be a string", E_INVALIDARG);
+    }
     const auto value = valueIt->get<std::string>();
 
     TargetGuard guard(session.hwnd);
@@ -2958,18 +3113,25 @@ json method_set_property(const json& params, bool allowInput) {
 
 json method_clear_property(const json& params, bool allowInput) {
     if (!allowInput) {
-        throw std::runtime_error(
-            "'clear_property' changes the target application, which needs --allow-input");
+        throw_typed_property_error(
+            "typed_property_input_disabled", "terminal", false,
+            "'clear_property' changes the target application, which needs --allow-input",
+            E_ACCESSDENIED);
     }
     if (params.contains("propertyIndex") || params.contains("valueType")) {
-        throw std::runtime_error(
+        throw_typed_property_error(
+            "typed_property_invalid_descriptor", "terminal", false,
             "clear_property accepts only a provider-owned 'descriptorId'; "
-            "client-supplied propertyIndex/valueType fields are not allowed");
+            "client-supplied propertyIndex/valueType fields are not allowed",
+            E_INVALIDARG);
     }
     const auto session = require_typed_property_session(params);
     const auto descriptorId = get_string(params, "descriptorId");
-    if (descriptorId.empty())
-        throw std::runtime_error("'descriptorId' must be a non-empty string");
+    if (descriptorId.empty()) {
+        throw_typed_property_error(
+            "typed_property_invalid_descriptor", "terminal", false,
+            "'descriptorId' must be a non-empty string", E_INVALIDARG);
+    }
 
     TargetGuard guard(session.hwnd);
     ensure_typed_property_session_active(session);

@@ -1731,7 +1731,7 @@ impl LvtServer {
                        by get_editable_properties. The provider owns type conversion and rejects \
                        unknown, stale, read-only, or element-mismatched descriptor ids. Command \
                        descriptors use the same call to run one provider-supplied choice.",
-        output_schema = crate::schema::property_mutation(),
+        output_schema = crate::schema::property_set_mutation(),
         annotations(destructive_hint = true, open_world_hint = true)
     )]
     async fn set_property(
@@ -1757,7 +1757,7 @@ impl LvtServer {
                        a local override or move a native control to its documented no-value state. \
                        Providers without a reset operation, including most UI Automation patterns, \
                        return an explicit unsupported error.",
-        output_schema = crate::schema::property_mutation(),
+        output_schema = crate::schema::property_clear_mutation(),
         annotations(destructive_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn clear_property(
@@ -2346,7 +2346,14 @@ mod tests {
         // lvt reports failures as data — `{"ok": false, "error": "..."}` with none
         // of the success fields — so a schema that only described success would
         // be violated by a perfectly correct refusal.
-        let failure = json!({ "ok": false, "error": "no element matched" });
+        let failure = json!({
+            "ok": false,
+            "error": "no element matched",
+            "errorCode": "typed_property_stale_element",
+            "errorDisposition": "terminal",
+            "retryable": false,
+            "hresult": "0x80070490"
+        });
         for tool in LvtServer::new(true).tool_router.list_all() {
             let schema = tool
                 .output_schema

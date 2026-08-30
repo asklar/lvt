@@ -393,8 +393,7 @@ namespace LvtWpfTap
                     ManagedProtocol.ConvertScalar(value, property.Scalar);
                 target.SetValue(property.Property, converted);
                 ValidateTargetRoot(target, expectedRoot);
-                return BuildMutationResult(
-                    target.GetValue(property.Property), false);
+                return BuildMutationResult(target, property, false);
             });
         }
 
@@ -420,8 +419,7 @@ namespace LvtWpfTap
                 }
                 target.ClearValue(property.Property);
                 ValidateTargetRoot(target, expectedRoot);
-                return BuildMutationResult(
-                    target.GetValue(property.Property), true);
+                return BuildMutationResult(target, property, true);
             });
         }
 
@@ -652,8 +650,13 @@ namespace LvtWpfTap
             }
         }
 
-        private static string BuildMutationResult(object value, bool cleared)
+        private static string BuildMutationResult(
+            DependencyObject target, WpfPropertyMetadata property, bool cleared)
         {
+            object value = target.GetValue(property.Property);
+            bool local =
+                target.ReadLocalValue(property.Property) !=
+                DependencyProperty.UnsetValue;
             var builder = new StringBuilder();
             builder.Append("{\"value\":");
             ManagedProtocol.AppendJsonString(
@@ -661,6 +664,13 @@ namespace LvtWpfTap
             builder.Append(",\"runtimeType\":");
             ManagedProtocol.AppendJsonString(
                 builder, ManagedProtocol.RuntimeTypeName(value));
+            builder.Append(",\"canClear\":")
+                .Append(local ? "true" : "false");
+            builder.Append(",\"overridden\":")
+                .Append(local ? "true" : "false");
+            builder.Append(",\"source\":");
+            ManagedProtocol.AppendJsonString(
+                builder, WpfValueSource(target, property.Property, local));
             if (cleared)
                 builder.Append(",\"cleared\":true");
             builder.Append('}');

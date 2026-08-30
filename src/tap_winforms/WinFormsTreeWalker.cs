@@ -507,7 +507,8 @@ namespace LvtWinFormsTap
                         ManagedProtocol.ConvertScalar(value, metadata.Scalar);
                     descriptor.SetValue(target, converted);
                     ValidateTargetRoot(target, expectedRoot);
-                    return BuildMutationResult(descriptor.GetValue(target), false);
+                    return BuildMutationResult(
+                        target, metadata, descriptor, false);
                 });
         }
 
@@ -542,7 +543,8 @@ namespace LvtWinFormsTap
                     }
                     descriptor.ResetValue(target);
                     ValidateTargetRoot(target, expectedRoot);
-                    return BuildMutationResult(descriptor.GetValue(target), true);
+                    return BuildMutationResult(
+                        target, metadata, descriptor, true);
                 });
         }
 
@@ -798,8 +800,13 @@ namespace LvtWinFormsTap
             builder.Append('}');
         }
 
-        private static string BuildMutationResult(object value, bool cleared)
+        private static string BuildMutationResult(
+            Control target, WinFormsPropertyMetadata metadata,
+            PropertyDescriptor descriptor, bool cleared)
         {
+            object value = descriptor.GetValue(target);
+            bool canReset =
+                metadata.SupportsReset && descriptor.CanResetValue(target);
             var builder = new StringBuilder();
             builder.Append("{\"value\":");
             ManagedProtocol.AppendJsonString(
@@ -807,6 +814,13 @@ namespace LvtWinFormsTap
             builder.Append(",\"runtimeType\":");
             ManagedProtocol.AppendJsonString(
                 builder, ManagedProtocol.RuntimeTypeName(value));
+            builder.Append(",\"canClear\":")
+                .Append(canReset ? "true" : "false");
+            builder.Append(",\"overridden\":")
+                .Append(canReset ? "true" : "false");
+            builder.Append(",\"source\":");
+            ManagedProtocol.AppendJsonString(
+                builder, canReset ? "Modified" : "Default");
             if (cleared)
                 builder.Append(",\"cleared\":true");
             builder.Append('}');

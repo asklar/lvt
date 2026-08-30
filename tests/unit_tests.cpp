@@ -2874,6 +2874,11 @@ TEST(UiaProperties, RangeReadbackFailureHasNoSuccessShapedValue) {
     EXPECT_FALSE(failed.hasValue);
     EXPECT_TRUE(failed.value.empty());
     EXPECT_EQ(failed.hresult, E_FAIL);
+    EXPECT_EQ(failed.errorCode, "typed_property_readback_failed");
+    EXPECT_EQ(
+        failed.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(failed.retryable);
     EXPECT_NE(failed.error.find("actual value is unknown"), std::string::npos);
 
     const auto nonFinite = uia_range_readback_result(
@@ -3473,6 +3478,35 @@ TEST(TypedPropertyContract, EditorKindWireNamesAreProviderNeutral) {
         property_editor_kind_name(PropertyEditorKind::enumeration), "enum");
     EXPECT_STREQ(
         property_editor_kind_name(PropertyEditorKind::command), "command");
+}
+
+TEST(TypedPropertyContract, MutationFailuresHaveStableDispositions) {
+    const auto invalid = property_mutation_failure(
+        E_INVALIDARG, "invalid value");
+    EXPECT_EQ(invalid.errorCode, "typed_property_invalid_value");
+    EXPECT_EQ(
+        invalid.errorDisposition,
+        PropertyErrorDisposition::terminal);
+    EXPECT_FALSE(invalid.retryable);
+
+    const auto timeout = property_mutation_failure(
+        HRESULT_FROM_WIN32(ERROR_TIMEOUT), "provider timeout");
+    EXPECT_EQ(timeout.errorCode, "typed_property_timeout");
+    EXPECT_EQ(
+        timeout.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(timeout.retryable);
+
+    const auto ownership = property_mutation_failure(
+        HRESULT_FROM_WIN32(ERROR_INVALID_OWNER), "target replaced");
+    EXPECT_EQ(
+        ownership.errorDisposition,
+        PropertyErrorDisposition::ownershipLost);
+    EXPECT_FALSE(ownership.retryable);
+    EXPECT_STREQ(
+        property_error_disposition_name(
+            PropertyErrorDisposition::ownershipLost),
+        "ownershipLost");
 }
 
 namespace {

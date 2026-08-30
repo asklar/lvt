@@ -663,11 +663,12 @@ public:
             const auto canonical = m_enumCatalog.canonical_input(
                 mutation.propertyType, value);
             if (!canonical) {
-                result.hresult = E_INVALIDARG;
-                result.error =
+                return property_mutation_failure(
+                    E_INVALIDARG,
                     "The value contains a member not present in enum type '" +
-                    mutation.propertyType + "'";
-                return result;
+                        mutation.propertyType + "'",
+                    "typed_property_invalid_value",
+                    PropertyErrorDisposition::terminal);
             }
             valueToSet = *canonical;
         }
@@ -680,15 +681,19 @@ public:
                 << " " << mutation.propertyIndex << " "
                 << hex_encode(valueToSet);
         auto raw = send_property_command(command.str(), commandId);
-        result.ok = raw.ok;
-        result.hresult = raw.hresult;
-        result.error = std::move(raw.error);
+        if (!raw.ok) {
+            return property_mutation_failure(
+                raw.hresult, std::move(raw.error));
+        }
+        result.ok = true;
+        result.hresult = S_OK;
+        result.error.clear();
         if (raw.ok && !raw.hasReadback) {
-            result.ok = false;
-            result.hresult = E_FAIL;
-            result.error =
-                "SetProperty completed without an effective-value readback";
-            return result;
+            return property_mutation_failure(
+                E_FAIL,
+                "SetProperty completed without an effective-value readback",
+                "typed_property_readback_failed",
+                PropertyErrorDisposition::transient);
         }
         if (raw.hasReadback) {
             result.hasValue = true;
@@ -722,15 +727,19 @@ public:
                        context.allowedProviderRoots)
                 << " " << mutation.propertyIndex;
         auto raw = send_property_command(command.str(), commandId);
-        result.ok = raw.ok;
-        result.hresult = raw.hresult;
-        result.error = std::move(raw.error);
+        if (!raw.ok) {
+            return property_mutation_failure(
+                raw.hresult, std::move(raw.error));
+        }
+        result.ok = true;
+        result.hresult = S_OK;
+        result.error.clear();
         if (raw.ok && !raw.hasReadback) {
-            result.ok = false;
-            result.hresult = E_FAIL;
-            result.error =
-                "ClearProperty completed without an effective-value readback";
-            return result;
+            return property_mutation_failure(
+                E_FAIL,
+                "ClearProperty completed without an effective-value readback",
+                "typed_property_readback_failed",
+                PropertyErrorDisposition::transient);
         }
         if (raw.hasReadback) {
             result.hasValue = true;
@@ -1046,27 +1055,36 @@ private:
         std::lock_guard<std::mutex> lock(m_propertyCacheMutex);
         const auto elementSchema = m_elementSchemaIds.find(handle);
         if (elementSchema == m_elementSchemaIds.end()) {
-            result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_STATE);
-            result.error =
+            result = property_mutation_failure(
+                HRESULT_FROM_WIN32(ERROR_INVALID_STATE),
                 "No property schema has been read for this element; call "
-                "get_editable_properties first";
+                "get_editable_properties first",
+                "typed_property_stale_element",
+                PropertyErrorDisposition::terminal);
             return false;
         }
         const auto found = m_mutationsByDescriptorId.find(descriptorId);
         if (found == m_mutationsByDescriptorId.end() ||
             found->second.schemaId != elementSchema->second) {
-            result.hresult = E_INVALIDARG;
-            result.error =
+            result = property_mutation_failure(
+                E_INVALIDARG,
                 "The property descriptor is unknown, stale, or does not apply "
-                "to this element";
+                "to this element",
+                "typed_property_invalid_descriptor",
+                PropertyErrorDisposition::terminal);
             return false;
         }
         if ((setting && !found->second.writable) ||
             (!setting && !found->second.supportsClear)) {
-            result.hresult = E_ACCESSDENIED;
-            result.error = setting
-                ? "The property descriptor is read-only"
-                : "The property descriptor does not support clearing";
+            result = property_mutation_failure(
+                E_ACCESSDENIED,
+                setting
+                    ? "The property descriptor is read-only"
+                    : "The property descriptor does not support clearing",
+                setting
+                    ? "typed_property_read_only"
+                    : "typed_property_unsupported",
+                PropertyErrorDisposition::terminal);
             return false;
         }
         mutation = found->second;

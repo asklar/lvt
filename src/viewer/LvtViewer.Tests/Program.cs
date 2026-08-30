@@ -555,6 +555,41 @@ foreach (var malformedPayload in new[]
         "malformed typed property snapshot passed raw validation");
 }
 
+var mutationPayload = Json(
+    """{"value":"effective","runtimeType":"System.String","source":"Local","canClear":true,"overridden":true}""");
+Assert(TypedPropertyRefreshPolicy.TryValidateMutationPayload(
+        mutationPayload, requireCleared: false, out _),
+    "complete mutation readback metadata was rejected");
+Assert(!TypedPropertyRefreshPolicy.TryValidateMutationPayload(
+        mutationPayload, requireCleared: true, out _),
+    "clear mutation without cleared:true was accepted");
+var clearMutationPayload = Json(
+    """{"value":"default","runtimeType":"System.String","source":"Default","canClear":false,"overridden":false,"cleared":true}""");
+Assert(TypedPropertyRefreshPolicy.TryValidateMutationPayload(
+        clearMutationPayload, requireCleared: true, out _),
+    "complete clear readback metadata was rejected");
+var mutationDescriptor = new PropertyDescriptorDto
+{
+    DescriptorId = "descriptor:metadata",
+    Name = "Metadata",
+    DisplayName = "Metadata",
+    Kind = "string",
+    Writable = true,
+    SupportsClear = true,
+};
+var mutationRow = TypedRowFromDescriptor(mutationDescriptor, "initial");
+mutationRow.EditText = "submitted";
+var mutationRevision = mutationRow.EditRevision;
+mutationRow.ApplyMutationResult(
+    "effective", "System.String", "Local",
+    canClear: true, overridden: true, mutationRevision);
+Assert(mutationRow.Value == "effective" &&
+       mutationRow.RuntimeType == "System.String" &&
+       mutationRow.Source == "Local" &&
+       mutationRow.CanClear &&
+       mutationRow.Overridden,
+    "Viewer did not apply effective mutation metadata");
+
 var refreshState = new TypedPropertyRefreshState();
 var requested = refreshState.Request();
 Assert(refreshState.TryBegin(out var firstAttempt), "schema refresh did not start");

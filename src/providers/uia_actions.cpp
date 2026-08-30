@@ -758,6 +758,132 @@ HRESULT read_current_range_value(
     return range->get_CurrentValue(&value);
 }
 
+HRESULT utf8_from_wide(
+    const wchar_t* value, int length, std::string& result) {
+    result.clear();
+    if (length == 0)
+        return S_OK;
+    RETURN_HR_IF(E_INVALIDARG, !value || length < 0);
+    const int size = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, value, length,
+        nullptr, 0, nullptr, nullptr);
+    if (size <= 0)
+        return HRESULT_FROM_WIN32(GetLastError());
+    result.resize(static_cast<size_t>(size));
+    if (WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, value, length,
+            result.data(), size, nullptr, nullptr) != size) {
+        result.clear();
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    return S_OK;
+}
+
+HRESULT read_current_value(
+    IUIAutomationElement* element, std::string& value) {
+    wil::com_ptr<IUIAutomationValuePattern> pattern;
+    RETURN_IF_FAILED(element->GetCurrentPatternAs(
+        UIA_ValuePatternId, IID_PPV_ARGS(&pattern)));
+    RETURN_HR_IF_NULL(
+        static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE), pattern.get());
+    wil::unique_bstr current;
+    RETURN_IF_FAILED(pattern->get_CurrentValue(current.put()));
+    return utf8_from_wide(
+        current.get(), static_cast<int>(SysStringLen(current.get())),
+        value);
+}
+
+HRESULT read_current_toggle_state(
+    IUIAutomationElement* element, std::string& value) {
+    wil::com_ptr<IUIAutomationTogglePattern> pattern;
+    RETURN_IF_FAILED(element->GetCurrentPatternAs(
+        UIA_TogglePatternId, IID_PPV_ARGS(&pattern)));
+    RETURN_HR_IF_NULL(
+        static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE), pattern.get());
+    ToggleState state = ToggleState_Off;
+    RETURN_IF_FAILED(pattern->get_CurrentToggleState(&state));
+    switch (state) {
+    case ToggleState_Off: value = "Off"; break;
+    case ToggleState_On: value = "On"; break;
+    case ToggleState_Indeterminate: value = "Indeterminate"; break;
+    default: return E_UNEXPECTED;
+    }
+    return S_OK;
+}
+
+HRESULT read_current_expand_collapse_state(
+    IUIAutomationElement* element, std::string& value) {
+    wil::com_ptr<IUIAutomationExpandCollapsePattern> pattern;
+    RETURN_IF_FAILED(element->GetCurrentPatternAs(
+        UIA_ExpandCollapsePatternId, IID_PPV_ARGS(&pattern)));
+    RETURN_HR_IF_NULL(
+        static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE), pattern.get());
+    ExpandCollapseState state = ExpandCollapseState_Collapsed;
+    RETURN_IF_FAILED(pattern->get_CurrentExpandCollapseState(&state));
+    switch (state) {
+    case ExpandCollapseState_Collapsed: value = "Collapsed"; break;
+    case ExpandCollapseState_Expanded: value = "Expanded"; break;
+    case ExpandCollapseState_PartiallyExpanded:
+        value = "PartiallyExpanded";
+        break;
+    case ExpandCollapseState_LeafNode: value = "LeafNode"; break;
+    default: return E_UNEXPECTED;
+    }
+    return S_OK;
+}
+
+HRESULT read_current_selection_state(
+    IUIAutomationElement* element, std::string& value) {
+    wil::com_ptr<IUIAutomationSelectionItemPattern> pattern;
+    RETURN_IF_FAILED(element->GetCurrentPatternAs(
+        UIA_SelectionItemPatternId, IID_PPV_ARGS(&pattern)));
+    RETURN_HR_IF_NULL(
+        static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE), pattern.get());
+    BOOL selected = FALSE;
+    RETURN_IF_FAILED(pattern->get_CurrentIsSelected(&selected));
+    value = selected ? "Selected" : "Not selected";
+    return S_OK;
+}
+
+HRESULT read_current_scroll_state(
+    IUIAutomationElement* element, std::string& value) {
+    wil::com_ptr<IUIAutomationScrollPattern> pattern;
+    RETURN_IF_FAILED(element->GetCurrentPatternAs(
+        UIA_ScrollPatternId, IID_PPV_ARGS(&pattern)));
+    RETURN_HR_IF_NULL(
+        static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE), pattern.get());
+    double horizontal = UIA_ScrollPatternNoScroll;
+    double vertical = UIA_ScrollPatternNoScroll;
+    RETURN_IF_FAILED(pattern->get_CurrentHorizontalScrollPercent(&horizontal));
+    RETURN_IF_FAILED(pattern->get_CurrentVerticalScrollPercent(&vertical));
+    value =
+        "Horizontal " + format_uia_double(horizontal) +
+        "%, Vertical " + format_uia_double(vertical) + "%";
+    return S_OK;
+}
+
+PropertyMutationResult uia_readback_result(
+    HRESULT readbackResult, std::string value) {
+    if (FAILED(readbackResult)) {
+        return property_mutation_failure(
+            readbackResult,
+            "The UI Automation property action completed, but provider "
+            "readback failed; the actual value is unknown",
+            "typed_property_readback_failed",
+            readbackResult == static_cast<HRESULT>(
+                                  UIA_E_ELEMENTNOTAVAILABLE)
+                ? PropertyErrorDisposition::terminal
+                : PropertyErrorDisposition::unspecified);
+    }
+    PropertyMutationResult result;
+    result.ok = true;
+    result.hresult = S_OK;
+    result.hasValue = true;
+    result.value = std::move(value);
+    result.error.clear();
+    return result;
+}
+
 PatternAttempt try_change_selection(IUIAutomationElement* element, bool add,
                                     std::string& method) {
     wil::com_ptr<IUIAutomationSelectionItemPattern> pattern;
@@ -869,13 +995,17 @@ std::string describe_decline(const PatternAttempt& attempt, const char* patternN
 
 PropertyMutationResult uia_range_readback_result(
     HRESULT readbackResult, double currentValue) {
-    PropertyMutationResult result;
     if (FAILED(readbackResult) || !std::isfinite(currentValue)) {
-        result.hresult = FAILED(readbackResult) ? readbackResult : E_FAIL;
-        result.error =
-            "RangeValue was set, but provider readback failed; the actual value is unknown";
-        return result;
+        return property_mutation_failure(
+            FAILED(readbackResult) ? readbackResult : E_FAIL,
+            "RangeValue was set, but provider readback failed; the actual value is unknown",
+            "typed_property_readback_failed",
+            readbackResult == static_cast<HRESULT>(
+                                  UIA_E_ELEMENTNOTAVAILABLE)
+                ? PropertyErrorDisposition::terminal
+                : PropertyErrorDisposition::unspecified);
     }
+    PropertyMutationResult result;
     result.ok = true;
     result.hresult = S_OK;
     result.hasValue = true;
@@ -890,11 +1020,12 @@ PropertyMutationResult perform_uia_property_action(
     HANDLE retainedProcess,
     const std::vector<int>& runtimeId,
     UiaPropertyAction action, const std::string& value) {
-    PropertyMutationResult result;
     if (!automation) {
-        result.hresult = E_POINTER;
-        result.error = "The UI Automation session is no longer available";
-        return result;
+        return property_mutation_failure(
+            E_POINTER,
+            "The UI Automation session is no longer available",
+            "typed_property_ownership_lost",
+            PropertyErrorDisposition::ownershipLost);
     }
 
     wil::com_ptr<IUIAutomationElement> element;
@@ -903,13 +1034,20 @@ PropertyMutationResult perform_uia_property_action(
             automation, identity, retainedProcess,
             runtimeId, &element);
     if (FAILED(findHr) || !element) {
-        result.hresult = FAILED(findHr)
-            ? findHr
-            : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-        result.error = is_ownership_lost(findHr)
-            ? "ownershipLost: the UI Automation target identity changed"
-            : "The UI Automation element changed or disappeared after its properties were read";
-        return result;
+        const bool ownershipLost = is_ownership_lost(findHr);
+        return property_mutation_failure(
+            FAILED(findHr)
+                ? findHr
+                : HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+            ownershipLost
+                ? "ownershipLost: the UI Automation target identity changed"
+                : "The UI Automation element changed or disappeared after its properties were read",
+            ownershipLost
+                ? "typed_property_ownership_lost"
+                : "typed_property_stale_element",
+            ownershipLost
+                ? PropertyErrorDisposition::ownershipLost
+                : PropertyErrorDisposition::terminal);
     }
 
     const auto validateTarget = [&]() -> HRESULT {
@@ -923,18 +1061,20 @@ PropertyMutationResult perform_uia_property_action(
     MutationBoundaryScope boundaryScope(boundary);
     const HRESULT beforeRealize = validateTarget();
     if (FAILED(beforeRealize)) {
-        result.hresult = beforeRealize;
-        result.error =
-            "ownershipLost: the UI Automation target identity changed";
-        return result;
+        return property_mutation_failure(
+            beforeRealize,
+            "ownershipLost: the UI Automation target identity changed",
+            "typed_property_ownership_lost",
+            PropertyErrorDisposition::ownershipLost);
     }
     (void)realize_if_virtualized(element.get());
     const HRESULT afterRealize = validateTarget();
     if (FAILED(afterRealize)) {
-        result.hresult = afterRealize;
-        result.error =
-            "ownershipLost: the UI Automation target identity changed";
-        return result;
+        return property_mutation_failure(
+            afterRealize,
+            "ownershipLost: the UI Automation target identity changed",
+            "typed_property_ownership_lost",
+            PropertyErrorDisposition::ownershipLost);
     }
 
     std::string method;
@@ -977,68 +1117,95 @@ PropertyMutationResult perform_uia_property_action(
     if (!attempt.succeeded()) {
         const HRESULT identityHr = validateTarget();
         if (FAILED(identityHr)) {
-            result.hresult = identityHr;
-            result.error =
-                "ownershipLost: the UI Automation target identity changed";
-            return result;
+            return property_mutation_failure(
+                identityHr,
+                "ownershipLost: the UI Automation target identity changed",
+                "typed_property_ownership_lost",
+                PropertyErrorDisposition::ownershipLost);
         }
-        result.hresult = attempt.supported ? attempt.hr : E_NOTIMPL;
         if (!attempt.supported) {
-            result.error =
-                "The UI Automation pattern advertised by this descriptor is no longer available";
+            return property_mutation_failure(
+                E_NOTIMPL,
+                "The UI Automation pattern advertised by this descriptor is no longer available",
+                "typed_property_stale_element",
+                PropertyErrorDisposition::terminal);
         } else if (attempt.hr == E_INVALIDARG) {
-            result.error = "The selected value is not valid for this property descriptor";
+            return property_mutation_failure(
+                attempt.hr,
+                "The selected value is not valid for this property descriptor",
+                "typed_property_invalid_value",
+                PropertyErrorDisposition::terminal);
         } else if (attempt.hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
-            result.error =
-                "The UI Automation provider cannot intentionally set the selected state";
+            return property_mutation_failure(
+                attempt.hr,
+                "The UI Automation provider cannot intentionally set the selected state",
+                "typed_property_unsupported",
+                PropertyErrorDisposition::terminal);
         } else {
             char buffer[32];
             snprintf(buffer, sizeof(buffer), "0x%08X",
                      static_cast<unsigned>(attempt.hr));
-            result.error =
+            return property_mutation_failure(
+                attempt.hr,
                 "The UI Automation provider rejected the property action (" +
-                std::string(buffer) + ")";
+                    std::string(buffer) + ")");
         }
-        return result;
     }
 
-    if (action == UiaPropertyAction::setRangeValue) {
-        double currentValue = 0;
-        const HRESULT beforeReadback = validateTarget();
-        if (FAILED(beforeReadback)) {
-            result.hresult = beforeReadback;
-            result.error =
-                "ownershipLost: the UI Automation target identity changed";
-            return result;
-        }
-        const auto readbackResult =
-            read_current_range_value(element.get(), currentValue);
-        const HRESULT afterReadback = validateTarget();
-        if (FAILED(afterReadback)) {
-            result.hresult = afterReadback;
-            result.error =
-                "ownershipLost: the UI Automation target identity changed";
-            return result;
-        }
-        return uia_range_readback_result(readbackResult, currentValue);
+    const HRESULT beforeReadback = validateTarget();
+    if (FAILED(beforeReadback)) {
+        return property_mutation_failure(
+            beforeReadback,
+            "ownershipLost: the UI Automation target identity changed",
+            "typed_property_ownership_lost",
+            PropertyErrorDisposition::ownershipLost);
     }
 
-    result.ok = true;
-    result.hresult = S_OK;
-    result.error.clear();
+    HRESULT readbackResult = E_FAIL;
+    std::string effectiveValue;
+    double effectiveRange = 0;
     switch (action) {
     case UiaPropertyAction::setValue:
-    case UiaPropertyAction::setToggleState:
-    case UiaPropertyAction::setExpandCollapseState:
-        result.hasValue = true;
-        result.value = value;
+        readbackResult =
+            read_current_value(element.get(), effectiveValue);
         break;
     case UiaPropertyAction::setRangeValue:
+        readbackResult =
+            read_current_range_value(element.get(), effectiveRange);
         break;
-    default:
+    case UiaPropertyAction::setToggleState:
+        readbackResult =
+            read_current_toggle_state(element.get(), effectiveValue);
+        break;
+    case UiaPropertyAction::setExpandCollapseState:
+        readbackResult =
+            read_current_expand_collapse_state(
+                element.get(), effectiveValue);
+        break;
+    case UiaPropertyAction::replaceSelection:
+    case UiaPropertyAction::addToSelection:
+    case UiaPropertyAction::removeFromSelection:
+        readbackResult =
+            read_current_selection_state(element.get(), effectiveValue);
+        break;
+    case UiaPropertyAction::scroll:
+        readbackResult =
+            read_current_scroll_state(element.get(), effectiveValue);
         break;
     }
-    return result;
+
+    const HRESULT afterReadback = validateTarget();
+    if (FAILED(afterReadback)) {
+        return property_mutation_failure(
+            afterReadback,
+            "ownershipLost: the UI Automation target identity changed",
+            "typed_property_ownership_lost",
+            PropertyErrorDisposition::ownershipLost);
+    }
+    if (action == UiaPropertyAction::setRangeValue)
+        return uia_range_readback_result(readbackResult, effectiveRange);
+    return uia_readback_result(
+        readbackResult, std::move(effectiveValue));
 }
 
 // The one place an ActionKind's textual name is defined. `parse_action_kind`
