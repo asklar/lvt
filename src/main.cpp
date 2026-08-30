@@ -1023,6 +1023,180 @@ static void reconcile_watch_connections(
     }
 }
 
+struct WatchElementLocation {
+    lvt::Element* element = nullptr;
+    lvt::Element* parent = nullptr;
+    std::string path;
+};
+
+static bool find_watch_element_location(
+    lvt::Element& element, const std::string& ref,
+    const std::string& path, lvt::Element* parent,
+    WatchElementLocation& out) {
+    if (element.id == ref || element.key == ref) {
+        out = {&element, parent, path};
+        return true;
+    }
+    for (size_t i = 0; i < element.children.size(); ++i) {
+        if (find_watch_element_location(
+                element.children[i], ref,
+                path + "." + std::to_string(i),
+                &element, out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool find_watch_element_location(
+    lvt::Element& root, const std::string& ref,
+    WatchElementLocation& out) {
+    return find_watch_element_location(
+        root, ref, "0", nullptr, out);
+}
+
+struct WatchScopeAnchor {
+    std::string key;
+    std::string baseIdentity;
+    std::string durableIdentity;
+    std::string parentKey;
+    std::string path;
+    uintptr_t nativeHandle = 0;
+    uint64_t providerHandle = 0;
+    bool durableProviderIdentity = false;
+    bool processWideProviderIdentity = false;
+};
+
+static void update_watch_scope_anchor(
+    WatchScopeAnchor& anchor,
+    const WatchElementLocation& location) {
+    anchor.key = location.element->key;
+    anchor.baseIdentity =
+        lvt::base_identity_key(*location.element);
+    anchor.durableIdentity =
+        location.element->durableIdentity;
+    anchor.parentKey =
+        location.parent ? location.parent->key : std::string();
+    anchor.path = location.path;
+    anchor.nativeHandle =
+        location.element->nativeHandle;
+    anchor.providerHandle =
+        location.element->providerHandle;
+    anchor.durableProviderIdentity =
+        lvt::has_durable_provider_identity(
+            *location.element);
+    anchor.processWideProviderIdentity =
+        lvt::has_process_wide_provider_identity(
+            *location.element);
+}
+
+static bool watch_scope_parent_matches(
+    const WatchScopeAnchor& anchor,
+    const WatchElementLocation& location) {
+    if (anchor.processWideProviderIdentity)
+        return true;
+    const auto parentKey =
+        location.parent ? location.parent->key : std::string();
+    return parentKey == anchor.parentKey;
+}
+
+enum class WatchScopeTransition {
+    absent,
+    same,
+    replacement,
+    reappeared,
+};
+
+static WatchScopeTransition resolve_watch_scope(
+    lvt::Element& current,
+    const std::vector<lvt::ChangeEvent>& fullEvents,
+    const WatchScopeAnchor& anchor, bool wasPresent,
+    WatchElementLocation& location) {
+    WatchElementLocation exact;
+    if (find_watch_element_location(
+            current, anchor.key, exact) &&
+        lvt::base_identity_key(*exact.element) ==
+            anchor.baseIdentity &&
+        (anchor.durableIdentity.empty() ||
+         exact.element->durableIdentity ==
+             anchor.durableIdentity) &&
+        (wasPresent ||
+         anchor.processWideProviderIdentity ||
+         exact.path == anchor.path) &&
+        watch_scope_parent_matches(anchor, exact)) {
+        location = exact;
+        return wasPresent
+            ? WatchScopeTransition::same
+            : WatchScopeTransition::reappeared;
+    }
+
+    if (!wasPresent)
+        return WatchScopeTransition::absent;
+
+    const bool removedAnchor = std::any_of(
+        fullEvents.begin(), fullEvents.end(),
+        [&](const lvt::ChangeEvent& event) {
+            return event.type ==
+                       lvt::ChangeEvent::Type::Removed &&
+                   event.key == anchor.key &&
+                   event.path == anchor.path;
+        });
+    if (!removedAnchor)
+        return WatchScopeTransition::absent;
+
+    // A different key can become the tracked root only as an explicit
+    // same-tick replacement at the exact old path, under the same surviving
+    // parent, with the same provider/type identity. A moved sibling merely
+    // occupying the old slot produces a Changed/path event, not this
+    // Removed+Added pair, and is therefore never silently adopted.
+    for (const auto& event : fullEvents) {
+        if (event.type != lvt::ChangeEvent::Type::Added ||
+            event.path != anchor.path ||
+            lvt::base_identity_key(event.element) !=
+                anchor.baseIdentity) {
+            continue;
+        }
+        WatchElementLocation candidate;
+        if (!find_watch_element_location(
+                current, event.key, candidate) ||
+            !watch_scope_parent_matches(anchor, candidate)) {
+            continue;
+        }
+        if (anchor.nativeHandle != 0 &&
+            candidate.element->nativeHandle !=
+                anchor.nativeHandle) {
+            continue;
+        }
+        if (anchor.durableProviderIdentity &&
+            candidate.element->providerHandle !=
+                anchor.providerHandle) {
+            continue;
+        }
+        location = candidate;
+        return WatchScopeTransition::replacement;
+    }
+    return WatchScopeTransition::absent;
+}
+
+static lvt::Element make_watch_scope_snapshot(
+    const lvt::Element& fullTree,
+    const WatchElementLocation& location, int depth) {
+    lvt::Element snapshot = *location.element;
+    if (depth >= 0)
+        lvt::trim_to_depth(snapshot, depth);
+    lvt::copy_incomplete_framework_refresh_markers(
+        fullTree, snapshot);
+    return snapshot;
+}
+
+static std::vector<lvt::ChangeEvent> removed_snapshot_events(
+    lvt::Element& snapshot) {
+    auto events = lvt::snapshot_added_events(snapshot);
+    for (auto& event : events)
+        event.type = lvt::ChangeEvent::Type::Removed;
+    return events;
+}
+
 static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
@@ -1034,6 +1208,16 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
         frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
     connections = acquire_watch_connections(target, args, frameworks);
     lvt::ConnectionLookup lookup = make_lookup(connections);
+    const bool scoped = !args.elementId.empty();
+    Args buildArgs = args;
+    if (scoped) {
+        // Resolve the user-supplied reference once. Later ticks must reconcile
+        // the authoritative full tree before deciding what that scoped root
+        // became; resolving the original key before diffing would skip every
+        // identity replacement forever.
+        buildArgs.elementId.clear();
+        buildArgs.depth = -1;
+    }
 
     // The very first tree build did not get the same tolerance the tick loop
     // below already has for a transient failure — it would fail outright
@@ -1062,15 +1246,41 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
                 target, args, frameworks, connections);
         }
         built = build_output_tree(
-                    target, args, previous, lookup,
+                    target, buildArgs, previous, lookup,
                     args.uia ? nullptr : &frameworks) &&
                 !lvt::has_incomplete_framework_refresh(previous);
     }
     if (!built)
         return 1;
 
-    for (const auto& event : lvt::snapshot_added_events(previous))
-        printf("%s\n", lvt::serialize_change_event(event).c_str());
+    WatchScopeAnchor scopeAnchor;
+    std::optional<lvt::Element> previousScope;
+    if (scoped) {
+        WatchElementLocation initialScope;
+        if (!find_watch_element_location(
+                previous, args.elementId, initialScope)) {
+            fprintf(
+                stderr, "lvt: element '%s' not found\n",
+                args.elementId.c_str());
+            return 1;
+        }
+        update_watch_scope_anchor(scopeAnchor, initialScope);
+        previousScope = make_watch_scope_snapshot(
+            previous, initialScope, args.depth);
+        for (const auto& event :
+             lvt::snapshot_added_events(*previousScope)) {
+            printf(
+                "%s\n",
+                lvt::serialize_change_event(event).c_str());
+        }
+    } else {
+        for (const auto& event :
+             lvt::snapshot_added_events(previous)) {
+            printf(
+                "%s\n",
+                lvt::serialize_change_event(event).c_str());
+        }
+    }
     fflush(stdout);
 
     while (!g_watchStop) {
@@ -1094,7 +1304,7 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
 
         lvt::Element current;
         if (!build_output_tree(
-                target, args, current, lookup,
+                target, buildArgs, current, lookup,
                 args.uia ? nullptr : &frameworks)) {
             // A tick can fail transiently — most easily in UIA mode, where a
             // momentarily busy target trips the transaction timeout. That is
@@ -1127,7 +1337,7 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
                     target, args, frameworks, connections);
                 lvt::Element retryTree;
                 if (build_output_tree(
-                        target, args, retryTree, lookup,
+                        target, buildArgs, retryTree, lookup,
                         args.uia ? nullptr : &frameworks))
                     current = std::move(retryTree);
             }
@@ -1141,8 +1351,76 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             }
         }
 
-        for (const auto& event : lvt::diff_trees(previous, current))
-            printf("%s\n", lvt::serialize_change_event(event).c_str());
+        if (scoped) {
+            // Reconcile full trees first so process-wide XAML moves and
+            // provider-authoritative identity replacement have their normal
+            // semantics before selecting the reporting scope.
+            auto fullEvents =
+                lvt::diff_trees(previous, current);
+            WatchElementLocation currentScope;
+            const auto transition = resolve_watch_scope(
+                current, fullEvents, scopeAnchor,
+                previousScope.has_value(), currentScope);
+
+            std::optional<lvt::Element> nextScope;
+            if (transition != WatchScopeTransition::absent) {
+                nextScope = make_watch_scope_snapshot(
+                    current, currentScope, args.depth);
+            }
+
+            if (previousScope && nextScope) {
+                if (transition ==
+                    WatchScopeTransition::replacement) {
+                    for (const auto& event :
+                         removed_snapshot_events(*previousScope)) {
+                        printf(
+                            "%s\n",
+                            lvt::serialize_change_event(event).c_str());
+                    }
+                    for (const auto& event :
+                         lvt::snapshot_added_events(*nextScope)) {
+                        printf(
+                            "%s\n",
+                            lvt::serialize_change_event(event).c_str());
+                    }
+                } else {
+                    for (const auto& event :
+                         lvt::diff_trees(
+                             *previousScope, *nextScope)) {
+                        printf(
+                            "%s\n",
+                            lvt::serialize_change_event(event).c_str());
+                    }
+                }
+            } else if (previousScope) {
+                for (const auto& event :
+                     removed_snapshot_events(*previousScope)) {
+                    printf(
+                        "%s\n",
+                        lvt::serialize_change_event(event).c_str());
+                }
+            } else if (nextScope) {
+                for (const auto& event :
+                     lvt::snapshot_added_events(*nextScope)) {
+                    printf(
+                        "%s\n",
+                        lvt::serialize_change_event(event).c_str());
+                }
+            }
+
+            if (nextScope) {
+                update_watch_scope_anchor(
+                    scopeAnchor, currentScope);
+            }
+            previousScope = std::move(nextScope);
+        } else {
+            for (const auto& event :
+                 lvt::diff_trees(previous, current)) {
+                printf(
+                    "%s\n",
+                    lvt::serialize_change_event(event).c_str());
+            }
+        }
         fflush(stdout);
         previous = std::move(current);
     }

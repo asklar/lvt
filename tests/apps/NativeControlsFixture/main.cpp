@@ -812,6 +812,27 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case fixture::kPopulateOversizedToolbarMessage:
         populate_oversized_toolbar();
         return TRUE;
+    case fixture::kDuplicateSecondListIdentityMessage:
+        ListView_SetItemText(
+            g_controls.listView, 1, 0,
+            const_cast<LPWSTR>(L"External replacement"));
+        return TRUE;
+    case fixture::kRestoreSecondListIdentityMessage:
+        ListView_SetItemText(
+            g_controls.listView, 1, 0,
+            const_cast<LPWSTR>(L"Beta row"));
+        return TRUE;
+    case fixture::kDeleteFirstListItemMessage:
+        return ListView_DeleteItem(g_controls.listView, 0);
+    case fixture::kInsertExternalFirstListItemMessage: {
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = 0;
+        item.pszText =
+            const_cast<LPWSTR>(L"External replacement");
+        return ListView_InsertItem(
+            g_controls.listView, &item) == 0;
+    }
     case fixture::kReparentGenericOutOfTreeMessage: {
         const HWND oldParent = SetParent(
             g_controls.genericText, g_controls.outOfTree);

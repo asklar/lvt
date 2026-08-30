@@ -3924,6 +3924,232 @@ TEST_F(NativeControlsFixture, DumpKeyScopesWatchAndWatchKeyQueriesOneShot) {
         << "a key emitted by watch must resolve in one-shot query";
 }
 
+TEST_F(
+    NativeControlsFixture,
+    ScopedWatchFollowsIdentityReplacementButNotSlotOccupants) {
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kRestoreDefaultListMessage),
+        0);
+    auto restoreList = wil::scope_exit([&] {
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kRestoreDefaultListMessage);
+    });
+
+    const auto findListItem =
+        [&](const json& tree, const std::string& text,
+            const std::string& index) -> const json* {
+        auto* listView = find_element_by_hwnd(
+            tree["root"], control(native_fixture::kListViewId));
+        if (!listView || !listView->contains("children"))
+            return nullptr;
+        for (const auto& child : (*listView)["children"]) {
+            if (child.value("type", "") == "ListViewItem" &&
+                child.value("text", "") == text &&
+                child.value("properties", json::object())
+                        .value("index", "") == index) {
+                return &child;
+            }
+        }
+        return nullptr;
+    };
+
+    auto initial = dump_tree();
+    const auto* alpha =
+        findListItem(initial, "Alpha row", "0");
+    ASSERT_NE(alpha, nullptr);
+    const auto alphaKey = alpha->value("key", "");
+    ASSERT_FALSE(alphaKey.empty());
+
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    wil::unique_handle readEnd;
+    wil::unique_handle writeEnd;
+    ASSERT_TRUE(CreatePipe(
+        readEnd.put(), writeEnd.put(), &security, 0));
+    ASSERT_TRUE(SetHandleInformation(
+        readEnd.get(), HANDLE_FLAG_INHERIT, 0));
+
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = writeEnd.get();
+    startup.hStdError = writeEnd.get();
+    PROCESS_INFORMATION processInfo{};
+    std::string command = make_cmd(
+        get_lvt_path(),
+        get_hwnd_arg() + " watch --interval 50 --element \"" +
+            alphaKey + "\"");
+    ASSERT_TRUE(CreateProcessA(
+        nullptr, command.data(), nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &processInfo));
+    wil::unique_handle process(processInfo.hProcess);
+    wil::unique_handle thread(processInfo.hThread);
+    writeEnd.reset();
+
+    std::string output;
+    const auto readAvailable = [&] {
+        DWORD available = 0;
+        if (!PeekNamedPipe(
+                readEnd.get(), nullptr, 0, nullptr,
+                &available, nullptr) ||
+            available == 0) {
+            return;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (ReadFile(
+                readEnd.get(), chunk.data(), available,
+                &read, nullptr) &&
+            read != 0) {
+            output.append(chunk, 0, read);
+        }
+    };
+    const auto eventSeen =
+        [&](size_t offset, const std::string& type,
+            const std::string& key) {
+        size_t cursor = offset;
+        if (cursor > 0 && cursor <= output.size() &&
+            output[cursor - 1] != '\n') {
+            const auto next = output.find('\n', cursor);
+            if (next == std::string::npos)
+                return false;
+            cursor = next + 1;
+        }
+        while (cursor < output.size()) {
+            const auto newline = output.find('\n', cursor);
+            if (newline == std::string::npos)
+                break;
+            const auto event = json::parse(
+                output.substr(cursor, newline - cursor),
+                nullptr, false);
+            if (!event.is_discarded() &&
+                event.value("event", "") == type &&
+                (key.empty() ||
+                 event.value("key", "") == key)) {
+                return true;
+            }
+            cursor = newline + 1;
+        }
+        return false;
+    };
+    const auto waitFor =
+        [&](const std::function<bool()>& ready,
+            DWORD timeoutMs) {
+        const auto deadline = GetTickCount64() + timeoutMs;
+        while (GetTickCount64() < deadline) {
+            readAvailable();
+            if (ready())
+                return true;
+            if (WaitForSingleObject(
+                    process.get(), 0) == WAIT_OBJECT_0) {
+                break;
+            }
+            Sleep(20);
+        }
+        readAvailable();
+        return ready();
+    };
+
+    ASSERT_TRUE(waitFor(
+        [&] { return eventSeen(0, "added", alphaKey); },
+        10000)) << output;
+
+    size_t phaseStart = output.size();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kMutateListViewIdentityMessage),
+        0);
+    auto changed = dump_tree();
+    const auto* replacement = findListItem(
+        changed, "External replacement", "0");
+    ASSERT_NE(replacement, nullptr);
+    const auto replacementKey =
+        replacement->value("key", "");
+    ASSERT_NE(replacementKey, alphaKey);
+    ASSERT_TRUE(waitFor(
+        [&] {
+            return eventSeen(
+                       phaseStart, "removed", alphaKey) &&
+                   eventSeen(
+                       phaseStart, "added", replacementKey);
+        },
+        10000)) << output;
+
+    phaseStart = output.size();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kDuplicateSecondListIdentityMessage),
+        0);
+    auto ambiguous = dump_tree();
+    const auto* ambiguousRoot = findListItem(
+        ambiguous, "External replacement", "0");
+    ASSERT_NE(ambiguousRoot, nullptr);
+    const auto ambiguousKey =
+        ambiguousRoot->value("key", "");
+    ASSERT_NE(ambiguousKey, replacementKey);
+    ASSERT_TRUE(waitFor(
+        [&] {
+            return eventSeen(
+                       phaseStart, "removed", replacementKey) &&
+                   eventSeen(
+                       phaseStart, "added", ambiguousKey);
+        },
+        10000)) << output;
+
+    phaseStart = output.size();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kRestoreSecondListIdentityMessage),
+        0);
+    ASSERT_TRUE(waitFor(
+        [&] {
+            return eventSeen(
+                       phaseStart, "removed", ambiguousKey) &&
+                   eventSeen(
+                       phaseStart, "added", replacementKey);
+        },
+        10000)) << output;
+
+    phaseStart = output.size();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kDeleteFirstListItemMessage),
+        0);
+    ASSERT_TRUE(waitFor(
+        [&] {
+            return eventSeen(
+                phaseStart, "removed", replacementKey);
+        },
+        10000)) << output;
+    Sleep(250);
+    readAvailable();
+    EXPECT_FALSE(eventSeen(
+        phaseStart, "added", std::string()))
+        << "a sibling moving into the removed root's slot was adopted";
+
+    phaseStart = output.size();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kInsertExternalFirstListItemMessage),
+        0);
+    ASSERT_TRUE(waitFor(
+        [&] {
+            return eventSeen(
+                phaseStart, "added", replacementKey);
+        },
+        10000)) << output;
+
+    TerminateProcess(process.get(), 0);
+    WaitForSingleObject(process.get(), 5000);
+    readAvailable();
+    EXPECT_EQ(output.find("element '"), std::string::npos)
+        << output;
+}
+
 TEST_F(NativeControlsFixture, NativeWatchDoesNotDuplicateStructuralDiffs) {
     send_native_fixture_message(
         s_hwnd, native_fixture::kDestroyEventChildMessage);

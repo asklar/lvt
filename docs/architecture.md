@@ -125,6 +125,18 @@ add/remove storms. The current schedulers do not wait on a provider event
 handle: `watch` latency remains bounded by `--interval`, and subscribed MCP
 resources by their approximately 500 ms polling cadence.
 
+Key-scoped watch resolves the requested `--element` only for its initial
+snapshot. It records the resolved key, parent, full-tree path, base identity,
+and provider identity, then builds and reconciles complete trees on every
+later tick before deriving the reported scoped snapshot. An authoritative
+durable-identity replacement at the anchored parent/path is surfaced as a
+Removed subtree followed by an Added subtree with the fresh key. A moved
+sibling merely occupying the old slot is not adopted, and removal without an
+explicit replacement keeps the watch alive until the anchored identity validly
+reappears. Full-tree reconciliation preserves process-wide XAML/WinUI reparent
+matching, while incomplete provider markers continue to preserve the previous
+snapshot rather than reporting false removals.
+
 ### Native typed-property safety (`native_message.*`,
 `native_property_connection.*`)
 

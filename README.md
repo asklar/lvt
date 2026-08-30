@@ -459,6 +459,15 @@ Element matching uses stable framework/type/class/path-derived keys instead of
 the positional `e0`, `e1`, ... ids, so unique moved elements are reported as
 `changed` events with a `path` field change.
 
+With `--element`, the first snapshot resolves the supplied reference normally.
+Later ticks still reconcile complete authoritative trees before selecting the
+reported subtree. If the scoped root's durable identity changes or becomes
+ambiguous, watch emits removal of the old scoped tree and addition of the
+replacement with its fresh key, then follows that replacement. A plain
+structural removal emits removal and keeps the watch alive; only the same
+anchored identity may reappear later, so an unrelated sibling moving into the
+old slot is not silently adopted.
+
 `--fast` applies to `watch` too: every tick collects the cheaper property set
 instead of the full XAML/WinUI3 property chain, so `changed` events on an
 arbitrary custom property outside bounds/Text/Content/basic state won't be
