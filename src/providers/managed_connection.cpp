@@ -52,6 +52,32 @@ bool managed_pipe_client_matches_pid(HANDLE pipe, DWORD expectedPid) {
            clientPid == expectedPid;
 }
 
+PropertyMutationResult managed_mutation_command_failure(
+    HRESULT hresult, std::string message) {
+    std::string normalized = message;
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+    const bool timeout =
+        hresult == E_PENDING ||
+        normalized.find("timed out") != std::string::npos ||
+        normalized.find("did not complete") != std::string::npos;
+    const bool descriptor =
+        normalized.find("descriptor") != std::string::npos;
+    return property_mutation_failure(
+        hresult, std::move(message),
+        timeout
+            ? "typed_property_timeout"
+            : descriptor
+                ? "typed_property_invalid_descriptor"
+                : std::string{},
+        timeout
+            ? PropertyErrorDisposition::transient
+            : PropertyErrorDisposition::unspecified);
+}
+
 } // namespace detail
 
 namespace {
@@ -1088,23 +1114,10 @@ private:
             return;
         }
         const auto hresult = parse_hresult(payload);
-        const auto message = payload.value(
+        auto message = payload.value(
             "message", "The managed property command failed");
-        const bool timeout =
-            message.find("did not complete") != std::string::npos ||
-            message.find("before execution") != std::string::npos;
-        const bool descriptor =
-            message.find("descriptor") != std::string::npos;
-        result = property_mutation_failure(
-            hresult, message,
-            timeout
-                ? "typed_property_timeout"
-                : descriptor
-                    ? "typed_property_invalid_descriptor"
-                    : std::string{},
-            timeout
-                ? PropertyErrorDisposition::transient
-                : PropertyErrorDisposition::unspecified);
+        result = detail::managed_mutation_command_failure(
+            hresult, std::move(message));
     }
 
     PropertyMutationResult parse_mutation_response(

@@ -10404,6 +10404,47 @@ TEST(McpServer, EveryToolDeclaresAnOutputSchemaAndAnnotations) {
     }
 }
 
+TEST(McpServer, MutationFailureSchemasAdmitProviderSemantics) {
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto schemas = output_schemas(client);
+
+    const std::vector<std::pair<std::string, json>> failures{
+        {"set_property",
+         json{{"ok", false},
+              {"errorCode", "typed_property_readback_failed"},
+              {"errorDisposition", "transient"},
+              {"retryable", true},
+              {"error",
+               "SetProperty succeeded, but effective-value readback failed"},
+              {"hresult", "0x80004005"}}},
+        {"clear_property",
+         json{{"ok", false},
+              {"errorCode", "typed_property_timeout"},
+              {"errorDisposition", "transient"},
+              {"retryable", true},
+              {"error",
+               "mutation timed out after execution began; its outcome is indeterminate"},
+              {"hresult", "0x8000000A"}}},
+        {"set_property",
+         json{{"ok", false},
+              {"errorCode", "typed_property_stale_element"},
+              {"errorDisposition", "terminal"},
+              {"retryable", false},
+              {"error",
+               "The UI Automation child element became unavailable"},
+              {"hresult", "0x80040201"}}},
+    };
+
+    for (const auto& [tool, failure] : failures) {
+        std::string why;
+        EXPECT_TRUE(schema_allows(
+            schemas.at(tool), failure, why))
+            << tool << ": " << why << "\n" << failure.dump(2);
+    }
+}
+
 TEST(McpServer, ReadOnlyToolsAreMarkedReadOnly) {
     McpClient readOnly(false);
     ASSERT_TRUE(readOnly.started());

@@ -2777,59 +2777,64 @@ lvt::PropertyMutationResult normalize_property_mutation_failure(
 
     auto code = normalized.errorCode;
     auto disposition = normalized.errorDisposition;
-    if (lowerError.find("read-only") != std::string::npos ||
-        lowerError.find("readonly") != std::string::npos) {
-        code = "typed_property_read_only";
-    } else if (lowerError.find("descriptor") != std::string::npos) {
-        code = "typed_property_invalid_descriptor";
-    } else if (
-        lowerError.find("does not support") != std::string::npos ||
-        lowerError.find("not supported") != std::string::npos ||
-        lowerError.find("does not expose") != std::string::npos) {
-        code = "typed_property_unsupported";
-    } else if (
-        lowerError.find("outside") != std::string::npos ||
-        lowerError.find("exceed") != std::string::npos ||
-        lowerError.find("out of bounds") != std::string::npos) {
-        code = "typed_property_out_of_bounds";
-    }
-    if (disposition == lvt::PropertyErrorDisposition::unspecified) {
+    const bool canRefineCode =
+        code.empty() ||
+        code == "typed_property_mutation_failed";
+    if (canRefineCode) {
         if (lowerError.find("readback") != std::string::npos ||
             lowerError.find("actual value is unknown") != std::string::npos) {
-            code = code.empty()
-                ? "typed_property_readback_failed"
-                : code;
-            disposition = lvt::PropertyErrorDisposition::transient;
+            code = "typed_property_readback_failed";
         } else if (
             lowerError.find("timeout") != std::string::npos ||
             lowerError.find("timed out") != std::string::npos ||
             lowerError.find("did not complete") != std::string::npos ||
             lowerError.find("before execution") != std::string::npos) {
             code = "typed_property_timeout";
-            disposition = lvt::PropertyErrorDisposition::transient;
         } else if (
             lowerError.find("broken pipe") != std::string::npos ||
             lowerError.find("connection is no longer available") !=
                 std::string::npos ||
             lowerError.find("could not send") != std::string::npos) {
-            code = code.empty()
-                ? "typed_property_transport_error"
-                : code;
+            code = "typed_property_transport_error";
+        } else if (
+            lowerError.find("read-only") != std::string::npos ||
+            lowerError.find("readonly") != std::string::npos) {
+            code = "typed_property_read_only";
+        } else if (
+            lowerError.find("descriptor") != std::string::npos) {
+            code = "typed_property_invalid_descriptor";
+        } else if (
+            lowerError.find("does not support") != std::string::npos ||
+            lowerError.find("not supported") != std::string::npos ||
+            lowerError.find("does not expose") != std::string::npos) {
+            code = "typed_property_unsupported";
+        } else if (
+            lowerError.find("outside") != std::string::npos ||
+            lowerError.find("exceed") != std::string::npos ||
+            lowerError.find("out of bounds") != std::string::npos) {
+            code = "typed_property_out_of_bounds";
+        } else if (
+            lowerError.find("stale") != std::string::npos ||
+            lowerError.find("changed since") != std::string::npos ||
+            lowerError.find("disappeared") != std::string::npos ||
+            lowerError.find("became unavailable") != std::string::npos ||
+            lowerError.find("not found") != std::string::npos ||
+            lowerError.find("unknown or closed") != std::string::npos ||
+            lowerError.find("no property schema") != std::string::npos) {
+            code = "typed_property_stale_element";
+        }
+    }
+    if (disposition == lvt::PropertyErrorDisposition::unspecified) {
+        if (code == "typed_property_readback_failed" ||
+            code == "typed_property_timeout" ||
+            code == "typed_property_transport_error") {
             disposition = lvt::PropertyErrorDisposition::transient;
         } else if (
             code == "typed_property_invalid_descriptor" ||
             code == "typed_property_read_only" ||
             code == "typed_property_unsupported" ||
-            code == "typed_property_out_of_bounds") {
-            disposition = lvt::PropertyErrorDisposition::terminal;
-        } else if (
-            lowerError.find("stale") != std::string::npos ||
-            lowerError.find("changed since") != std::string::npos ||
-            lowerError.find("disappeared") != std::string::npos ||
-            lowerError.find("not found") != std::string::npos ||
-            lowerError.find("unknown or closed") != std::string::npos ||
-            lowerError.find("no property schema") != std::string::npos) {
-            code = "typed_property_stale_element";
+            code == "typed_property_out_of_bounds" ||
+            code == "typed_property_stale_element") {
             disposition = lvt::PropertyErrorDisposition::terminal;
         }
     }

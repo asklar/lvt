@@ -20,6 +20,7 @@
 #include "providers/native_property_connection.h"
 #include "providers/native_win_event.h"
 #include "providers/overlapped_io.h"
+#include "providers/xaml_diag_common.h"
 #include "providers/xaml_enum_catalog.h"
 #include "providers/uia_props.h"
 #include "providers/uia_property_adapter.h"
@@ -3507,6 +3508,54 @@ TEST(TypedPropertyContract, MutationFailuresHaveStableDispositions) {
         property_error_disposition_name(
             PropertyErrorDisposition::ownershipLost),
         "ownershipLost");
+}
+
+TEST(TypedPropertyContract, ProvidersRefineMutationFailureSemantics) {
+    const std::string xamlMessage =
+        "SetProperty succeeded, but effective-value readback failed: "
+        "provider disconnected";
+    const auto genericReadback = property_mutation_failure(
+        E_FAIL, xamlMessage, "typed_property_mutation_failed",
+        PropertyErrorDisposition::transient);
+    EXPECT_EQ(
+        genericReadback.errorCode,
+        "typed_property_readback_failed");
+
+    const auto xaml = detail::xaml_mutation_command_failure(
+        E_FAIL, xamlMessage);
+    EXPECT_EQ(xaml.errorCode, "typed_property_readback_failed");
+    EXPECT_EQ(
+        xaml.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(xaml.retryable);
+    EXPECT_EQ(xaml.error, xamlMessage);
+
+    const std::string managedMessage =
+        "WPF mutation timed out after execution began; its outcome is "
+        "indeterminate";
+    const auto genericTimeout = property_mutation_failure(
+        E_PENDING, managedMessage, "typed_property_mutation_failed",
+        PropertyErrorDisposition::transient);
+    EXPECT_EQ(genericTimeout.errorCode, "typed_property_timeout");
+
+    const auto managed = detail::managed_mutation_command_failure(
+        E_PENDING, managedMessage);
+    EXPECT_EQ(managed.errorCode, "typed_property_timeout");
+    EXPECT_EQ(
+        managed.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(managed.retryable);
+    EXPECT_EQ(managed.hresult, E_PENDING);
+    EXPECT_EQ(managed.error, managedMessage);
+
+    const auto stale =
+        uia_property_detail::pattern_operation_failure(
+            static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE));
+    EXPECT_EQ(stale.errorCode, "typed_property_stale_element");
+    EXPECT_EQ(
+        stale.errorDisposition,
+        PropertyErrorDisposition::terminal);
+    EXPECT_FALSE(stale.retryable);
 }
 
 namespace {

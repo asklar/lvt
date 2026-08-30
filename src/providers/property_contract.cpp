@@ -80,9 +80,51 @@ PropertyMutationResult property_mutation_failure(
     const auto win32 = HRESULT_FACILITY(hresult) == FACILITY_WIN32
         ? HRESULT_CODE(hresult)
         : ERROR_SUCCESS;
+    const bool canRefineCode =
+        errorCode.empty() ||
+        errorCode == "typed_property_mutation_failed";
+    if (canRefineCode) {
+        std::string normalized = error;
+        std::transform(
+            normalized.begin(), normalized.end(), normalized.begin(),
+            [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+        if (normalized.find("readback") != std::string::npos ||
+            normalized.find("actual value is unknown") !=
+                std::string::npos) {
+            errorCode = "typed_property_readback_failed";
+        } else if (
+            normalized.find("timeout") != std::string::npos ||
+            normalized.find("timed out") != std::string::npos ||
+            normalized.find("did not complete") != std::string::npos) {
+            errorCode = "typed_property_timeout";
+        } else if (
+            normalized.find("broken pipe") != std::string::npos ||
+            normalized.find("connection is no longer available") !=
+                std::string::npos ||
+            normalized.find("could not send") != std::string::npos) {
+            errorCode = "typed_property_transport_error";
+        } else if (
+            normalized.find("stale") != std::string::npos ||
+            normalized.find("changed since") != std::string::npos ||
+            normalized.find("disappeared") != std::string::npos ||
+            normalized.find("became unavailable") != std::string::npos ||
+            normalized.find("not found") != std::string::npos ||
+            normalized.find("unknown or closed") != std::string::npos) {
+            errorCode = "typed_property_stale_element";
+        }
+    }
 
     if (disposition == PropertyErrorDisposition::unspecified) {
-        if (hresult == HRESULT_FROM_WIN32(ERROR_INVALID_OWNER) ||
+        if (errorCode == "typed_property_readback_failed" ||
+            errorCode == "typed_property_timeout" ||
+            errorCode == "typed_property_transport_error") {
+            disposition = PropertyErrorDisposition::transient;
+        } else if (errorCode == "typed_property_stale_element") {
+            disposition = PropertyErrorDisposition::terminal;
+        } else if (
+            hresult == HRESULT_FROM_WIN32(ERROR_INVALID_OWNER) ||
             hresult == HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE)) {
             disposition = PropertyErrorDisposition::ownershipLost;
         } else if (
@@ -118,7 +160,8 @@ PropertyMutationResult property_mutation_failure(
         }
     }
 
-    if (errorCode.empty()) {
+    if (errorCode.empty() ||
+        errorCode == "typed_property_mutation_failed") {
         if (disposition == PropertyErrorDisposition::ownershipLost) {
             errorCode = "typed_property_ownership_lost";
         } else if (hresult == E_INVALIDARG) {

@@ -1014,6 +1014,26 @@ PropertyMutationResult uia_range_readback_result(
     return result;
 }
 
+PropertyMutationResult uia_property_detail::pattern_operation_failure(
+    HRESULT hresult) {
+    if (hresult == static_cast<HRESULT>(
+                       UIA_E_ELEMENTNOTAVAILABLE)) {
+        return property_mutation_failure(
+            hresult,
+            "The UI Automation element became unavailable while applying "
+            "the property action",
+            "typed_property_stale_element",
+            PropertyErrorDisposition::terminal);
+    }
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "0x%08X",
+             static_cast<unsigned>(hresult));
+    return property_mutation_failure(
+        hresult,
+        "The UI Automation provider rejected the property action (" +
+            std::string(buffer) + ")");
+}
+
 PropertyMutationResult perform_uia_property_action(
     IUIAutomation* automation,
     const UiaTargetIdentity& identity,
@@ -1142,13 +1162,8 @@ PropertyMutationResult perform_uia_property_action(
                 "typed_property_unsupported",
                 PropertyErrorDisposition::terminal);
         } else {
-            char buffer[32];
-            snprintf(buffer, sizeof(buffer), "0x%08X",
-                     static_cast<unsigned>(attempt.hr));
-            return property_mutation_failure(
-                attempt.hr,
-                "The UI Automation provider rejected the property action (" +
-                    std::string(buffer) + ")");
+            return uia_property_detail::pattern_operation_failure(
+                attempt.hr);
         }
     }
 

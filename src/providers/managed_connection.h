@@ -43,6 +43,8 @@ bool managed_pipe_client_matches_pid(HANDLE pipe, DWORD expectedPid);
 bool wait_for_expected_pipe_client(
     HANDLE pipe, HANDLE process, DWORD expectedPid, OVERLAPPED& overlapped,
     DWORD connectError, DWORD timeoutMs);
+PropertyMutationResult managed_mutation_command_failure(
+    HRESULT hresult, std::string message);
 }
 
 } // namespace lvt

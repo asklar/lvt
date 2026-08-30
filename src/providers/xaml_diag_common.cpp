@@ -494,6 +494,21 @@ struct XamlPropertyCommandResult {
     XamlRawProperty readback;
 };
 
+PropertyMutationResult detail::xaml_mutation_command_failure(
+    HRESULT hresult, std::string error) {
+    const bool readbackFailure =
+        error.find("effective-value readback") != std::string::npos ||
+        error.find("actual value is unknown") != std::string::npos;
+    return property_mutation_failure(
+        hresult, std::move(error),
+        readbackFailure
+            ? "typed_property_readback_failed"
+            : std::string{},
+        readbackFailure
+            ? PropertyErrorDisposition::transient
+            : PropertyErrorDisposition::unspecified);
+}
+
 bool is_local_property_source(const std::string& source) {
     return source == "Local" || source.rfind("Local: ", 0) == 0;
 }
@@ -682,7 +697,7 @@ public:
                 << hex_encode(valueToSet);
         auto raw = send_property_command(command.str(), commandId);
         if (!raw.ok) {
-            return property_mutation_failure(
+            return detail::xaml_mutation_command_failure(
                 raw.hresult, std::move(raw.error));
         }
         result.ok = true;
@@ -728,7 +743,7 @@ public:
                 << " " << mutation.propertyIndex;
         auto raw = send_property_command(command.str(), commandId);
         if (!raw.ok) {
-            return property_mutation_failure(
+            return detail::xaml_mutation_command_failure(
                 raw.hresult, std::move(raw.error));
         }
         result.ok = true;

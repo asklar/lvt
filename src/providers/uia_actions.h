@@ -115,6 +115,10 @@ PropertyMutationResult perform_uia_property_action(
 PropertyMutationResult uia_range_readback_result(
     HRESULT readbackResult, double currentValue);
 
+namespace uia_property_detail {
+PropertyMutationResult pattern_operation_failure(HRESULT hresult);
+}
+
 // Parse an action name as accepted on the command line.
 bool parse_action_kind(const std::string& name, ActionKind& out);
 const char* action_kind_name(ActionKind kind);
