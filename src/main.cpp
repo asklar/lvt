@@ -1055,6 +1055,33 @@ static bool find_watch_element_location(
         root, ref, "0", nullptr, out);
 }
 
+static bool find_watch_element_location(
+    lvt::Element& element, const lvt::Element* target,
+    const std::string& path, lvt::Element* parent,
+    WatchElementLocation& out) {
+    if (&element == target) {
+        out = {&element, parent, path};
+        return true;
+    }
+    for (size_t i = 0; i < element.children.size(); ++i) {
+        if (find_watch_element_location(
+                element.children[i], target,
+                path + "." + std::to_string(i),
+                &element, out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool find_watch_element_location(
+    lvt::Element& root, const lvt::Element* target,
+    WatchElementLocation& out) {
+    return target &&
+           find_watch_element_location(
+               root, target, "0", nullptr, out);
+}
+
 struct WatchScopeAnchor {
     std::string key;
     std::string baseIdentity;
@@ -1256,9 +1283,11 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     WatchScopeAnchor scopeAnchor;
     std::optional<lvt::Element> previousScope;
     if (scoped) {
+        auto* resolved =
+            lvt::find_element_by_ref(previous, args.elementId);
         WatchElementLocation initialScope;
         if (!find_watch_element_location(
-                previous, args.elementId, initialScope)) {
+                previous, resolved, initialScope)) {
             fprintf(
                 stderr, "lvt: element '%s' not found\n",
                 args.elementId.c_str());

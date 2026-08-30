@@ -221,6 +221,113 @@ static std::string run_command(const std::string& cmd) {
     return result;
 }
 
+struct FirstWatchEvent {
+    json event;
+    std::string output;
+    bool started = false;
+};
+
+static FirstWatchEvent capture_first_watch_event(
+    std::string command, DWORD timeoutMs = 10000) {
+    FirstWatchEvent result;
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    wil::unique_handle readEnd;
+    wil::unique_handle writeEnd;
+    if (!CreatePipe(
+            readEnd.put(), writeEnd.put(), &security, 0) ||
+        !SetHandleInformation(
+            readEnd.get(), HANDLE_FLAG_INHERIT, 0)) {
+        return result;
+    }
+
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = writeEnd.get();
+    startup.hStdError = writeEnd.get();
+    PROCESS_INFORMATION processInfo{};
+    if (!CreateProcessA(
+            nullptr, command.data(), nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW, nullptr, nullptr,
+            &startup, &processInfo)) {
+        return result;
+    }
+    result.started = true;
+    wil::unique_handle process(processInfo.hProcess);
+    wil::unique_handle thread(processInfo.hThread);
+    writeEnd.reset();
+
+    const auto parseEvent = [&] {
+        size_t cursor = 0;
+        while (cursor < result.output.size()) {
+            const auto newline =
+                result.output.find('\n', cursor);
+            if (newline == std::string::npos)
+                break;
+            auto parsed = json::parse(
+                result.output.substr(
+                    cursor, newline - cursor),
+                nullptr, false);
+            if (!parsed.is_discarded() &&
+                parsed.contains("event")) {
+                result.event = std::move(parsed);
+                return true;
+            }
+            cursor = newline + 1;
+        }
+        return false;
+    };
+    const auto deadline = GetTickCount64() + timeoutMs;
+    while (GetTickCount64() < deadline &&
+           !parseEvent()) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(
+                readEnd.get(), nullptr, 0, nullptr,
+                &available, nullptr)) {
+            break;
+        }
+        if (available == 0) {
+            if (WaitForSingleObject(
+                    process.get(), 0) == WAIT_OBJECT_0) {
+                break;
+            }
+            Sleep(20);
+            continue;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!ReadFile(
+                readEnd.get(), chunk.data(), available,
+                &read, nullptr) ||
+            read == 0) {
+            break;
+        }
+        result.output.append(chunk, 0, read);
+    }
+
+    TerminateProcess(process.get(), 0);
+    WaitForSingleObject(process.get(), 5000);
+    for (;;) {
+        DWORD available = 0;
+        if (!PeekNamedPipe(
+                readEnd.get(), nullptr, 0, nullptr,
+                &available, nullptr) ||
+            available == 0) {
+            break;
+        }
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!ReadFile(
+                readEnd.get(), chunk.data(), available,
+                &read, nullptr) ||
+            read == 0) {
+            break;
+        }
+        result.output.append(chunk, 0, read);
+    }
+    parseEvent();
+    return result;
+}
+
 // Build a command string
 static std::string make_cmd(const std::string& lvt, const std::string& args) {
     return "\"" + lvt + "\" " + args;
@@ -3922,6 +4029,82 @@ TEST_F(NativeControlsFixture, DumpKeyScopesWatchAndWatchKeyQueriesOneShot) {
             cmd_escape_arg(watchKey) + " index"));
     EXPECT_EQ(trim_crlf(queried), "1")
         << "a key emitted by watch must resolve in one-shot query";
+}
+
+TEST_F(
+    NativeControlsFixture,
+    VisualScopedWatchInitialResolutionAcceptsPositionalRef) {
+    auto dump = dump_tree();
+    auto* listView = find_element_by_hwnd(
+        dump["root"], control(native_fixture::kListViewId));
+    ASSERT_NE(listView, nullptr);
+    auto* beta = find_element_by_type_property(
+        *listView, "ListViewItem", "index", "1");
+    ASSERT_NE(beta, nullptr);
+    const auto id = beta->value("id", "");
+    const auto key = beta->value("key", "");
+    ASSERT_FALSE(id.empty());
+    ASSERT_FALSE(key.empty());
+
+    auto result = capture_first_watch_event(make_cmd(
+        get_lvt_path(),
+        get_hwnd_arg() + " watch --interval 50 --element \"" +
+            id + "\""));
+    ASSERT_TRUE(result.started);
+    ASSERT_FALSE(result.event.is_null()) << result.output;
+    EXPECT_EQ(result.event.value("event", ""), "added");
+    EXPECT_EQ(result.event.value("key", ""), key);
+    ASSERT_TRUE(result.event.contains("element"));
+    EXPECT_EQ(
+        result.event["element"].value("text", ""),
+        "Beta row");
+    EXPECT_EQ(result.output.find("element '"), std::string::npos)
+        << result.output;
+}
+
+TEST_F(
+    NativeControlsFixture,
+    UiaScopedWatchInitialResolutionAcceptsRuntimeId) {
+    const auto output = run_command(make_cmd(
+        get_lvt_path(), get_hwnd_arg() + " dump --uia"));
+    auto tree = json::parse(output, nullptr, false);
+    ASSERT_FALSE(tree.is_discarded()) << output;
+    ASSERT_TRUE(tree.contains("root"));
+
+    std::vector<const json*> elements;
+    collect_json_elements(tree["root"], elements);
+    const json* target = nullptr;
+    for (const auto* element : elements) {
+        const auto properties =
+            element->value("properties", json::object());
+        if (element->value("text", "") == "Fixture action" &&
+            !properties.value("RuntimeId", "").empty()) {
+            target = element;
+            break;
+        }
+    }
+    ASSERT_NE(target, nullptr) << output;
+    const auto runtimeId =
+        (*target)["properties"].value("RuntimeId", "");
+    const auto key = target->value("key", "");
+    ASSERT_FALSE(runtimeId.empty());
+    ASSERT_FALSE(key.empty());
+
+    auto result = capture_first_watch_event(make_cmd(
+        get_lvt_path(),
+        get_hwnd_arg() +
+            " watch --uia --interval 50 --element \"uia:" +
+            runtimeId + "\""));
+    ASSERT_TRUE(result.started);
+    ASSERT_FALSE(result.event.is_null()) << result.output;
+    EXPECT_EQ(result.event.value("event", ""), "added");
+    EXPECT_EQ(result.event.value("key", ""), key);
+    ASSERT_TRUE(result.event.contains("element"));
+    EXPECT_EQ(
+        result.event["element"].value("text", ""),
+        "Fixture action");
+    EXPECT_EQ(result.output.find("element '"), std::string::npos)
+        << result.output;
 }
 
 TEST_F(
