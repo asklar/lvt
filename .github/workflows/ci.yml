@@ -62,6 +62,12 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      - name: WinUI fixture isolation regression tests
+        run: >
+          ctest --test-dir build
+          -R "^winui3_fixture_(static|legacy_obj_regression)$"
+          --output-on-failure
+
       - name: MCP server unit tests
         run: cargo test --manifest-path mcp/Cargo.toml
 

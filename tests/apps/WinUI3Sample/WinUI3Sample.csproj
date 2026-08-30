@@ -18,6 +18,12 @@
     <RuntimeIdentifiers>win-x64;win-x86;win-arm64</RuntimeIdentifiers>
     <SelfContained>true</SelfContained>
     <UseRidGraph>true</UseRidGraph>
+    <!-- CMake relocates BaseOutputPath and BaseIntermediateOutputPath into its
+         architecture-specific build tree. Preserve the SDK's normal exclusion
+         of this project's legacy bin/obj directories so incremental builds do
+         not glob stale generated XAML sources or resources from the old layout. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);$(MSBuildProjectDirectory)\bin\**;$(MSBuildProjectDirectory)\obj\**</DefaultItemExcludes>
+    <DefaultItemExcludesInProjectFolder>$(DefaultItemExcludesInProjectFolder);$(MSBuildProjectDirectory)\bin\**;$(MSBuildProjectDirectory)\obj\**</DefaultItemExcludesInProjectFolder>
   </PropertyGroup>
 
   <ItemGroup>

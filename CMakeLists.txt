@@ -1268,6 +1268,15 @@ add_test(
         -Root "${WINUI3_SAMPLE_OUTPUT_DIR}"
         -IntermediateRoot "${WINUI3_SAMPLE_INTERMEDIATE_DIR}"
         -Architecture "${LVT_WINUI3_SAMPLE_ARCH}")
+add_test(
+    NAME winui3_fixture_legacy_obj_regression
+    COMMAND "${LVT_POWERSHELL_EXE}" -NoProfile -ExecutionPolicy Bypass
+        -File "${CMAKE_SOURCE_DIR}/scripts/test-winui3-isolated-build.ps1"
+        -SourceRoot "${CMAKE_SOURCE_DIR}"
+        -ScratchRoot "${CMAKE_BINARY_DIR}/tests/winui3-legacy-obj-regression")
+set_tests_properties(
+    winui3_fixture_legacy_obj_regression
+    PROPERTIES TIMEOUT 300)
 
 # --- MCP server tests ------------------------------------------------------
 # A separate binary because it needs a live JSON-RPC conversation over pipes
