@@ -13,6 +13,7 @@
 #include "lvt_config.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -522,6 +523,17 @@ std::string typed_property_value(const json& snapshot, const std::string& name) 
     const auto* value =
         find_property_value(snapshot, descriptor->value("descriptorId", ""));
     return value ? value->value("value", "") : std::string();
+}
+
+void expect_typed_property_session_disconnected(const json& result) {
+    EXPECT_FALSE(result.value("ok", true)) << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorCode", ""),
+        "typed_property_session_disconnected")
+        << result.dump(2);
+    EXPECT_EQ(result.value("errorDisposition", ""), "ownershipLost")
+        << result.dump(2);
+    EXPECT_FALSE(result.value("retryable", true)) << result.dump(2);
 }
 
 bool descriptor_has_choice(const json& descriptor, const std::string& value) {
@@ -2192,6 +2204,32 @@ TEST(McpServer, ToolFailuresComeBackAsToolErrorsNotProtocolErrors) {
     EXPECT_NE(result.value("error", "").find("unknown session"), std::string::npos)
         << result.dump(2);
     EXPECT_FALSE(result.value("ok", true));
+}
+
+TEST(McpServer, TypedPropertyMissingSessionsHaveDisposition) {
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    const std::array<std::pair<const char*, json>, 3> calls{{
+        {"get_editable_properties",
+         json{{"session", "missing-session"}, {"element", "uia:1"}}},
+        {"set_property",
+         json{{"session", "missing-session"},
+              {"element", "uia:1"},
+              {"descriptorId", "missing"},
+              {"value", "value"}}},
+        {"clear_property",
+         json{{"session", "missing-session"},
+              {"element", "uia:1"},
+              {"descriptorId", "missing"}}},
+    }};
+    for (const auto& [tool, arguments] : calls) {
+        bool isError = false;
+        auto result = client.call_tool(tool, arguments, &isError);
+        EXPECT_TRUE(isError) << tool << ": " << result.dump(2);
+        expect_typed_property_session_disconnected(result);
+    }
 }
 
 TEST(McpServer, ConnectingToNothingFailsWithAReadableMessage) {
@@ -4048,9 +4086,7 @@ TEST_F(NativeMcpFixture, DisconnectRacingNativePropertyReadDoesNotRecreateSessio
         json{{"session", session}, {"element", genericKey}},
         &isError);
     EXPECT_TRUE(isError) << oldSession.dump(2);
-    EXPECT_NE(
-        oldSession.value("error", "").find("unknown session"),
-        std::string::npos);
+    expect_typed_property_session_disconnected(oldSession);
 
     const auto replacement = connect(client);
     ASSERT_FALSE(replacement.empty());
@@ -5119,8 +5155,7 @@ TEST_F(McpSampleFixture, DisconnectRacingTypedPropertyDoesNotRecreateSession) {
             "get_editable_properties",
             json{{"session", session}, {"element", key}}, &isError);
         EXPECT_TRUE(isError) << afterDisconnect.dump(2);
-        EXPECT_NE(afterDisconnect.dump().find("unknown session"), std::string::npos)
-            << afterDisconnect.dump(2);
+        expect_typed_property_session_disconnected(afterDisconnect);
     }
 
     auto healthy = client.call_tool("list_apps", json::object());
@@ -5318,7 +5353,7 @@ TEST_F(McpSampleFixture, InlineScreenshotsDoNotLeaveTempFilesBehind) {
 
 TEST_F(McpSampleFixture, SessionsFailCleanlyOnceTheirWindowIsGone) {
     SkipIfNotReady();
-    McpClient client(false);
+    McpClient client(true);
     ASSERT_TRUE(client.started());
     ASSERT_TRUE(client.handshake());
 
@@ -5385,6 +5420,26 @@ TEST_F(McpSampleFixture, SessionsFailCleanlyOnceTheirWindowIsGone) {
     EXPECT_TRUE(isError) << "a session whose window closed must not keep answering";
     EXPECT_NE(result.value("error", "").find("closed"), std::string::npos)
         << "the error should say the window closed: " << result.dump(2);
+
+    const std::array<std::pair<const char*, json>, 3> typedCalls{{
+        {"get_editable_properties",
+         json{{"session", session}, {"element", "uia:1"}}},
+        {"set_property",
+         json{{"session", session},
+              {"element", "uia:1"},
+              {"descriptorId", "missing"},
+              {"value", "value"}}},
+        {"clear_property",
+         json{{"session", session},
+              {"element", "uia:1"},
+              {"descriptorId", "missing"}}},
+    }};
+    for (const auto& [tool, arguments] : typedCalls) {
+        auto typedResult =
+            client.call_tool(tool, arguments, &isError);
+        EXPECT_TRUE(isError) << tool << ": " << typedResult.dump(2);
+        expect_typed_property_session_disconnected(typedResult);
+    }
 
     // And the server must still be usable for everything else.
     auto apps = client.call_tool("list_apps", json::object());

@@ -593,13 +593,15 @@ std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& se
 
 std::shared_ptr<lvt::UiaConnection> uia_connection_for_active_session(
     const Session& session) {
-    std::lock_guard<std::mutex> sessionsLock(g_sessionsMutex);
-    const auto found = g_sessions.find(session.id);
-    if (found == g_sessions.end() ||
-        found->second.hwnd != session.hwnd ||
-        found->second.pid != session.pid ||
-        found->second.visualMode != session.visualMode) {
-        return nullptr;
+    {
+        std::lock_guard<std::mutex> sessionsLock(g_sessionsMutex);
+        const auto found = g_sessions.find(session.id);
+        if (found == g_sessions.end() ||
+            found->second.hwnd != session.hwnd ||
+            found->second.pid != session.pid ||
+            found->second.visualMode != session.visualMode) {
+            return nullptr;
+        }
     }
     return uia_connection_for_session(session);
 }
@@ -1684,6 +1686,37 @@ PropertyTarget require_property_target(
     throw std::runtime_error(error.dump());
 }
 
+[[noreturn]] void throw_typed_property_session_disconnected(
+    const std::string& message) {
+    throw_typed_property_error(
+        "typed_property_session_disconnected",
+        "ownershipLost",
+        false,
+        message);
+}
+
+Session require_typed_property_session(const json& params) {
+    const auto id = get_string(params, "session");
+    Session session;
+    if (!find_session(id, session)) {
+        throw_typed_property_session_disconnected(
+            "unknown or disconnecting typed-property session '" + id + "'");
+    }
+    if (!IsWindow(session.hwnd)) {
+        throw_typed_property_session_disconnected(
+            "the window for typed-property session '" + id + "' has closed");
+    }
+    return session;
+}
+
+void ensure_typed_property_session_active(const Session& session) {
+    if (!session_is_active(session.id) || !IsWindow(session.hwnd)) {
+        throw_typed_property_session_disconnected(
+            "typed-property session '" + session.id +
+            "' disconnected or its target window closed while the request was waiting");
+    }
+}
+
 bool provider_supports_typed_properties(const std::string& provider) {
     if (provider == "win32" || provider == "comctl")
         return true;
@@ -1712,6 +1745,7 @@ bool provider_supports_typed_properties(const std::string& provider) {
 
 std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
     const Session& session, const PropertyTarget& target) {
+    ensure_typed_property_session_active(session);
     if (target.provider == "uia") {
 #ifdef LVT_ENABLE_UIA
         if (session.visualMode) {
@@ -1761,7 +1795,7 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
     {
         std::lock_guard<std::mutex> lock(g_connectionsMutex);
         if (!session_is_active(session.id)) {
-            throw std::runtime_error(
+            throw_typed_property_session_disconnected(
                 "this session was disconnected while the request was waiting");
         }
         const auto entry = g_sessionConnections.find(session.id);
@@ -1793,7 +1827,8 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
     const auto entry = g_sessionConnections.find(session.id);
     if (entry != g_sessionConnections.end()) {
         for (const auto& [label, handle] : entry->second) {
-            if (label == target.provider && handle.get() == connection)
+            if (label == target.provider &&
+                handle.get() == connection.get())
                 return handle.shared();
         }
     }
@@ -1805,15 +1840,16 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
 
 std::shared_ptr<lvt::IFrameworkConnection> active_typed_property_connection(
     const Session& session, const PropertyTarget& target) {
-    std::lock_guard<std::mutex> sessionsLock(g_sessionsMutex);
-    const auto found = g_sessions.find(session.id);
-    if (found == g_sessions.end() ||
-        found->second.hwnd != session.hwnd ||
-        found->second.pid != session.pid ||
-        found->second.visualMode != session.visualMode) {
-        throw_typed_property_error(
-            "typed_property_session_disconnected", "ownershipLost", false,
-            "this session was disconnected while the property request was waiting");
+    {
+        std::lock_guard<std::mutex> sessionsLock(g_sessionsMutex);
+        const auto found = g_sessions.find(session.id);
+        if (found == g_sessions.end() ||
+            found->second.hwnd != session.hwnd ||
+            found->second.pid != session.pid ||
+            found->second.visualMode != session.visualMode) {
+            throw_typed_property_session_disconnected(
+                "this session was disconnected while the property request was waiting");
+        }
     }
     return typed_property_connection(session, target);
 }
@@ -1946,11 +1982,9 @@ json property_mutation_result(
 }
 
 json method_get_editable_properties(const json& params) {
-    const auto session = require_session(params);
+    const auto session = require_typed_property_session(params);
     TargetGuard guard(session.hwnd);
-    if (!session_is_active(session.id))
-        throw std::runtime_error(
-            "this session was disconnected while the property request was waiting");
+    ensure_typed_property_session_active(session);
     const auto target =
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
@@ -1961,6 +1995,11 @@ json method_get_editable_properties(const json& params) {
         connection = typed_property_connection(session, target);
         handle = resolve_property_handle(session, target, connection);
         result = connection->get_property_snapshot(handle);
+    }
+    if (!result.ok &&
+        (!session_is_active(session.id) || !IsWindow(session.hwnd))) {
+        throw_typed_property_session_disconnected(
+            "the typed-property session disconnected while reading properties");
     }
     return property_snapshot_result(
         get_string(params, "element"),
@@ -1978,7 +2017,7 @@ json method_set_property(const json& params, bool allowInput) {
             "set_property accepts only a provider-owned 'descriptorId'; "
             "client-supplied propertyIndex/valueType fields are not allowed");
     }
-    const auto session = require_session(params);
+    const auto session = require_typed_property_session(params);
     const auto descriptorId = get_string(params, "descriptorId");
     if (descriptorId.empty())
         throw std::runtime_error("'descriptorId' must be a non-empty string");
@@ -1988,16 +2027,21 @@ json method_set_property(const json& params, bool allowInput) {
     const auto value = valueIt->get<std::string>();
 
     TargetGuard guard(session.hwnd);
-    if (!session_is_active(session.id))
-        throw std::runtime_error(
-            "this session was disconnected while the property mutation was waiting");
+    ensure_typed_property_session_active(session);
     const auto target =
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
     const auto handle = resolve_property_handle(session, target, connection);
+    const auto result =
+        connection->set_property(handle, descriptorId, value);
+    if (!result.ok &&
+        (!session_is_active(session.id) || !IsWindow(session.hwnd))) {
+        throw_typed_property_session_disconnected(
+            "the typed-property session disconnected while setting a property");
+    }
     return property_mutation_result(
         get_string(params, "element"), descriptorId,
-        connection->set_property(handle, descriptorId, value));
+        result);
 }
 
 json method_clear_property(const json& params, bool allowInput) {
@@ -2010,22 +2054,27 @@ json method_clear_property(const json& params, bool allowInput) {
             "clear_property accepts only a provider-owned 'descriptorId'; "
             "client-supplied propertyIndex/valueType fields are not allowed");
     }
-    const auto session = require_session(params);
+    const auto session = require_typed_property_session(params);
     const auto descriptorId = get_string(params, "descriptorId");
     if (descriptorId.empty())
         throw std::runtime_error("'descriptorId' must be a non-empty string");
 
     TargetGuard guard(session.hwnd);
-    if (!session_is_active(session.id))
-        throw std::runtime_error(
-            "this session was disconnected while the property mutation was waiting");
+    ensure_typed_property_session_active(session);
     const auto target =
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
     const auto handle = resolve_property_handle(session, target, connection);
+    const auto result =
+        connection->clear_property(handle, descriptorId);
+    if (!result.ok &&
+        (!session_is_active(session.id) || !IsWindow(session.hwnd))) {
+        throw_typed_property_session_disconnected(
+            "the typed-property session disconnected while clearing a property");
+    }
     return property_mutation_result(
         get_string(params, "element"), descriptorId,
-        connection->clear_property(handle, descriptorId));
+        result);
 }
 
 std::string tree_snapshot_options_key(const json& params, bool uia) {
