@@ -1621,6 +1621,54 @@ TEST(McpUiaIdentity, AltTabSequenceRechecksForegroundBeforeDelete) {
     fs::remove(visualStats, ec);
 }
 
+TEST(McpUiaIdentity, VisualMinimizedClickAlwaysRunsActivation) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath =
+        plugin_stats_path("visual-minimized-click");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+    ScopedEnvironmentVariable visualForeground(
+        "LVT_TEST_VISUAL_FOREGROUND_SUCCESS", "1");
+    ScopedEnvironmentVariable visualOutput(
+        "LVT_TEST_VISUAL_SEND_INPUT_STATS",
+        statsPath.string());
+    ScopedEnvironmentVariable visualSuppress(
+        "LVT_TEST_VISUAL_SUPPRESS_SEND_INPUT", "1");
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "visual"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    const auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto rootRef =
+        tree["root"].value("ref", "");
+    ASSERT_FALSE(rootRef.empty()) << tree.dump(2);
+
+    ShowWindow(sample.hwnd(), SW_MINIMIZE);
+    ASSERT_TRUE(IsIconic(sample.hwnd()));
+    bool isError = false;
+    const auto clicked = client.call_tool(
+        "click",
+        json{{"session", session},
+             {"element", rootRef}},
+        &isError);
+    EXPECT_FALSE(isError) << clicked.dump(2);
+    EXPECT_FALSE(IsIconic(sample.hwnd()));
+
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "activate"), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "click"), 1u);
+    fs::remove(statsPath, ec);
+}
+
 TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
     ManagedSampleProcess sample;
     ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));

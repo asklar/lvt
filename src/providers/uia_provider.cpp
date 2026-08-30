@@ -1003,8 +1003,16 @@ HRESULT build_tree_with_automation(IUIAutomation* automation,
     wil::com_ptr<IUIAutomationCacheRequest> request;
     RETURN_IF_FAILED(make_cache_request(automation, options, properties, &request));
 
+    wait_after_element_from_handle_test_gate(
+        "LVT_TEST_UIA_BEFORE_BUILD_CACHE_GATE");
     wil::com_ptr<IUIAutomationElement> cachedRoot;
-    RETURN_IF_FAILED(root->BuildUpdatedCache(request.get(), &cachedRoot));
+    const HRESULT cacheHr =
+        root->BuildUpdatedCache(request.get(), &cachedRoot);
+    wil::com_ptr<IUIAutomationElement> currentRoot;
+    const HRESULT identityHr = get_validated_uia_root(
+        automation, identity, retainedProcess, &currentRoot);
+    RETURN_IF_FAILED(identityHr);
+    RETURN_IF_FAILED(cacheHr);
     RETURN_HR_IF_NULL(E_FAIL, cachedRoot.get());
 
     WalkContext ctx;

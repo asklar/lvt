@@ -318,8 +318,16 @@ HRESULT find_by_runtime_id(
         RETURN_IF_FAILED(cache->put_AutomationElementMode(AutomationElementMode_Full));
         RETURN_IF_FAILED(cache->AddProperty(UIA_RuntimeIdPropertyId));
 
+        wait_action_test_gate(
+            "LVT_TEST_UIA_BEFORE_ACTION_CACHE_GATE");
         wil::com_ptr<IUIAutomationElement> cachedRoot;
-        RETURN_IF_FAILED(root->BuildUpdatedCache(cache.get(), &cachedRoot));
+        const HRESULT cacheHr =
+            root->BuildUpdatedCache(cache.get(), &cachedRoot);
+        wil::com_ptr<IUIAutomationElement> currentRoot;
+        const HRESULT identityHr = get_validated_uia_root(
+            automation, identity, retainedProcess, &currentRoot);
+        RETURN_IF_FAILED(identityHr);
+        RETURN_IF_FAILED(cacheHr);
         RETURN_HR_IF_NULL(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), cachedRoot.get());
         found = find_in_cached_tree(cachedRoot.get(), runtimeId);
     }
@@ -398,12 +406,55 @@ struct PatternAttempt {
     bool succeeded() const { return supported && SUCCEEDED(hr); }
 };
 
+struct MutationBoundary {
+    std::function<HRESULT()> validate;
+};
+
+thread_local MutationBoundary* g_mutationBoundary = nullptr;
+
+class MutationBoundaryScope {
+public:
+    explicit MutationBoundaryScope(MutationBoundary& boundary)
+        : m_previous(g_mutationBoundary) {
+        g_mutationBoundary = &boundary;
+    }
+    ~MutationBoundaryScope() {
+        g_mutationBoundary = m_previous;
+    }
+
+private:
+    MutationBoundary* m_previous;
+};
+
+template <typename Fn>
+HRESULT run_mutation_call(Fn&& operation) {
+    if (g_mutationBoundary) {
+        const HRESULT before =
+            g_mutationBoundary->validate();
+        if (FAILED(before))
+            return before;
+        wait_action_test_gate(
+            "LVT_TEST_UIA_BEFORE_PATTERN_OPERATION_GATE");
+    }
+
+    const HRESULT providerResult = operation();
+    if (!g_mutationBoundary)
+        return providerResult;
+
+    const HRESULT after =
+        g_mutationBoundary->validate();
+    return FAILED(after) ? after : providerResult;
+}
+
 PatternAttempt try_invoke(IUIAutomationElement* element, std::string& method) {
     wil::com_ptr<IUIAutomationInvokePattern> invoke;
     if (FAILED(element->GetCurrentPatternAs(UIA_InvokePatternId, IID_PPV_ARGS(&invoke))) ||
         !invoke)
         return {};
-    PatternAttempt attempt{true, invoke->Invoke()};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return invoke->Invoke();
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = "InvokePattern";
@@ -417,7 +468,10 @@ PatternAttempt try_legacy_default_action(IUIAutomationElement* element, std::str
         return {};
     // Nearly everything exposes LegacyIAccessible, but only some have a default
     // action that does anything, so a failure here is routine.
-    PatternAttempt attempt{true, legacy->DoDefaultAction()};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return legacy->DoDefaultAction();
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = "LegacyIAccessible.DoDefaultAction";
@@ -429,7 +483,10 @@ PatternAttempt try_toggle(IUIAutomationElement* element, std::string& method) {
     if (FAILED(element->GetCurrentPatternAs(UIA_TogglePatternId, IID_PPV_ARGS(&toggle))) ||
         !toggle)
         return {};
-    PatternAttempt attempt{true, toggle->Toggle()};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return toggle->Toggle();
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = "TogglePattern";
@@ -481,7 +538,10 @@ PatternAttempt try_set_toggle_state(
             return {true, HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)};
         seen[index] = true;
 
-        const HRESULT toggleHr = toggle->Toggle();
+        const HRESULT toggleHr =
+            run_mutation_call([&] {
+                return toggle->Toggle();
+            });
         LOG_IF_FAILED(toggleHr);
         if (FAILED(toggleHr))
             return {true, toggleHr};
@@ -502,7 +562,10 @@ PatternAttempt try_set_value(IUIAutomationElement* element, const std::string& t
     wil::unique_bstr bstr(SysAllocString(widen(text).c_str()));
     if (!bstr)
         return {true, E_OUTOFMEMORY};
-    PatternAttempt attempt{true, value->SetValue(bstr.get())};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return value->SetValue(bstr.get());
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = "ValuePattern";
@@ -515,7 +578,11 @@ PatternAttempt try_expand_collapse(IUIAutomationElement* element, bool expand,
     if (FAILED(element->GetCurrentPatternAs(UIA_ExpandCollapsePatternId,
                                             IID_PPV_ARGS(&pattern))) || !pattern)
         return {};
-    PatternAttempt attempt{true, expand ? pattern->Expand() : pattern->Collapse()};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return expand ? pattern->Expand()
+                          : pattern->Collapse();
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = "ExpandCollapsePattern";
@@ -527,7 +594,10 @@ PatternAttempt try_select(IUIAutomationElement* element, std::string& method) {
     if (FAILED(element->GetCurrentPatternAs(UIA_SelectionItemPatternId,
                                             IID_PPV_ARGS(&pattern))) || !pattern)
         return {};
-    PatternAttempt attempt{true, pattern->Select()};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return pattern->Select();
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = "SelectionItemPattern";
@@ -550,8 +620,11 @@ PatternAttempt try_scroll_pattern(
             return {true, E_INVALIDARG};
 
         HRESULT hr = S_OK;
-        for (int i = 0; i < (std::max)(1, amount) && SUCCEEDED(hr); ++i)
-            hr = scroll->Scroll(horizontal, vertical);
+        for (int i = 0; i < (std::max)(1, amount) && SUCCEEDED(hr); ++i) {
+            hr = run_mutation_call([&] {
+                return scroll->Scroll(horizontal, vertical);
+            });
+        }
         LOG_IF_FAILED(hr);
         PatternAttempt attempt{true, hr};
         if (attempt.succeeded())
@@ -572,7 +645,10 @@ PatternAttempt try_scroll(IUIAutomationElement* element, const std::string& dire
     wil::com_ptr<IUIAutomationScrollItemPattern> scrollItem;
     if (SUCCEEDED(element->GetCurrentPatternAs(UIA_ScrollItemPatternId,
                                                IID_PPV_ARGS(&scrollItem))) && scrollItem) {
-        PatternAttempt attempt{true, scrollItem->ScrollIntoView()};
+        PatternAttempt attempt{
+            true, run_mutation_call([&] {
+                return scrollItem->ScrollIntoView();
+            })};
         LOG_IF_FAILED(attempt.hr);
         if (attempt.succeeded())
             method = "ScrollItemPattern.ScrollIntoView";
@@ -593,7 +669,9 @@ bool realize_if_virtualized(IUIAutomationElement* element) {
     if (FAILED(element->GetCurrentPatternAs(UIA_VirtualizedItemPatternId,
                                             IID_PPV_ARGS(&virtualized))) || !virtualized)
         return false;
-    const HRESULT hr = virtualized->Realize();
+    const HRESULT hr = run_mutation_call([&] {
+        return virtualized->Realize();
+    });
     LOG_IF_FAILED(hr);
     return SUCCEEDED(hr);
 }
@@ -613,7 +691,10 @@ PatternAttempt try_set_range_value(IUIAutomationElement* element, const std::str
     if (end == text.c_str() || *end != '\0')
         return {};  // not a number, so RangeValue is not what the caller meant
 
-    PatternAttempt attempt{true, range->SetValue(value)};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return range->SetValue(value);
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = "RangeValuePattern";
@@ -635,8 +716,11 @@ PatternAttempt try_change_selection(IUIAutomationElement* element, bool add,
     if (FAILED(element->GetCurrentPatternAs(UIA_SelectionItemPatternId,
                                             IID_PPV_ARGS(&pattern))) || !pattern)
         return {};
-    PatternAttempt attempt{true, add ? pattern->AddToSelection()
-                                     : pattern->RemoveFromSelection()};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return add ? pattern->AddToSelection()
+                       : pattern->RemoveFromSelection();
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = add ? "SelectionItemPattern.AddToSelection"
@@ -655,7 +739,10 @@ PatternAttempt try_select_text(IUIAutomationElement* element, const std::string&
         return {true, E_FAIL};
 
     if (needle.empty()) {
-        PatternAttempt attempt{true, document->Select()};
+        PatternAttempt attempt{
+            true, run_mutation_call([&] {
+                return document->Select();
+            })};
         LOG_IF_FAILED(attempt.hr);
         if (attempt.succeeded())
             method = "TextPattern.SelectAll";
@@ -670,7 +757,10 @@ PatternAttempt try_select_text(IUIAutomationElement* element, const std::string&
     if (FAILED(document->FindText(wanted.get(), FALSE, FALSE, &found)) || !found)
         return {true, HRESULT_FROM_WIN32(ERROR_NOT_FOUND)};
 
-    PatternAttempt attempt{true, found->Select()};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return found->Select();
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = "TextPattern.Select";
@@ -685,7 +775,10 @@ PatternAttempt try_window_action(IUIAutomationElement* element, ActionKind kind,
         return {};
 
     if (kind == ActionKind::windowClose) {
-        PatternAttempt attempt{true, window->Close()};
+        PatternAttempt attempt{
+            true, run_mutation_call([&] {
+                return window->Close();
+            })};
         LOG_IF_FAILED(attempt.hr);
         if (attempt.succeeded())
             method = "WindowPattern.Close";
@@ -704,7 +797,10 @@ PatternAttempt try_window_action(IUIAutomationElement* element, ActionKind kind,
     if (!canDo)
         return {true, HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)};
 
-    PatternAttempt attempt{true, window->SetWindowVisualState(state)};
+    PatternAttempt attempt{
+        true, run_mutation_call([&] {
+            return window->SetWindowVisualState(state);
+        })};
     LOG_IF_FAILED(attempt.hr);
     if (attempt.succeeded())
         method = "WindowPattern.SetWindowVisualState";
@@ -768,7 +864,28 @@ PropertyMutationResult perform_uia_property_action(
         return result;
     }
 
+    const auto validateTarget = [&]() -> HRESULT {
+        wil::com_ptr<IUIAutomationElement> root;
+        return get_validated_uia_root(
+            automation, identity, retainedProcess, &root);
+    };
+    MutationBoundary boundary{validateTarget};
+    MutationBoundaryScope boundaryScope(boundary);
+    const HRESULT beforeRealize = validateTarget();
+    if (FAILED(beforeRealize)) {
+        result.hresult = beforeRealize;
+        result.error =
+            "ownershipLost: the UI Automation target identity changed";
+        return result;
+    }
     (void)realize_if_virtualized(element.get());
+    const HRESULT afterRealize = validateTarget();
+    if (FAILED(afterRealize)) {
+        result.hresult = afterRealize;
+        result.error =
+            "ownershipLost: the UI Automation target identity changed";
+        return result;
+    }
 
     std::string method;
     PatternAttempt attempt;
@@ -808,6 +925,13 @@ PropertyMutationResult perform_uia_property_action(
     }
 
     if (!attempt.succeeded()) {
+        const HRESULT identityHr = validateTarget();
+        if (FAILED(identityHr)) {
+            result.hresult = identityHr;
+            result.error =
+                "ownershipLost: the UI Automation target identity changed";
+            return result;
+        }
         result.hresult = attempt.supported ? attempt.hr : E_NOTIMPL;
         if (!attempt.supported) {
             result.error =
@@ -830,8 +954,22 @@ PropertyMutationResult perform_uia_property_action(
 
     if (action == UiaPropertyAction::setRangeValue) {
         double currentValue = 0;
+        const HRESULT beforeReadback = validateTarget();
+        if (FAILED(beforeReadback)) {
+            result.hresult = beforeReadback;
+            result.error =
+                "ownershipLost: the UI Automation target identity changed";
+            return result;
+        }
         const auto readbackResult =
             read_current_range_value(element.get(), currentValue);
+        const HRESULT afterReadback = validateTarget();
+        if (FAILED(afterReadback)) {
+            result.hresult = afterReadback;
+            result.error =
+                "ownershipLost: the UI Automation target identity changed";
+            return result;
+        }
         return uia_range_readback_result(readbackResult, currentValue);
     }
 
@@ -1110,6 +1248,16 @@ ActionResult perform_action(
             }
             return S_OK;
         };
+        MutationBoundary boundary{validate_target};
+        MutationBoundaryScope boundaryScope(boundary);
+        const auto checked_pattern =
+            [&](auto&& operation) -> PatternAttempt {
+            auto attempt = operation();
+            const HRESULT identityHr = validate_target();
+            if (FAILED(identityHr))
+                return {true, identityHr};
+            return attempt;
+        };
 
         wil::com_ptr<IUIAutomationElement> element;
         if (needsElement) {
@@ -1125,13 +1273,19 @@ ActionResult perform_action(
             }
             // Virtualized items have to be made real before anything can touch
             // them, and this is a no-op on elements that are already real.
+            RETURN_IF_FAILED(validate_target());
             if (realize_if_virtualized(element.get()))
                 realized = true;
+            RETURN_IF_FAILED(validate_target());
         }
 
         switch (request.kind) {
         case ActionKind::invoke: {
-            const auto attempt = try_invoke(element.get(), method);
+            const auto attempt = checked_pattern([&] {
+                return try_invoke(element.get(), method);
+            });
+            if (is_ownership_lost(attempt.hr))
+                return attempt.hr;
             if (attempt.succeeded())
                 return S_OK;
             failure = describe_decline(attempt, "Invoke");
@@ -1143,10 +1297,19 @@ ActionResult perform_action(
             // just as much a reason to move on as one that is missing, which is
             // why both fall through rather than aborting.
             if (!request.forceSyntheticClick) {
-                const auto invoked = try_invoke(element.get(), method);
+                const auto invoked = checked_pattern([&] {
+                    return try_invoke(element.get(), method);
+                });
+                if (is_ownership_lost(invoked.hr))
+                    return invoked.hr;
                 if (invoked.succeeded())
                     return S_OK;
-                const auto legacy = try_legacy_default_action(element.get(), method);
+                const auto legacy = checked_pattern([&] {
+                    return try_legacy_default_action(
+                        element.get(), method);
+                });
+                if (is_ownership_lost(legacy.hr))
+                    return legacy.hr;
                 if (legacy.succeeded())
                     return S_OK;
             }
@@ -1182,7 +1345,11 @@ ActionResult perform_action(
         }
 
         case ActionKind::toggle: {
-            const auto attempt = try_toggle(element.get(), method);
+            const auto attempt = checked_pattern([&] {
+                return try_toggle(element.get(), method);
+            });
+            if (is_ownership_lost(attempt.hr))
+                return attempt.hr;
             if (attempt.succeeded())
                 return S_OK;
             failure = describe_decline(attempt, "Toggle");
@@ -1190,18 +1357,32 @@ ActionResult perform_action(
         }
 
         case ActionKind::setValue: {
-            const auto attempt = try_set_value(element.get(), request.text, method);
+            const auto attempt = checked_pattern([&] {
+                return try_set_value(
+                    element.get(), request.text, method);
+            });
+            if (is_ownership_lost(attempt.hr))
+                return attempt.hr;
             if (attempt.succeeded())
                 return S_OK;
 
             // Sliders and spinners carry their value through RangeValue rather
             // than Value, so a numeric argument gets a second chance there.
-            const auto range = try_set_range_value(element.get(), request.text, method);
+            const auto range = checked_pattern([&] {
+                return try_set_range_value(
+                    element.get(), request.text, method);
+            });
+            if (is_ownership_lost(range.hr))
+                return range.hr;
             if (range.succeeded())
                 return S_OK;
 
             // No writable Value pattern: focus it and retype the contents.
-            if (FAILED(element->SetFocus())) {
+            const HRESULT focusHr = run_mutation_call([&] {
+                return element->SetFocus();
+            });
+            if (FAILED(focusHr)) {
+                RETURN_IF_FAILED(validate_target());
                 failure = describe_decline(attempt, "Value") +
                           ", and the element could not be focused to type into";
                 return E_NOTIMPL;
@@ -1244,7 +1425,12 @@ ActionResult perform_action(
         case ActionKind::expand:
         case ActionKind::collapse: {
             const bool expand = request.kind == ActionKind::expand;
-            const auto attempt = try_expand_collapse(element.get(), expand, method);
+            const auto attempt = checked_pattern([&] {
+                return try_expand_collapse(
+                    element.get(), expand, method);
+            });
+            if (is_ownership_lost(attempt.hr))
+                return attempt.hr;
             if (attempt.succeeded())
                 return S_OK;
             failure = describe_decline(attempt, "ExpandCollapse");
@@ -1252,7 +1438,11 @@ ActionResult perform_action(
         }
 
         case ActionKind::select: {
-            const auto attempt = try_select(element.get(), method);
+            const auto attempt = checked_pattern([&] {
+                return try_select(element.get(), method);
+            });
+            if (is_ownership_lost(attempt.hr))
+                return attempt.hr;
             if (attempt.succeeded())
                 return S_OK;
             failure = describe_decline(attempt, "SelectionItem");
@@ -1262,7 +1452,12 @@ ActionResult perform_action(
         case ActionKind::addToSelection:
         case ActionKind::removeFromSelection: {
             const bool add = request.kind == ActionKind::addToSelection;
-            const auto attempt = try_change_selection(element.get(), add, method);
+            const auto attempt = checked_pattern([&] {
+                return try_change_selection(
+                    element.get(), add, method);
+            });
+            if (is_ownership_lost(attempt.hr))
+                return attempt.hr;
             if (attempt.succeeded())
                 return S_OK;
             failure = describe_decline(attempt, "SelectionItem");
@@ -1270,7 +1465,12 @@ ActionResult perform_action(
         }
 
         case ActionKind::selectText: {
-            const auto attempt = try_select_text(element.get(), request.text, method);
+            const auto attempt = checked_pattern([&] {
+                return try_select_text(
+                    element.get(), request.text, method);
+            });
+            if (is_ownership_lost(attempt.hr))
+                return attempt.hr;
             if (attempt.succeeded())
                 return S_OK;
             if (attempt.supported && attempt.hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
@@ -1285,7 +1485,12 @@ ActionResult perform_action(
         case ActionKind::windowMinimize:
         case ActionKind::windowMaximize:
         case ActionKind::windowRestore: {
-            const auto attempt = try_window_action(element.get(), request.kind, method);
+            const auto attempt = checked_pattern([&] {
+                return try_window_action(
+                    element.get(), request.kind, method);
+            });
+            if (is_ownership_lost(attempt.hr))
+                return attempt.hr;
             if (attempt.succeeded())
                 return S_OK;
             if (attempt.supported && attempt.hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)) {
@@ -1297,8 +1502,11 @@ ActionResult perform_action(
         }
 
         case ActionKind::focus: {
-            const HRESULT hr = element->SetFocus();
+            const HRESULT hr = run_mutation_call([&] {
+                return element->SetFocus();
+            });
             if (FAILED(hr)) {
+                RETURN_IF_FAILED(validate_target());
                 failure = "the element refused focus";
                 RETURN_HR(hr);
             }
@@ -1307,8 +1515,13 @@ ActionResult perform_action(
         }
 
         case ActionKind::scroll: {
-            const auto attempt = try_scroll(element.get(), request.direction,
-                                            request.amount, method);
+            const auto attempt = checked_pattern([&] {
+                return try_scroll(
+                    element.get(), request.direction,
+                    request.amount, method);
+            });
+            if (is_ownership_lost(attempt.hr))
+                return attempt.hr;
             if (attempt.succeeded())
                 return S_OK;
 
@@ -1349,9 +1562,16 @@ ActionResult perform_action(
         case ActionKind::pressKey: {
             // Synthetic keyboard input goes to the focused element of the
             // foreground window, so both prerequisites have to hold.
-            if (element && FAILED(element->SetFocus())) {
-                failure = "could not focus the element to send input to it";
-                return E_NOTIMPL;
+            if (element) {
+                const HRESULT focusHr = run_mutation_call([&] {
+                    return element->SetFocus();
+                });
+                if (FAILED(focusHr)) {
+                    RETURN_IF_FAILED(validate_target());
+                    failure =
+                        "could not focus the element to send input to it";
+                    return E_NOTIMPL;
+                }
             }
             RETURN_IF_FAILED(validate_target());
             if (!activate_target_for_input(hwnd)) {

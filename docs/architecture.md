@@ -215,6 +215,13 @@ window. Multi-batch operations (focus-click then text, select-all then text, or
 multi-chord key sequences) re-activate and revalidate between batches if
 foreground moved; otherwise they refuse the remaining input.
 
+UIA cache and pattern boundaries are fenced too. Every `BuildUpdatedCache`
+result is followed by a fresh original-token/root validation before cached data
+is traversed or returned, including when the provider call failed. Mutation
+patterns, `Realize`, and `SetFocus` validate immediately before the provider
+call and again afterwards; a provider failure is never classified until that
+post-call validation has ruled out target replacement.
+
 Visual MCP sessions capture the same `UiaTargetIdentity` even though their tree
 comes from framework-native providers. Geometry-based input and Win32 window
 commands validate that original identity before acting, after foreground
@@ -226,6 +233,11 @@ The initial visual activation is unconditional: even an already-foreground
 root still passes through `bring_to_foreground`, whose contract also restores a
 minimized window and raises it in Z order. Subsequent batches re-activate only
 when foreground moved.
+
+If Windows temporarily reports no foreground window, `bring_to_foreground`
+creates the caller's message queue, restores and raises only the intended root,
+and retries activation twice before returning the system-observed result. It
+never focuses an unrelated window as an intermediate step.
 
 ### Native typed-property safety (`native_message.*`,
 `native_property_connection.*`)

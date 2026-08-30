@@ -39,6 +39,7 @@
 #include "apps/NativeControlsFixture/native_controls_fixture_ids.h"
 #include "element_key.h"
 #include "framework_detector.h"
+#include "input.h"
 #include "providers/native_message.h"
 #include "providers/native_property_connection.h"
 #include "providers/native_win_event.h"
@@ -531,6 +532,58 @@ private:
     std::string previous_;
     bool hadPrevious_ = false;
 };
+
+TEST(InputForeground, NullForegroundFallbackRestoresMinimizedTargetRepeatedly) {
+    HWND window = CreateWindowExW(
+        WS_EX_TOOLWINDOW, L"STATIC", L"LVT foreground fallback",
+        WS_OVERLAPPEDWINDOW,
+        120, 120, 320, 180,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    ASSERT_TRUE(IsWindow(window));
+    auto cleanup = wil::scope_exit([&] {
+        if (IsWindow(window))
+            DestroyWindow(window);
+    });
+    ShowWindow(window, SW_SHOW);
+    UpdateWindow(window);
+    SetForegroundWindow(window);
+
+    const fs::path statsPath =
+        fs::path(LVT_SOURCE_DIR) /
+        ("foreground-null-" +
+         std::to_string(GetCurrentProcessId()) + ".log");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+    ScopedEnvironmentVariable firstFailure(
+        "LVT_TEST_FOREGROUND_FIRST_SET_FAILURE", "1");
+    ScopedEnvironmentVariable nullForeground(
+        "LVT_TEST_NULL_CURRENT_FOREGROUND", "1");
+    ScopedEnvironmentVariable assumeSuccess(
+        "LVT_TEST_FOREGROUND_ASSUME_SUCCESS", "1");
+    ScopedEnvironmentVariable stats(
+        "LVT_TEST_FOREGROUND_STATS", statsPath.string());
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        ShowWindow(window, SW_MINIMIZE);
+        ASSERT_TRUE(IsIconic(window));
+        EXPECT_TRUE(lvt::bring_to_foreground(window));
+        EXPECT_FALSE(IsIconic(window));
+    }
+    std::ifstream stream(statsPath);
+    const std::string contents{
+        std::istreambuf_iterator<char>(stream),
+        std::istreambuf_iterator<char>()};
+    size_t retries = 0;
+    for (size_t at = 0;
+         (at = contents.find(
+              "null-foreground-retry", at)) !=
+         std::string::npos;
+         at += 21) {
+        ++retries;
+    }
+    EXPECT_EQ(retries, 3u);
+    stream.close();
+    fs::remove(statsPath, ec);
+}
 
 class PluginTargetProcess {
 public:
@@ -3971,12 +4024,13 @@ static LRESULT send_native_fixture_message(
 }
 
 static HWND recycle_event_child_exact(
-    HWND fixtureRoot, HWND original) {
+    HWND fixtureRoot, HWND original,
+    int targetId = 0) {
     DWORD_PTR recycled = 0;
     const LRESULT sent = SendMessageTimeoutW(
         fixtureRoot,
         native_fixture::kRecycleEventChildHwndMessage,
-        131072, 0,
+        131072, targetId,
         SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
         120000, &recycled);
     EXPECT_NE(sent, 0);
@@ -4557,6 +4611,114 @@ TEST(UiaTargetIdentity, ReplacementAfterElementFromHandleIsRejected) {
     EXPECT_TRUE(result.second)
         << "replacement between precheck and ElementFromHandle validation "
            "must fail ownership";
+}
+
+TEST_F(
+    NativeControlsFixture,
+    CacheRefreshRevalidatesAfterBuildUpdatedCacheBoundary) {
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+    const HWND original = reinterpret_cast<HWND>(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kCreateEventChildMessage));
+    ASSERT_TRUE(IsWindow(original));
+    const auto identity = lvt::capture_uia_target_identity(
+        original, s_pid, lvt::process_creation_identity(s_pid));
+    ASSERT_TRUE(identity.has_value());
+
+    const std::string base =
+        "Local\\LvtUiaCacheBoundary_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_UIA_BEFORE_BUILD_CACHE_GATE", base);
+
+    auto pending = std::async(
+        std::launch::async, [identity] {
+            lvt::UiaProvider provider;
+            bool ownershipLost = false;
+            auto tree = provider.build(
+                *identity, lvt::UiaOptions{}, nullptr,
+                &ownershipLost);
+            return std::make_pair(
+                tree.has_value(), ownershipLost);
+        });
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0);
+    ASSERT_EQ(
+        recycle_event_child_exact(s_hwnd, original),
+        original);
+    SetEvent(release.get());
+
+    const auto result = pending.get();
+    EXPECT_FALSE(result.first);
+    EXPECT_TRUE(result.second)
+        << "cache success/failure must be followed by identity validation";
+}
+
+TEST_F(
+    NativeControlsFixture,
+    PatternMutationRevalidatesAfterProviderBoundary) {
+    const HWND original = control(native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(original));
+    const auto identity = lvt::capture_uia_target_identity(
+        original, s_pid, lvt::process_creation_identity(s_pid));
+    ASSERT_TRUE(identity.has_value());
+
+    const std::string base =
+        "Local\\LvtUiaPatternBoundary_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_UIA_BEFORE_PATTERN_OPERATION_GATE", base);
+
+    lvt::ActionRequest request;
+    request.kind = lvt::ActionKind::setValue;
+    request.elementRef =
+        "uia:" + lvt::format_runtime_id(
+            identity->rootRuntimeId);
+    request.text = "must-not-reach-replacement";
+    auto pending = std::async(
+        std::launch::async, [identity, request] {
+            return lvt::perform_action(
+                *identity, lvt::UiaOptions{}, request);
+        });
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0);
+    ASSERT_EQ(
+        recycle_event_child_exact(
+            s_hwnd, original, native_fixture::kEditId),
+        original);
+    SetEvent(release.get());
+
+    const auto result = pending.get();
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.errorCode, "ownershipLost")
+        << result.message;
+    wchar_t text[128]{};
+    GetWindowTextW(
+        original, text, static_cast<int>(_countof(text)));
+    EXPECT_NE(
+        std::wstring(text),
+        L"must-not-reach-replacement");
 }
 #endif
 
