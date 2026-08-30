@@ -633,31 +633,53 @@ fn tree_patch_params(resource: &SessionResource, reset: bool) -> serde_json::Val
     params
 }
 
-async fn get_tree_patch(resource: &SessionResource, reset: bool) -> Result<TreePatch, String> {
+struct TreePatchError {
+    message: String,
+    data: Option<serde_json::Value>,
+}
+
+async fn get_tree_patch(
+    resource: &SessionResource,
+    reset: bool,
+) -> Result<TreePatch, TreePatchError> {
     let result = call_lvt(
         resource.tree.changes_method(),
         tree_patch_params(resource, reset),
         false,
     )
     .await
-    .map_err(|error| error.message.to_string())?;
-    let response: serde_json::Value = serde_json::from_str(&result.json)
-        .map_err(|error| format!("lvt returned malformed tree-change JSON: {error}"))?;
+    .map_err(|error| TreePatchError {
+        message: error.message.to_string(),
+        data: None,
+    })?;
+    let response: serde_json::Value =
+        serde_json::from_str(&result.json).map_err(|error| TreePatchError {
+            message: format!("lvt returned malformed tree-change JSON: {error}"),
+            data: None,
+        })?;
     if !result.ok {
-        return Err(response
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or("tree change polling failed")
-            .to_string());
+        return Err(TreePatchError {
+            message: response
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("tree change polling failed")
+                .to_string(),
+            data: Some(response),
+        });
     }
-    let patch: TreePatch = serde_json::from_value(response)
-        .map_err(|error| format!("lvt returned an invalid tree patch: {error}"))?;
+    let patch: TreePatch = serde_json::from_value(response).map_err(|error| TreePatchError {
+        message: format!("lvt returned an invalid tree patch: {error}"),
+        data: None,
+    })?;
     if patch.tree != resource.tree.name() {
-        return Err(format!(
-            "lvt returned a '{}' patch for a '{}' resource",
-            patch.tree,
-            resource.tree.name()
-        ));
+        return Err(TreePatchError {
+            message: format!(
+                "lvt returned a '{}' patch for a '{}' resource",
+                patch.tree,
+                resource.tree.name()
+            ),
+            data: None,
+        });
     }
     Ok(patch)
 }
@@ -2002,7 +2024,7 @@ impl ServerHandler for LvtServer {
                     }
                     Err(error) => {
                         registry.clear_resource(&resource, epoch).await;
-                        return Err(ErrorData::internal_error(error, None));
+                        return Err(ErrorData::internal_error(error.message, error.data));
                     }
                 }
             };
@@ -2074,7 +2096,7 @@ impl ServerHandler for LvtServer {
                         for (resource, subscriber_id) in registered {
                             registry.unregister(&resource, subscriber_id).await;
                         }
-                        return Err(ErrorData::internal_error(error, None));
+                        return Err(ErrorData::internal_error(error.message, error.data));
                     }
                 };
                 if !registry.store_initial(&resource, epoch, snapshot).await {
@@ -2149,7 +2171,7 @@ impl ServerHandler for LvtServer {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     registry.clear_resource(&resource, epoch).await;
-                    return Err(ErrorData::internal_error(error, None));
+                    return Err(ErrorData::internal_error(error.message, error.data));
                 }
             };
             if !registry.store_initial(&resource, epoch, snapshot).await {

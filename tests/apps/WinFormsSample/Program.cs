@@ -21,7 +21,19 @@ namespace WinFormsSample
                 new SampleFormTypeDescriptionProvider(
                     TypeDescriptor.GetProvider(typeof(SampleForm))),
                 typeof(SampleForm));
-            Application.Run(new SampleForm());
+            var mainForm = new SampleForm(false);
+            SampleForm secondaryForm = null;
+            if (Environment.GetEnvironmentVariable(
+                    "LVT_TEST_SECONDARY_WINFORMS_WINDOW") == "1")
+            {
+                mainForm.Shown += (sender, args) =>
+                {
+                    secondaryForm = new SampleForm(true);
+                    secondaryForm.Show();
+                };
+            }
+            Application.Run(mainForm);
+            secondaryForm?.Dispose();
         }
     }
 
@@ -41,17 +53,23 @@ namespace WinFormsSample
         private int retryCount = 5;
         private SampleMode mode = SampleMode.Basic;
 
-        public SampleForm()
+        public SampleForm(bool secondary)
         {
-            Name = "MainForm";
-            Text = "LVT WinForms Sample";
+            Name = secondary ? "SecondaryForm" : "MainForm";
+            Text = secondary
+                ? "LVT WinForms Secondary"
+                : "LVT WinForms Sample";
             StartPosition = FormStartPosition.Manual;
-            Location = new Point(120, 120);
+            Location = secondary
+                ? new Point(620, 140)
+                : new Point(120, 120);
             Size = new Size(420, 260);
 
             var label = new Label
             {
-                Name = "messageLabel",
+                Name = secondary
+                    ? "secondaryMessageLabel"
+                    : "messageLabel",
                 Text = "Sample label",
                 AutoSize = true,
                 Location = new Point(20, 20)
@@ -59,7 +77,9 @@ namespace WinFormsSample
 
             var textBox = new TextBox
             {
-                Name = "inputTextBox",
+                Name = secondary
+                    ? "secondaryInputTextBox"
+                    : "inputTextBox",
                 Text = "Sample text",
                 Location = new Point(20, 55),
                 Width = 220
@@ -67,7 +87,9 @@ namespace WinFormsSample
 
             var button = new Button
             {
-                Name = "okButton",
+                Name = secondary
+                    ? "secondaryOkButton"
+                    : "okButton",
                 Text = "OK",
                 Location = new Point(20, 95),
                 Size = new Size(90, 30)
@@ -75,7 +97,9 @@ namespace WinFormsSample
 
             var checkBox = new CheckBox
             {
-                Name = "enabledCheckBox",
+                Name = secondary
+                    ? "secondaryEnabledCheckBox"
+                    : "enabledCheckBox",
                 Text = "Enabled",
                 Checked = true,
                 Location = new Point(20, 135),

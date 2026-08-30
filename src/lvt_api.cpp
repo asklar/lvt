@@ -219,6 +219,105 @@ bool uia_identity_is_current(const Session& session) {
 }
 #endif
 
+bool session_target_identity_is_current(const Session& session) {
+#ifdef LVT_ENABLE_UIA
+    return uia_identity_is_current(session);
+#else
+    if (!session.hwnd || !IsWindow(session.hwnd))
+        return false;
+    DWORD currentPid = 0;
+    GetWindowThreadProcessId(session.hwnd, &currentPid);
+    return currentPid == session.pid;
+#endif
+}
+
+[[noreturn]] void throw_session_ownership_lost(
+    const std::string& message) {
+    throw std::runtime_error(json{
+        {"error", message},
+        {"code", "ownershipLost"},
+    }.dump());
+}
+
+void ensure_session_target_identity_current(
+    const Session& session, const char* operation) {
+    if (!session_target_identity_is_current(session)) {
+        throw_session_ownership_lost(
+            "ownershipLost: the session target identity changed " +
+            std::string(operation));
+    }
+}
+
+using AuthorizedPropertyTarget =
+    std::pair<std::string, uint64_t>;
+
+std::mutex g_propertyAuthorizationMutex;
+std::map<
+    std::string, std::set<AuthorizedPropertyTarget>>
+    g_sessionAuthorizedPropertyTargets;
+
+void collect_session_property_targets(
+    const Session& session, const lvt::Element& element,
+    bool belongsToSession,
+    std::set<AuthorizedPropertyTarget>& targets) {
+    bool elementBelongsToSession = belongsToSession;
+    if (element.nativeHandle != 0) {
+        const HWND elementHwnd = reinterpret_cast<HWND>(
+            static_cast<uintptr_t>(element.nativeHandle));
+        elementBelongsToSession =
+            elementHwnd == session.hwnd ||
+            IsChild(session.hwnd, elementHwnd);
+    }
+
+    if (!elementBelongsToSession)
+        return;
+
+    if (!element.framework.empty() &&
+        element.providerHandle != 0) {
+        targets.emplace(
+            element.framework, element.providerHandle);
+    }
+    for (const auto& child : element.children) {
+        collect_session_property_targets(
+            session, child, elementBelongsToSession,
+            targets);
+    }
+}
+
+void replace_session_property_authorization(
+    const Session& session, const lvt::Element& root) {
+    std::set<AuthorizedPropertyTarget> targets;
+    collect_session_property_targets(
+        session, root, true, targets);
+    ensure_session_target_identity_current(
+        session, "before publishing visual property targets");
+
+    std::lock_guard<std::mutex> lock(
+        g_propertyAuthorizationMutex);
+    g_sessionAuthorizedPropertyTargets[session.id] =
+        std::move(targets);
+}
+
+bool session_authorizes_property_target(
+    const Session& session, const std::string& provider,
+    uint64_t handle) {
+    std::lock_guard<std::mutex> lock(
+        g_propertyAuthorizationMutex);
+    const auto sessionTargets =
+        g_sessionAuthorizedPropertyTargets.find(session.id);
+    return sessionTargets !=
+               g_sessionAuthorizedPropertyTargets.end() &&
+           sessionTargets->second.contains(
+               {provider, handle});
+}
+
+void clear_session_property_authorization(
+    const std::string& sessionId) {
+    std::lock_guard<std::mutex> lock(
+        g_propertyAuthorizationMutex);
+    g_sessionAuthorizedPropertyTargets.erase(sessionId);
+}
+
 // --- per-session persistent connections ----------------------------------
 //
 // Session is copied out of g_sessions by find_session/require_session (a
@@ -260,7 +359,14 @@ std::string uia_connection_registry_key(HWND hwnd) {
 // "disconnecting" before waiting for that same guard, and a read already
 // inside it owns the right to finish with its retained connection snapshot.
 lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
-                                                    const std::vector<lvt::FrameworkInfo>& frameworks) {
+                                                    const std::vector<lvt::FrameworkInfo>& frameworks,
+                                                    const std::function<void()>& validateTarget = {}) {
+    const auto validate_target = [&] {
+        if (validateTarget)
+            validateTarget();
+    };
+    validate_target();
+
     bool hasXaml = false, hasWinUI3 = false;
     bool hasWpf = false, hasWinForms = false;
     bool hasComCtl = false;
@@ -329,6 +435,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
     if (needWin32 || needComCtl || needXaml || needWinUI3 ||
         needWpf || needWinForms || !neededPlugins.empty()) {
         if (needWin32) {
+            validate_target();
             const auto registryKey =
                 native_connection_registry_key(
                     "win32", session.hwnd, session.id);
@@ -343,6 +450,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
                 entry.emplace_back("win32", std::move(handle));
         }
         if (needComCtl) {
+            validate_target();
             const auto registryKey =
                 native_connection_registry_key(
                     "comctl", session.hwnd, session.id);
@@ -370,8 +478,10 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         // immediately before opening the persistent connection.
 #if LVT_ENABLE_XAML
         if (needXaml) {
+            validate_target();
             lvt::Element probeTree =
                 lvt::build_tree(session.hwnd, session.pid, {});
+            validate_target();
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "xaml",
                 [&probeTree](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -384,6 +494,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 #endif
 #if LVT_ENABLE_WINUI3
         if (needWinUI3) {
+            validate_target();
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "winui3",
                 [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -396,6 +507,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 #endif
 #if LVT_ENABLE_WPF
         if (needWpf) {
+            validate_target();
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "wpf",
                 [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -408,6 +520,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 #endif
 #if LVT_ENABLE_WINFORMS
         if (needWinForms) {
+            validate_target();
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "winforms",
                 [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -419,6 +532,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         }
 #endif
         for (const auto& plugin : neededPlugins) {
+            validate_target();
             const auto label =
                 lvt::plugin_connection_label(plugin, session.hwnd);
             auto handle = lvt::ConnectionRegistry::instance().acquire(
@@ -596,6 +710,8 @@ void drain_session_connection_events(
 std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& session) {
     if (!session_is_active(session.id))
         return nullptr;
+    if (!session_target_identity_is_current(session))
+        return nullptr;
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
     auto& entry = g_sessionConnections[session.id];
 
@@ -616,6 +732,8 @@ std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& se
     }
 
     const auto identity = uia_identity_for_session(session);
+    if (!session_target_identity_is_current(session))
+        return nullptr;
     auto handle = lvt::ConnectionRegistry::instance().acquire(
         session.pid, session.hwnd,
         uia_connection_registry_key(session.hwnd),
@@ -624,6 +742,8 @@ std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& se
             return lvt::UiaConnection::connect(identity);
         });
     if (!handle)
+        return nullptr;
+    if (!session_target_identity_is_current(session))
         return nullptr;
     auto connection =
         std::dynamic_pointer_cast<lvt::UiaConnection>(handle.shared());
@@ -1161,7 +1281,11 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
 #endif
     }
 
+    ensure_session_target_identity_current(
+        session, "before visual framework detection");
     auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
+    ensure_session_target_identity_current(
+        session, "after visual framework detection");
     const bool nativeOnly = std::all_of(
         frameworks.begin(), frameworks.end(),
         [](const lvt::FrameworkInfo& framework) {
@@ -1182,7 +1306,17 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
 
     const bool fastProperties = get_bool(params, "fast", false);
     for (int attempt = 0; attempt < 3; ++attempt) {
-        auto connectionLookup = connection_lookup_for_session(session, frameworks);
+        if (attempt > 0)
+            Sleep(500);
+        ensure_session_target_identity_current(
+            session, "before a visual snapshot attempt");
+        auto connectionLookup = connection_lookup_for_session(
+            session, frameworks, [&] {
+                ensure_session_target_identity_current(
+                    session, "before visual connection acquisition");
+            });
+        ensure_session_target_identity_current(
+            session, "after visual connection acquisition");
         // Native WinEvents are snapshot hints, so discard only those already
         // queued immediately before the authoritative native walk. Plugins
         // and injected frameworks are polled exactly once, after a successful
@@ -1192,15 +1326,23 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         drain_session_connection_events(
             session.id,
             ConnectionEventDrainScope::nativeBeforeBuild);
+        ensure_session_target_identity_current(
+            session, "before building the visual snapshot");
         tree = lvt::build_tree(
             session.hwnd, session.pid, frameworks, -1,
             session.pluginOption, fastProperties, connectionLookup);
+        ensure_session_target_identity_current(
+            session, "after building the visual snapshot");
         if (!missing_injected_framework_content(tree)) {
             // Publish the complete unscoped snapshot while the same target
             // guard that ordered the walk is still held. Response scoping,
             // depth trimming, correlation, diffing, and MCP delivery all
             // happen later and must never replace authorization with only the
             // subset one response happened to expose.
+            replace_session_property_authorization(
+                session, tree);
+            ensure_session_target_identity_current(
+                session, "before publishing native property targets");
             publish_native_property_targets(session, tree);
             drain_session_connection_events(
                 session.id,
@@ -1214,8 +1356,6 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         // reconnection. Retry so the lookup can prune/reacquire the dead
         // connection, and never advance an MCP snapshot to this transient
         // host-only state.
-        if (attempt < 2)
-            Sleep(500);
     }
 
     error =
@@ -1430,6 +1570,7 @@ json method_disconnect(const json& params) {
         std::lock_guard<std::mutex> lock(g_connectionsMutex);
         g_sessionConnections.erase(id);
     }
+    clear_session_property_authorization(id);
     {
         std::lock_guard<std::mutex> lock(g_treeSnapshotsMutex);
         for (auto it = g_treeSnapshots.begin(); it != g_treeSnapshots.end();) {
@@ -1450,7 +1591,9 @@ Session require_session(const json& params) {
     if (!find_session(id, session))
         throw std::runtime_error("unknown session '" + id + "'; call connect first");
     if (!IsWindow(session.hwnd))
-        throw std::runtime_error("the window for session '" + id + "' has closed");
+        throw_session_ownership_lost(
+            "ownershipLost: the window for session '" +
+            id + "' has closed");
     return session;
 }
 
@@ -1641,9 +1784,14 @@ json method_get_tree(const json& params, bool uia) {
     }
     if (truncated)
         out["truncated"] = truncation_note();
-    if (!uia)
+    if (!uia) {
+        ensure_session_target_identity_current(
+            session, "before returning the visual snapshot");
         wait_for_native_publication_test_gate(
             "get_visual_tree", params);
+        ensure_session_target_identity_current(
+            session, "after completing the visual snapshot response");
+    }
     return out;
 }
 
@@ -1652,6 +1800,29 @@ std::string format_hresult(HRESULT hresult) {
     snprintf(buffer, sizeof(buffer), "0x%08lX",
              static_cast<unsigned long>(hresult));
     return buffer;
+}
+
+[[noreturn]] void throw_typed_property_error(
+    std::string code, std::string disposition, bool retryable,
+    std::string message, std::optional<HRESULT> hresult = std::nullopt) {
+    json error{
+        {"error", std::move(message)},
+        {"errorCode", std::move(code)},
+        {"errorDisposition", std::move(disposition)},
+        {"retryable", retryable},
+    };
+    if (hresult)
+        error["hresult"] = format_hresult(*hresult);
+    throw std::runtime_error(error.dump());
+}
+
+[[noreturn]] void throw_typed_property_session_disconnected(
+    const std::string& message) {
+    throw_typed_property_error(
+        "typed_property_session_disconnected",
+        "ownershipLost",
+        false,
+        message);
 }
 
 struct PropertyTarget {
@@ -1723,8 +1894,25 @@ PropertyTarget require_property_target(
         return target;
     }
 
-    if (!uia && parse_compact_property_target(parsedRef.ref, target))
+    if (!uia && parse_compact_property_target(parsedRef.ref, target)) {
+        const bool requiresAuthorization =
+            target.provider == "xaml" ||
+            target.provider == "winui3" ||
+            target.provider == "wpf" ||
+            target.provider == "winforms";
+        if (requiresAuthorization &&
+            !session_authorizes_property_target(
+                session, target.provider, target.handle)) {
+            throw_typed_property_error(
+                "typed_property_target_not_authorized",
+                "transient", true,
+                "element '" + elementRef +
+                    "' was not published by this session's latest complete "
+                    "visual snapshot; refresh get_visual_tree and use a key "
+                    "from this window");
+        }
         return target;
+    }
 
     json treeParams = params;
     treeParams["fast"] = true;
@@ -1751,29 +1939,6 @@ PropertyTarget require_property_target(
     return target;
 }
 
-[[noreturn]] void throw_typed_property_error(
-    std::string code, std::string disposition, bool retryable,
-    std::string message, std::optional<HRESULT> hresult = std::nullopt) {
-    json error{
-        {"error", std::move(message)},
-        {"errorCode", std::move(code)},
-        {"errorDisposition", std::move(disposition)},
-        {"retryable", retryable},
-    };
-    if (hresult)
-        error["hresult"] = format_hresult(*hresult);
-    throw std::runtime_error(error.dump());
-}
-
-[[noreturn]] void throw_typed_property_session_disconnected(
-    const std::string& message) {
-    throw_typed_property_error(
-        "typed_property_session_disconnected",
-        "ownershipLost",
-        false,
-        message);
-}
-
 Session require_typed_property_session(const json& params) {
     const auto id = get_string(params, "session");
     Session session;
@@ -1781,18 +1946,20 @@ Session require_typed_property_session(const json& params) {
         throw_typed_property_session_disconnected(
             "unknown or disconnecting typed-property session '" + id + "'");
     }
-    if (!IsWindow(session.hwnd)) {
+    if (!session_target_identity_is_current(session)) {
         throw_typed_property_session_disconnected(
-            "the window for typed-property session '" + id + "' has closed");
+            "the target identity for typed-property session '" + id +
+            "' changed");
     }
     return session;
 }
 
 void ensure_typed_property_session_active(const Session& session) {
-    if (!session_is_active(session.id) || !IsWindow(session.hwnd)) {
+    if (!session_is_active(session.id) ||
+        !session_target_identity_is_current(session)) {
         throw_typed_property_session_disconnected(
             "typed-property session '" + session.id +
-            "' disconnected or its target window closed while the request was waiting");
+            "' disconnected or its target identity changed while the request was waiting");
     }
 }
 
@@ -1871,8 +2038,14 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
                 lvt::architecture_name(session.architecture));
     }
 
-    auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
-    connection_lookup_for_session(session, frameworks);
+    ensure_typed_property_session_active(session);
+    auto frameworks = lvt::detect_frameworks(
+        session.hwnd, session.pid);
+    ensure_typed_property_session_active(session);
+    connection_lookup_for_session(
+        session, frameworks, [&] {
+            ensure_typed_property_session_active(session);
+        });
 
     std::shared_ptr<lvt::IFrameworkConnection> connection;
     {
@@ -1963,8 +2136,11 @@ void wait_for_property_reference_test_gate() {
 uint64_t resolve_property_handle(
     const Session& session, const PropertyTarget& target,
     const std::shared_ptr<lvt::IFrameworkConnection>& connection) {
-    if (target.provider != "uia")
+    ensure_typed_property_session_active(session);
+    if (target.provider != "uia") {
+        ensure_typed_property_session_active(session);
         return target.handle;
+    }
 #ifdef LVT_ENABLE_UIA
     auto uia = std::dynamic_pointer_cast<lvt::UiaConnection>(connection);
     if (!uia || !uia->matches_target(session.hwnd)) {
@@ -1976,6 +2152,7 @@ uint64_t resolve_property_handle(
             "the UI Automation property connection does not match this session's target window");
     }
     wait_for_property_reference_test_gate();
+    ensure_typed_property_session_active(session);
     std::string error;
     const auto handle =
         uia->resolve_property_reference(target.reference, error);
@@ -2001,14 +2178,8 @@ bool typed_property_ownership_lost(
             ERROR_INVALID_WINDOW_HANDLE)) {
         return true;
     }
-#ifdef LVT_ENABLE_UIA
-    return provider == "uia" &&
-           !uia_identity_is_current(session);
-#else
-    (void)session;
     (void)provider;
-    return false;
-#endif
+    return !session_target_identity_is_current(session);
 }
 
 json property_snapshot_result(
@@ -2139,15 +2310,20 @@ json method_get_editable_properties(const json& params) {
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
     auto handle = resolve_property_handle(session, target, connection);
+    ensure_typed_property_session_active(session);
     auto result = connection->get_property_snapshot(handle);
     if (!result.ok && !connection->is_alive() &&
         session_is_active(session.id)) {
+        ensure_typed_property_session_active(session);
         connection = typed_property_connection(session, target);
         handle = resolve_property_handle(session, target, connection);
+        ensure_typed_property_session_active(session);
         result = connection->get_property_snapshot(handle);
     }
+    ensure_typed_property_session_active(session);
     if (!result.ok &&
-        (!session_is_active(session.id) || !IsWindow(session.hwnd))) {
+        (!session_is_active(session.id) ||
+         !session_target_identity_is_current(session))) {
         throw_typed_property_session_disconnected(
             "the typed-property session disconnected while reading properties");
     }
@@ -2183,10 +2359,13 @@ json method_set_property(const json& params, bool allowInput) {
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
     const auto handle = resolve_property_handle(session, target, connection);
+    ensure_typed_property_session_active(session);
     const auto result =
         connection->set_property(handle, descriptorId, value);
+    ensure_typed_property_session_active(session);
     if (!result.ok &&
-        (!session_is_active(session.id) || !IsWindow(session.hwnd))) {
+        (!session_is_active(session.id) ||
+         !session_target_identity_is_current(session))) {
         throw_typed_property_session_disconnected(
             "the typed-property session disconnected while setting a property");
     }
@@ -2217,10 +2396,13 @@ json method_clear_property(const json& params, bool allowInput) {
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
     const auto handle = resolve_property_handle(session, target, connection);
+    ensure_typed_property_session_active(session);
     const auto result =
         connection->clear_property(handle, descriptorId);
+    ensure_typed_property_session_active(session);
     if (!result.ok &&
-        (!session_is_active(session.id) || !IsWindow(session.hwnd))) {
+        (!session_is_active(session.id) ||
+         !session_target_identity_is_current(session))) {
         throw_typed_property_session_disconnected(
             "the typed-property session disconnected while clearing a property");
     }
@@ -2252,6 +2434,10 @@ json method_get_tree_changes(const json& params, bool uia) {
     if (truncated) {
         throw std::runtime_error(
             "cannot diff a truncated UI Automation tree; increase timeoutMs and try again");
+    }
+    if (!uia) {
+        ensure_session_target_identity_current(
+            session, "before publishing visual tree changes");
     }
 
     const TreeSnapshotKey key{
@@ -2304,6 +2490,10 @@ json method_get_tree_changes(const json& params, bool uia) {
     if (!uia)
         wait_for_native_publication_test_gate(
             "get_visual_tree_changes", params);
+    if (!uia) {
+        ensure_session_target_identity_current(
+            session, "after completing the visual tree-change response");
+    }
     return out;
 }
 
@@ -2739,17 +2929,10 @@ void record_visual_input_test_attempt(const char* operation) {
 
 void validate_visual_action_identity(
     const Session& session) {
-#ifdef LVT_ENABLE_UIA
-    if (FAILED(lvt::validate_uia_target_identity(
-            uia_identity_for_session(session)))) {
+    if (!session_target_identity_is_current(session)) {
         throw_action_ownership_lost(
             "ownershipLost: the visual session target identity changed");
     }
-#else
-    if (!IsWindow(session.hwnd))
-        throw_action_ownership_lost(
-            "ownershipLost: the visual session target window closed");
-#endif
 }
 
 void activate_visual_action_target(

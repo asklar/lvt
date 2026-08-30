@@ -30,6 +30,20 @@ namespace lvt {
 
 using json = nlohmann::json;
 
+static bool fail_tree_for_testing() {
+    char eventName[256]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_MANAGED_FAIL_TREE_EVENT",
+        eventName, static_cast<DWORD>(_countof(eventName)));
+    if (length == 0 || length >= _countof(eventName))
+        return false;
+    wil::unique_handle event(OpenEventA(
+        SYNCHRONIZE, FALSE, eventName));
+    return event &&
+           WaitForSingleObject(event.get(), 0) ==
+               WAIT_OBJECT_0;
+}
+
 namespace detail {
 
 bool managed_pipe_client_matches_pid(HANDLE pipe, DWORD expectedPid) {
@@ -685,6 +699,8 @@ public:
                   const std::string& = {}) override {
         std::lock_guard<std::mutex> lock(m_commandMutex);
         if (!connection_alive())
+            return false;
+        if (fail_tree_for_testing())
             return false;
 
         auto response = send_command_locked(

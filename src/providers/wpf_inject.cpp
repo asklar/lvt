@@ -25,7 +25,9 @@ std::string sanitize(const std::string& value) {
     return result;
 }
 
-uint64_t json_handle(const json& node, const char* name) {
+uint64_t json_handle(
+    const json& node, const char* name,
+    int defaultBase = 10) {
     auto value = node.find(name);
     if (value == node.end())
         return 0;
@@ -39,7 +41,7 @@ uint64_t json_handle(const json& node, const char* name) {
         return 0;
 
     std::string text = value->get<std::string>();
-    int base = 10;
+    int base = defaultBase;
     size_t start = 0;
     if (text.rfind("0x", 0) == 0 || text.rfind("0X", 0) == 0) {
         base = 16;
@@ -71,7 +73,8 @@ void graft_json_node(const json& node, Element& parent, const std::string& frame
         element.properties["managedHandle"] = hex_handle(element.providerHandle);
         element.properties["handleKind"] = "managed";
     }
-    const uint64_t hwnd = json_handle(node, "hwnd");
+    const uint64_t hwnd =
+        json_handle(node, "hwnd", 16);
     if (hwnd != 0) {
         element.nativeHandle = static_cast<uintptr_t>(hwnd);
         element.properties["hwnd"] = hex_handle(hwnd);

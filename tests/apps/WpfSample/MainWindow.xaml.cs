@@ -15,8 +15,24 @@ public partial class MainWindow : Window
     public string OrdinaryClrProperty { get; set; } = "not a dependency property";
 
     public MainWindow()
+        : this(false)
+    {
+    }
+
+    internal MainWindow(bool secondary)
     {
         InitializeComponent();
+        if (secondary)
+        {
+            Name = "SecondaryWindowRoot";
+            Title = "LVT WPF Secondary";
+            WindowStartupLocation = WindowStartupLocation.Manual;
+            Left = 620;
+            Top = 140;
+            NameBox.Name = "SecondaryNameBox";
+            NameBox.Text = "Secondary Ada";
+            OkButton.Name = "SecondaryOkButton";
+        }
         var prefix = $@"Local\LvtWpfSampleUiBlock_{Process.GetCurrentProcess().Id}";
         blockTrigger = new EventWaitHandle(
             false, EventResetMode.AutoReset, prefix + "_trigger");

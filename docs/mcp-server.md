@@ -196,6 +196,16 @@ failure can use a one-shot fallback only with the captured identity;
 PID/HWND/root replacement instead returns the structured code
 `ownershipLost`.
 
+Visual tree walks validate that identity before connection acquisition, before
+and after every snapshot attempt, and again before publishing a response or
+diff baseline. A complete successful root snapshot also atomically replaces
+the session's authorized `(provider, providerHandle)` set. Compact
+XAML/WinUI/WPF/WinForms property keys must be present in that set, so a
+process-wide diagnostics connection cannot use another application window's
+registry entry. Scoped responses, failed/incomplete refreshes, and unrelated
+sessions never narrow or expand the set; disconnect clears it, and a new
+session must publish its own complete snapshot before compact keys are usable.
+
 Visual-mode actions validate that same original identity rather than trusting
 only the current numeric HWND. Both visual and UIA synthetic input paths require
 the target root to remain foreground and repeat identity/foreground checks
