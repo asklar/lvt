@@ -47,6 +47,12 @@ static PropertyRowViewModel TypedRowFromDescriptor(
     return row;
 }
 
+static System.Text.Json.JsonElement Json(string text)
+{
+    using var document = System.Text.Json.JsonDocument.Parse(text);
+    return document.RootElement.Clone();
+}
+
 static async Task<bool> ApplyDelayedTypedSnapshotAsync(
     Task release,
     ElementNodeViewModel node,
@@ -374,6 +380,98 @@ Assert(preservedToggle.CanApply, "provider enum choice was rejected");
 var booleanRow = TypedRow("Flag", "Flag", "true", "boolean");
 booleanRow.EditText = "TRUE";
 Assert(booleanRow.CanApply, "boolean validation stopped being case-insensitive");
+
+var canceledAttempt = await TypedPropertyRefreshPolicy.RunAttemptAsync(
+    () => Task.FromException<TypedPropertyRefreshAttemptResult>(
+        new OperationCanceledException("canceled")),
+    ownershipChanged: () => false);
+Assert(canceledAttempt.Status == TypedPropertyRefreshAttemptStatus.Retry,
+    "current refresh cancellation escaped instead of becoming a retry");
+
+var obsoleteCancellation = await TypedPropertyRefreshPolicy.RunAttemptAsync(
+    () => Task.FromException<TypedPropertyRefreshAttemptResult>(
+        new OperationCanceledException("obsolete")),
+    ownershipChanged: () => true);
+Assert(obsoleteCancellation.Status ==
+       TypedPropertyRefreshAttemptStatus.OwnershipLost,
+    "obsolete refresh cancellation was not classified as superseded");
+
+var loggedTransportFailures = 0;
+var transportAttempt = await TypedPropertyRefreshPolicy.RunAttemptAsync(
+    () => Task.FromException<TypedPropertyRefreshAttemptResult>(
+        new IOException("transport closed")),
+    ownershipChanged: () => false,
+    logFailure: _ => ++loggedTransportFailures);
+Assert(transportAttempt.Status == TypedPropertyRefreshAttemptStatus.Retry &&
+       loggedTransportFailures == 1,
+    "transport failure escaped the refresh attempt guard");
+
+var malformedAttempt = await TypedPropertyRefreshPolicy.RunAttemptAsync(
+    async () =>
+    {
+        await Task.Yield();
+        using var malformed = System.Text.Json.JsonDocument.Parse("[]");
+        malformed.RootElement.TryGetProperty("schemaId", out _);
+        return TypedPropertyRefreshAttemptResult.Applied();
+    },
+    ownershipChanged: () => false);
+Assert(malformedAttempt.Status == TypedPropertyRefreshAttemptStatus.Retry,
+    "malformed payload exception escaped the refresh attempt guard");
+
+var retryBudget = new TypedPropertyRefreshRetryBudget();
+for (int attempt = 1;
+     attempt <= TypedPropertyRefreshPolicy.MaximumAutomaticAttempts;
+     ++attempt)
+{
+    Assert(retryBudget.BeginAttempt() == attempt,
+        "refresh retry attempt count drifted");
+    Assert(retryBudget.RetryDelayMs <=
+           TypedPropertyRefreshPolicy.MaximumDelayMs,
+        "refresh retry backoff exceeded its cap");
+    Assert(retryBudget.CanRetry ==
+           (attempt <
+            TypedPropertyRefreshPolicy.MaximumAutomaticAttempts),
+        "refresh retry budget did not stop at its finite limit");
+}
+retryBudget.Reset();
+Assert(retryBudget.BeginAttempt() == 1,
+    "explicit refresh did not reset the automatic retry budget");
+
+Assert(TypedPropertyRefreshAttemptResult.Failure(
+           "typed properties are unsupported").Status ==
+       TypedPropertyRefreshAttemptStatus.Terminal,
+    "unsupported provider failure was treated as transient");
+Assert(TypedPropertyRefreshAttemptResult.Failure(
+           "provider 'win32' does not expose a live typed-property connection "
+           + "for this session").Status ==
+       TypedPropertyRefreshAttemptStatus.Terminal,
+    "no-live-provider failure was treated as transient");
+Assert(TypedPropertyRefreshAttemptResult.Failure(
+           "this property is read-only").Status ==
+       TypedPropertyRefreshAttemptStatus.Terminal,
+    "read-only provider failure was treated as transient");
+Assert(TypedPropertyRefreshAttemptResult.Failure(
+           "unknown session").Status ==
+       TypedPropertyRefreshAttemptStatus.OwnershipLost,
+    "disconnected session failure did not cancel ownership");
+
+var validSnapshotPayload = Json(
+    """{"schemaId":"schema","descriptors":[],"values":[]}""");
+Assert(TypedPropertyRefreshPolicy.TryValidateSnapshotPayload(
+        validSnapshotPayload, out _),
+    "valid typed property snapshot failed raw validation");
+foreach (var malformedPayload in new[]
+         {
+             Json("""{"schemaId":"schema","values":[]}"""),
+             Json("""{"schemaId":"schema","descriptors":[],"values":{}}"""),
+             Json("""{"schemaId":"","descriptors":[],"values":[]}"""),
+             Json("[]"),
+         })
+{
+    Assert(!TypedPropertyRefreshPolicy.TryValidateSnapshotPayload(
+            malformedPayload, out _),
+        "malformed typed property snapshot passed raw validation");
+}
 
 var refreshState = new TypedPropertyRefreshState();
 var requested = refreshState.Request();
@@ -816,6 +914,87 @@ failedRefreshNode.SetProperty("Value.Value", "after retry");
 Assert(failedRefreshRow.EditText == "after retry" &&
        !failedRefreshRow.IsDirty,
     "successful retry did not settle its completed mutation context");
+
+var terminalNode = new ElementNodeViewModel();
+var terminalRow = TypedRow(
+    "Value.Value", "Value", "effective", "string");
+terminalNode.ReplaceTypedPropertyRows([terminalRow]);
+var terminalRevision = terminalRow.EditRevision;
+var terminalMutation = terminalNode.BeginPropertyMutation(
+    "Value.Value", terminalRevision);
+terminalRow.EditText = "temporary";
+terminalRow.EditText = "effective";
+Assert(terminalNode.TryCompletePropertyMutation(terminalMutation),
+    "terminal-refresh mutation was unexpectedly superseded");
+Assert(!terminalRow.TryDiscardSubmittedEdit(terminalRevision),
+    "terminal-refresh setup discarded its newer action");
+var terminalState = new TypedPropertyRefreshState();
+terminalState.Request();
+Assert(terminalState.TryBegin(out var terminalAttempt),
+    "terminal refresh did not start");
+var terminalResult = TypedPropertyRefreshAttemptResult.Failure(
+    "no live property provider is available");
+Assert(terminalResult.Status ==
+       TypedPropertyRefreshAttemptStatus.Terminal,
+    "no-provider response did not stop automatic retries");
+Assert(terminalState.Complete(terminalAttempt, applied: false),
+    "terminal refresh did not release the coordinator");
+terminalState.Reset();
+Assert(!terminalState.HasPending,
+    "terminal refresh left automatic retries running");
+terminalState.Request();
+Assert(terminalState.TryBegin(out var explicitRetry),
+    "later explicit refresh did not restart after a terminal result");
+var explicitRetryApplied = await ApplyDelayedTypedSnapshotAsync(
+    Task.CompletedTask,
+    terminalNode,
+    terminalNode.PropertyVersion,
+    terminalState,
+    explicitRetry,
+    [TypedRow("Value.Value", "Value", "default", "string")]);
+terminalState.Complete(explicitRetry, explicitRetryApplied);
+terminalNode.SettleCompletedPropertyMutations();
+terminalRow = terminalNode.FindProperty("Value.Value")!;
+Assert(terminalRow.Value == "default" &&
+       terminalRow.EditText == "effective" &&
+       terminalRow.IsDirty,
+    "explicit retry did not preserve the context left by terminal failure");
+
+var malformedContextNode = new ElementNodeViewModel();
+var malformedContextRow = TypedRow(
+    "Selection.Command", "Selection", "", "command",
+    ("add", "Add"), ("remove", "Remove"));
+malformedContextNode.ReplaceTypedPropertyRows([malformedContextRow]);
+var malformedContextRevision = malformedContextRow.EditRevision;
+var malformedContextMutation =
+    malformedContextNode.BeginPropertyMutation(
+        "Selection.Command", malformedContextRevision);
+malformedContextRow.EditText = "remove";
+Assert(malformedContextNode.TryCompletePropertyMutation(
+        malformedContextMutation),
+    "malformed-snapshot mutation was unexpectedly superseded");
+malformedContextRow.ApplyMutationValue(
+    "", malformedContextRevision);
+var missingArrays = Json("""{"schemaId":"schema","descriptors":[]}""");
+Assert(!TypedPropertyRefreshPolicy.TryValidateSnapshotPayload(
+        missingArrays, out _),
+    "missing values array passed raw validation");
+Assert(malformedContextNode.FindProperty("Selection.Command") ==
+       malformedContextRow &&
+       malformedContextRow.EditText == "remove",
+    "malformed snapshot changed rows before validation");
+malformedContextNode.ReplaceTypedPropertyRows(
+    [
+        TypedRow(
+            "Selection.Command", "Selection", "", "command",
+            ("add", "Add"), ("remove", "Remove")),
+    ],
+    preservePendingEdits: true);
+malformedContextNode.SettleCompletedPropertyMutations();
+malformedContextRow =
+    malformedContextNode.FindProperty("Selection.Command")!;
+Assert(malformedContextRow.EditText == "remove",
+    "successful retry lost the context preserved across malformed payload");
 
 var abaState = new TypedPropertyRefreshState();
 abaState.Request();

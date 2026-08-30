@@ -16,6 +16,9 @@ public sealed class TypedPropertyRefreshState
         token.Epoch == _epoch &&
         token.Generation == _requestedGeneration &&
         _active == token;
+    public bool IsLatest(Token token) =>
+        token.Epoch == _epoch &&
+        token.Generation == _requestedGeneration;
 
     public Token Request() =>
         new(_epoch, ++_requestedGeneration);

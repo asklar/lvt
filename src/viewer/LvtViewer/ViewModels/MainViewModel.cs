@@ -36,7 +36,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly DispatcherTimer _targetLivenessTimer;
     private readonly DispatcherTimer _typedPropertyRefreshTimer;
     private readonly TypedPropertyRefreshState _typedPropertyRefreshState = new();
-    private int _typedPropertyRefreshDelayMs = 100;
+    private readonly TypedPropertyRefreshRetryBudget
+        _typedPropertyRefreshRetryBudget = new();
+    private int _typedPropertyRefreshDelayMs =
+        TypedPropertyRefreshPolicy.InitialDelayMs;
     private bool _typedRefreshNeedsFullUiaLoad;
     private bool _typedRefreshPreservePendingEdits;
     private bool _awaitingSnapshot;
@@ -77,48 +80,123 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var preservePendingEdits = _typedRefreshPreservePendingEdits;
             _typedRefreshNeedsFullUiaLoad = false;
             _typedRefreshPreservePendingEdits = false;
-            bool applied = false;
+            var attemptNumber =
+                _typedPropertyRefreshRetryBudget.BeginAttempt();
+            var refreshResult = TypedPropertyRefreshAttemptResult.Retry(
+                "No property snapshot was applied.");
             try
             {
-                if (node != null)
-                {
-                    applied = UseUia && fullUiaLoad
-                        ? await RefreshUiaPropertiesAsync(
-                            node, preservePendingEdits, refreshToken)
-                        : await RefreshTypedPropertiesAsync(
-                            node, preservePendingEdits, refreshToken);
-                    applied = applied &&
-                              generation == _connectionGeneration &&
-                              SelectedElement == node;
-                    if (applied)
-                        node.SettleCompletedPropertyMutations();
-                }
+                refreshResult =
+                    await TypedPropertyRefreshPolicy.RunAttemptAsync(
+                        async () =>
+                        {
+                            if (node == null)
+                            {
+                                return TypedPropertyRefreshAttemptResult
+                                    .OwnershipLost(
+                                        "No property target is selected.");
+                            }
+                            var result = UseUia && fullUiaLoad
+                                ? await RefreshUiaPropertiesAsync(
+                                    node, preservePendingEdits, refreshToken)
+                                : await RefreshTypedPropertiesAsync(
+                                    node, preservePendingEdits, refreshToken);
+                            if (result.Status ==
+                                    TypedPropertyRefreshAttemptStatus.Applied &&
+                                (generation != _connectionGeneration ||
+                                 SelectedElement != node))
+                            {
+                                return TypedPropertyRefreshAttemptResult
+                                    .OwnershipLost(
+                                        "The property target changed during refresh.");
+                            }
+                            return result;
+                        },
+                        () => generation != _connectionGeneration ||
+                              SelectedElement != node,
+                        ex => Logger.LogException(
+                            "properties", "Property refresh failed", ex));
             }
             finally
             {
+                bool wasLatest =
+                    _typedPropertyRefreshState.IsLatest(refreshToken);
+                bool applied =
+                    refreshResult.Status ==
+                    TypedPropertyRefreshAttemptStatus.Applied;
                 var completionAccepted =
                     _typedPropertyRefreshState.Complete(
                         refreshToken, applied);
-                if (completionAccepted && !applied)
-                {
-                    _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
-                    _typedRefreshPreservePendingEdits |= preservePendingEdits;
-                }
                 if (completionAccepted)
-                    _typedPropertyRefreshDelayMs = applied
-                        ? 100
-                        : Math.Min(_typedPropertyRefreshDelayMs * 2, 1000);
-                if (completionAccepted &&
-                    _typedPropertyRefreshState.HasPending &&
-                    SelectedElement != null)
                 {
-                    _typedPropertyRefreshTimer.Interval =
-                        TimeSpan.FromMilliseconds(_typedPropertyRefreshDelayMs);
-                    _typedPropertyRefreshTimer.Start();
-                }
-                else if (completionAccepted && applied)
-                {
-                    IsPropertyPanelLoading = false;
+                    if (!wasLatest)
+                    {
+                        _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+                        _typedRefreshPreservePendingEdits |=
+                            preservePendingEdits;
+                    }
+                    else if (applied)
+                    {
+                        node?.SettleCompletedPropertyMutations();
+                        _typedPropertyRefreshRetryBudget.Reset();
+                        _typedPropertyRefreshDelayMs =
+                            TypedPropertyRefreshPolicy.InitialDelayMs;
+                        IsPropertyPanelLoading = false;
+                    }
+                    else if (refreshResult.Status is
+                             TypedPropertyRefreshAttemptStatus.Terminal or
+                             TypedPropertyRefreshAttemptStatus.OwnershipLost)
+                    {
+                        if (refreshResult.Status ==
+                            TypedPropertyRefreshAttemptStatus.OwnershipLost)
+                        {
+                            node?.ClearPropertyMutations();
+                        }
+                        else
+                        {
+                            _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+                            _typedRefreshPreservePendingEdits |=
+                                preservePendingEdits;
+                        }
+                        _typedPropertyRefreshState.Reset();
+                        IsPropertyPanelLoading = false;
+                        if (SelectedElement == node)
+                        {
+                            StatusText =
+                                $"Could not refresh properties: {refreshResult.Error}";
+                        }
+                    }
+                    else if (!_typedPropertyRefreshRetryBudget.CanRetry)
+                    {
+                        _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+                        _typedRefreshPreservePendingEdits |=
+                            preservePendingEdits;
+                        _typedPropertyRefreshState.Reset();
+                        IsPropertyPanelLoading = false;
+                        if (SelectedElement == node)
+                        {
+                            StatusText =
+                                "Could not refresh properties after "
+                                + $"{attemptNumber} attempts: {refreshResult.Error}";
+                        }
+                    }
+                    else
+                    {
+                        _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+                        _typedRefreshPreservePendingEdits |=
+                            preservePendingEdits;
+                        _typedPropertyRefreshDelayMs =
+                            _typedPropertyRefreshRetryBudget.RetryDelayMs;
+                    }
+
+                    if (_typedPropertyRefreshState.HasPending &&
+                        SelectedElement != null)
+                    {
+                        _typedPropertyRefreshTimer.Interval =
+                            TimeSpan.FromMilliseconds(
+                                _typedPropertyRefreshDelayMs);
+                        _typedPropertyRefreshTimer.Start();
+                    }
                 }
             }
         };
@@ -293,6 +371,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _typedPropertyRefreshState.Reset();
             _typedRefreshNeedsFullUiaLoad = false;
             _typedRefreshPreservePendingEdits = false;
+            _typedPropertyRefreshRetryBudget.Reset();
+            _typedPropertyRefreshDelayMs =
+                TypedPropertyRefreshPolicy.InitialDelayMs;
             IsPropertyPanelLoading = value != null;
             if (value != null)
             {
@@ -655,7 +736,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         title = Interop.NativeMethods.GetWindowTitle(hwnd);
     }
 
-    private async System.Threading.Tasks.Task<bool> RefreshUiaPropertiesAsync(
+    private async System.Threading.Tasks.Task<TypedPropertyRefreshAttemptResult>
+        RefreshUiaPropertiesAsync(
         ElementNodeViewModel? node,
         bool preservePendingEdits = false,
         TypedPropertyRefreshState.Token? refreshToken = null)
@@ -663,26 +745,34 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (node == null)
         {
             IsPropertyPanelLoading = false;
-            return false;
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "No property target is selected.");
         }
 
         long propertyVersion = node.PropertyVersion;
         var stopwatch = Stopwatch.StartNew();
         var result = await _mcp.GetElementPropertiesAsync(node.Key);
-        if (SelectedElement != node ||
-            node.PropertyVersion != propertyVersion ||
+        if (SelectedElement != node)
+        {
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "The property target changed during refresh.");
+        }
+        if (node.PropertyVersion != propertyVersion ||
             (refreshToken.HasValue &&
              !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
         {
-            return false;
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "The property snapshot was superseded.");
         }
         if (!result.Ok)
         {
             StatusText = $"Could not read UI Automation properties: {result.Error}";
-            return false;
+            return TypedPropertyRefreshAttemptResult.Failure(result.Error);
         }
 
-        if (!result.Payload.TryGetProperty("element", out var element) ||
+        if (result.Payload.ValueKind !=
+                System.Text.Json.JsonValueKind.Object ||
+            !result.Payload.TryGetProperty("element", out var element) ||
             element.ValueKind != System.Text.Json.JsonValueKind.Object ||
             !element.TryGetProperty("properties", out var properties) ||
             properties.ValueKind != System.Text.Json.JsonValueKind.Object)
@@ -690,7 +780,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Logger.Log(
                 "properties",
                 $"UI Automation property response for {node.Key} had no property snapshot");
-            return false;
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "UI Automation property response had no property snapshot.");
         }
 
         try
@@ -707,12 +798,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                             : property.Value.ToString()))
                     .ToList();
             });
-            if (SelectedElement != node ||
-                node.PropertyVersion != propertyVersion ||
+            if (SelectedElement != node)
+            {
+                return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                    "The property target changed during refresh.");
+            }
+            if (node.PropertyVersion != propertyVersion ||
                 (refreshToken.HasValue &&
                  !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
             {
-                return false;
+                return TypedPropertyRefreshAttemptResult.Retry(
+                    "The property snapshot was superseded.");
             }
             node.ReplacePropertyRows(
                 rows, preserveTypedRows: preservePendingEdits);
@@ -724,7 +820,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             Logger.LogException(
                 "properties", "Could not parse UI Automation properties", ex);
-            return false;
+            return TypedPropertyRefreshAttemptResult.Retry(ex.Message);
         }
         Logger.Log("properties", $"Loaded UIA properties in {stopwatch.ElapsedMilliseconds} ms");
         return await RefreshTypedPropertiesAsync(
@@ -740,17 +836,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
         _typedRefreshPreservePendingEdits |= preservePendingEdits;
+        _typedPropertyRefreshRetryBudget.Reset();
+        _typedPropertyRefreshDelayMs =
+            TypedPropertyRefreshPolicy.InitialDelayMs;
         _typedPropertyRefreshState.Request();
         if (_typedPropertyRefreshState.IsRunning)
             return;
-        _typedPropertyRefreshDelayMs = 100;
         _typedPropertyRefreshTimer.Interval =
             TimeSpan.FromMilliseconds(_typedPropertyRefreshDelayMs);
         _typedPropertyRefreshTimer.Stop();
         _typedPropertyRefreshTimer.Start();
     }
 
-    private async System.Threading.Tasks.Task<bool> RefreshTypedPropertiesAsync(
+    private async System.Threading.Tasks.Task<TypedPropertyRefreshAttemptResult>
+        RefreshTypedPropertiesAsync(
         ElementNodeViewModel? node, bool preservePendingEdits = false,
         TypedPropertyRefreshState.Token? refreshToken = null,
         bool clearLoadingOnCompletion = true)
@@ -758,23 +857,38 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (node == null)
         {
             IsPropertyPanelLoading = false;
-            return false;
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "No property target is selected.");
         }
 
         long propertyVersion = node.PropertyVersion;
         var stopwatch = Stopwatch.StartNew();
         var result = await _mcp.GetEditablePropertiesAsync(node.Key);
-        if (SelectedElement != node ||
-            node.PropertyVersion != propertyVersion ||
+        if (SelectedElement != node)
+        {
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "The property target changed during refresh.");
+        }
+        if (node.PropertyVersion != propertyVersion ||
             (refreshToken.HasValue &&
              !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
-            return false;
+        {
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "The typed property snapshot was superseded.");
+        }
         if (!result.Ok)
         {
             Logger.Log(
                 "properties",
                 $"No typed property provider for {node.Key}: {result.Error}");
-            return false;
+            return TypedPropertyRefreshAttemptResult.Failure(result.Error);
+        }
+
+        if (!TypedPropertyRefreshPolicy.TryValidateSnapshotPayload(
+                result.Payload, out var validationError))
+        {
+            Logger.Log("properties", validationError);
+            return TypedPropertyRefreshAttemptResult.Retry(validationError);
         }
 
         PropertySnapshotDto? snapshot;
@@ -792,19 +906,27 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             Logger.LogException(
                 "properties", "Could not parse typed property snapshot", ex);
-            return false;
+            return TypedPropertyRefreshAttemptResult.Retry(ex.Message);
         }
-        if (SelectedElement != node ||
-            node.PropertyVersion != propertyVersion ||
+        if (SelectedElement != node)
+        {
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "The property target changed during refresh.");
+        }
+        if (node.PropertyVersion != propertyVersion ||
             (refreshToken.HasValue &&
              !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
-            return false;
+        {
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "The typed property snapshot was superseded.");
+        }
         if (snapshot == null || string.IsNullOrWhiteSpace(snapshot.SchemaId))
         {
             Logger.Log(
                 "properties",
                 $"Typed property response for {node.Key} had no schema");
-            return false;
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "Typed property response had no schema.");
         }
 
         try
@@ -845,11 +967,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             Logger.LogException(
                 "properties", "Invalid typed property snapshot", ex);
-            return false;
+            return TypedPropertyRefreshAttemptResult.Retry(ex.Message);
         }
         if (clearLoadingOnCompletion)
             IsPropertyPanelLoading = false;
-        return true;
+        return TypedPropertyRefreshAttemptResult.Applied();
     }
 
     private async System.Threading.Tasks.Task SetPropertyAsync(PropertyRowViewModel? row)
@@ -894,7 +1016,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (!node.TryCompletePropertyMutation(mutation))
             return;
         var acceptedValue = submittedValue;
-        if (result.Payload.TryGetProperty("value", out var returnedValue) &&
+        if (result.Payload.ValueKind ==
+                System.Text.Json.JsonValueKind.Object &&
+            result.Payload.TryGetProperty("value", out var returnedValue) &&
             returnedValue.ValueKind == System.Text.Json.JsonValueKind.String)
         {
             acceptedValue = returnedValue.GetString() ?? acceptedValue;
