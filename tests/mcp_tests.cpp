@@ -732,6 +732,7 @@ public:
     }
 
     DWORD pid() const { return pid_; }
+    HWND hwnd() const { return hwnd_; }
 
     std::string hwnd_string() const {
         char buffer[32];
@@ -1187,6 +1188,18 @@ TEST(McpUiaIdentity, ElementlessKeyboardActionsReturnStructuredOwnershipLost) {
         << visualConnected.dump(2);
 
     bool isError = false;
+    const auto stale = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", "uia:99.99.99"}},
+        &isError);
+    EXPECT_TRUE(isError) << stale.dump(2);
+    EXPECT_NE(
+        stale.value("errorCode", ""),
+        "typed_property_session_disconnected")
+        << "a missing element in a live target is not ownership loss: "
+        << stale.dump(2);
+
     SetEvent(invalidated.get());
     for (const auto& [tool, arguments] :
          std::vector<std::pair<std::string, json>>{
@@ -1380,6 +1393,147 @@ TEST(McpUiaIdentity, TypedMutationsDetectOwnershipLossAfterInitialCheck) {
     runMutation("clear_property");
 }
 
+TEST(McpUiaIdentity, TypedReferenceResolutionRacesAreStructured) {
+    const auto runRace = [](
+        const std::string& tool, bool recycleTarget) {
+        ManagedSampleProcess sample;
+        ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+        struct FixtureWindow {
+            DWORD pid;
+            HWND root = nullptr;
+        } fixture{sample.pid()};
+        EnumWindows(
+            [](HWND candidate, LPARAM parameter) -> BOOL {
+                auto* fixture =
+                    reinterpret_cast<FixtureWindow*>(parameter);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(candidate, &owner);
+                if (owner == fixture->pid &&
+                    GetDlgItem(candidate, native_fixture::kEditId)) {
+                    fixture->root = candidate;
+                    return FALSE;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&fixture));
+        ASSERT_TRUE(IsWindow(fixture.root));
+        const HWND edit = GetDlgItem(
+            fixture.root, native_fixture::kEditId);
+        ASSERT_TRUE(IsWindow(edit));
+        char editHwnd[32]{};
+        snprintf(
+            editHwnd, sizeof(editHwnd), "0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(edit)));
+
+        const std::string gateBase =
+            "Local\\LvtTypedReference_" +
+            std::to_string(GetCurrentProcessId()) + "_" +
+            std::to_string(GetTickCount64()) + "_" + tool;
+        wil::unique_event entered(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-entered").c_str()));
+        wil::unique_event release(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-release").c_str()));
+        ASSERT_TRUE(entered);
+        ASSERT_TRUE(release);
+        ScopedEnvironmentVariable referenceGate(
+            "LVT_TEST_UIA_BEFORE_PROPERTY_REFERENCE_GATE",
+            gateBase);
+
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd", editHwnd}, {"mode", "uia"}});
+        const auto session = connected.value("session", "");
+        ASSERT_FALSE(session.empty()) << connected.dump(2);
+        const auto tree = client.call_tool(
+            "get_uia_tree", json{{"session", session}});
+        ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+        const auto runtimeId =
+            tree["root"]
+                .value("properties", json::object())
+                .value("RuntimeId", "");
+        ASSERT_FALSE(runtimeId.empty()) << tree.dump(2);
+        const auto inputRef = "uia:" + runtimeId;
+
+        bool isError = false;
+        const auto properties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", inputRef}},
+            &isError);
+        ASSERT_FALSE(isError) << properties.dump(2);
+        const auto* value = find_property_descriptor(
+            properties, "Value.Value");
+        ASSERT_NE(value, nullptr);
+        json arguments{
+            {"session", session},
+            {"element", inputRef},
+        };
+        if (tool != "get_editable_properties") {
+            arguments["descriptorId"] =
+                value->value("descriptorId", "");
+        }
+        if (tool == "set_property")
+            arguments["value"] = "must-not-set";
+
+        const int request = client.send_request(
+            "tools/call",
+            json{{"name", tool},
+                 {"arguments", arguments}});
+        ASSERT_EQ(
+            WaitForSingleObject(entered.get(), 10000),
+            WAIT_OBJECT_0)
+            << tool << " did not reach reference resolution";
+
+        if (recycleTarget) {
+            DWORD_PTR recycled = 0;
+            ASSERT_NE(
+                SendMessageTimeoutW(
+                    fixture.root,
+                    native_fixture::kRecycleEventChildHwndMessage,
+                    131072, native_fixture::kEditId,
+                    SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                    120000, &recycled),
+                0);
+            ASSERT_EQ(
+                reinterpret_cast<HWND>(recycled), edit);
+        } else {
+            sample.stop();
+        }
+        SetEvent(release.get());
+
+        const auto response = client.await_response(request);
+        ASSERT_TRUE(response.contains("result"))
+            << response.dump(2);
+        EXPECT_TRUE(
+            response["result"].value("isError", false))
+            << response.dump(2);
+        json error;
+        for (const auto& block :
+             response["result"].value(
+                 "content", json::array())) {
+            if (block.value("type", "") == "text") {
+                error = json::parse(
+                    block.value("text", "{}"),
+                    nullptr, false);
+                break;
+            }
+        }
+        ASSERT_FALSE(error.is_discarded())
+            << response.dump(2);
+        expect_typed_property_session_disconnected(error);
+    };
+
+    runRace("get_editable_properties", false);
+    runRace("set_property", true);
+    runRace("clear_property", false);
+}
+
 TEST(McpUiaIdentity, AltTabSequenceRechecksForegroundBeforeDelete) {
     ManagedSampleProcess sample;
     ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
@@ -1428,6 +1582,9 @@ TEST(McpUiaIdentity, AltTabSequenceRechecksForegroundBeforeDelete) {
     ASSERT_FALSE(visualSession.empty())
         << visualConnected.dump(2);
 
+    ShowWindow(sample.hwnd(), SW_MINIMIZE);
+    Sleep(100);
+    ASSERT_TRUE(IsIconic(sample.hwnd()));
     for (const auto& session :
          {uiaSession, visualSession}) {
         bool isError = false;
@@ -1438,6 +1595,8 @@ TEST(McpUiaIdentity, AltTabSequenceRechecksForegroundBeforeDelete) {
             &isError);
         EXPECT_FALSE(isError) << result.dump(2);
     }
+    EXPECT_FALSE(IsIconic(sample.hwnd()))
+        << "unconditional visual activation must restore a minimized root";
 
     for (const auto& statsPath :
          {uiaStats, visualStats}) {
@@ -1450,6 +1609,14 @@ TEST(McpUiaIdentity, AltTabSequenceRechecksForegroundBeforeDelete) {
             << "the second chord must re-activate after Alt+Tab: "
             << statsPath.string();
     }
+    const auto visualActivationStats =
+        read_plugin_stats(visualStats);
+    EXPECT_EQ(
+        count_plugin_stats(
+            visualActivationStats, "activate"),
+        2u)
+        << "visual mode must activate initially even when already foreground, "
+           "then activate again after the simulated Alt+Tab";
     fs::remove(uiaStats, ec);
     fs::remove(visualStats, ec);
 }

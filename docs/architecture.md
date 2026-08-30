@@ -222,6 +222,11 @@ activation, and immediately before each dispatch. Visual and UIA `wait-gone`
 still succeed when the original target disappears, while `wait-for` reports
 structured `ownershipLost`.
 
+The initial visual activation is unconditional: even an already-foreground
+root still passes through `bring_to_foreground`, whose contract also restores a
+minimized window and raises it in Z order. Subsequent batches re-activate only
+when foreground moved.
+
 ### Native typed-property safety (`native_message.*`,
 `native_property_connection.*`)
 

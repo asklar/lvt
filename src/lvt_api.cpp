@@ -1937,6 +1937,29 @@ std::shared_ptr<lvt::IFrameworkConnection> active_typed_property_connection(
     return typed_property_connection(session, target);
 }
 
+void wait_for_property_reference_test_gate() {
+    char base[192]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_BEFORE_PROPERTY_REFERENCE_GATE",
+        base, static_cast<DWORD>(_countof(base)));
+    if (length == 0 || length >= _countof(base))
+        return;
+    char enteredName[224]{};
+    char releaseName[224]{};
+    snprintf(
+        enteredName, sizeof(enteredName), "%s-entered", base);
+    snprintf(
+        releaseName, sizeof(releaseName), "%s-release", base);
+    wil::unique_handle entered(OpenEventA(
+        EVENT_MODIFY_STATE, FALSE, enteredName));
+    wil::unique_handle release(OpenEventA(
+        SYNCHRONIZE, FALSE, releaseName));
+    if (!entered || !release)
+        return;
+    SetEvent(entered.get());
+    WaitForSingleObject(release.get(), 10000);
+}
+
 uint64_t resolve_property_handle(
     const Session& session, const PropertyTarget& target,
     const std::shared_ptr<lvt::IFrameworkConnection>& connection) {
@@ -1945,14 +1968,24 @@ uint64_t resolve_property_handle(
 #ifdef LVT_ENABLE_UIA
     auto uia = std::dynamic_pointer_cast<lvt::UiaConnection>(connection);
     if (!uia || !uia->matches_target(session.hwnd)) {
+        if (!uia_identity_is_current(session)) {
+            throw_typed_property_session_disconnected(
+                "the UI Automation target identity changed while resolving a property reference");
+        }
         throw std::runtime_error(
             "the UI Automation property connection does not match this session's target window");
     }
+    wait_for_property_reference_test_gate();
     std::string error;
     const auto handle =
         uia->resolve_property_reference(target.reference, error);
-    if (!handle)
+    if (!handle) {
+        if (!uia_identity_is_current(session)) {
+            throw_typed_property_session_disconnected(
+                "the UI Automation target identity changed while resolving a property reference");
+        }
         throw std::runtime_error(error);
+    }
     return *handle;
 #else
     throw std::runtime_error(
@@ -2661,8 +2694,13 @@ bool action_target_is_foreground(HWND hwnd) {
 }
 
 bool activate_visual_target_window(HWND hwnd) {
-    return visual_input_test_override() ||
-           lvt::bring_to_foreground(hwnd);
+    if (visual_input_test_override()) {
+        const HWND root = action_root_window(hwnd);
+        if (IsIconic(root))
+            ShowWindow(root, SW_RESTORE);
+        return true;
+    }
+    return lvt::bring_to_foreground(hwnd);
 }
 
 bool suppress_visual_input_for_testing() {
@@ -2717,8 +2755,10 @@ void validate_visual_action_identity(
 void activate_visual_action_target(
     const Session& session, bool force = false) {
     validate_visual_action_identity(session);
-    if ((force || !action_target_is_foreground(session.hwnd)) &&
-        !activate_visual_target_window(session.hwnd)) {
+    // input.cpp's activation path also restores minimized windows and raises
+    // already-foreground roots. Never skip it based only on foreground state.
+    record_visual_input_test_attempt("activate");
+    if (!activate_visual_target_window(session.hwnd)) {
         throw std::runtime_error(
             "the target window could not be brought to the foreground, so "
             "synthetic input would go somewhere else");

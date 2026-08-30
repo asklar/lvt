@@ -203,6 +203,9 @@ before every mouse, wheel, text, select-all, or individual key-chord batch.
 Typed-property reads and mutations map identity loss—including a race after the
 initial descriptor read—to `typed_property_session_disconnected`,
 `errorDisposition: ownershipLost`, and `retryable: false`.
+Reference-to-provider-handle resolution performs the same original-token check,
+so a close or exact HWND recycle during resolution is never downgraded to an
+ordinary stale-element error.
 
 Visual resources always poll `get_visual_tree_changes` with `fast: true`,
 matching the Viewer's former `watch --fast` path. The live stream still carries
