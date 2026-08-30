@@ -134,6 +134,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
                         _typedRefreshPreservePendingEdits |=
                             preservePendingEdits;
+                        if (!_typedPropertyRefreshRetryBudget.CanRetry)
+                        {
+                            _typedPropertyRefreshRetryBudget.Stop();
+                            _typedPropertyRefreshState.Reset();
+                            IsPropertyPanelLoading = false;
+                            if (SelectedElement == node)
+                            {
+                                StatusText =
+                                    "Could not refresh properties after "
+                                    + $"{attemptNumber} attempts: "
+                                    + refreshResult.Error;
+                            }
+                        }
                     }
                     else if (applied)
                     {
@@ -158,6 +171,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                             _typedRefreshPreservePendingEdits |=
                                 preservePendingEdits;
                         }
+                        _typedPropertyRefreshRetryBudget.Stop();
                         _typedPropertyRefreshState.Reset();
                         IsPropertyPanelLoading = false;
                         if (SelectedElement == node)
@@ -171,6 +185,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
                         _typedRefreshPreservePendingEdits |=
                             preservePendingEdits;
+                        _typedPropertyRefreshRetryBudget.Stop();
                         _typedPropertyRefreshState.Reset();
                         IsPropertyPanelLoading = false;
                         if (SelectedElement == node)
@@ -523,7 +538,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             DiscoverFrameworks(evt);
         }
         if (refreshTypedSchema)
-            RequestTypedPropertySchemaRefresh();
+        {
+            RequestTypedPropertySchemaRefresh(
+                resetRetryBudget: false);
+        }
         ScheduleFilterRefresh();
         _lastPatchUtc = DateTime.UtcNow;
         _resourceProbeFailures = 0;
@@ -767,7 +785,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (!result.Ok)
         {
             StatusText = $"Could not read UI Automation properties: {result.Error}";
-            return TypedPropertyRefreshAttemptResult.Failure(result.Error);
+            return TypedPropertyRefreshAttemptResult.Failure(
+                result.Error, result.ErrorDisposition, result.Retryable);
         }
 
         if (result.Payload.ValueKind !=
@@ -832,15 +851,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void RequestTypedPropertySchemaRefresh(
         bool fullUiaLoad = false,
-        bool preservePendingEdits = true)
+        bool preservePendingEdits = true,
+        bool resetRetryBudget = true)
     {
         _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
         _typedRefreshPreservePendingEdits |= preservePendingEdits;
-        _typedPropertyRefreshRetryBudget.Reset();
-        _typedPropertyRefreshDelayMs =
-            TypedPropertyRefreshPolicy.InitialDelayMs;
+        _typedPropertyRefreshRetryBudget.RegisterRequest(
+            resetRetryBudget);
+        if (resetRetryBudget)
+        {
+            _typedPropertyRefreshDelayMs =
+                TypedPropertyRefreshPolicy.InitialDelayMs;
+        }
         _typedPropertyRefreshState.Request();
-        if (_typedPropertyRefreshState.IsRunning)
+        if (_typedPropertyRefreshState.IsRunning ||
+            _typedPropertyRefreshRetryBudget.IsStopped)
             return;
         _typedPropertyRefreshTimer.Interval =
             TimeSpan.FromMilliseconds(_typedPropertyRefreshDelayMs);
@@ -881,7 +906,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Logger.Log(
                 "properties",
                 $"No typed property provider for {node.Key}: {result.Error}");
-            return TypedPropertyRefreshAttemptResult.Failure(result.Error);
+            return TypedPropertyRefreshAttemptResult.Failure(
+                result.Error, result.ErrorDisposition, result.Retryable);
         }
 
         if (!TypedPropertyRefreshPolicy.TryValidateSnapshotPayload(

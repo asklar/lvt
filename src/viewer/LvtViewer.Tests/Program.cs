@@ -433,25 +433,107 @@ for (int attempt = 1;
             TypedPropertyRefreshPolicy.MaximumAutomaticAttempts),
         "refresh retry budget did not stop at its finite limit");
 }
-retryBudget.Reset();
+retryBudget.Stop();
+for (int patch = 0; patch < 10; ++patch)
+    retryBudget.RegisterRequest(resetBudget: false);
+Assert(retryBudget.IsStopped &&
+       retryBudget.AttemptCount ==
+       TypedPropertyRefreshPolicy.MaximumAutomaticAttempts,
+    "automatic patches restarted an exhausted refresh budget");
+retryBudget.RegisterRequest(resetBudget: true);
+Assert(!retryBudget.IsStopped && retryBudget.AttemptCount == 0,
+    "explicit refresh did not reopen the stopped retry budget");
 Assert(retryBudget.BeginAttempt() == 1,
     "explicit refresh did not reset the automatic retry budget");
 
+var coalescedBudget = new TypedPropertyRefreshRetryBudget();
+coalescedBudget.BeginAttempt();
+coalescedBudget.BeginAttempt();
+coalescedBudget.RegisterRequest(resetBudget: false);
+Assert(coalescedBudget.AttemptCount == 2,
+    "automatic coalescing reset the active retry budget");
+
+var patchFailureState = new TypedPropertyRefreshState();
+var patchFailureBudget = new TypedPropertyRefreshRetryBudget();
+patchFailureState.Request();
+for (int attempt = 1;
+     attempt <= TypedPropertyRefreshPolicy.MaximumAutomaticAttempts;
+     ++attempt)
+{
+    Assert(patchFailureState.TryBegin(out var activePatchAttempt),
+        "automatic patch failure attempt did not start");
+    patchFailureBudget.BeginAttempt();
+    patchFailureBudget.RegisterRequest(resetBudget: false);
+    patchFailureState.Request();
+    Assert(patchFailureState.Complete(
+            activePatchAttempt, applied: false),
+        "automatic patch did not release the superseded attempt");
+    if (!patchFailureBudget.CanRetry)
+    {
+        patchFailureBudget.Stop();
+        patchFailureState.Reset();
+        break;
+    }
+}
+Assert(patchFailureBudget.IsStopped &&
+       !patchFailureState.HasPending,
+    "repeated automatic patches bypassed the finite retry budget");
+patchFailureBudget.RegisterRequest(resetBudget: false);
+patchFailureState.Request();
+Assert(patchFailureBudget.IsStopped,
+    "automatic patch restarted an exhausted retry budget");
+patchFailureBudget.RegisterRequest(resetBudget: true);
+patchFailureState.Request();
+Assert(patchFailureState.TryBegin(out _),
+    "explicit retry did not restart after patch-driven exhaustion");
+
 Assert(TypedPropertyRefreshAttemptResult.Failure(
-           "typed properties are unsupported").Status ==
+           "typed properties are unsupported",
+           errorDisposition: "terminal",
+           retryable: false).Status ==
        TypedPropertyRefreshAttemptStatus.Terminal,
     "unsupported provider failure was treated as transient");
 Assert(TypedPropertyRefreshAttemptResult.Failure(
-           "provider 'win32' does not expose a live typed-property connection "
-           + "for this session").Status ==
-       TypedPropertyRefreshAttemptStatus.Terminal,
-    "no-live-provider failure was treated as transient");
+           "provider 'xaml' has no live typed-property connection yet",
+           errorDisposition: "transient",
+           retryable: true).Status ==
+       TypedPropertyRefreshAttemptStatus.Retry,
+    "supported XAML connection loss was treated as terminal");
+var xamlRecoveryState = new TypedPropertyRefreshState();
+var xamlRecoveryBudget = new TypedPropertyRefreshRetryBudget();
+xamlRecoveryState.Request();
+Assert(xamlRecoveryState.TryBegin(out var xamlUnavailableAttempt),
+    "supported XAML refresh did not start");
+xamlRecoveryBudget.BeginAttempt();
+Assert(xamlRecoveryState.Complete(
+        xamlUnavailableAttempt, applied: false),
+    "supported XAML connection failure did not enter retry state");
+Assert(xamlRecoveryState.TryBegin(out var xamlRecoveredAttempt),
+    "supported XAML connection failure did not retry");
+xamlRecoveryBudget.BeginAttempt();
+Assert(xamlRecoveryState.Complete(
+        xamlRecoveredAttempt, applied: true),
+    "recovered XAML refresh did not complete");
+xamlRecoveryBudget.Reset();
+Assert(!xamlRecoveryState.HasPending &&
+       xamlRecoveryBudget.AttemptCount == 0,
+    "successful XAML recovery did not settle and reset its budget");
 Assert(TypedPropertyRefreshAttemptResult.Failure(
-           "this property is read-only").Status ==
+           "provider 'win32' has no live typed-property connection yet",
+           errorDisposition: "transient",
+           retryable: true).Status ==
+       TypedPropertyRefreshAttemptStatus.Retry,
+    "supported native connection loss was treated as terminal");
+Assert(TypedPropertyRefreshAttemptResult.Failure(
+           "this property is read-only",
+           errorDisposition: "terminal",
+           retryable: false).Status ==
        TypedPropertyRefreshAttemptStatus.Terminal,
     "read-only provider failure was treated as transient");
 Assert(TypedPropertyRefreshAttemptResult.Failure(
-           "unknown session").Status ==
+           "unknown session",
+           errorDisposition: "ownershipLost",
+           retryable: false).Status ==
        TypedPropertyRefreshAttemptStatus.OwnershipLost,
     "disconnected session failure did not cancel ownership");
 
@@ -933,7 +1015,9 @@ terminalState.Request();
 Assert(terminalState.TryBegin(out var terminalAttempt),
     "terminal refresh did not start");
 var terminalResult = TypedPropertyRefreshAttemptResult.Failure(
-    "no live property provider is available");
+    "provider 'plugin' does not support typed properties",
+    errorDisposition: "terminal",
+    retryable: false);
 Assert(terminalResult.Status ==
        TypedPropertyRefreshAttemptStatus.Terminal,
     "no-provider response did not stop automatic retries");

@@ -13,7 +13,13 @@ namespace LvtViewer.Services;
 
 public sealed record McpStartResult(bool Ok, string Error = "");
 
-public sealed record McpToolResult(bool Ok, JsonElement Payload, string Error = "");
+public sealed record McpToolResult(
+    bool Ok,
+    JsonElement Payload,
+    string Error = "",
+    string ErrorCode = "",
+    string ErrorDisposition = "",
+    bool? Retryable = null);
 
 /// <summary>
 /// One long-lived MCP conversation with `lvt mcp --allow-input`.
@@ -313,7 +319,28 @@ public sealed class McpSession : IAsyncDisposable, IDisposable
                            payload.TryGetProperty("error", out var message)
                 ? message.GetString() ?? $"{name} failed"
                 : $"{name} failed";
-            return new(false, payload, NormalizeError(error));
+            string errorCode =
+                payload.ValueKind == JsonValueKind.Object &&
+                payload.TryGetProperty("errorCode", out var code) &&
+                code.ValueKind == JsonValueKind.String
+                    ? code.GetString() ?? ""
+                    : "";
+            string errorDisposition =
+                payload.ValueKind == JsonValueKind.Object &&
+                payload.TryGetProperty(
+                    "errorDisposition", out var disposition) &&
+                disposition.ValueKind == JsonValueKind.String
+                    ? disposition.GetString() ?? ""
+                    : "";
+            bool? retryable =
+                payload.ValueKind == JsonValueKind.Object &&
+                payload.TryGetProperty("retryable", out var retry) &&
+                retry.ValueKind is JsonValueKind.True or JsonValueKind.False
+                    ? retry.GetBoolean()
+                    : null;
+            return new(
+                false, payload, NormalizeError(error),
+                errorCode, errorDisposition, retryable);
         }
         return new(true, payload);
     }

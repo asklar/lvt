@@ -4078,6 +4078,62 @@ TEST_F(NativeMcpFixture, DisconnectRacingNativePropertyReadDoesNotRecreateSessio
     EXPECT_FALSE(isError) << replacementProperties.dump(2);
 }
 
+TEST_F(McpSampleFixture, TypedPropertyConnectionErrorsHaveDisposition) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto temporarilyUnavailable = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", "xaml:0x1"}},
+        &isError);
+    ASSERT_TRUE(isError) << temporarilyUnavailable.dump(2);
+    EXPECT_EQ(
+        temporarilyUnavailable.value("errorCode", ""),
+        "typed_property_connection_unavailable");
+    EXPECT_EQ(
+        temporarilyUnavailable.value("errorDisposition", ""),
+        "transient");
+    EXPECT_TRUE(temporarilyUnavailable.value("retryable", false));
+
+    auto unsupported = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", "unsupported_plugin:0x1"}},
+        &isError);
+    ASSERT_TRUE(isError) << unsupported.dump(2);
+    EXPECT_EQ(
+        unsupported.value("errorCode", ""),
+        "typed_property_provider_unsupported");
+    EXPECT_EQ(unsupported.value("errorDisposition", ""), "terminal");
+    EXPECT_FALSE(unsupported.value("retryable", true));
+
+    auto visual = client.call_tool(
+        "get_visual_tree", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << visual.dump(2);
+    std::vector<const json*> elements;
+    collect_json_elements(visual["root"], elements);
+    const json* button = nullptr;
+    for (const auto* element : elements) {
+        if (element->value("properties", json::object())
+                .value("name", "") == "PrimaryButton") {
+            button = element;
+            break;
+        }
+    }
+    ASSERT_NE(button, nullptr);
+    auto recovered = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", button->value("key", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << recovered.dump(2);
+    EXPECT_FALSE(recovered.value("schemaId", "").empty())
+        << recovered.dump(2);
+}
+
 TEST_F(McpSampleFixture, ResourcesMatchEachSessionsFixedTreeMode) {
     SkipIfNotReady();
     McpClient client(false);

@@ -24,9 +24,13 @@ public readonly record struct TypedPropertyRefreshAttemptResult(
     public static TypedPropertyRefreshAttemptResult Applied() =>
         new(TypedPropertyRefreshAttemptStatus.Applied);
 
-    public static TypedPropertyRefreshAttemptResult Failure(string error)
+    public static TypedPropertyRefreshAttemptResult Failure(
+        string error,
+        string errorDisposition = "",
+        bool? retryable = null)
     {
-        var status = TypedPropertyRefreshPolicy.ClassifyFailure(error) switch
+        var status = TypedPropertyRefreshPolicy.ClassifyFailure(
+            errorDisposition, retryable) switch
         {
             TypedPropertyRefreshFailureDisposition.Terminal =>
                 TypedPropertyRefreshAttemptStatus.Terminal,
@@ -48,6 +52,7 @@ public readonly record struct TypedPropertyRefreshAttemptResult(
 public sealed class TypedPropertyRefreshRetryBudget
 {
     public int AttemptCount { get; private set; }
+    public bool IsStopped { get; private set; }
     public bool CanRetry =>
         AttemptCount < TypedPropertyRefreshPolicy.MaximumAutomaticAttempts;
     public int RetryDelayMs =>
@@ -55,9 +60,21 @@ public sealed class TypedPropertyRefreshRetryBudget
 
     public int BeginAttempt() => ++AttemptCount;
 
+    public void RegisterRequest(bool resetBudget)
+    {
+        if (resetBudget)
+            Reset();
+    }
+
+    public void Stop()
+    {
+        IsStopped = true;
+    }
+
     public void Reset()
     {
         AttemptCount = 0;
+        IsStopped = false;
     }
 }
 
@@ -74,31 +91,19 @@ public static class TypedPropertyRefreshPolicy
     }
 
     public static TypedPropertyRefreshFailureDisposition ClassifyFailure(
-        string error)
+        string errorDisposition,
+        bool? retryable = null)
     {
-        if (ContainsAny(
-                error,
-                "unknown session",
-                "session was disconnected",
-                "no active session",
-                "connection was superseded",
-                "connection is no longer available",
-                "lost its typed-property connection"))
+        if (string.Equals(
+                errorDisposition, "ownershipLost",
+                StringComparison.OrdinalIgnoreCase))
         {
             return TypedPropertyRefreshFailureDisposition.OwnershipLost;
         }
-        if (ContainsAny(
-                error,
-                "not supported",
-                "unsupported",
-                "read-only",
-                "read only",
-                "no live property provider",
-                "no typed property provider",
-                "does not expose a live typed-property connection",
-                "has no provider-owned property identity",
-                "cannot be read across architectures",
-                "require a session connected"))
+        if (string.Equals(
+                errorDisposition, "terminal",
+                StringComparison.OrdinalIgnoreCase) ||
+            retryable == false)
         {
             return TypedPropertyRefreshFailureDisposition.Terminal;
         }
@@ -160,11 +165,5 @@ public static class TypedPropertyRefreshPolicy
         }
         error = "";
         return true;
-    }
-
-    private static bool ContainsAny(string value, params string[] needles)
-    {
-        return needles.Any(needle =>
-            value.Contains(needle, StringComparison.OrdinalIgnoreCase));
     }
 }

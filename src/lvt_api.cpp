@@ -1657,13 +1657,57 @@ PropertyTarget require_property_target(
     if (!element)
         throw std::runtime_error("element '" + elementRef + "' not found");
     if (element->framework.empty() || element->providerHandle == 0) {
-        throw std::runtime_error(
-            "element '" + elementRef +
-            "' has no provider-owned property identity");
+        throw std::runtime_error(json{
+            {"error", "element '" + elementRef +
+                "' has no provider-owned property identity"},
+            {"errorCode", "typed_property_provider_unsupported"},
+            {"errorDisposition", "terminal"},
+            {"retryable", false},
+        }.dump());
     }
     target.provider = element->framework;
     target.handle = element->providerHandle;
     return target;
+}
+
+[[noreturn]] void throw_typed_property_error(
+    std::string code, std::string disposition, bool retryable,
+    std::string message, std::optional<HRESULT> hresult = std::nullopt) {
+    json error{
+        {"error", std::move(message)},
+        {"errorCode", std::move(code)},
+        {"errorDisposition", std::move(disposition)},
+        {"retryable", retryable},
+    };
+    if (hresult)
+        error["hresult"] = format_hresult(*hresult);
+    throw std::runtime_error(error.dump());
+}
+
+bool provider_supports_typed_properties(const std::string& provider) {
+    if (provider == "win32" || provider == "comctl")
+        return true;
+#ifdef LVT_ENABLE_UIA
+    if (provider == "uia")
+        return true;
+#endif
+#if LVT_ENABLE_XAML
+    if (provider == "xaml")
+        return true;
+#endif
+#if LVT_ENABLE_WINUI3
+    if (provider == "winui3")
+        return true;
+#endif
+#if LVT_ENABLE_WPF
+    if (provider == "wpf")
+        return true;
+#endif
+#if LVT_ENABLE_WINFORMS
+    if (provider == "winforms")
+        return true;
+#endif
+    return false;
 }
 
 std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
@@ -1671,24 +1715,28 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
     if (target.provider == "uia") {
 #ifdef LVT_ENABLE_UIA
         if (session.visualMode) {
-            throw std::runtime_error(
+            throw_typed_property_error(
+                "typed_property_wrong_mode", "terminal", false,
                 "UI Automation properties require a session connected in uia mode");
         }
         auto connection = uia_connection_for_session(session);
         if (!connection || !connection->is_alive() ||
             !connection->matches_target(session.hwnd)) {
-            throw std::runtime_error(
-                "the UI Automation property connection is no longer available");
+            throw_typed_property_error(
+                "typed_property_connection_unavailable", "transient", true,
+                "the UI Automation property connection is temporarily unavailable");
         }
         return connection;
 #else
-        throw std::runtime_error(
+        throw_typed_property_error(
+            "typed_property_provider_unsupported", "terminal", false,
             "this build has UI Automation support compiled out");
 #endif
     }
 
     if (!session.visualMode) {
-        throw std::runtime_error(
+        throw_typed_property_error(
+            "typed_property_wrong_mode", "terminal", false,
             "visual typed properties require a session connected in visual mode");
     }
     const auto hostArch = lvt::get_host_architecture();
@@ -1698,11 +1746,12 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
         session.architecture != lvt::Architecture::unknown &&
         hostArch != lvt::Architecture::unknown &&
         session.architecture != hostArch) {
-        throw std::runtime_error(
-            std::string("native visual properties cannot be read across architectures: this "
-                        "lvt is ") +
-            lvt::architecture_name(hostArch) + " and the target is " +
-            lvt::architecture_name(session.architecture));
+        throw_typed_property_error(
+            "typed_property_cross_architecture", "terminal", false,
+            std::string(
+                "native visual properties cannot be read across architectures: this lvt is ") +
+                lvt::architecture_name(hostArch) + " and the target is " +
+                lvt::architecture_name(session.architecture));
     }
 
     auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
@@ -1726,9 +1775,19 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
         }
     }
     if (!connection || !connection->is_alive()) {
-        throw std::runtime_error(
-            "provider '" + target.provider +
-            "' does not expose a live typed-property connection for this session");
+        const bool supported =
+            provider_supports_typed_properties(target.provider);
+        throw_typed_property_error(
+            supported
+                ? "typed_property_connection_unavailable"
+                : "typed_property_provider_unsupported",
+            supported ? "transient" : "terminal",
+            supported,
+            supported
+                ? "provider '" + target.provider +
+                    "' has no live typed-property connection yet"
+                : "provider '" + target.provider +
+                    "' does not support typed properties");
     }
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
     const auto entry = g_sessionConnections.find(session.id);
@@ -1738,9 +1797,10 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
                 return handle.shared();
         }
     }
-    throw std::runtime_error(
+    throw_typed_property_error(
+        "typed_property_connection_unavailable", "transient", true,
         "provider '" + target.provider +
-        "' lost its typed-property connection for this session");
+            "' temporarily lost its typed-property connection for this session");
 }
 
 std::shared_ptr<lvt::IFrameworkConnection> active_typed_property_connection(
@@ -1751,7 +1811,8 @@ std::shared_ptr<lvt::IFrameworkConnection> active_typed_property_connection(
         found->second.hwnd != session.hwnd ||
         found->second.pid != session.pid ||
         found->second.visualMode != session.visualMode) {
-        throw std::runtime_error(
+        throw_typed_property_error(
+            "typed_property_session_disconnected", "ownershipLost", false,
             "this session was disconnected while the property request was waiting");
     }
     return typed_property_connection(session, target);
@@ -1781,16 +1842,30 @@ uint64_t resolve_property_handle(
 }
 
 json property_snapshot_result(
-    const std::string& element, const lvt::PropertySnapshotResult& result) {
+    const std::string& element, const std::string& provider,
+    const lvt::PropertySnapshotResult& result) {
     if (!result.ok) {
-        throw std::runtime_error(json{
-            {"error", result.error.empty() ? "typed property operation failed" : result.error},
-            {"hresult", format_hresult(result.hresult)},
-        }.dump());
+        const bool unsupported =
+            result.hresult == E_NOTIMPL &&
+            !provider_supports_typed_properties(provider);
+        throw_typed_property_error(
+            unsupported
+                ? "typed_property_provider_unsupported"
+                : result.hresult == E_NOTIMPL
+                    ? "typed_property_connection_unavailable"
+                    : "typed_property_read_failed",
+            unsupported ? "terminal" : "transient",
+            !unsupported,
+            result.error.empty()
+                ? "typed property operation failed"
+                : result.error,
+            result.hresult);
     }
 
     if (!result.schema)
-        throw std::runtime_error("typed property provider returned no schema");
+        throw_typed_property_error(
+            "typed_property_invalid_snapshot", "transient", true,
+            "typed property provider returned no schema");
 
     json out{
         {"ok", true},
@@ -1887,7 +1962,10 @@ json method_get_editable_properties(const json& params) {
         handle = resolve_property_handle(session, target, connection);
         result = connection->get_property_snapshot(handle);
     }
-    return property_snapshot_result(get_string(params, "element"), result);
+    return property_snapshot_result(
+        get_string(params, "element"),
+        target.provider,
+        result);
 }
 
 json method_set_property(const json& params, bool allowInput) {
