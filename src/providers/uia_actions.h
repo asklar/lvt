@@ -60,6 +60,7 @@ struct ActionRequest {
 
 struct ActionResult {
     bool ok = false;
+    std::string errorCode;
     // How the action was actually carried out — "InvokePattern",
     // "ValuePattern", "SendInput", ... Callers surface this because a pattern
     // and a synthetic click are meaningfully different outcomes.

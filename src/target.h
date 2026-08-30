@@ -3,8 +3,11 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <memory>
 
 namespace lvt {
+
+class UiaWindowLifetimeToken;
 
 enum class Architecture { unknown, x64, arm64, x86 };
 
@@ -22,6 +25,8 @@ struct TargetInfo {
     DWORD pid = 0;
     uint64_t processCreationIdentity = 0;
     std::vector<int> uiaRootRuntimeId;
+    std::shared_ptr<UiaWindowLifetimeToken>
+        uiaWindowLifetime;
     std::string processName;
     Architecture architecture = Architecture::unknown;
 };

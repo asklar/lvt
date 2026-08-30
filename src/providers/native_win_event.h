@@ -107,6 +107,7 @@ public:
     bool hook_active() const;
     bool root_destroyed() const;
     bool target_exited() const;
+    bool synchronize();
     std::shared_ptr<NativeWinEventDiagnostics> diagnostics() const;
 
 private:

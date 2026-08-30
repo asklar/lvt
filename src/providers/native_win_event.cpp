@@ -8,6 +8,8 @@
 namespace lvt::native_eventing_detail {
 namespace {
 
+constexpr UINT kSynchronizeMessage = WM_APP + 0x4C56;
+
 bool is_relevant_event(DWORD event) noexcept {
     switch (event) {
     case EVENT_OBJECT_CREATE:
@@ -54,6 +56,8 @@ struct NativeWinEventSource::State {
         CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     wil::unique_event_nothrow rootGone{
         CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    wil::unique_event_nothrow synchronized{
+        CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     wil::unique_handle process;
     NativeWinEventQueue<kNativeWinEventQueueCapacity> queue;
     std::shared_ptr<NativeWinEventDiagnostics> diagnostics;
@@ -61,7 +65,9 @@ struct NativeWinEventSource::State {
     std::atomic<bool> accepting{false};
     std::atomic<bool> rootDestroyed{false};
     std::atomic<bool> targetExited{false};
+    std::atomic<DWORD> threadId{0};
     std::atomic_flag callbackActive = ATOMIC_FLAG_INIT;
+    std::mutex synchronizeMutex;
     mutable std::mutex publishedMutex;
     std::set<HWND> publishedWindows;
 };
@@ -83,7 +89,8 @@ std::unique_ptr<NativeWinEventSource> NativeWinEventSource::create(
     auto source = std::unique_ptr<NativeWinEventSource>(
         new NativeWinEventSource(std::move(state)));
     if (!source->m_state->ready || !source->m_state->stop ||
-        !source->m_state->rootGone) {
+        !source->m_state->rootGone ||
+        !source->m_state->synchronized) {
         return source;
     }
 
@@ -114,6 +121,8 @@ NativeWinEventSource::~NativeWinEventSource() {
 void NativeWinEventSource::run(
     const std::shared_ptr<State>& state) noexcept {
     s_callbackState = state.get();
+    state->threadId.store(
+        GetCurrentThreadId(), std::memory_order_release);
 
     // SetWinEventHook requires the installing thread to own and pump a message
     // queue. Creating it before registration also makes shutdown wakeups
@@ -164,6 +173,10 @@ void NativeWinEventSource::run(
                 if (message.message == WM_QUIT) {
                     quit = true;
                     break;
+                }
+                if (message.message == kSynchronizeMessage) {
+                    SetEvent(state->synchronized.get());
+                    continue;
                 }
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
@@ -300,6 +313,26 @@ bool NativeWinEventSource::root_destroyed() const {
 bool NativeWinEventSource::target_exited() const {
     return m_state &&
            m_state->targetExited.load(std::memory_order_acquire);
+}
+
+bool NativeWinEventSource::synchronize() {
+    if (!m_state || !m_state->synchronized)
+        return false;
+    const DWORD threadId =
+        m_state->threadId.load(std::memory_order_acquire);
+    if (!threadId || !hook_active())
+        return false;
+
+    std::lock_guard<std::mutex> lock(
+        m_state->synchronizeMutex);
+    ResetEvent(m_state->synchronized.get());
+    if (!PostThreadMessageW(
+            threadId, kSynchronizeMessage, 0, 0)) {
+        return false;
+    }
+    return WaitForSingleObject(
+               m_state->synchronized.get(), 5000) ==
+           WAIT_OBJECT_0;
 }
 
 std::shared_ptr<NativeWinEventDiagnostics>

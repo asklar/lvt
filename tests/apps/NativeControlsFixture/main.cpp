@@ -600,6 +600,16 @@ bool set_toolbar_command_by_index(int index, int commandId) {
                reinterpret_cast<LPARAM>(&info)) != FALSE;
 }
 
+HWND create_out_of_tree_window() {
+    return CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        fixture::kGenericChildClass,
+        fixture::kOutOfTreeTitle,
+        WS_OVERLAPPED | WS_CAPTION,
+        1100, 80, 280, 100,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+}
+
 bool create_controls(HWND parent) {
     g_controls.checkbox = create_child(
         parent, 0, WC_BUTTONW, L"Tri-state check",
@@ -692,13 +702,7 @@ bool create_controls(HWND parent) {
     SetWindowSubclass(
         g_controls.toolbar, toolbar_subclass_proc, 1, 0);
 
-    g_controls.outOfTree = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        fixture::kGenericChildClass,
-        fixture::kOutOfTreeTitle,
-        WS_OVERLAPPED | WS_CAPTION,
-        1100, 80, 280, 100,
-        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    g_controls.outOfTree = create_out_of_tree_window();
     if (!g_controls.outOfTree)
         return false;
     ShowWindow(g_controls.outOfTree, SW_SHOWNOACTIVATE);
@@ -971,6 +975,74 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return destroyed;
         }
         return FALSE;
+    case fixture::kRecycleEventChildHwndMessage: {
+        const HWND original = g_controls.eventChild;
+        if (!original || !IsWindow(original))
+            return 0;
+        DestroyWindow(original);
+        g_controls.eventChild = nullptr;
+
+        const DWORD maximumAttempts =
+            wParam != 0
+                ? static_cast<DWORD>(wParam)
+                : 131072u;
+        const auto originalIndex =
+            reinterpret_cast<uintptr_t>(original) & 0xFFFFu;
+        const auto createCandidate = [&]() -> HWND {
+            return CreateWindowExW(
+                0, fixture::kGenericChildClass,
+                L"Event child", WS_CHILD,
+                8, 8, 160, 24, hwnd,
+                reinterpret_cast<HMENU>(
+                    static_cast<INT_PTR>(1016)),
+                GetModuleHandleW(nullptr), nullptr);
+        };
+        std::vector<HWND> heldWindows;
+        const auto acquireOriginalIndex = [&]() -> HWND {
+            for (DWORD attempt = 0; attempt < 16384u; ++attempt) {
+                HWND candidate = createCandidate();
+                if (!candidate)
+                    return nullptr;
+                if ((reinterpret_cast<uintptr_t>(candidate) & 0xFFFFu) ==
+                    originalIndex) {
+                    return candidate;
+                }
+                heldWindows.push_back(candidate);
+            }
+            return nullptr;
+        };
+        HWND originalIndexWindow = acquireOriginalIndex();
+        for (DWORD attempt = 0;
+             originalIndexWindow && attempt < maximumAttempts;
+             ++attempt) {
+            DestroyWindow(originalIndexWindow);
+            HWND candidate = createCandidate();
+            if (!candidate)
+                return 0;
+            if (candidate == original) {
+                g_controls.eventChild = candidate;
+                ShowWindow(candidate, SW_SHOWNA);
+                for (HWND held : heldWindows)
+                    DestroyWindow(held);
+                return reinterpret_cast<LRESULT>(candidate);
+            }
+            if ((reinterpret_cast<uintptr_t>(candidate) & 0xFFFFu) ==
+                originalIndex) {
+                originalIndexWindow = candidate;
+            } else {
+                heldWindows.push_back(candidate);
+                originalIndexWindow = acquireOriginalIndex();
+            }
+        }
+        if (originalIndexWindow)
+            DestroyWindow(originalIndexWindow);
+        for (HWND held : heldWindows)
+            DestroyWindow(held);
+        g_controls.eventChild = create_child(
+            hwnd, 0, fixture::kGenericChildClass,
+            L"Event child", 0, 8, 8, 160, 24, 1016);
+        return 0;
+    }
     case fixture::kHangMessage:
         Sleep(2500);
         return TRUE;

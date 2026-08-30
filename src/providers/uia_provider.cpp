@@ -1,5 +1,6 @@
 #include "uia_provider.h"
 #include "uia_actions.h"
+#include "native_win_event.h"
 #include "uia_property_adapter.h"
 #include "../debug.h"
 
@@ -30,6 +31,161 @@
 #include <vector>
 
 namespace lvt {
+
+class UiaWindowLifetimeToken {
+public:
+    static std::shared_ptr<UiaWindowLifetimeToken> create(
+        HWND hwnd, DWORD pid,
+        uint64_t processCreationIdentity) {
+        auto token = std::shared_ptr<UiaWindowLifetimeToken>(
+            new (std::nothrow) UiaWindowLifetimeToken(
+                hwnd, pid, processCreationIdentity));
+        if (!token || !token->initialize())
+            return {};
+        return token;
+    }
+
+    ~UiaWindowLifetimeToken() {
+        if (!m_propertyInstalled)
+            return;
+        if (exact_owner_and_process() &&
+            GetPropW(m_hwnd, m_propertyName.c_str()) ==
+                m_propertyValue) {
+            RemovePropW(m_hwnd, m_propertyName.c_str());
+        }
+    }
+
+    bool matches() {
+        if (m_testInvalidation &&
+            WaitForSingleObject(
+                m_testInvalidation.get(), 0) ==
+                WAIT_OBJECT_0) {
+            return false;
+        }
+        if (!exact_owner_and_process())
+            return false;
+        if (m_propertyInstalled) {
+            return GetPropW(
+                       m_hwnd, m_propertyName.c_str()) ==
+                   m_propertyValue;
+        }
+        if (!m_destroyWatcher ||
+            !m_destroyWatcher->synchronize()) {
+            return false;
+        }
+        return !m_destroyWatcher->root_destroyed() &&
+               !m_destroyWatcher->target_exited();
+    }
+
+private:
+    UiaWindowLifetimeToken(
+        HWND hwnd, DWORD pid,
+        uint64_t processCreationIdentity)
+        : m_hwnd(hwnd), m_pid(pid),
+          m_processCreationIdentity(
+              processCreationIdentity),
+          m_propertyValue(
+              reinterpret_cast<HANDLE>(this)) {
+    }
+
+    bool exact_owner_and_process() const {
+        DWORD currentPid = 0;
+        return m_hwnd && IsWindow(m_hwnd) &&
+               GetWindowThreadProcessId(
+                   m_hwnd, &currentPid) != 0 &&
+               currentPid == m_pid &&
+               process_creation_identity(m_pid) ==
+                   m_processCreationIdentity;
+    }
+
+    bool initialize() {
+        if (!exact_owner_and_process())
+            return false;
+
+        char invalidationEvent[160]{};
+        const DWORD invalidationLength =
+            GetEnvironmentVariableA(
+                "LVT_TEST_UIA_LIFETIME_INVALIDATION_EVENT",
+                invalidationEvent,
+                static_cast<DWORD>(
+                    _countof(invalidationEvent)));
+        if (invalidationLength > 0 &&
+            invalidationLength < _countof(invalidationEvent)) {
+            m_testInvalidation.reset(OpenEventA(
+                SYNCHRONIZE, FALSE, invalidationEvent));
+            if (!m_testInvalidation)
+                return false;
+        }
+
+        GUID guid{};
+        if (SUCCEEDED(CoCreateGuid(&guid))) {
+            wchar_t guidText[64]{};
+            if (StringFromGUID2(
+                    guid, guidText,
+                    static_cast<int>(_countof(guidText))) > 0) {
+                m_propertyName =
+                    L"lvt.uia.window." +
+                    std::wstring(guidText);
+            }
+        }
+        if (m_propertyName.empty())
+            return false;
+
+        char forceFailure[8]{};
+        const bool forcePropertyFailure =
+            GetEnvironmentVariableA(
+                "LVT_TEST_UIA_FORCE_WINDOW_PROP_FAILURE",
+                forceFailure,
+                static_cast<DWORD>(
+                    _countof(forceFailure))) != 0 &&
+            strtoul(forceFailure, nullptr, 10) != 0;
+
+        SetLastError(ERROR_SUCCESS);
+        if (!forcePropertyFailure &&
+            SetPropW(
+                m_hwnd, m_propertyName.c_str(),
+                m_propertyValue) &&
+            GetPropW(m_hwnd, m_propertyName.c_str()) ==
+                m_propertyValue) {
+            m_propertyInstalled = true;
+            return true;
+        }
+
+        const DWORD propertyError = GetLastError();
+        if (GetPropW(m_hwnd, m_propertyName.c_str()) ==
+            m_propertyValue) {
+            RemovePropW(m_hwnd, m_propertyName.c_str());
+        }
+        m_destroyWatcher =
+            native_eventing_detail::NativeWinEventSource::create(
+                m_hwnd, m_pid);
+        if (m_destroyWatcher &&
+            m_destroyWatcher->hook_active()) {
+            return true;
+        }
+        if (g_debug) {
+            fprintf(
+                stderr,
+                "lvt: UIA window lifetime sentinel failed "
+                "(SetProp error %lu, WinEvent unavailable)\n",
+                static_cast<unsigned long>(propertyError));
+        }
+        m_destroyWatcher.reset();
+        return false;
+    }
+
+    HWND m_hwnd = nullptr;
+    DWORD m_pid = 0;
+    uint64_t m_processCreationIdentity = 0;
+    std::wstring m_propertyName;
+    HANDLE m_propertyValue = nullptr;
+    bool m_propertyInstalled = false;
+    std::unique_ptr<
+        native_eventing_detail::NativeWinEventSource>
+        m_destroyWatcher;
+    wil::unique_handle m_testInvalidation;
+};
+
 namespace {
 
 using clock_type = std::chrono::steady_clock;
@@ -135,6 +291,17 @@ bool target_process_matches(
     return process_identity_matches(
         process.get(), identity.pid,
         identity.processCreationIdentity);
+}
+
+bool target_identity_matches(
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess) {
+    return identity.valid() &&
+           exact_window_matches(
+               identity.hwnd, identity.pid) &&
+           target_process_matches(
+               identity, retainedProcess) &&
+           identity.windowLifetime->matches();
 }
 
 bool read_runtime_id(
@@ -917,8 +1084,8 @@ HRESULT get_validated_uia_root(
     RETURN_HR_IF(E_INVALIDARG, !identity.valid());
     RETURN_HR_IF(
         HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
-        !exact_window_matches(identity.hwnd, identity.pid) ||
-        !target_process_matches(identity, retainedProcess));
+        !target_identity_matches(
+            identity, retainedProcess));
 
     wil::com_ptr<IUIAutomationElement> candidate;
     const HRESULT elementHr = automation->ElementFromHandle(
@@ -926,8 +1093,8 @@ HRESULT get_validated_uia_root(
     if (FAILED(elementHr)) {
         RETURN_HR_IF(
             HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
-            !exact_window_matches(identity.hwnd, identity.pid) ||
-            !target_process_matches(identity, retainedProcess));
+            !target_identity_matches(
+                identity, retainedProcess));
         RETURN_HR(elementHr);
     }
     RETURN_HR_IF_NULL(E_FAIL, candidate.get());
@@ -939,8 +1106,8 @@ HRESULT get_validated_uia_root(
         testGateEnvironment);
     RETURN_HR_IF(
         HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
-        !exact_window_matches(identity.hwnd, identity.pid) ||
-        !target_process_matches(identity, retainedProcess));
+        !target_identity_matches(
+            identity, retainedProcess));
 
     int rootPid = 0;
     RETURN_IF_FAILED(candidate->get_CurrentProcessId(&rootPid));
@@ -983,6 +1150,11 @@ std::optional<UiaTargetIdentity> capture_uia_target_identity(
     identity.hwnd = hwnd;
     identity.pid = expectedPid;
     identity.processCreationIdentity = creationIdentity;
+    identity.windowLifetime =
+        UiaWindowLifetimeToken::create(
+            hwnd, expectedPid, creationIdentity);
+    if (!identity.windowLifetime)
+        return std::nullopt;
     const HRESULT hr = run_on_mta([&]() -> HRESULT {
         wil::com_ptr<IUIAutomation> automation;
         UiaOptions options;
@@ -995,8 +1167,11 @@ std::optional<UiaTargetIdentity> capture_uia_target_identity(
         RETURN_HR_IF_NULL(E_FAIL, root.get());
         RETURN_HR_IF(
             HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
-            !exact_window_matches(identity.hwnd, identity.pid) ||
-            !target_process_matches(identity, process.get()));
+            !exact_window_matches(
+                identity.hwnd, identity.pid) ||
+            !target_process_matches(
+                identity, process.get()) ||
+            !identity.windowLifetime->matches());
 
         int rootPid = 0;
         RETURN_IF_FAILED(root->get_CurrentProcessId(&rootPid));
@@ -1194,9 +1369,7 @@ private:
         RETURN_HR_IF(
             HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
             !process ||
-            !exact_window_matches(
-                targetIdentity.hwnd, targetIdentity.pid) ||
-            !target_process_matches(
+            !target_identity_matches(
                 targetIdentity, process.get()));
         UiaOptions connectOptions;
         connectOptions.timeoutMs = 0;
@@ -1266,11 +1439,8 @@ private:
                     operation();
 
                 if (connected() &&
-                    (!exact_window_matches(
-                         targetIdentity.hwnd,
-                         targetIdentity.pid) ||
-                     !target_process_matches(
-                         targetIdentity, process.get()))) {
+                    !target_identity_matches(
+                        targetIdentity, process.get())) {
                     teardown_on_mta();
                 }
             }
@@ -1699,9 +1869,7 @@ UiaConnection::UiaConnection(UiaTargetIdentity identity)
 std::shared_ptr<UiaConnection> UiaConnection::connect(
     const UiaTargetIdentity& identity) {
     if (!identity.valid() ||
-        !exact_window_matches(identity.hwnd, identity.pid) ||
-        process_creation_identity(identity.pid) !=
-            identity.processCreationIdentity) {
+        !target_identity_matches(identity, nullptr)) {
         return {};
     }
     auto connection = std::shared_ptr<UiaConnection>(
@@ -1837,9 +2005,7 @@ std::optional<uint64_t> UiaConnection::resolve_property_reference(
 
 bool UiaConnection::matches_target(HWND hwnd) const {
     return hwnd == m_hwnd &&
-           exact_window_matches(hwnd, m_pid) &&
-           process_creation_identity(m_pid) ==
-               m_identity.processCreationIdentity;
+           target_identity_matches(m_identity, nullptr);
 }
 
 bool UiaConnection::validate_target_identity_locked() const {

@@ -116,6 +116,8 @@ struct Session {
     DWORD pid = 0;
     uint64_t processCreationIdentity = 0;
     std::vector<int> uiaRootRuntimeId;
+    std::shared_ptr<lvt::UiaWindowLifetimeToken>
+        uiaWindowLifetime;
     std::string processName;
     lvt::Architecture architecture = lvt::Architecture::unknown;
     // Provider-specific selector used by plugins (for example Chromium's
@@ -170,6 +172,8 @@ std::string add_session(const lvt::TargetInfo& target, bool visualMode,
         target.processCreationIdentity;
     session.uiaRootRuntimeId =
         target.uiaRootRuntimeId;
+    session.uiaWindowLifetime =
+        target.uiaWindowLifetime;
     session.processName = target.processName;
     session.architecture = target.architecture;
     session.visualMode = visualMode;
@@ -204,6 +208,7 @@ lvt::UiaTargetIdentity uia_identity_for_session(
         .processCreationIdentity =
             session.processCreationIdentity,
         .rootRuntimeId = session.uiaRootRuntimeId,
+        .windowLifetime = session.uiaWindowLifetime,
     };
 }
 
@@ -1336,6 +1341,8 @@ json method_connect(const json& params) {
     }
     target.uiaRootRuntimeId =
         uiaIdentity->rootRuntimeId;
+    target.uiaWindowLifetime =
+        uiaIdentity->windowLifetime;
 #endif
 
     auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
@@ -2566,6 +2573,8 @@ json action_result_to_json(const lvt::ActionResult& result, const std::string& a
         out["method"] = result.method;
     if (!result.message.empty())
         out["error"] = result.message;
+    if (!result.errorCode.empty())
+        out["code"] = result.errorCode;
     if (result.hasElement)
         out["result"] = element_fields(result.element, "uia");
     return out;

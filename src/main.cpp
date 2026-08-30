@@ -544,6 +544,8 @@ static std::optional<lvt::UiaTargetIdentity> uia_identity_for_target(
     identity.processCreationIdentity =
         target.processCreationIdentity;
     identity.rootRuntimeId = target.uiaRootRuntimeId;
+    identity.windowLifetime =
+        target.uiaWindowLifetime;
     if (!identity.valid())
         return std::nullopt;
     return identity;
@@ -1846,6 +1848,8 @@ static int run_action(const lvt::TargetInfo& target, const Args& args) {
         out["method"] = result.method;
     if (!result.message.empty())
         out["error"] = result.message;
+    if (!result.errorCode.empty())
+        out["code"] = result.errorCode;
     if (result.hasElement)
         out["result"] = query_element_to_json(result.element);
 
@@ -1976,6 +1980,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         target.uiaRootRuntimeId = identity->rootRuntimeId;
+        target.uiaWindowLifetime =
+            identity->windowLifetime;
     }
 #endif
 

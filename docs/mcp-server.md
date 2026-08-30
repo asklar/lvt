@@ -188,10 +188,13 @@ so UIA notification latency is bounded by the same roughly 500 ms cadence.
 
 At `connect`, MCP captures a UIA target identity containing the authoritative
 PID, process creation timestamp, and root `RuntimeId`, even for visual sessions
-that may later request correlation. UIA tree reads, correlation, resources,
-typed properties, and actions all reuse that identity. A transient persistent
-client failure can use a one-shot fallback only with the captured identity;
-PID/HWND/root replacement instead returns `ownershipLost`.
+that may later request correlation. The identity also retains a per-window
+generation sentinel, so exact numeric HWND reuse inside the same process cannot
+masquerade as the old root. UIA tree reads, correlation, resources, typed
+properties, and actions all reuse that identity. A transient persistent client
+failure can use a one-shot fallback only with the captured identity;
+PID/HWND/root replacement instead returns the structured code
+`ownershipLost`.
 
 Visual resources always poll `get_visual_tree_changes` with `fast: true`,
 matching the Viewer's former `watch --fast` path. The live stream still carries

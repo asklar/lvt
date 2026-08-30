@@ -156,9 +156,21 @@ before starting the worker. Target resolution also captures the process
 creation timestamp and the root UIA `RuntimeId`. Persistent connections retain
 an open handle to that original process, while one-shot tree/action fallbacks
 carry the same immutable PID, creation identity, and root token captured by the
-CLI command or MCP session. Immediately after every `ElementFromHandle`, on the
-owning MTA, lvt rechecks the current HWND owner, retained process identity, UIA
-root `ProcessId`, and root `RuntimeId` before reading or acting. A stale
+CLI command or MCP session.
+
+Because a same-process HWND can eventually recycle to the exact same numeric
+value and therefore reproduce an HWND-derived UIA `RuntimeId`, identity also
+owns a non-recyclable window-lifetime sentinel. lvt normally installs a
+GUID-named window property whose unique value exists only for that window
+generation and disappears when it is destroyed. The last identity owner removes
+the property only if the original process is still live and the property still
+matches. If `SetProp` is denied (for example by an integrity boundary), lvt
+keeps support by falling back to an exact-root destroy WinEvent subscription;
+validation synchronizes with that hook before accepting the window.
+
+Immediately after every `ElementFromHandle`, on the owning MTA, lvt rechecks
+the current HWND owner, retained process identity, window-lifetime sentinel,
+UIA root `ProcessId`, and root `RuntimeId` before reading or acting. A stale
 registry key therefore cannot attach to a replacement process after Windows
 reuses a PID/HWND, and same-process HWND reuse cannot silently switch to a
 different automation root. No desktop/global UIA
@@ -192,6 +204,12 @@ ordinary transient provider contention, but the fallback receives the
 session's captured `UiaTargetIdentity`; it never re-derives ownership from the
 current numeric HWND. Identity mismatch returns `ownershipLost` and stops the
 walk/action rather than exposing a replacement process or root.
+
+Synthetic UIA fallbacks repeat the full identity check after foreground
+activation and again immediately before every `SendInput` dispatch (mouse,
+wheel, text, or each key chord). Ownership failures set the structured action
+code `ownershipLost`, including elementless type/press-key requests, so CLI and
+MCP clients can distinguish a security boundary from an ordinary action error.
 
 ### Native typed-property safety (`native_message.*`,
 `native_property_connection.*`)

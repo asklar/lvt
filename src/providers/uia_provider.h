@@ -19,15 +19,18 @@ struct IUIAutomationElement;
 
 namespace lvt {
 
+class UiaWindowLifetimeToken;
+
 struct UiaTargetIdentity {
     HWND hwnd = nullptr;
     DWORD pid = 0;
     uint64_t processCreationIdentity = 0;
     std::vector<int> rootRuntimeId;
+    std::shared_ptr<UiaWindowLifetimeToken> windowLifetime;
 
     bool valid() const {
         return hwnd && pid && processCreationIdentity &&
-               !rootRuntimeId.empty();
+               !rootRuntimeId.empty() && windowLifetime;
     }
 };
 

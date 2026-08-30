@@ -1003,8 +1003,15 @@ TEST(McpPluginPersistent, CorrelationScopesVisualAndUiaEventPolling) {
         count_plugin_stats(uiaAfterVisual, "refresh"),
         count_plugin_stats(uiaBefore, "refresh"));
 
-    auto refreshedUia = client->call_tool(
-        "get_uia_tree", json{{"session", uiaSession}});
+    json refreshedUia;
+    for (int attempt = 0;
+         attempt < 3 && !refreshedUia.contains("root");
+         ++attempt) {
+        if (attempt > 0)
+            Sleep(static_cast<DWORD>(150 * attempt));
+        refreshedUia = client->call_tool(
+            "get_uia_tree", json{{"session", uiaSession}});
+    }
     ASSERT_TRUE(refreshedUia.contains("root"))
         << refreshedUia.dump(2);
     const auto pluginAfterUia =
@@ -1120,6 +1127,140 @@ TEST(McpUiaIdentity, ReplacementDuringFallbackFailsOwnershipLost) {
         response.dump().find("ownershipLost"),
         std::string::npos)
         << response.dump(2);
+}
+
+TEST(McpUiaIdentity, ElementlessKeyboardActionsReturnStructuredOwnershipLost) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const std::string eventName =
+        "Local\\LvtMcpUiaLifetime_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event invalidated(CreateEventA(
+        nullptr, TRUE, FALSE, eventName.c_str()));
+    ASSERT_TRUE(invalidated);
+    ScopedEnvironmentVariable invalidation(
+        "LVT_TEST_UIA_LIFETIME_INVALIDATION_EVENT",
+        eventName);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    SetEvent(invalidated.get());
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"type_text",
+              json{{"session", session},
+                   {"text", "must-not-type"}}},
+             {"press_key",
+              json{{"session", session},
+                   {"text", "A"}}}}) {
+        bool isError = false;
+        const auto result =
+            client.call_tool(tool, arguments, &isError);
+        EXPECT_TRUE(isError) << result.dump(2);
+        EXPECT_EQ(result.value("code", ""), "ownershipLost")
+            << result.dump(2);
+    }
+}
+
+TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner == fixture->pid &&
+                GetDlgItem(candidate, native_fixture::kEditId)) {
+                fixture->root = candidate;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+
+    DWORD_PTR childValue = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            fixture.root,
+            native_fixture::kCreateEventChildMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            5000, &childValue),
+        0);
+    const HWND original =
+        reinterpret_cast<HWND>(childValue);
+    ASSERT_TRUE(IsWindow(original));
+    char originalText[32]{};
+    snprintf(
+        originalText, sizeof(originalText), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(original)));
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", originalText}, {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    ASSERT_TRUE(client.call_tool(
+        "get_uia_tree", json{{"session", session}})
+                    .contains("root"));
+
+    DWORD_PTR recycledValue = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            fixture.root,
+            native_fixture::kRecycleEventChildHwndMessage,
+            131072, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            120000, &recycledValue),
+        0);
+    EXPECT_EQ(
+        reinterpret_cast<HWND>(recycledValue),
+        original);
+
+    bool treeError = false;
+    const auto tree = client.call_tool(
+        "get_uia_tree",
+        json{{"session", session}}, &treeError);
+    EXPECT_TRUE(treeError) << tree.dump(2);
+    EXPECT_NE(
+        tree.dump().find("ownershipLost"),
+        std::string::npos)
+        << tree.dump(2);
+
+    for (const auto& [tool, text] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"type_text", "must-not-type"},
+             {"press_key", "A"}}) {
+        bool actionError = false;
+        const auto action = client.call_tool(
+            tool,
+            json{{"session", session}, {"text", text}},
+            &actionError);
+        EXPECT_TRUE(actionError) << action.dump(2);
+        EXPECT_EQ(
+            action.value("code", ""),
+            "ownershipLost")
+            << action.dump(2);
+    }
 }
 
 TEST(McpPluginPersistent, SharesRegistryConnectionAcrossSessions) {

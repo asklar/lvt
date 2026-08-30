@@ -78,6 +78,7 @@ inline constexpr UINT kInsertExternalFirstListItemMessage = WM_APP + 0x12A;
 inline constexpr UINT kInsertAlphaFirstListItemMessage = WM_APP + 0x12B;
 inline constexpr UINT kPopulateAdjacentToolbarSeparatorsMessage = WM_APP + 0x12C;
 inline constexpr UINT kDeleteFirstToolbarSeparatorMessage = WM_APP + 0x12D;
+inline constexpr UINT kRecycleEventChildHwndMessage = WM_APP + 0x12E;
 inline constexpr LRESULT kSummaryProtocolVersion = 2;
 inline constexpr size_t kLongToolbarTextLength = 6000;
 inline constexpr size_t kLongItemTextLength = 5000;

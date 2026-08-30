@@ -3970,6 +3970,21 @@ static LRESULT send_native_fixture_message(
     return sent ? static_cast<LRESULT>(result) : 0;
 }
 
+static HWND recycle_event_child_exact(
+    HWND fixtureRoot, HWND original) {
+    DWORD_PTR recycled = 0;
+    const LRESULT sent = SendMessageTimeoutW(
+        fixtureRoot,
+        native_fixture::kRecycleEventChildHwndMessage,
+        131072, 0,
+        SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+        120000, &recycled);
+    EXPECT_NE(sent, 0);
+    const HWND result = reinterpret_cast<HWND>(recycled);
+    EXPECT_EQ(result, original);
+    return sent ? result : nullptr;
+}
+
 static bool wait_for_native_snapshot(
     lvt::IFrameworkConnection& connection,
     std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
@@ -4256,39 +4271,145 @@ TEST(UiaEventLifecycle, RejectsReplacementProcessWithStaleExpectedPid) {
 
 TEST_F(
     NativeControlsFixture,
-    SameProcessReplacementRootRuntimeIdIsRejected) {
-    const auto identity = lvt::capture_uia_target_identity(
-        s_hwnd, s_pid, lvt::process_creation_identity(s_pid));
-    ASSERT_TRUE(identity.has_value());
-    const HWND other = reinterpret_cast<HWND>(
+    ExactRecycledHwndIsRejectedEvenWhenRuntimeIdMatches) {
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+    const HWND original = reinterpret_cast<HWND>(
         send_native_fixture_message(
-            s_hwnd, native_fixture::kGetOutOfTreeHwndMessage));
-    ASSERT_TRUE(IsWindow(other));
+            s_hwnd, native_fixture::kCreateEventChildMessage));
+    ASSERT_TRUE(IsWindow(original));
+    const auto identity = lvt::capture_uia_target_identity(
+        original, s_pid, lvt::process_creation_identity(s_pid));
+    ASSERT_TRUE(identity.has_value());
+    auto connection = lvt::UiaConnection::connect(*identity);
+    ASSERT_NE(connection, nullptr);
 
-    auto replacement = *identity;
-    replacement.hwnd = other;
+    const HWND recycled =
+        recycle_event_child_exact(s_hwnd, original);
+    ASSERT_EQ(recycled, original);
+    ASSERT_TRUE(IsWindow(recycled));
+
+    const auto replacement =
+        lvt::capture_uia_target_identity(
+            recycled, s_pid,
+            identity->processCreationIdentity);
+    ASSERT_TRUE(replacement.has_value());
+    EXPECT_EQ(
+        replacement->rootRuntimeId,
+        identity->rootRuntimeId)
+        << "this regression requires the HWND-derived RuntimeId collision";
+    EXPECT_FALSE(connection->is_alive())
+        << "the original per-window generation sentinel survived HWND reuse";
+
     lvt::UiaProvider provider;
     bool ownershipLost = false;
     EXPECT_FALSE(provider.build(
-        replacement, lvt::UiaOptions{}, nullptr,
+        *identity, lvt::UiaOptions{}, nullptr,
         &ownershipLost));
     EXPECT_TRUE(ownershipLost);
-    EXPECT_EQ(
-        lvt::UiaConnection::connect(replacement),
-        nullptr)
-        << "same-process HWND reuse must not adopt a different UIA root";
 
     lvt::ActionRequest request;
     request.kind = lvt::ActionKind::windowMinimize;
     request.elementRef =
         "uia:" + lvt::format_runtime_id(
-            replacement.rootRuntimeId);
+            identity->rootRuntimeId);
     const auto action = lvt::perform_action(
-        replacement, lvt::UiaOptions{}, request);
+        *identity, lvt::UiaOptions{}, request);
     EXPECT_FALSE(action.ok);
+    EXPECT_EQ(action.errorCode, "ownershipLost");
     EXPECT_NE(
         action.message.find("ownershipLost"),
         std::string::npos);
+
+    for (const auto kind : {
+             lvt::ActionKind::typeText,
+             lvt::ActionKind::pressKey}) {
+        lvt::ActionRequest elementless;
+        elementless.kind = kind;
+        elementless.text =
+            kind == lvt::ActionKind::typeText
+                ? "must-not-type"
+                : "A";
+        const auto rejected = lvt::perform_action(
+            *identity, lvt::UiaOptions{},
+            elementless);
+        EXPECT_FALSE(rejected.ok);
+        EXPECT_EQ(rejected.errorCode, "ownershipLost");
+    }
+}
+
+TEST_F(
+    NativeControlsFixture,
+    SyntheticInputRevalidatesAfterForegroundBeforeSendInput) {
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+    const HWND original = reinterpret_cast<HWND>(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kCreateEventChildMessage));
+    ASSERT_TRUE(IsWindow(original));
+
+    const std::string base =
+        "Local\\LvtUiaForeground_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    const fs::path statsPath =
+        fs::path(get_lvt_path()).parent_path() /
+        ("uia-send-input-" +
+         std::to_string(GetCurrentProcessId()) + ".log");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+    ScopedEnvironmentVariable foregroundGate(
+        "LVT_TEST_UIA_AFTER_FOREGROUND_GATE", base);
+    ScopedEnvironmentVariable sendInputStats(
+        "LVT_TEST_UIA_SEND_INPUT_STATS",
+        statsPath.string());
+    ScopedEnvironmentVariable foregroundSuccess(
+        "LVT_TEST_UIA_FOREGROUND_SUCCESS", "1");
+
+    char hwndArgument[64]{};
+    snprintf(
+        hwndArgument, sizeof(hwndArgument),
+        "--hwnd 0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(original)));
+    auto pending = std::async(
+        std::launch::async,
+        [command = make_cmd(
+             get_lvt_path(),
+             std::string(hwndArgument) +
+                 " type should-not-reach-replacement")] {
+            return run_command(command);
+        });
+
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 15000),
+        WAIT_OBJECT_0)
+        << "the synthetic action did not reach foreground activation";
+    ASSERT_EQ(
+        recycle_event_child_exact(s_hwnd, original),
+        original);
+    SetEvent(release.get());
+
+    const auto output = pending.get();
+    const auto result =
+        json::parse(output, nullptr, false);
+    ASSERT_FALSE(result.is_discarded()) << output;
+    EXPECT_FALSE(result.value("ok", true));
+    EXPECT_EQ(result.value("code", ""), "ownershipLost")
+        << result.dump(2);
+    EXPECT_TRUE(
+        !fs::exists(statsPath) ||
+        fs::file_size(statsPath, ec) == 0)
+        << "SendInput was dispatched after target replacement";
+    fs::remove(statsPath, ec);
 }
 
 TEST(UiaTargetIdentity, ProcessCreationMismatchRejectsPidReuse) {
@@ -4310,6 +4431,30 @@ TEST(UiaTargetIdentity, ProcessCreationMismatchRejectsPidReuse) {
     EXPECT_EQ(
         lvt::UiaConnection::connect(recycledPid),
         nullptr);
+}
+
+TEST(UiaTargetIdentity, WinEventFallbackPreservesTargetsWhenSetPropIsUnavailable) {
+    ScopedEnvironmentVariable forcePropertyFailure(
+        "LVT_TEST_UIA_FORCE_WINDOW_PROP_FAILURE", "1");
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto identity = lvt::capture_uia_target_identity(
+        fixture.hwnd, fixture.pid,
+        lvt::process_creation_identity(fixture.pid));
+    ASSERT_TRUE(identity.has_value())
+        << "SetProp failure must fall back to the destroy subscription";
+    auto connection = lvt::UiaConnection::connect(*identity);
+    ASSERT_NE(connection, nullptr);
+
+    fixture.stop();
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(5);
+    while (connection->is_alive() &&
+           std::chrono::steady_clock::now() < deadline) {
+        Sleep(20);
+    }
+    EXPECT_FALSE(connection->is_alive());
 }
 
 TEST(UiaTargetIdentity, OneShotFallbackKeepsOriginalIdentity) {

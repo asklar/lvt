@@ -119,10 +119,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up MSVC
+      - name: Set up MSVC for x64 fixture
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: amd64_x86
+          arch: x64
 
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
@@ -136,6 +136,19 @@ jobs:
 
       - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
         run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
+
+      - name: Build opposite-architecture native fixture
+        run: |
+          cmake --preset default `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DLVT_BUILD_MANAGED=OFF `
+            -DLVT_ENABLE_MCP=OFF
+          cmake --build build --target lvt_native_controls_fixture
+
+      - name: Set up MSVC for x86 tests
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_x86
 
       - name: Set up Rust (for the x86 MCP server)
         run: rustup target add i686-pc-windows-msvc
@@ -170,6 +183,24 @@ jobs:
           build-x86\lvt_mcp_tests.exe
           --gtest_filter=McpSampleFixture.VisualTreeIsAvailableAndDiffersFromTheUiaTree:McpSampleFixture.TypedPropertySchemasAndDiffsReuseOnePersistentInjection:McpSampleFixture.ResourcesMatchEachSessionsFixedTreeMode:McpSampleFixture.ResourceSubscriptionPushesVisualPropertyChange
           --gtest_output=xml:build-x86\winui_x86_mcp_test_results.xml
+
+      - name: UIA x86-to-x64 cross-bitness event test
+        shell: pwsh
+        run: |
+          $result = 'build-x86\uia_cross_bitness_test_results.xml'
+          build-x86\lvt_integration_tests.exe `
+            --gtest_filter=NativeCrossBitness.UiaPersistentEventsRemainAvailable `
+            --gtest_output="xml:$result"
+          [xml]$report = Get-Content $result
+          $case = @(
+            @($report.testsuites.testsuite.testcase) |
+              Where-Object { $_.name -eq 'UiaPersistentEventsRemainAvailable' }
+          )
+          if (@($case).Count -ne 1 -or
+              $case[0].status -ne 'run' -or
+              $case[0].result -eq 'skipped') {
+            throw 'Cross-bitness UIA event test did not execute'
+          }
 
       - name: Chromium x86 compatibility tests
         run: >

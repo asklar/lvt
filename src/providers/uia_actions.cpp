@@ -60,6 +60,77 @@ HRESULT create_automation(const UiaOptions& options, IUIAutomation** out) {
     return S_OK;
 }
 
+void wait_action_test_gate(const char* environmentName) {
+    char base[160]{};
+    const DWORD length = GetEnvironmentVariableA(
+        environmentName, base,
+        static_cast<DWORD>(_countof(base)));
+    if (length == 0 || length >= _countof(base))
+        return;
+
+    char enteredName[192]{};
+    char releaseName[192]{};
+    snprintf(
+        enteredName, sizeof(enteredName), "%s-entered", base);
+    snprintf(
+        releaseName, sizeof(releaseName), "%s-release", base);
+    wil::unique_handle entered(OpenEventA(
+        EVENT_MODIFY_STATE, FALSE, enteredName));
+    wil::unique_handle release(OpenEventA(
+        SYNCHRONIZE, FALSE, releaseName));
+    if (!entered || !release)
+        return;
+    SetEvent(entered.get());
+    WaitForSingleObject(release.get(), 10000);
+}
+
+void record_send_input_test_attempt(const char* operation) {
+    char path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_SEND_INPUT_STATS", path,
+        static_cast<DWORD>(_countof(path)));
+    if (length == 0 || length >= _countof(path))
+        return;
+    wil::unique_handle file(CreateFileA(
+        path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file)
+        return;
+    char line[64]{};
+    const int written = snprintf(
+        line, sizeof(line), "%s\r\n", operation);
+    if (written <= 0)
+        return;
+    DWORD ignored = 0;
+    WriteFile(
+        file.get(), line,
+        static_cast<DWORD>(
+            (std::min)(written, static_cast<int>(sizeof(line) - 1))),
+        &ignored, nullptr);
+}
+
+bool activate_target_for_input(HWND hwnd) {
+    char overrideValue[8]{};
+    char gate[160]{};
+    char stats[MAX_PATH]{};
+    if (GetEnvironmentVariableA(
+            "LVT_TEST_UIA_FOREGROUND_SUCCESS",
+            overrideValue,
+            static_cast<DWORD>(
+                _countof(overrideValue))) != 0 &&
+        strtoul(overrideValue, nullptr, 10) != 0 &&
+        GetEnvironmentVariableA(
+            "LVT_TEST_UIA_AFTER_FOREGROUND_GATE",
+            gate, static_cast<DWORD>(_countof(gate))) != 0 &&
+        GetEnvironmentVariableA(
+            "LVT_TEST_UIA_SEND_INPUT_STATS",
+            stats, static_cast<DWORD>(_countof(stats))) != 0) {
+        return true;
+    }
+    return bring_to_foreground(hwnd);
+}
+
 std::optional<Element> build_tree_for_action(
     const UiaTargetIdentity& identity,
     const UiaOptions& options,
@@ -821,6 +892,7 @@ ActionResult perform_action(
     ActionResult result;
     const HWND hwnd = identity.hwnd;
     if (!identity.valid()) {
+        result.errorCode = "ownershipLost";
         result.message =
             "ownershipLost: the target identity is unavailable";
         return result;
@@ -880,6 +952,7 @@ ActionResult perform_action(
                     return result;
                 }
             } else if (ownershipLost) {
+                result.errorCode = "ownershipLost";
                 result.message =
                     "ownershipLost: the UI Automation target identity changed";
                 return result;
@@ -918,6 +991,8 @@ ActionResult perform_action(
         auto tree = build_tree_for_action(
             identity, options, connection, &ownershipLost);
         if (!tree) {
+            if (ownershipLost)
+                result.errorCode = "ownershipLost";
             result.message = ownershipLost
                 ? "ownershipLost: the UI Automation target identity changed"
                 : "could not read the UI Automation tree for this window";
@@ -949,9 +1024,18 @@ ActionResult perform_action(
         wil::com_ptr<IUIAutomation> automation;
         RETURN_IF_FAILED(create_automation(options, &automation));
         wil::com_ptr<IUIAutomationElement> validatedRoot;
-        RETURN_IF_FAILED(get_validated_uia_root(
-            automation.get(), identity, nullptr,
-            &validatedRoot));
+        const auto validate_target = [&]() -> HRESULT {
+            validatedRoot.reset();
+            const HRESULT validateHr = get_validated_uia_root(
+                automation.get(), identity, nullptr,
+                &validatedRoot);
+            if (is_ownership_lost(validateHr)) {
+                failure =
+                    "ownershipLost: the UI Automation target identity changed";
+            }
+            return validateHr;
+        };
+        RETURN_IF_FAILED(validate_target());
 
         wil::com_ptr<IUIAutomationElement> element;
         if (needsElement) {
@@ -997,16 +1081,17 @@ ActionResult perform_action(
             // only path that needs the window on top and moves the cursor.
             POINT center{};
             RETURN_IF_FAILED(live_element_center(element.get(), target, center, failure));
-            validatedRoot.reset();
-            RETURN_IF_FAILED(get_validated_uia_root(
-                automation.get(), identity, nullptr,
-                &validatedRoot));
-            if (!bring_to_foreground(hwnd)) {
+            RETURN_IF_FAILED(validate_target());
+            if (!activate_target_for_input(hwnd)) {
                 failure = "no pattern would activate this element, and the window "
                           "could not be brought to the foreground, so a synthetic "
                           "click would land on the wrong window";
                 return E_ACCESSDENIED;
             }
+            wait_action_test_gate(
+                "LVT_TEST_UIA_AFTER_FOREGROUND_GATE");
+            RETURN_IF_FAILED(validate_target());
+            record_send_input_test_attempt("click");
             if (!send_click(center, request.button, request.amount)) {
                 failure = "SendInput click failed";
                 return E_FAIL;
@@ -1040,14 +1125,26 @@ ActionResult perform_action(
                           ", and the element could not be focused to type into";
                 return E_NOTIMPL;
             }
-            if (!bring_to_foreground(hwnd)) {
+            RETURN_IF_FAILED(validate_target());
+            if (!activate_target_for_input(hwnd)) {
                 failure = describe_decline(attempt, "Value") +
                           ", and the window could not be brought forward to type into it";
                 return E_ACCESSDENIED;
             }
+            wait_action_test_gate(
+                "LVT_TEST_UIA_AFTER_FOREGROUND_GATE");
+            RETURN_IF_FAILED(validate_target());
             KeyChord selectAll;
-            if (parse_key_chord("Ctrl+A", selectAll))
-                send_key_chord(selectAll);
+            if (parse_key_chord("Ctrl+A", selectAll)) {
+                RETURN_IF_FAILED(validate_target());
+                record_send_input_test_attempt("set-value-select-all");
+                if (!send_key_chord(selectAll)) {
+                    failure = "SendInput select-all failed";
+                    return E_FAIL;
+                }
+            }
+            RETURN_IF_FAILED(validate_target());
+            record_send_input_test_attempt("set-value-text");
             if (!send_text(request.text)) {
                 failure = "SendInput typing failed";
                 return E_FAIL;
@@ -1127,17 +1224,23 @@ ActionResult perform_action(
             if (attempt.succeeded())
                 return S_OK;
 
-            if (!bring_to_foreground(hwnd)) {
+            RETURN_IF_FAILED(validate_target());
+            if (!activate_target_for_input(hwnd)) {
                 failure = describe_decline(attempt, "Scroll") +
                           ", and the window could not be brought forward to send a "
                           "wheel event";
                 return E_ACCESSDENIED;
             }
+            wait_action_test_gate(
+                "LVT_TEST_UIA_AFTER_FOREGROUND_GATE");
+            RETURN_IF_FAILED(validate_target());
             const int notch = WHEEL_DELTA * (std::max)(1, request.amount);
             const bool horizontal = request.direction == "left" || request.direction == "right";
             const bool negative = request.direction == "down" || request.direction == "left";
             POINT wheelPoint{};
             RETURN_IF_FAILED(live_element_center(element.get(), target, wheelPoint, failure));
+            RETURN_IF_FAILED(validate_target());
+            record_send_input_test_attempt("scroll");
             if (!send_wheel(wheelPoint, negative ? -notch : notch, horizontal)) {
                 failure = "SendInput wheel failed";
                 return E_FAIL;
@@ -1154,12 +1257,18 @@ ActionResult perform_action(
                 failure = "could not focus the element to send input to it";
                 return E_NOTIMPL;
             }
-            if (!bring_to_foreground(hwnd)) {
+            RETURN_IF_FAILED(validate_target());
+            if (!activate_target_for_input(hwnd)) {
                 failure = "could not bring the target window to the foreground, so "
                           "keyboard input would go elsewhere";
                 return E_ACCESSDENIED;
             }
+            wait_action_test_gate(
+                "LVT_TEST_UIA_AFTER_FOREGROUND_GATE");
+            RETURN_IF_FAILED(validate_target());
             if (request.kind == ActionKind::typeText) {
+                RETURN_IF_FAILED(validate_target());
+                record_send_input_test_attempt("type-text");
                 if (!send_text(request.text)) {
                     failure = "SendInput typing failed";
                     return E_FAIL;
@@ -1174,6 +1283,8 @@ ActionResult perform_action(
                 return E_INVALIDARG;
             }
             for (const auto& chord : chords) {
+                RETURN_IF_FAILED(validate_target());
+                record_send_input_test_attempt("press-key");
                 if (!send_key_chord(chord)) {
                     failure = "SendInput key chord failed";
                     return E_FAIL;
@@ -1187,6 +1298,8 @@ ActionResult perform_action(
     });
 
     if (FAILED(hr)) {
+        if (is_ownership_lost(hr))
+            result.errorCode = "ownershipLost";
         result.message = failure.empty() ? "action failed" : failure;
         return result;
     }
