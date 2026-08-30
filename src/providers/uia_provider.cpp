@@ -11,12 +11,18 @@
 #include <UIAutomation.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <functional>
+#include <future>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <thread>
@@ -29,6 +35,162 @@ namespace {
 using clock_type = std::chrono::steady_clock;
 static constexpr DWORD kUiaDefaultTransactionTimeoutMs = 20000;
 static constexpr DWORD kUiaConnectionTimeoutCapMs = 2000;
+static constexpr auto kUiaTargetLivenessInterval = std::chrono::milliseconds(100);
+
+std::atomic_uint64_t g_uiaEventConnections = 0;
+std::atomic_uint64_t g_uiaStructureRegistrations = 0;
+std::atomic_uint64_t g_uiaPropertyRegistrations = 0;
+std::atomic_uint64_t g_uiaAutomationRegistrations = 0;
+std::atomic_uint64_t g_uiaEventCallbacks = 0;
+std::atomic_uint64_t g_uiaRemoveAllCalls = 0;
+
+const std::vector<int>& uia_event_property_ids() {
+    static const std::vector<int> ids = {
+        UIA_NamePropertyId,
+        UIA_AutomationIdPropertyId,
+        UIA_ClassNamePropertyId,
+        UIA_ControlTypePropertyId,
+        UIA_FrameworkIdPropertyId,
+        UIA_BoundingRectanglePropertyId,
+        UIA_IsOffscreenPropertyId,
+        UIA_IsEnabledPropertyId,
+        UIA_IsControlElementPropertyId,
+        UIA_IsContentElementPropertyId,
+        UIA_HasKeyboardFocusPropertyId,
+        UIA_IsKeyboardFocusablePropertyId,
+
+        UIA_IsValuePatternAvailablePropertyId,
+        UIA_ValueValuePropertyId,
+        UIA_ValueIsReadOnlyPropertyId,
+
+        UIA_IsRangeValuePatternAvailablePropertyId,
+        UIA_RangeValueValuePropertyId,
+        UIA_RangeValueMinimumPropertyId,
+        UIA_RangeValueMaximumPropertyId,
+        UIA_RangeValueSmallChangePropertyId,
+        UIA_RangeValueLargeChangePropertyId,
+        UIA_RangeValueIsReadOnlyPropertyId,
+
+        UIA_IsTogglePatternAvailablePropertyId,
+        UIA_ToggleToggleStatePropertyId,
+
+        UIA_IsExpandCollapsePatternAvailablePropertyId,
+        UIA_ExpandCollapseExpandCollapseStatePropertyId,
+
+        UIA_IsSelectionPatternAvailablePropertyId,
+        UIA_SelectionCanSelectMultiplePropertyId,
+        UIA_SelectionIsSelectionRequiredPropertyId,
+        UIA_IsSelectionItemPatternAvailablePropertyId,
+        UIA_SelectionItemIsSelectedPropertyId,
+
+        UIA_IsScrollPatternAvailablePropertyId,
+        UIA_ScrollHorizontalScrollPercentPropertyId,
+        UIA_ScrollVerticalScrollPercentPropertyId,
+        UIA_ScrollHorizontalViewSizePropertyId,
+        UIA_ScrollVerticalViewSizePropertyId,
+        UIA_ScrollHorizontallyScrollablePropertyId,
+        UIA_ScrollVerticallyScrollablePropertyId,
+    };
+    return ids;
+}
+
+const std::vector<int>& uia_automation_event_ids() {
+    static const std::vector<int> ids = {
+        UIA_Invoke_InvokedEventId,
+        UIA_SelectionItem_ElementAddedToSelectionEventId,
+        UIA_SelectionItem_ElementRemovedFromSelectionEventId,
+        UIA_SelectionItem_ElementSelectedEventId,
+        UIA_Text_TextChangedEventId,
+        UIA_Text_TextSelectionChangedEventId,
+        UIA_MenuOpenedEventId,
+        UIA_MenuClosedEventId,
+        UIA_LayoutInvalidatedEventId,
+    };
+    return ids;
+}
+
+bool exact_window_matches(HWND hwnd, DWORD pid) {
+    if (!hwnd || !IsWindow(hwnd))
+        return false;
+    DWORD currentPid = 0;
+    GetWindowThreadProcessId(hwnd, &currentPid);
+    return currentPid != 0 && currentPid == pid;
+}
+
+class UiaEventHandler final
+    : public IUIAutomationStructureChangedEventHandler,
+      public IUIAutomationPropertyChangedEventHandler,
+      public IUIAutomationEventHandler {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+        REFIID iid, void** object) noexcept override {
+        if (!object)
+            return E_POINTER;
+        *object = nullptr;
+        if (iid == __uuidof(IUnknown) ||
+            iid == __uuidof(IUIAutomationStructureChangedEventHandler)) {
+            *object =
+                static_cast<IUIAutomationStructureChangedEventHandler*>(this);
+        } else if (iid ==
+                   __uuidof(IUIAutomationPropertyChangedEventHandler)) {
+            *object =
+                static_cast<IUIAutomationPropertyChangedEventHandler*>(this);
+        } else if (iid == __uuidof(IUIAutomationEventHandler)) {
+            *object = static_cast<IUIAutomationEventHandler*>(this);
+        } else {
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() noexcept override {
+        return m_references.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    ULONG STDMETHODCALLTYPE Release() noexcept override {
+        const ULONG remaining =
+            m_references.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (remaining == 0)
+            delete this;
+        return remaining;
+    }
+
+    HRESULT STDMETHODCALLTYPE HandleStructureChangedEvent(
+        IUIAutomationElement*, StructureChangeType, SAFEARRAY*) noexcept override {
+        signal();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE HandlePropertyChangedEvent(
+        IUIAutomationElement*, PROPERTYID, VARIANT) noexcept override {
+        signal();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE HandleAutomationEvent(
+        IUIAutomationElement*, EVENTID) noexcept override {
+        signal();
+        return S_OK;
+    }
+
+    bool consume() noexcept {
+        return m_hint.consume();
+    }
+
+    void stop() noexcept {
+        m_hint.stop();
+    }
+
+private:
+    void signal() noexcept {
+        g_uiaEventCallbacks.fetch_add(1, std::memory_order_relaxed);
+        m_hint.signal();
+    }
+
+    std::atomic<ULONG> m_references{1};
+    uia_eventing_detail::SnapshotHint m_hint;
+};
 
 std::string narrow(BSTR bstr) {
     if (!bstr)
@@ -437,6 +599,88 @@ HRESULT create_automation(const UiaOptions& options, IUIAutomation** out) {
     return S_OK;
 }
 
+struct UiaEventRegistration {
+    wil::com_ptr<IUIAutomationElement> root;
+    wil::com_ptr<IUIAutomationCacheRequest> cacheRequest;
+    wil::com_ptr<UiaEventHandler> handler;
+};
+
+HRESULT register_uia_event_handlers(
+    IUIAutomation* automation, HWND hwnd, DWORD pid,
+    UiaEventRegistration& registration) {
+    RETURN_HR_IF_NULL(E_POINTER, automation);
+
+    wil::com_ptr<IUIAutomationElement> root;
+    RETURN_IF_FAILED(automation->ElementFromHandle(hwnd, &root));
+    RETURN_HR_IF_NULL(E_FAIL, root.get());
+
+    int rootPid = 0;
+    RETURN_IF_FAILED(root->get_CurrentProcessId(&rootPid));
+    RETURN_HR_IF(
+        HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE),
+        rootPid <= 0 || static_cast<DWORD>(rootPid) != pid);
+
+    wil::com_ptr<IUIAutomationCacheRequest> cacheRequest;
+    RETURN_IF_FAILED(automation->CreateCacheRequest(&cacheRequest));
+    RETURN_IF_FAILED(cacheRequest->put_TreeScope(TreeScope_Element));
+    RETURN_IF_FAILED(
+        cacheRequest->put_AutomationElementMode(AutomationElementMode_None));
+    RETURN_IF_FAILED(cacheRequest->AddProperty(UIA_RuntimeIdPropertyId));
+    RETURN_IF_FAILED(cacheRequest->AddProperty(UIA_ProcessIdPropertyId));
+    RETURN_IF_FAILED(cacheRequest->AddProperty(UIA_NativeWindowHandlePropertyId));
+
+    wil::com_ptr<UiaEventHandler> handler;
+    handler.attach(new (std::nothrow) UiaEventHandler());
+    RETURN_IF_NULL_ALLOC(handler);
+
+    const HRESULT structureHr =
+        automation->AddStructureChangedEventHandler(
+            root.get(), TreeScope_Subtree, cacheRequest.get(),
+            static_cast<IUIAutomationStructureChangedEventHandler*>(
+                handler.get()));
+    if (FAILED(structureHr))
+        RETURN_HR(structureHr);
+    g_uiaStructureRegistrations.fetch_add(1, std::memory_order_relaxed);
+
+    const auto& properties = uia_event_property_ids();
+    const HRESULT propertyHr =
+        automation->AddPropertyChangedEventHandlerNativeArray(
+            root.get(), TreeScope_Subtree, cacheRequest.get(),
+            static_cast<IUIAutomationPropertyChangedEventHandler*>(
+                handler.get()),
+            const_cast<PROPERTYID*>(properties.data()),
+            static_cast<int>(properties.size()));
+    if (FAILED(propertyHr)) {
+        (void)automation->RemoveAllEventHandlers();
+        RETURN_HR(propertyHr);
+    }
+    g_uiaPropertyRegistrations.fetch_add(1, std::memory_order_relaxed);
+
+    uint64_t automationRegistrations = 0;
+    for (const EVENTID eventId : uia_automation_event_ids()) {
+        const HRESULT eventHr = automation->AddAutomationEventHandler(
+            eventId, root.get(), TreeScope_Subtree, cacheRequest.get(),
+            static_cast<IUIAutomationEventHandler*>(handler.get()));
+        if (SUCCEEDED(eventHr)) {
+            ++automationRegistrations;
+        } else {
+            LOG_IF_FAILED(eventHr);
+        }
+    }
+    if (automationRegistrations == 0) {
+        (void)automation->RemoveAllEventHandlers();
+        RETURN_HR(E_FAIL);
+    }
+    g_uiaAutomationRegistrations.fetch_add(
+        automationRegistrations, std::memory_order_relaxed);
+    g_uiaEventConnections.fetch_add(1, std::memory_order_relaxed);
+
+    registration.root = std::move(root);
+    registration.cacheRequest = std::move(cacheRequest);
+    registration.handler = std::move(handler);
+    return S_OK;
+}
+
 HRESULT build_tree_with_automation(IUIAutomation* automation, HWND hwnd,
                                    const UiaOptions& options,
                                    Element& out, bool& truncated) {
@@ -487,11 +731,10 @@ HRESULT build_tree_on_mta(HWND hwnd, const UiaOptions& options,
 // thread, and a thread cannot be in both, so all UIA work is marshalled onto a
 // dedicated MTA thread.
 //
-// One-shot callers still create and release their COM objects inside `fn`.
-// UiaConnection is the deliberate exception: it creates IUIAutomation once on
-// one run_on_mta call and reuses that pointer on later run_on_mta calls. That
-// is still the SAME apartment because COINIT_MULTITHREADED joins the single,
-// process-wide MTA rather than inventing a per-thread apartment.
+// One-shot callers create and release their COM objects inside `fn`.
+// UiaConnection instead owns one long-lived MTA worker (see State below), so
+// its client, handlers, tree reads, event drains, and teardown all stay on one
+// exact thread.
 //
 // The body is wrapped in CATCH_RETURN because an exception escaping a thread
 // function calls std::terminate: building the Element tree allocates freely, so
@@ -514,6 +757,44 @@ HRESULT run_on_mta(Fn&& fn) {
 }
 
 } // namespace
+
+namespace uia_eventing_detail {
+
+SubscriptionCounters subscription_counters() {
+    return {
+        .connections =
+            g_uiaEventConnections.load(std::memory_order_relaxed),
+        .structureRegistrations =
+            g_uiaStructureRegistrations.load(std::memory_order_relaxed),
+        .propertyRegistrations =
+            g_uiaPropertyRegistrations.load(std::memory_order_relaxed),
+        .automationRegistrations =
+            g_uiaAutomationRegistrations.load(std::memory_order_relaxed),
+        .callbacks =
+            g_uiaEventCallbacks.load(std::memory_order_relaxed),
+        .removeAllCalls =
+            g_uiaRemoveAllCalls.load(std::memory_order_relaxed),
+    };
+}
+
+void reset_subscription_counters() {
+    g_uiaEventConnections.store(0, std::memory_order_relaxed);
+    g_uiaStructureRegistrations.store(0, std::memory_order_relaxed);
+    g_uiaPropertyRegistrations.store(0, std::memory_order_relaxed);
+    g_uiaAutomationRegistrations.store(0, std::memory_order_relaxed);
+    g_uiaEventCallbacks.store(0, std::memory_order_relaxed);
+    g_uiaRemoveAllCalls.store(0, std::memory_order_relaxed);
+}
+
+const std::vector<int>& subscribed_property_ids() {
+    return uia_event_property_ids();
+}
+
+const std::vector<int>& subscribed_automation_event_ids() {
+    return uia_automation_event_ids();
+}
+
+} // namespace uia_eventing_detail
 
 std::string format_uia_double(double value) {
     return format_double_round_trip(value);
@@ -584,12 +865,150 @@ std::optional<Element> UiaProvider::build(HWND hwnd, const UiaOptions& options, 
 }
 
 struct UiaConnection::State {
-    std::mutex mutex;
-    wil::com_ptr<IUIAutomation> automation;
-    CO_MTA_USAGE_COOKIE mtaCookie = nullptr;
+    State(HWND hwnd, DWORD pid)
+        : targetHwnd(hwnd), targetPid(pid),
+          worker([this] { worker_main(); }) {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        readyCondition.wait(lock, [this] { return ready; });
+    }
+
+    ~State() {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            stopping = true;
+        }
+        queueCondition.notify_one();
+        if (worker.joinable())
+            worker.join();
+    }
+
+    HRESULT invoke(std::function<HRESULT()> operation) {
+        auto completion = std::make_shared<std::promise<HRESULT>>();
+        auto future = completion->get_future();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (stopping)
+                return HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
+            if (FAILED(initializeResult))
+                return initializeResult;
+            operations.emplace_back(
+                [operation = std::move(operation),
+                 completion = std::move(completion)]() mutable {
+                    const HRESULT result = [&]() -> HRESULT {
+                        try {
+                            return operation();
+                        }
+                        CATCH_RETURN();
+                    }();
+                    completion->set_value(result);
+                });
+        }
+        queueCondition.notify_one();
+        return future.get();
+    }
+
+    bool connected() const noexcept {
+        return alive.load(std::memory_order_acquire);
+    }
+
+    std::mutex operationMutex;
     UiaPropertyIdentityCache identities;
     UiaPropertySchemaCache schemaCache;
     std::string identityError;
+
+private:
+    HRESULT initialize_on_mta() {
+        UiaOptions connectOptions;
+        connectOptions.timeoutMs = 0;
+        RETURN_IF_FAILED(create_automation(connectOptions, &automation));
+        const HRESULT eventHr = register_uia_event_handlers(
+            automation.get(), targetHwnd, targetPid, eventRegistration);
+        if (FAILED(eventHr)) {
+            automation.reset();
+            RETURN_HR(eventHr);
+        }
+        alive.store(true, std::memory_order_release);
+        return S_OK;
+    }
+
+    void teardown_on_mta() noexcept {
+        if (eventRegistration.handler)
+            eventRegistration.handler->stop();
+        if (automation && eventRegistration.handler) {
+            g_uiaRemoveAllCalls.fetch_add(1, std::memory_order_relaxed);
+            LOG_IF_FAILED(automation->RemoveAllEventHandlers());
+        }
+        eventRegistration.handler.reset();
+        eventRegistration.cacheRequest.reset();
+        eventRegistration.root.reset();
+        automation.reset();
+        alive.store(false, std::memory_order_release);
+    }
+
+    void worker_main() {
+        const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        HRESULT result = coHr;
+        if (SUCCEEDED(coHr)) {
+            result = [&]() -> HRESULT {
+                try {
+                    return initialize_on_mta();
+                }
+                CATCH_RETURN();
+            }();
+        }
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            initializeResult = result;
+            ready = true;
+        }
+        readyCondition.notify_one();
+
+        if (SUCCEEDED(coHr)) {
+            for (;;) {
+                std::function<void()> operation;
+                {
+                    std::unique_lock<std::mutex> lock(queueMutex);
+                    queueCondition.wait_for(
+                        lock, kUiaTargetLivenessInterval,
+                        [this] {
+                            return stopping || !operations.empty();
+                        });
+                    if (stopping && operations.empty())
+                        break;
+                    if (!operations.empty()) {
+                        operation = std::move(operations.front());
+                        operations.pop_front();
+                    }
+                }
+
+                if (operation)
+                    operation();
+
+                if (connected() &&
+                    !exact_window_matches(targetHwnd, targetPid)) {
+                    teardown_on_mta();
+                }
+            }
+            teardown_on_mta();
+            CoUninitialize();
+        }
+    }
+
+    HWND targetHwnd = nullptr;
+    DWORD targetPid = 0;
+    std::mutex queueMutex;
+    std::condition_variable queueCondition;
+    std::condition_variable readyCondition;
+    std::deque<std::function<void()>> operations;
+    bool ready = false;
+    bool stopping = false;
+    HRESULT initializeResult = E_PENDING;
+    std::thread worker;
+    std::atomic<bool> alive{false};
+    wil::com_ptr<IUIAutomation> automation;
+    UiaEventRegistration eventRegistration;
+
+    friend class UiaConnection;
 };
 
 bool UiaPropertyIdentityCache::attach(
@@ -987,65 +1406,22 @@ bool validate_number(
 } // namespace
 
 UiaConnection::UiaConnection(HWND hwnd)
-    : m_hwnd(hwnd), m_state(std::make_unique<State>()) {
+    : m_hwnd(hwnd) {
     GetWindowThreadProcessId(hwnd, &m_pid);
+    m_state = std::make_unique<State>(hwnd, m_pid);
 }
 
 std::shared_ptr<UiaConnection> UiaConnection::connect(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd))
+        return {};
     auto connection = std::shared_ptr<UiaConnection>(new UiaConnection(hwnd));
-    const HRESULT hr = run_on_mta([&]() -> HRESULT {
-        CO_MTA_USAGE_COOKIE cookie = nullptr;
-        RETURN_IF_FAILED(CoIncrementMTAUsage(&cookie));
-
-        wil::com_ptr<IUIAutomation> automation;
-        UiaOptions connectOptions;
-        // connect() is not itself a tree walk; the very next get_tree call
-        // re-applies that walk's own timeout anyway, so create the client with
-        // the default-effective setting rather than baking in an arbitrary
-        // caller-specific budget up front.
-        connectOptions.timeoutMs = 0;
-        const HRESULT createHr = create_automation(connectOptions, &automation);
-        if (FAILED(createHr)) {
-            CoDecrementMTAUsage(cookie);
-            RETURN_HR(createHr);
-        }
-
-        std::lock_guard<std::mutex> lock(connection->m_state->mutex);
-        connection->m_state->automation = std::move(automation);
-        connection->m_state->mtaCookie = cookie;
-        return S_OK;
-    });
-
-    if (FAILED(hr)) {
-        LOG_IF_FAILED(hr);
+    if (!connection->m_state->connected()) {
         return {};
     }
     return connection;
 }
 
-UiaConnection::~UiaConnection() {
-    wil::com_ptr<IUIAutomation> automation;
-    CO_MTA_USAGE_COOKIE cookie = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(m_state->mutex);
-        automation = std::move(m_state->automation);
-        cookie = m_state->mtaCookie;
-        m_state->mtaCookie = nullptr;
-    }
-    if (automation) {
-        // connect() took an MTA-usage cookie specifically so the process-wide
-        // MTA stays alive even between our short-lived worker threads. Release
-        // the automation object before dropping that cookie, otherwise the last
-        // CoDecrementMTAUsage could tear the apartment down while this pointer
-        // still belongs to it.
-        (void)run_on_mta([&]() -> HRESULT {
-            automation.reset();
-            return S_OK;
-        });
-    }
-    if (cookie)
-        CoDecrementMTAUsage(cookie);
-}
+UiaConnection::~UiaConnection() = default;
 
 bool UiaConnection::get_tree(Element& root, bool fastProperties,
                              const std::string& /*providerOption*/) {
@@ -1058,33 +1434,24 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
     if (truncated)
         *truncated = false;
 
-    // One live walk at a time against the reused client. Parallel reads buy
-    // nothing here — the target's UI thread still answers them serially — and
-    // holding the lock across the whole run also keeps teardown from releasing
-    // the shared automation object while this call is still using it. Read
-    // only the raw pointer here; even com_ptr's AddRef would execute on the
-    // caller's thread, which may be STA or not in COM at all.
-    std::unique_lock<std::mutex> lock(m_state->mutex);
-    if (!matches_target(m_hwnd))
-        return false;
-    IUIAutomation* automation = m_state->automation.get();
-    if (!automation)
+    // All COM work is dispatched to the connection's one persistent MTA
+    // thread. The operation lock serializes tree/property/event consumers
+    // before they enqueue work, while the worker owns every COM reference.
+    std::unique_lock<std::mutex> lock(m_state->operationMutex);
+    if (!matches_target(m_hwnd) || !m_state->connected())
         return false;
 
     Element built;
     bool wasTruncated = false;
     const HWND hwnd = m_hwnd;
-    const HRESULT hr = run_on_mta([automation, hwnd, &options, &built, &wasTruncated]() -> HRESULT {
-        // connect() created this automation object on one thread that had
-        // joined the process-wide MTA. Every get_tree_with_options call joins
-        // that same single MTA before touching it, so the raw pointer stays in
-        // one apartment throughout its whole life and needs no marshal/proxy.
-        // connect() also took an MTA-usage cookie, so that apartment survives
-        // between our short-lived worker threads instead of being torn down
-        // when the creating thread exits.
-        apply_automation_timeouts(automation, options);
-        return build_tree_with_automation(automation, hwnd, options, built, wasTruncated);
-    });
+    const HRESULT hr = m_state->invoke(
+        [state = m_state.get(), hwnd, &options, &built,
+         &wasTruncated]() -> HRESULT {
+            RETURN_HR_IF_NULL(E_FAIL, state->automation.get());
+            apply_automation_timeouts(state->automation.get(), options);
+            return build_tree_with_automation(
+                state->automation.get(), hwnd, options, built, wasTruncated);
+        });
     if (SUCCEEDED(hr)) {
         if (!m_state->identities.attach(
                 built, identity_scope(options), !wasTruncated)) {
@@ -1115,8 +1482,8 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
 
 bool UiaConnection::attach_property_identities(
     Element& root, const UiaOptions& options, bool completeSnapshot) {
-    std::lock_guard<std::mutex> lock(m_state->mutex);
-    if (!m_state->automation || !matches_target(m_hwnd))
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    if (!m_state->connected() || !matches_target(m_hwnd))
         return false;
     const bool attached = m_state->identities.attach(
         root, identity_scope(options), completeSnapshot);
@@ -1130,8 +1497,8 @@ bool UiaConnection::attach_property_identities(
 bool UiaConnection::remember_property_references(
     const Element& root, const UiaOptions& options,
     bool completeSnapshot) {
-    std::lock_guard<std::mutex> lock(m_state->mutex);
-    if (!m_state->automation || !matches_target(m_hwnd))
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    if (!m_state->connected() || !matches_target(m_hwnd))
         return false;
     const bool remembered =
         m_state->identities.remember(
@@ -1144,14 +1511,14 @@ bool UiaConnection::remember_property_references(
 }
 
 std::string UiaConnection::property_identity_error() {
-    std::lock_guard<std::mutex> lock(m_state->mutex);
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
     return m_state->identityError;
 }
 
 std::optional<uint64_t> UiaConnection::resolve_property_reference(
     const std::string& reference, std::string& error) {
-    std::lock_guard<std::mutex> lock(m_state->mutex);
-    if (!m_state->automation || !matches_target(m_hwnd)) {
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    if (!m_state->connected() || !matches_target(m_hwnd)) {
         error = "The UI Automation connection no longer matches this session's target window";
         return std::nullopt;
     }
@@ -1160,11 +1527,7 @@ std::optional<uint64_t> UiaConnection::resolve_property_reference(
 }
 
 bool UiaConnection::matches_target(HWND hwnd) const {
-    if (!hwnd || hwnd != m_hwnd || !IsWindow(hwnd))
-        return false;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    return pid != 0 && pid == m_pid;
+    return hwnd == m_hwnd && exact_window_matches(hwnd, m_pid);
 }
 
 PropertySnapshotResult UiaConnection::get_property_snapshot(uint64_t handle) {
@@ -1203,7 +1566,7 @@ PropertySnapshotResult UiaConnection::get_property_snapshot(uint64_t handle) {
         return result;
     }
 
-    std::lock_guard<std::mutex> lock(m_state->mutex);
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
     return make_uia_property_snapshot(
         *located.element, located.selection, m_state->schemaCache);
 }
@@ -1277,8 +1640,8 @@ PropertyMutationResult UiaConnection::set_property(
         return result;
     }
 
-    std::unique_lock<std::mutex> lock(m_state->mutex);
-    if (!matches_target(m_hwnd)) {
+    std::unique_lock<std::mutex> lock(m_state->operationMutex);
+    if (!matches_target(m_hwnd) || !m_state->connected()) {
         PropertyMutationResult result;
         result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
         result.error =
@@ -1286,8 +1649,7 @@ PropertyMutationResult UiaConnection::set_property(
         return result;
     }
     const auto runtime = m_state->identities.runtime_id(handle);
-    IUIAutomation* automation = m_state->automation.get();
-    if (!runtime || !automation) {
+    if (!runtime) {
         PropertyMutationResult result;
         result.hresult = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
         result.error =
@@ -1304,9 +1666,10 @@ PropertyMutationResult UiaConnection::set_property(
 
     const HWND hwnd = m_hwnd;
     PropertyMutationResult result;
-    const HRESULT hr = run_on_mta([&]() -> HRESULT {
+    const HRESULT hr = m_state->invoke([&, state = m_state.get()]() -> HRESULT {
+        RETURN_HR_IF_NULL(E_FAIL, state->automation.get());
         result = perform_uia_property_action(
-            automation, hwnd, runtimeId, action, value);
+            state->automation.get(), hwnd, runtimeId, action, value);
         return S_OK;
     });
     if (FAILED(hr)) {
@@ -1342,12 +1705,41 @@ PropertyMutationResult UiaConnection::clear_property(
 }
 
 std::vector<ConnectionEvent> UiaConnection::poll_events() {
-    return {};
+    std::vector<ConnectionEvent> result;
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    if (!m_state->connected() || !matches_target(m_hwnd))
+        return result;
+
+    bool snapshotRequired = false;
+    const HRESULT hr = m_state->invoke(
+        [state = m_state.get(), &snapshotRequired]() -> HRESULT {
+            if (!state->eventRegistration.handler)
+                return E_FAIL;
+            snapshotRequired =
+                state->eventRegistration.handler->consume();
+            return S_OK;
+        });
+    if (SUCCEEDED(hr) && snapshotRequired) {
+        ConnectionEvent event;
+        event.mutation = ConnectionEvent::Mutation::snapshotRequired;
+        result.push_back(std::move(event));
+    }
+    return result;
+}
+
+bool UiaConnection::refresh_events() {
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    if (!m_state->connected() || !matches_target(m_hwnd))
+        return false;
+    return SUCCEEDED(m_state->invoke([] { return S_OK; }));
 }
 
 bool UiaConnection::is_alive() const {
-    std::lock_guard<std::mutex> lock(m_state->mutex);
-    return m_state->automation != nullptr;
+    // The owning MTA thread performs the exact HWND/PID liveness check every
+    // 100 ms and sets this false only after event handlers and COM references
+    // have been torn down. Callers therefore never observe "dead" before
+    // RemoveAllEventHandlers has completed.
+    return m_state->connected();
 }
 
 } // namespace lvt

@@ -32,4 +32,11 @@ public sealed partial class MainWindow : Window
         _listIsSmall = !_listIsSmall;
         ItemsList.ItemsSource = _listIsSmall ? _items.GetRange(0, 1) : _items;
     }
+
+    private void OnReorderListClick(object sender, RoutedEventArgs e)
+    {
+        _items.Reverse();
+        ItemsList.ItemsSource = null;
+        ItemsList.ItemsSource = _listIsSmall ? _items.GetRange(0, 1) : _items;
+    }
 }

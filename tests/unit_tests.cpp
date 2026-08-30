@@ -1713,6 +1713,56 @@ TEST(BoundedEventQueue, OverflowRequiresSnapshotAndRecoversAfterDrain) {
     EXPECT_EQ(recovered.events[0], 4);
 }
 
+TEST(UiaEventSnapshotHint, BurstCoalescesAndStopRejectsLaterCallbacks) {
+    lvt::uia_eventing_detail::SnapshotHint hint;
+    for (int i = 0; i < 10000; ++i)
+        hint.signal();
+
+    EXPECT_TRUE(hint.consume());
+    EXPECT_FALSE(hint.consume());
+
+    hint.stop();
+    hint.signal();
+    EXPECT_FALSE(hint.consume());
+}
+
+TEST(UiaEventSubscriptions, CoverTreeSchemaAndTypedPropertyState) {
+    const auto& properties =
+        lvt::uia_eventing_detail::subscribed_property_ids();
+    const auto has_property = [&](long id) {
+        return std::find(properties.begin(), properties.end(), id) !=
+               properties.end();
+    };
+
+    EXPECT_TRUE(has_property(UIA_NamePropertyId));
+    EXPECT_TRUE(has_property(UIA_BoundingRectanglePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsOffscreenPropertyId));
+    EXPECT_TRUE(has_property(UIA_IsEnabledPropertyId));
+    EXPECT_TRUE(has_property(UIA_IsValuePatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_ValueValuePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsRangeValuePatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_RangeValueValuePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsTogglePatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_ToggleToggleStatePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsExpandCollapsePatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_ExpandCollapseExpandCollapseStatePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsSelectionPatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_SelectionItemIsSelectedPropertyId));
+    EXPECT_TRUE(has_property(UIA_IsScrollPatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_ScrollVerticalScrollPercentPropertyId));
+
+    const auto& events =
+        lvt::uia_eventing_detail::subscribed_automation_event_ids();
+    EXPECT_NE(
+        std::find(
+            events.begin(), events.end(),
+            UIA_SelectionItem_ElementSelectedEventId),
+        events.end());
+    EXPECT_NE(
+        std::find(events.begin(), events.end(), UIA_Text_TextChangedEventId),
+        events.end());
+}
+
 TEST(NativeWinEventQueue, BurstOverflowIsBoundedAndRecoversAfterDrain) {
     using namespace lvt::native_eventing_detail;
     NativeWinEventQueue<4> queue;

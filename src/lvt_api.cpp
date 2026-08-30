@@ -522,6 +522,8 @@ void drain_session_connection_events(
             continue;
         if (!connection->is_alive())
             continue;
+        if (!native && !connection->refresh_events())
+            continue;
         const auto events = connection->poll_events();
         count += events.size();
         snapshotRequired =
@@ -1089,6 +1091,12 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             error = connection->property_identity_error();
             return false;
         }
+        // UIA callbacks are advisory snapshot hints. Drain them only after a
+        // successful authoritative tree read so a transient failed snapshot
+        // cannot consume the wake-up that should drive the next retry.
+        drain_session_connection_events(
+            session.id,
+            ConnectionEventDrainPhase::nonNativeAfterSuccess);
         return true;
 #else
         error = "this build has UI Automation support compiled out";

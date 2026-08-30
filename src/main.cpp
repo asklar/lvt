@@ -730,13 +730,20 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
 
 #ifdef LVT_ENABLE_UIA
     if (args.uia) {
+        char key[64]{};
+        snprintf(
+            key, sizeof(key), "uia@watch@0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(target.hwnd)));
         auto handle = lvt::ConnectionRegistry::instance().acquire(
-            target.pid, target.hwnd, "uia",
+            target.pid, target.hwnd, key,
             [](HWND hwnd, DWORD) -> std::shared_ptr<lvt::IFrameworkConnection> {
                 return lvt::UiaConnection::connect(hwnd);
             });
-        if (handle)
-            connections.emplace_back("uia", std::move(handle));
+        // Retain a slot after a transient registration failure so the normal
+        // watch reconciliation path retries instead of permanently falling
+        // back to one-shot UIA walks.
+        connections.emplace_back("uia", std::move(handle));
         return connections;
     }
 #endif
@@ -898,12 +905,28 @@ static lvt::ConnectionLookup make_lookup(
     };
 }
 
+enum class WatchConnectionEventDrainPhase {
+    nativeBeforeBuild,
+    nonNativeAfterSuccess,
+};
+
 static void drain_watch_connection_events(
-    std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
+    std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections,
+    WatchConnectionEventDrainPhase phase) {
     size_t count = 0;
     bool snapshotRequired = false;
-    for (auto& [_, handle] : connections) {
+    for (auto& [label, handle] : connections) {
         if (!handle)
+            continue;
+        const bool native =
+            label == "win32" || label == "comctl" ||
+            dynamic_cast<lvt::NativePropertyConnection*>(
+                handle.get()) != nullptr;
+        if ((phase == WatchConnectionEventDrainPhase::nativeBeforeBuild) !=
+            native) {
+            continue;
+        }
+        if (!native && !handle->refresh_events())
             continue;
         auto events = handle->poll_events();
         count += events.size();
@@ -919,9 +942,13 @@ static void drain_watch_connection_events(
     if (lvt::g_debug && count != 0) {
         fprintf(
             stderr,
-            "lvt: drained %zu pushed connection event(s)%s; "
+            "lvt: drained %zu %s connection event(s)%s; "
             "this tick's authoritative snapshot will consume the signal\n",
-            count, snapshotRequired ? " including snapshotRequired" : "");
+            count,
+            phase == WatchConnectionEventDrainPhase::nativeBeforeBuild
+                ? "pre-build native"
+                : "post-success",
+            snapshotRequired ? " including snapshotRequired" : "");
     }
 }
 
@@ -934,6 +961,29 @@ static void reconcile_watch_connections(
     const lvt::TargetInfo& target, const Args& args,
     const std::vector<lvt::FrameworkInfo>& frameworks,
     std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
+    if (args.uia) {
+        auto found = std::find_if(
+            connections.begin(), connections.end(),
+            [](const auto& entry) { return entry.first == "uia"; });
+        if (found == connections.end()) {
+            connections.emplace_back("uia", lvt::ConnectionHandle{});
+            found = std::prev(connections.end());
+        }
+        if (found->second && found->second->is_alive())
+            return;
+
+        found->second.reset();
+        auto fresh =
+            acquire_watch_connections(target, args, frameworks);
+        for (auto& [label, handle] : fresh) {
+            if (label == "uia" && handle) {
+                found->second = std::move(handle);
+                break;
+            }
+        }
+        return;
+    }
+
     std::set<std::string> desiredPluginLabels;
     const bool wantsComCtl = std::any_of(
         frameworks.begin(), frameworks.end(),
@@ -1422,6 +1472,9 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             reconcile_watch_connections(
                 target, args, frameworks, connections);
         }
+        drain_watch_connection_events(
+            connections,
+            WatchConnectionEventDrainPhase::nativeBeforeBuild);
         built = build_output_tree(
                     target, buildArgs, previous, lookup,
                     args.uia ? nullptr : &frameworks) &&
@@ -1429,6 +1482,9 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     }
     if (!built)
         return 1;
+    drain_watch_connection_events(
+        connections,
+        WatchConnectionEventDrainPhase::nonNativeAfterSuccess);
 
     WatchScopeAnchor scopeAnchor;
     std::optional<lvt::Element> previousScope;
@@ -1479,7 +1535,9 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
         if (!args.uia)
             frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
         reconcile_watch_connections(target, args, frameworks, connections);
-        drain_watch_connection_events(connections);
+        drain_watch_connection_events(
+            connections,
+            WatchConnectionEventDrainPhase::nativeBeforeBuild);
 
         lvt::Element current;
         if (!build_output_tree(
@@ -1530,6 +1588,9 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             }
         }
 
+        drain_watch_connection_events(
+            connections,
+            WatchConnectionEventDrainPhase::nonNativeAfterSuccess);
         if (scoped) {
             // Reconcile full trees first so process-wide XAML moves and
             // provider-authoritative identity replacement have their normal

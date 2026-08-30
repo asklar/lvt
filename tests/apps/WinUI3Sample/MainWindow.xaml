@@ -49,6 +49,9 @@
             <Button x:Name="ToggleListSizeButton"
                     Content="Toggle list size"
                     Click="OnToggleListSizeClick" />
+            <Button x:Name="ReorderListButton"
+                    Content="Reorder"
+                    Click="OnReorderListClick" />
         </StackPanel>
         <ListView x:Name="ItemsList" Grid.Row="10" Height="220" SelectionMode="Multiple" />
     </Grid>

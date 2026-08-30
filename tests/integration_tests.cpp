@@ -43,6 +43,9 @@
 #include "providers/native_property_connection.h"
 #include "providers/native_win_event.h"
 #include "providers/connection_registry.h"
+#ifdef LVT_ENABLE_UIA
+#include "providers/uia_provider.h"
+#endif
 #include "tree_builder.h"
 
 using json = nlohmann::json;
@@ -4018,6 +4021,210 @@ static bool wait_for_atomic_at_least(
     return value.load(std::memory_order_acquire) >= expected;
 }
 
+#ifdef LVT_ENABLE_UIA
+static bool wait_for_uia_snapshot(
+    lvt::UiaConnection& connection,
+    std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        if (!connection.refresh_events())
+            return false;
+        const auto events = connection.poll_events();
+        if (std::any_of(
+                events.begin(), events.end(),
+                [](const lvt::ConnectionEvent& event) {
+                    return event.mutation ==
+                           lvt::ConnectionEvent::Mutation::snapshotRequired;
+                })) {
+            return true;
+        }
+        Sleep(20);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+static void drain_uia_events(lvt::UiaConnection& connection) {
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        Sleep(20);
+        ASSERT_TRUE(connection.refresh_events());
+        (void)connection.poll_events();
+    }
+}
+
+TEST_F(NativeControlsFixture, UiaHandlersRegisterOnceAndRemoveOnce) {
+    lvt::uia_eventing_detail::reset_subscription_counters();
+    {
+        auto connection = lvt::UiaConnection::connect(s_hwnd);
+        ASSERT_NE(connection, nullptr);
+
+        lvt::Element tree;
+        const auto read_tree = [&] {
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                if (connection->get_tree(tree, false))
+                    return true;
+                Sleep(static_cast<DWORD>(120 * (attempt + 1)));
+            }
+            return false;
+        };
+        ASSERT_TRUE(read_tree());
+        ASSERT_TRUE(read_tree());
+
+        const auto active =
+            lvt::uia_eventing_detail::subscription_counters();
+        EXPECT_EQ(active.connections, 1u);
+        EXPECT_EQ(active.structureRegistrations, 1u);
+        EXPECT_EQ(active.propertyRegistrations, 1u);
+        EXPECT_EQ(
+            active.automationRegistrations,
+            lvt::uia_eventing_detail::
+                subscribed_automation_event_ids().size());
+        EXPECT_EQ(active.removeAllCalls, 0u);
+    }
+
+    const auto removed =
+        lvt::uia_eventing_detail::subscription_counters();
+    EXPECT_EQ(removed.removeAllCalls, 1u);
+}
+
+TEST_F(NativeControlsFixture, UiaEventsCoverValueStateAndStructureChanges) {
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+    auto connection = lvt::UiaConnection::connect(s_hwnd);
+    ASSERT_NE(connection, nullptr);
+    drain_uia_events(*connection);
+
+    HWND edit = control(native_fixture::kEditId);
+    wchar_t originalText[256]{};
+    GetWindowTextW(edit, originalText, static_cast<int>(_countof(originalText)));
+    ASSERT_TRUE(SetWindowTextW(edit, L"UIA event value change"));
+    NotifyWinEvent(
+        EVENT_OBJECT_VALUECHANGE, edit, OBJID_CLIENT, CHILDID_SELF);
+    EXPECT_TRUE(wait_for_uia_snapshot(*connection))
+        << "a Value/Name-affecting update did not request a UIA snapshot";
+    ASSERT_TRUE(SetWindowTextW(edit, originalText));
+
+    drain_uia_events(*connection);
+    HWND button = control(native_fixture::kButtonId);
+    EnableWindow(button, FALSE);
+    ASSERT_FALSE(IsWindowEnabled(button));
+    NotifyWinEvent(
+        EVENT_OBJECT_STATECHANGE, button, OBJID_CLIENT, CHILDID_SELF);
+    EXPECT_TRUE(wait_for_uia_snapshot(*connection))
+        << "an IsEnabled/state update did not request a UIA snapshot";
+    EnableWindow(button, TRUE);
+    ASSERT_TRUE(IsWindowEnabled(button));
+
+    drain_uia_events(*connection);
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kCreateEventChildMessage),
+        0);
+    EXPECT_TRUE(wait_for_uia_snapshot(*connection))
+        << "a UIA child addition did not request a snapshot";
+
+    drain_uia_events(*connection);
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kReorderEventChildrenMessage);
+    EXPECT_TRUE(wait_for_uia_snapshot(*connection))
+        << "a UIA child reorder did not request a snapshot";
+
+    drain_uia_events(*connection);
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+    (void)connection->poll_events();
+}
+
+TEST_F(NativeControlsFixture, UiaSubscriptionsIsolateTwoWindowsInOneProcess) {
+    const HWND other = reinterpret_cast<HWND>(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kGetOutOfTreeHwndMessage));
+    ASSERT_TRUE(IsWindow(other));
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage, 0);
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage, 1);
+
+    auto rootConnection = lvt::UiaConnection::connect(s_hwnd);
+    auto otherConnection = lvt::UiaConnection::connect(other);
+    ASSERT_NE(rootConnection, nullptr);
+    ASSERT_NE(otherConnection, nullptr);
+    drain_uia_events(*rootConnection);
+    drain_uia_events(*otherConnection);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kCreateEventChildMessage, 0),
+        0);
+    EXPECT_TRUE(wait_for_uia_snapshot(*rootConnection));
+    Sleep(250);
+    EXPECT_TRUE(otherConnection->poll_events().empty())
+        << "a root-subtree UIA event leaked to another top-level HWND";
+
+    drain_uia_events(*rootConnection);
+    drain_uia_events(*otherConnection);
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kCreateEventChildMessage, 1),
+        0);
+    EXPECT_TRUE(wait_for_uia_snapshot(*otherConnection));
+    Sleep(250);
+    EXPECT_TRUE(rootConnection->poll_events().empty())
+        << "the second HWND's UIA event leaked back to the first root";
+
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage, 0);
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage, 1);
+}
+
+TEST_F(NativeControlsFixture, UiaSubscriptionsIsolateDifferentProcesses) {
+    ScopedNativeFixtureProcess second;
+    ASSERT_TRUE(second.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+
+    auto firstConnection = lvt::UiaConnection::connect(s_hwnd);
+    auto secondConnection = lvt::UiaConnection::connect(second.hwnd);
+    ASSERT_NE(firstConnection, nullptr);
+    ASSERT_NE(secondConnection, nullptr);
+    drain_uia_events(*firstConnection);
+    drain_uia_events(*secondConnection);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kCreateEventChildMessage),
+        0);
+    EXPECT_TRUE(wait_for_uia_snapshot(*firstConnection));
+    Sleep(250);
+    EXPECT_TRUE(secondConnection->poll_events().empty())
+        << "a UIA event leaked across target processes";
+
+    send_native_fixture_message(
+        s_hwnd, native_fixture::kDestroyEventChildMessage);
+}
+
+TEST(UiaEventLifecycle, TargetExitRemovesHandlersAndStopsDelivery) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto before =
+        lvt::uia_eventing_detail::subscription_counters();
+    auto connection = lvt::UiaConnection::connect(fixture.hwnd);
+    ASSERT_NE(connection, nullptr);
+
+    fixture.stop();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (connection->is_alive() &&
+           std::chrono::steady_clock::now() < deadline) {
+        Sleep(20);
+    }
+    EXPECT_FALSE(connection->is_alive());
+    EXPECT_TRUE(connection->poll_events().empty());
+
+    const auto after =
+        lvt::uia_eventing_detail::subscription_counters();
+    EXPECT_GE(after.removeAllCalls, before.removeAllCalls + 1);
+}
+#endif
+
 TEST_F(NativeControlsFixture, NativeWinEventsSignalCreateDestroyReorderAndBurst) {
     send_native_fixture_message(
         s_hwnd, native_fixture::kDestroyEventChildMessage);
@@ -6614,6 +6821,36 @@ TEST(NativeCrossBitness, WinEventSnapshotsRemainAvailable) {
         native_fixture::kDestroyEventChildMessage);
 }
 
+#ifdef LVT_ENABLE_UIA
+TEST(NativeCrossBitness, UiaPersistentEventsRemainAvailable) {
+    const fs::path source = LVT_SOURCE_DIR;
+    const fs::path otherFixture =
+        sizeof(void*) == 8
+            ? source / "build-x86" / "lvt_native_controls_fixture.exe"
+            : source / "build" / "lvt_native_controls_fixture.exe";
+    if (!fs::exists(otherFixture))
+        GTEST_SKIP() << "opposite-architecture fixture is not built";
+
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(otherFixture));
+    ASSERT_NE(
+        lvt::detect_process_architecture(fixture.pid),
+        lvt::get_host_architecture());
+
+    auto connection = lvt::UiaConnection::connect(fixture.hwnd);
+    ASSERT_NE(connection, nullptr);
+    drain_uia_events(*connection);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            fixture.hwnd,
+            native_fixture::kCreateEventChildMessage),
+        0);
+    EXPECT_TRUE(wait_for_uia_snapshot(*connection))
+        << "the persistent UIA callback did not cross the architecture boundary";
+}
+#endif
+
 TEST(NativeCrossBitness, PublicBuildTreeSkipsAbiSensitiveComCtlMessages) {
     const fs::path source = LVT_SOURCE_DIR;
     const fs::path otherFixture =
@@ -6996,6 +7233,22 @@ size_t count_json_nodes(const json& node) {
     return count;
 }
 
+const lvt::Element* find_uia_element_by_automation_id(
+    const lvt::Element& element, const std::string& automationId) {
+    const auto found = element.properties.find("AutomationId");
+    if (found != element.properties.end() &&
+        found->second == automationId) {
+        return &element;
+    }
+    for (const auto& child : element.children) {
+        if (const auto* match =
+                find_uia_element_by_automation_id(child, automationId)) {
+            return match;
+        }
+    }
+    return nullptr;
+}
+
 } // namespace
 
 TEST_F(WinUI3SampleFixture, UiaTreeExposesAutomationIdsAndControlTypes) {
@@ -7315,6 +7568,81 @@ TEST_F(WinUI3SampleFixture, UiaWatchEmitsAddedEvents) {
     }
     EXPECT_GT(events, 0) << "no complete watch events parsed";
 }
+
+#ifdef LVT_ENABLE_UIA
+TEST_F(
+    WinUI3SampleFixture,
+    UiaStructureEventsCoverChildRemovalAdditionAndReorder) {
+    SkipIfNotReady();
+    const HWND hwnd = visible_window_for_pid(s_pid);
+    ASSERT_NE(hwnd, nullptr);
+    auto connection = lvt::UiaConnection::connect(hwnd);
+    ASSERT_NE(connection, nullptr);
+    drain_uia_events(*connection);
+
+    const auto read_list = [&]() {
+        lvt::Element tree;
+        EXPECT_TRUE(connection->get_tree(tree, false));
+        const auto* list =
+            find_uia_element_by_automation_id(tree, "ItemsList");
+        EXPECT_NE(list, nullptr);
+        return list ? *list : lvt::Element{};
+    };
+    const auto invoke = [&](const std::string& automationId) {
+        auto tree = json::parse(
+            run_command(make_cmd(
+                get_lvt_path(), get_pid_arg() + " dump --uia")),
+            nullptr, false);
+        EXPECT_FALSE(tree.is_discarded());
+        const auto* button =
+            tree.is_discarded()
+                ? nullptr
+                : find_by_automation_id(tree["root"], automationId);
+        EXPECT_NE(button, nullptr);
+        if (!button)
+            return false;
+        const auto runtimeId = uia_prop(*button, "RuntimeId");
+        auto result = json::parse(
+            run_command(make_cmd(
+                get_lvt_path(),
+                get_pid_arg() + " invoke uia:" + runtimeId)),
+            nullptr, false);
+        EXPECT_FALSE(result.is_discarded());
+        EXPECT_TRUE(result.value("ok", false)) << result.dump(2);
+        return result.value("ok", false);
+    };
+
+    const auto large = read_list();
+    ASSERT_GT(large.children.size(), 1u);
+
+    ASSERT_TRUE(invoke("ToggleListSizeButton"));
+    EXPECT_TRUE(wait_for_uia_snapshot(*connection))
+        << "removing UIA list children did not request a snapshot";
+    const auto small = read_list();
+    EXPECT_LT(small.children.size(), large.children.size());
+
+    drain_uia_events(*connection);
+    ASSERT_TRUE(invoke("ToggleListSizeButton"));
+    EXPECT_TRUE(wait_for_uia_snapshot(*connection))
+        << "adding UIA list children did not request a snapshot";
+    const auto restored = read_list();
+    EXPECT_GT(restored.children.size(), small.children.size());
+
+    const std::string firstBefore =
+        restored.children.empty()
+            ? std::string()
+            : restored.children.front().text;
+    drain_uia_events(*connection);
+    ASSERT_TRUE(invoke("ReorderListButton"));
+    EXPECT_TRUE(wait_for_uia_snapshot(*connection))
+        << "reordering UIA list children did not request a snapshot";
+    const auto reordered = read_list();
+    ASSERT_FALSE(reordered.children.empty());
+    EXPECT_NE(reordered.children.front().text, firstBefore);
+
+    ASSERT_TRUE(invoke("ReorderListButton"));
+}
+#endif
 
 // Regression test for the persistent-connection redesign (see
 // connection_registry.h / xaml_diag_common.cpp's XamlDiagConnection): watch

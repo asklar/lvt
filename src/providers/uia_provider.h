@@ -3,6 +3,8 @@
 #include "provider.h"
 #include "uia_props.h"
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <set>
@@ -12,6 +14,58 @@
 #include <vector>
 
 namespace lvt {
+
+namespace uia_eventing_detail {
+
+class SnapshotHint {
+public:
+    void signal() noexcept {
+        uint32_t state = m_state.load(std::memory_order_acquire);
+        while ((state & kAccepting) != 0 &&
+               (state & kSnapshotRequired) == 0 &&
+               !m_state.compare_exchange_weak(
+                   state, state | kSnapshotRequired,
+                   std::memory_order_release, std::memory_order_acquire)) {
+        }
+    }
+
+    bool consume() noexcept {
+        uint32_t state = m_state.load(std::memory_order_acquire);
+        while ((state & kSnapshotRequired) != 0) {
+            if (m_state.compare_exchange_weak(
+                    state, state & ~kSnapshotRequired,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void stop() noexcept {
+        m_state.store(0, std::memory_order_release);
+    }
+
+private:
+    static constexpr uint32_t kAccepting = 1;
+    static constexpr uint32_t kSnapshotRequired = 2;
+    std::atomic<uint32_t> m_state{kAccepting};
+};
+
+struct SubscriptionCounters {
+    uint64_t connections = 0;
+    uint64_t structureRegistrations = 0;
+    uint64_t propertyRegistrations = 0;
+    uint64_t automationRegistrations = 0;
+    uint64_t callbacks = 0;
+    uint64_t removeAllCalls = 0;
+};
+
+SubscriptionCounters subscription_counters();
+void reset_subscription_counters();
+const std::vector<int>& subscribed_property_ids();
+const std::vector<int>& subscribed_automation_event_ids();
+
+} // namespace uia_eventing_detail
 
 struct UiaOptions {
     UiaView view = UiaView::control;
@@ -146,6 +200,7 @@ public:
         const std::string& value) override;
     PropertyMutationResult clear_property(
         uint64_t handle, const std::string& descriptorId) override;
+    bool refresh_events() override;
     std::vector<ConnectionEvent> poll_events() override;
     bool is_alive() const override;
 

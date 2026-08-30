@@ -89,8 +89,11 @@ ComCtlProvider use lightweight per-session connections, not for tree
 collection, but to register opaque native element identities and cache
 provider-owned typed-property schemas. The Win32 connection also owns one
 root-scoped WinEvent subscription that covers the native HWND subtree and
-common-control logical-item notifications. Plugins can adopt the interface
-without changing how callers acquire or use them.
+common-control logical-item notifications. UI Automation sessions own one
+`IUIAutomation` client and one exact-HWND event subscription on a persistent
+MTA thread; registry keys include the root HWND so two top-level windows in one
+process never share callbacks or identity state. Plugins can adopt the
+interface without changing how callers acquire or use them.
 
 ### Native WinEvent refresh hints (`native_win_event.*`)
 
@@ -141,6 +144,32 @@ until that anchored identity validly reappears. Full-tree reconciliation
 preserves process-wide XAML/WinUI reparent matching, while incomplete provider
 markers continue to preserve the previous snapshot rather than reporting false
 removals.
+
+### UI Automation refresh hints (`uia_provider.*`)
+
+Each persistent `UiaConnection` creates its `IUIAutomation` client, root
+element, cache request, and event handlers on one connection-owned MTA thread.
+The subscriptions use `TreeScope_Subtree` from the exact `ElementFromHandle`
+root, whose PID is verified before registration; no desktop/global UIA
+subscription is installed. Structure changes, UIA property changes affecting
+tree shape/identity/bounds/enabled/offscreen state, pattern availability and
+Value/RangeValue/Toggle/ExpandCollapse/Selection/Scroll state, plus relevant
+automation events all feed the same provider-neutral event flow.
+
+The COM callback object is free-threaded and deliberately does no UIA work: it
+takes no lock, performs no tree walk or provider call, and allocates nothing.
+It atomically coalesces any burst to one bounded `snapshotRequired` bit.
+`refresh_events()` provides an MTA barrier and `poll_events()` exchanges that
+bit on the owning MTA. Watch and MCP consume the bit only after a successful
+authoritative UIA snapshot, so a failed walk cannot lose the wake-up needed by
+the retry and no duplicate native/plugin polling is introduced.
+
+The MTA worker checks the exact HWND/PID every 100 ms. On disconnect, target
+exit, or final release it first stops accepting callback hints, calls
+`RemoveAllEventHandlers` on the same `IUIAutomation` instance/thread, releases
+all COM references there, and only then reports the connection dead. UIA
+remains architecture-neutral because no target-side code or pointer-sized
+payload is injected.
 
 ### Native typed-property safety (`native_message.*`,
 `native_property_connection.*`)
@@ -294,10 +323,12 @@ Three implementation constraints shape the provider:
    Separately, `uia_props.cpp` suppresses framework-specific "unset" sentinels
    (Win32 uses `0` where XAML uses `-1` for an unset `Level`).
 
-3. **It runs on a dedicated MTA thread.** UIA clients want an MTA;
-   `screenshot.cpp` initializes an STA on the calling thread. A thread cannot be
-   both, so `run_on_mta()` marshals the walk onto its own thread, which also
-   serializes access to the client.
+3. **It runs in the MTA.** UIA clients want an MTA; `screenshot.cpp` initializes
+   an STA on the calling thread. A thread cannot be both, so one-shot walks use
+   `run_on_mta()`. Long-running watch/MCP sessions instead keep one dedicated
+   MTA worker for the lifetime of `UiaConnection`; every reused-client tree
+   read, typed-property mutation, event registration/drain, and COM release is
+   dispatched to that same worker.
 
 The walk is bounded by `--uia-timeout`, which drives UIA's transaction timeout —
 the thing that actually bounds a wedged target, since every cross-process call

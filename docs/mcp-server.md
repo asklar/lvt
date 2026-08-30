@@ -160,9 +160,9 @@ MCP resource, matching the session's fixed mode:
 returns `{ "tree": "uia"|"visual", "snapshot": bool, "events": [...] }`, and
 `resources/subscribe` opts into `notifications/resources/updated`. The server
 diff-polls the appropriate native tree about every 500 ms, with missed ticks
-skipped. This is necessary for both modes: UIA event-handler integration is a
-future optimization, while XAML's structural callbacks do not report
-text/property/bounds changes.
+skipped. This remains the correctness path for both modes: XAML structural
+callbacks do not report text/property/bounds changes, and UIA providers are not
+required to raise every event consistently.
 
 Visual sessions also maintain a PID- and root-scoped out-of-context WinEvent
 hook for native Win32/Common Controls create, destroy, reorder, parent, state,
@@ -173,6 +173,15 @@ does not yet wait directly on the hook, so notification latency is still
 bounded by the roughly 500 ms cadence. The next full tree refresh consumes the
 hint; only its authoritative diff is cached/notified, avoiding a second stream
 of duplicate native add/remove events.
+
+UIA sessions similarly keep exact-HWND, subtree-scoped structure/property/
+automation handlers on their persistent `IUIAutomation` connection. Callback
+bursts allocate nothing and coalesce to one `snapshotRequired` hint. The MCP
+bridge drains that hint only after a successful UIA snapshot, so a failed
+refresh cannot consume the notification and plugin/native event sources are
+still polled exactly once in their existing phases. The resource scheduler
+remains interval-based rather than waiting directly on provider event handles,
+so UIA notification latency is bounded by the same roughly 500 ms cadence.
 
 Visual resources always poll `get_visual_tree_changes` with `fast: true`,
 matching the Viewer's former `watch --fast` path. The live stream still carries
