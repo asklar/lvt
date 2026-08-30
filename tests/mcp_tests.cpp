@@ -1132,6 +1132,31 @@ TEST(McpUiaIdentity, ReplacementDuringFallbackFailsOwnershipLost) {
 TEST(McpUiaIdentity, ElementlessKeyboardActionsReturnStructuredOwnershipLost) {
     ManagedSampleProcess sample;
     ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner == fixture->pid &&
+                GetDlgItem(candidate, native_fixture::kEditId)) {
+                fixture->root = candidate;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+    char fixtureHwnd[32]{};
+    snprintf(
+        fixtureHwnd, sizeof(fixtureHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(fixture.root)));
+
     const std::string eventName =
         "Local\\LvtMcpUiaLifetime_" +
         std::to_string(GetCurrentProcessId()) + "_" +
@@ -1148,11 +1173,20 @@ TEST(McpUiaIdentity, ElementlessKeyboardActionsReturnStructuredOwnershipLost) {
     ASSERT_TRUE(client.handshake());
     const auto connected = client.call_tool(
         "connect",
-        json{{"hwnd", sample.hwnd_string()},
+        json{{"hwnd", fixtureHwnd},
              {"mode", "uia"}});
     const auto session = connected.value("session", "");
     ASSERT_FALSE(session.empty()) << connected.dump(2);
+    const auto visualConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", fixtureHwnd},
+             {"mode", "visual"}});
+    const auto visualSession =
+        visualConnected.value("session", "");
+    ASSERT_FALSE(visualSession.empty())
+        << visualConnected.dump(2);
 
+    bool isError = false;
     SetEvent(invalidated.get());
     for (const auto& [tool, arguments] :
          std::vector<std::pair<std::string, json>>{
@@ -1162,13 +1196,262 @@ TEST(McpUiaIdentity, ElementlessKeyboardActionsReturnStructuredOwnershipLost) {
              {"press_key",
               json{{"session", session},
                    {"text", "A"}}}}) {
-        bool isError = false;
+        isError = false;
         const auto result =
             client.call_tool(tool, arguments, &isError);
         EXPECT_TRUE(isError) << result.dump(2);
         EXPECT_EQ(result.value("code", ""), "ownershipLost")
             << result.dump(2);
     }
+
+    for (const auto& [waitSession, element] :
+         std::vector<std::pair<std::string, std::string>>{
+             {session, "uia:99.99.99"},
+             {visualSession, "visual:e0"}}) {
+        isError = false;
+        const auto waiting = client.call_tool(
+            "wait_for",
+            json{{"session", waitSession},
+                 {"element", element},
+                 {"timeoutMs", 500}},
+            &isError);
+        EXPECT_TRUE(isError) << waiting.dump(2);
+        EXPECT_EQ(waiting.value("code", ""), "ownershipLost")
+            << waiting.dump(2);
+
+        isError = false;
+        const auto gone = client.call_tool(
+            "wait_for",
+            json{{"session", waitSession},
+                 {"element", element},
+                 {"gone", true},
+                 {"timeoutMs", 500}},
+            &isError);
+        EXPECT_FALSE(isError) << gone.dump(2);
+        EXPECT_TRUE(gone.value("ok", false))
+            << gone.dump(2);
+    }
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"type_text",
+              json{{"session", visualSession},
+                   {"text", "must-not-type"}}},
+             {"press_key",
+              json{{"session", visualSession},
+                   {"text", "A"}}},
+             {"window_action",
+              json{{"session", visualSession},
+                   {"action", "minimize"}}}}) {
+        isError = false;
+        const auto result =
+            client.call_tool(tool, arguments, &isError);
+        EXPECT_TRUE(isError) << result.dump(2);
+        EXPECT_EQ(result.value("code", ""), "ownershipLost")
+            << result.dump(2);
+    }
+
+}
+
+TEST(McpUiaIdentity, TypedMutationsDetectOwnershipLossAfterInitialCheck) {
+    const auto runMutation = [](const std::string& tool) {
+        ManagedSampleProcess sample;
+        ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+        struct FixtureWindow {
+            DWORD pid;
+            HWND root = nullptr;
+        } fixture{sample.pid()};
+        EnumWindows(
+            [](HWND candidate, LPARAM parameter) -> BOOL {
+                auto* fixture =
+                    reinterpret_cast<FixtureWindow*>(parameter);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(candidate, &owner);
+                if (owner == fixture->pid &&
+                    GetDlgItem(candidate, native_fixture::kEditId)) {
+                    fixture->root = candidate;
+                    return FALSE;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&fixture));
+        ASSERT_TRUE(IsWindow(fixture.root));
+        char fixtureHwnd[32]{};
+        snprintf(
+            fixtureHwnd, sizeof(fixtureHwnd), "0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(fixture.root)));
+
+        const std::string suffix =
+            std::to_string(GetCurrentProcessId()) + "_" +
+            std::to_string(GetTickCount64()) + "_" + tool;
+        const std::string invalidationName =
+            "Local\\LvtTypedInvalidation_" + suffix;
+        const std::string gateBase =
+            "Local\\LvtTypedMutation_" + suffix;
+        wil::unique_event invalidated(CreateEventA(
+            nullptr, TRUE, FALSE, invalidationName.c_str()));
+        wil::unique_event entered(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-entered").c_str()));
+        wil::unique_event release(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-release").c_str()));
+        ASSERT_TRUE(invalidated);
+        ASSERT_TRUE(entered);
+        ASSERT_TRUE(release);
+        ScopedEnvironmentVariable invalidation(
+            "LVT_TEST_UIA_LIFETIME_INVALIDATION_EVENT",
+            invalidationName);
+        ScopedEnvironmentVariable mutationGate(
+            "LVT_TEST_UIA_BEFORE_PROPERTY_MUTATION_GATE",
+            gateBase);
+
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd", fixtureHwnd}, {"mode", "uia"}});
+        const auto session = connected.value("session", "");
+        ASSERT_FALSE(session.empty()) << connected.dump(2);
+        const auto inputs = client.call_tool(
+            "find_elements",
+            json{{"session", session},
+                 {"automationId",
+                  std::to_string(native_fixture::kEditId)}});
+        ASSERT_EQ(inputs["elements"].size(), 1u)
+            << inputs.dump(2);
+        const auto inputKey =
+            inputs["elements"][0].value("key", "");
+        bool isError = false;
+        const auto properties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", inputKey}},
+            &isError);
+        ASSERT_FALSE(isError) << properties.dump(2);
+        const auto* value = find_property_descriptor(
+            properties, "Value.Value");
+        ASSERT_NE(value, nullptr);
+        json arguments{
+            {"session", session},
+            {"element", inputKey},
+            {"descriptorId",
+             value->value("descriptorId", "")},
+        };
+        if (tool == "set_property")
+            arguments["value"] = "must-not-set";
+
+        const int request = client.send_request(
+            "tools/call",
+            json{{"name", tool},
+                 {"arguments", arguments}});
+        ASSERT_EQ(
+            WaitForSingleObject(entered.get(), 10000),
+            WAIT_OBJECT_0)
+            << tool << " did not reach the provider mutation gate";
+        SetEvent(invalidated.get());
+        SetEvent(release.get());
+
+        const auto response = client.await_response(request);
+        ASSERT_TRUE(response.contains("result"))
+            << response.dump(2);
+        EXPECT_TRUE(
+            response["result"].value("isError", false))
+            << response.dump(2);
+        json error;
+        for (const auto& block :
+             response["result"].value(
+                 "content", json::array())) {
+            if (block.value("type", "") == "text") {
+                error = json::parse(
+                    block.value("text", "{}"),
+                    nullptr, false);
+                break;
+            }
+        }
+        ASSERT_FALSE(error.is_discarded())
+            << response.dump(2);
+        expect_typed_property_session_disconnected(error);
+    };
+
+    runMutation("set_property");
+    runMutation("clear_property");
+}
+
+TEST(McpUiaIdentity, AltTabSequenceRechecksForegroundBeforeDelete) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto uiaStats =
+        plugin_stats_path("uia-alt-tab-sequence");
+    const auto visualStats =
+        plugin_stats_path("visual-alt-tab-sequence");
+    std::error_code ec;
+    fs::remove(uiaStats, ec);
+    fs::remove(visualStats, ec);
+    ScopedEnvironmentVariable uiaForeground(
+        "LVT_TEST_UIA_FOREGROUND_SUCCESS", "1");
+    ScopedEnvironmentVariable uiaGate(
+        "LVT_TEST_UIA_AFTER_FOREGROUND_GATE",
+        "Local\\LvtUnusedForegroundGate");
+    ScopedEnvironmentVariable uiaOutput(
+        "LVT_TEST_UIA_SEND_INPUT_STATS", uiaStats.string());
+    ScopedEnvironmentVariable uiaSuppress(
+        "LVT_TEST_UIA_SUPPRESS_SEND_INPUT", "1");
+    ScopedEnvironmentVariable uiaSteal(
+        "LVT_TEST_UIA_FOREGROUND_STEAL_AT", "2");
+    ScopedEnvironmentVariable visualForeground(
+        "LVT_TEST_VISUAL_FOREGROUND_SUCCESS", "1");
+    ScopedEnvironmentVariable visualOutput(
+        "LVT_TEST_VISUAL_SEND_INPUT_STATS",
+        visualStats.string());
+    ScopedEnvironmentVariable visualSuppress(
+        "LVT_TEST_VISUAL_SUPPRESS_SEND_INPUT", "1");
+    ScopedEnvironmentVariable visualSteal(
+        "LVT_TEST_VISUAL_FOREGROUND_STEAL_AT", "2");
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto uiaConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()}, {"mode", "uia"}});
+    const auto visualConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const auto uiaSession =
+        uiaConnected.value("session", "");
+    const auto visualSession =
+        visualConnected.value("session", "");
+    ASSERT_FALSE(uiaSession.empty()) << uiaConnected.dump(2);
+    ASSERT_FALSE(visualSession.empty())
+        << visualConnected.dump(2);
+
+    for (const auto& session :
+         {uiaSession, visualSession}) {
+        bool isError = false;
+        const auto result = client.call_tool(
+            "press_key",
+            json{{"session", session},
+                 {"text", "Alt+Tab;Delete"}},
+            &isError);
+        EXPECT_FALSE(isError) << result.dump(2);
+    }
+
+    for (const auto& statsPath :
+         {uiaStats, visualStats}) {
+        const auto stats = read_plugin_stats(statsPath);
+        EXPECT_EQ(
+            count_plugin_stats(stats, "press-key"), 2u)
+            << statsPath.string();
+        EXPECT_EQ(
+            count_plugin_stats(stats, "reactivate"), 1u)
+            << "the second chord must re-activate after Alt+Tab: "
+            << statsPath.string();
+    }
+    fs::remove(uiaStats, ec);
+    fs::remove(visualStats, ec);
 }
 
 TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
@@ -1194,16 +1477,8 @@ TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
         reinterpret_cast<LPARAM>(&fixture));
     ASSERT_TRUE(IsWindow(fixture.root));
 
-    DWORD_PTR childValue = 0;
-    ASSERT_NE(
-        SendMessageTimeoutW(
-            fixture.root,
-            native_fixture::kCreateEventChildMessage,
-            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
-            5000, &childValue),
-        0);
-    const HWND original =
-        reinterpret_cast<HWND>(childValue);
+    const HWND original = GetDlgItem(
+        fixture.root, native_fixture::kEditId);
     ASSERT_TRUE(IsWindow(original));
     char originalText[32]{};
     snprintf(
@@ -1219,16 +1494,42 @@ TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
         json{{"hwnd", originalText}, {"mode", "uia"}});
     const auto session = connected.value("session", "");
     ASSERT_FALSE(session.empty()) << connected.dump(2);
-    ASSERT_TRUE(client.call_tool(
-        "get_uia_tree", json{{"session", session}})
-                    .contains("root"));
+    const auto visualConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", originalText}, {"mode", "visual"}});
+    const auto visualSession =
+        visualConnected.value("session", "");
+    ASSERT_FALSE(visualSession.empty())
+        << visualConnected.dump(2);
+    const auto initialTree = client.call_tool(
+        "get_uia_tree", json{{"session", session}});
+    ASSERT_TRUE(initialTree.contains("root"))
+        << initialTree.dump(2);
+    const auto runtimeId =
+        initialTree["root"]
+            .value("properties", json::object())
+            .value("RuntimeId", "");
+    ASSERT_FALSE(runtimeId.empty()) << initialTree.dump(2);
+    const auto inputRef = "uia:" + runtimeId;
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", inputRef}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* value = find_property_descriptor(
+        properties, "Value.Value");
+    ASSERT_NE(value, nullptr);
+    const auto descriptorId =
+        value->value("descriptorId", "");
 
     DWORD_PTR recycledValue = 0;
     ASSERT_NE(
         SendMessageTimeoutW(
             fixture.root,
             native_fixture::kRecycleEventChildHwndMessage,
-            131072, 0,
+            131072, native_fixture::kEditId,
             SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
             120000, &recycledValue),
         0);
@@ -1260,6 +1561,48 @@ TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
             action.value("code", ""),
             "ownershipLost")
             << action.dump(2);
+    }
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"type_text",
+              json{{"session", visualSession},
+                   {"text", "must-not-type"}}},
+             {"press_key",
+              json{{"session", visualSession},
+                   {"text", "A"}}},
+             {"window_action",
+              json{{"session", visualSession},
+                   {"action", "minimize"}}}}) {
+        bool actionError = false;
+        const auto action = client.call_tool(
+            tool, arguments, &actionError);
+        EXPECT_TRUE(actionError) << action.dump(2);
+        EXPECT_EQ(
+            action.value("code", ""),
+            "ownershipLost")
+            << action.dump(2);
+    }
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"get_editable_properties",
+              json{{"session", session},
+                   {"element", inputRef}}},
+             {"set_property",
+              json{{"session", session},
+                   {"element", inputRef},
+                   {"descriptorId", descriptorId},
+                   {"value", "must-not-set"}}},
+             {"clear_property",
+              json{{"session", session},
+                   {"element", inputRef},
+                   {"descriptorId", descriptorId}}}}) {
+        isError = false;
+        const auto result = client.call_tool(
+            tool, arguments, &isError);
+        EXPECT_TRUE(isError) << result.dump(2);
+        expect_typed_property_session_disconnected(result);
     }
 }
 

@@ -1189,6 +1189,22 @@ std::optional<UiaTargetIdentity> capture_uia_target_identity(
     return identity;
 }
 
+HRESULT validate_uia_target_identity(
+    const UiaTargetIdentity& identity) {
+    if (!identity.valid())
+        return HRESULT_FROM_WIN32(ERROR_INVALID_OWNER);
+    return run_on_mta([&]() -> HRESULT {
+        wil::com_ptr<IUIAutomation> automation;
+        UiaOptions options;
+        options.timeoutMs = 0;
+        RETURN_IF_FAILED(create_automation(
+            options, &automation));
+        wil::com_ptr<IUIAutomationElement> root;
+        return get_validated_uia_root(
+            automation.get(), identity, nullptr, &root);
+    });
+}
+
 namespace uia_eventing_detail {
 
 SubscriptionCounters subscription_counters() {
@@ -2134,6 +2150,8 @@ PropertyMutationResult UiaConnection::set_property(
         return result;
     }
 
+    wait_after_element_from_handle_test_gate(
+        "LVT_TEST_UIA_BEFORE_PROPERTY_MUTATION_GATE");
     std::unique_lock<std::mutex> lock(m_state->operationMutex);
     if (!validate_target_identity_locked()) {
         PropertyMutationResult result;
@@ -2189,6 +2207,21 @@ PropertyMutationResult UiaConnection::clear_property(
         result.error =
             "The property descriptor is unknown, stale, or belongs to a different UI Automation element";
         return result;
+    }
+
+    wait_after_element_from_handle_test_gate(
+        "LVT_TEST_UIA_BEFORE_PROPERTY_MUTATION_GATE");
+    {
+        std::lock_guard<std::mutex> lock(
+            m_state->operationMutex);
+        if (!validate_target_identity_locked()) {
+            PropertyMutationResult result;
+            result.hresult =
+                HRESULT_FROM_WIN32(ERROR_INVALID_OWNER);
+            result.error =
+                "ownershipLost: the UI Automation target identity changed";
+            return result;
+        }
     }
 
     PropertyMutationResult result;

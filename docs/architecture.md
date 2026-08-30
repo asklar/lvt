@@ -210,6 +210,17 @@ activation and again immediately before every `SendInput` dispatch (mouse,
 wheel, text, or each key chord). Ownership failures set the structured action
 code `ownershipLost`, including elementless type/press-key requests, so CLI and
 MCP clients can distinguish a security boundary from an ordinary action error.
+Every dispatch also verifies that the target root is still the foreground
+window. Multi-batch operations (focus-click then text, select-all then text, or
+multi-chord key sequences) re-activate and revalidate between batches if
+foreground moved; otherwise they refuse the remaining input.
+
+Visual MCP sessions capture the same `UiaTargetIdentity` even though their tree
+comes from framework-native providers. Geometry-based input and Win32 window
+commands validate that original identity before acting, after foreground
+activation, and immediately before each dispatch. Visual and UIA `wait-gone`
+still succeed when the original target disappears, while `wait-for` reports
+structured `ownershipLost`.
 
 ### Native typed-property safety (`native_message.*`,
 `native_property_connection.*`)

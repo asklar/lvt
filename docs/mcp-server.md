@@ -196,6 +196,14 @@ failure can use a one-shot fallback only with the captured identity;
 PID/HWND/root replacement instead returns the structured code
 `ownershipLost`.
 
+Visual-mode actions validate that same original identity rather than trusting
+only the current numeric HWND. Both visual and UIA synthetic input paths require
+the target root to remain foreground and repeat identity/foreground checks
+before every mouse, wheel, text, select-all, or individual key-chord batch.
+Typed-property reads and mutations map identity loss—including a race after the
+initial descriptor read—to `typed_property_session_disconnected`,
+`errorDisposition: ownershipLost`, and `retryable: false`.
+
 Visual resources always poll `get_visual_tree_changes` with `fast: true`,
 matching the Viewer's former `watch --fast` path. The live stream still carries
 the bounds, text, content, and basic state needed to render and search the tree;

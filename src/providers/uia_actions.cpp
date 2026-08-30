@@ -110,11 +110,12 @@ void record_send_input_test_attempt(const char* operation) {
         &ignored, nullptr);
 }
 
-bool activate_target_for_input(HWND hwnd) {
+bool input_foreground_test_override() {
     char overrideValue[8]{};
     char gate[160]{};
     char stats[MAX_PATH]{};
-    if (GetEnvironmentVariableA(
+    char suppress[8]{};
+    return GetEnvironmentVariableA(
             "LVT_TEST_UIA_FOREGROUND_SUCCESS",
             overrideValue,
             static_cast<DWORD>(
@@ -125,10 +126,35 @@ bool activate_target_for_input(HWND hwnd) {
             gate, static_cast<DWORD>(_countof(gate))) != 0 &&
         GetEnvironmentVariableA(
             "LVT_TEST_UIA_SEND_INPUT_STATS",
-            stats, static_cast<DWORD>(_countof(stats))) != 0) {
+            stats, static_cast<DWORD>(_countof(stats))) != 0 &&
+        GetEnvironmentVariableA(
+            "LVT_TEST_UIA_SUPPRESS_SEND_INPUT",
+            suppress, static_cast<DWORD>(_countof(suppress))) != 0 &&
+        strtoul(suppress, nullptr, 10) != 0;
+}
+
+bool input_target_is_foreground(HWND hwnd) {
+    if (input_foreground_test_override())
         return true;
-    }
+    HWND root = GetAncestor(hwnd, GA_ROOT);
+    if (!root)
+        root = hwnd;
+    return GetForegroundWindow() == root;
+}
+
+bool activate_target_for_input(HWND hwnd) {
+    if (input_foreground_test_override())
+        return true;
     return bring_to_foreground(hwnd);
+}
+
+bool suppress_send_input_for_testing() {
+    char value[8]{};
+    return GetEnvironmentVariableA(
+               "LVT_TEST_UIA_SUPPRESS_SEND_INPUT",
+               value,
+               static_cast<DWORD>(_countof(value))) != 0 &&
+           strtoul(value, nullptr, 10) != 0;
 }
 
 std::optional<Element> build_tree_for_action(
@@ -922,6 +948,7 @@ ActionResult perform_action(
                     result.method = "wait-gone";
                     return result;
                 }
+                result.errorCode = "ownershipLost";
                 result.message = "the window closed while waiting for '" +
                                  request.elementRef + "'";
                 return result;
@@ -952,6 +979,11 @@ ActionResult perform_action(
                     return result;
                 }
             } else if (ownershipLost) {
+                if (!wantPresent) {
+                    result.ok = true;
+                    result.method = "wait-gone";
+                    return result;
+                }
                 result.errorCode = "ownershipLost";
                 result.message =
                     "ownershipLost: the UI Automation target identity changed";
@@ -1036,6 +1068,48 @@ ActionResult perform_action(
             return validateHr;
         };
         RETURN_IF_FAILED(validate_target());
+        int syntheticDispatchIndex = 0;
+        const auto prepare_synthetic_dispatch = [&]() -> HRESULT {
+            RETURN_IF_FAILED(validate_target());
+            ++syntheticDispatchIndex;
+
+            char stealAtText[16]{};
+            const int stealAt =
+                GetEnvironmentVariableA(
+                    "LVT_TEST_UIA_FOREGROUND_STEAL_AT",
+                    stealAtText,
+                    static_cast<DWORD>(
+                        _countof(stealAtText))) != 0
+                    ? static_cast<int>(
+                          strtol(stealAtText, nullptr, 10))
+                    : 0;
+            const bool foregroundStolen =
+                stealAt > 0 &&
+                syntheticDispatchIndex == stealAt;
+            if (foregroundStolen ||
+                !input_target_is_foreground(hwnd)) {
+                if (!activate_target_for_input(hwnd)) {
+                    failure =
+                        "the target window lost foreground before synthetic input";
+                    return E_ACCESSDENIED;
+                }
+                record_send_input_test_attempt("reactivate");
+                RETURN_IF_FAILED(validate_target());
+                if (!input_target_is_foreground(hwnd)) {
+                    failure =
+                        "the target window could not regain foreground before synthetic input";
+                    return E_ACCESSDENIED;
+                }
+            }
+            // This final check is intentionally adjacent to the dispatch.
+            RETURN_IF_FAILED(validate_target());
+            if (!input_target_is_foreground(hwnd)) {
+                failure =
+                    "the target window lost foreground immediately before synthetic input";
+                return E_ACCESSDENIED;
+            }
+            return S_OK;
+        };
 
         wil::com_ptr<IUIAutomationElement> element;
         if (needsElement) {
@@ -1091,8 +1165,15 @@ ActionResult perform_action(
             wait_action_test_gate(
                 "LVT_TEST_UIA_AFTER_FOREGROUND_GATE");
             RETURN_IF_FAILED(validate_target());
+            if (!input_target_is_foreground(hwnd)) {
+                failure =
+                    "the target window lost foreground after activation";
+                return E_ACCESSDENIED;
+            }
+            RETURN_IF_FAILED(prepare_synthetic_dispatch());
             record_send_input_test_attempt("click");
-            if (!send_click(center, request.button, request.amount)) {
+            if (!suppress_send_input_for_testing() &&
+                !send_click(center, request.button, request.amount)) {
                 failure = "SendInput click failed";
                 return E_FAIL;
             }
@@ -1134,18 +1215,25 @@ ActionResult perform_action(
             wait_action_test_gate(
                 "LVT_TEST_UIA_AFTER_FOREGROUND_GATE");
             RETURN_IF_FAILED(validate_target());
+            if (!input_target_is_foreground(hwnd)) {
+                failure =
+                    "the target window lost foreground after activation";
+                return E_ACCESSDENIED;
+            }
             KeyChord selectAll;
             if (parse_key_chord("Ctrl+A", selectAll)) {
-                RETURN_IF_FAILED(validate_target());
+                RETURN_IF_FAILED(prepare_synthetic_dispatch());
                 record_send_input_test_attempt("set-value-select-all");
-                if (!send_key_chord(selectAll)) {
+                if (!suppress_send_input_for_testing() &&
+                    !send_key_chord(selectAll)) {
                     failure = "SendInput select-all failed";
                     return E_FAIL;
                 }
             }
-            RETURN_IF_FAILED(validate_target());
+            RETURN_IF_FAILED(prepare_synthetic_dispatch());
             record_send_input_test_attempt("set-value-text");
-            if (!send_text(request.text)) {
+            if (!suppress_send_input_for_testing() &&
+                !send_text(request.text)) {
                 failure = "SendInput typing failed";
                 return E_FAIL;
             }
@@ -1234,14 +1322,22 @@ ActionResult perform_action(
             wait_action_test_gate(
                 "LVT_TEST_UIA_AFTER_FOREGROUND_GATE");
             RETURN_IF_FAILED(validate_target());
+            if (!input_target_is_foreground(hwnd)) {
+                failure =
+                    "the target window lost foreground after activation";
+                return E_ACCESSDENIED;
+            }
             const int notch = WHEEL_DELTA * (std::max)(1, request.amount);
             const bool horizontal = request.direction == "left" || request.direction == "right";
             const bool negative = request.direction == "down" || request.direction == "left";
             POINT wheelPoint{};
             RETURN_IF_FAILED(live_element_center(element.get(), target, wheelPoint, failure));
-            RETURN_IF_FAILED(validate_target());
+            RETURN_IF_FAILED(prepare_synthetic_dispatch());
             record_send_input_test_attempt("scroll");
-            if (!send_wheel(wheelPoint, negative ? -notch : notch, horizontal)) {
+            if (!suppress_send_input_for_testing() &&
+                !send_wheel(
+                    wheelPoint, negative ? -notch : notch,
+                    horizontal)) {
                 failure = "SendInput wheel failed";
                 return E_FAIL;
             }
@@ -1266,10 +1362,16 @@ ActionResult perform_action(
             wait_action_test_gate(
                 "LVT_TEST_UIA_AFTER_FOREGROUND_GATE");
             RETURN_IF_FAILED(validate_target());
+            if (!input_target_is_foreground(hwnd)) {
+                failure =
+                    "the target window lost foreground after activation";
+                return E_ACCESSDENIED;
+            }
             if (request.kind == ActionKind::typeText) {
-                RETURN_IF_FAILED(validate_target());
+                RETURN_IF_FAILED(prepare_synthetic_dispatch());
                 record_send_input_test_attempt("type-text");
-                if (!send_text(request.text)) {
+                if (!suppress_send_input_for_testing() &&
+                    !send_text(request.text)) {
                     failure = "SendInput typing failed";
                     return E_FAIL;
                 }
@@ -1283,9 +1385,10 @@ ActionResult perform_action(
                 return E_INVALIDARG;
             }
             for (const auto& chord : chords) {
-                RETURN_IF_FAILED(validate_target());
+                RETURN_IF_FAILED(prepare_synthetic_dispatch());
                 record_send_input_test_attempt("press-key");
-                if (!send_key_chord(chord)) {
+                if (!suppress_send_input_for_testing() &&
+                    !send_key_chord(chord)) {
                     failure = "SendInput key chord failed";
                     return E_FAIL;
                 }

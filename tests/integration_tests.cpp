@@ -4373,6 +4373,8 @@ TEST_F(
         statsPath.string());
     ScopedEnvironmentVariable foregroundSuccess(
         "LVT_TEST_UIA_FOREGROUND_SUCCESS", "1");
+    ScopedEnvironmentVariable suppressInput(
+        "LVT_TEST_UIA_SUPPRESS_SEND_INPUT", "1");
 
     char hwndArgument[64]{};
     snprintf(
@@ -4455,6 +4457,34 @@ TEST(UiaTargetIdentity, WinEventFallbackPreservesTargetsWhenSetPropIsUnavailable
         Sleep(20);
     }
     EXPECT_FALSE(connection->is_alive());
+}
+
+TEST(UiaTargetIdentity, WaitClosureIsStructuredButWaitGoneStillSucceeds) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto identity = lvt::capture_uia_target_identity(
+        fixture.hwnd, fixture.pid,
+        lvt::process_creation_identity(fixture.pid));
+    ASSERT_TRUE(identity.has_value());
+    const auto reference =
+        "uia:" + lvt::format_runtime_id(
+            identity->rootRuntimeId);
+    fixture.stop();
+
+    lvt::ActionRequest waitFor;
+    waitFor.kind = lvt::ActionKind::waitFor;
+    waitFor.elementRef = reference;
+    const auto closed = lvt::perform_action(
+        *identity, lvt::UiaOptions{}, waitFor);
+    EXPECT_FALSE(closed.ok);
+    EXPECT_EQ(closed.errorCode, "ownershipLost");
+
+    lvt::ActionRequest waitGone = waitFor;
+    waitGone.kind = lvt::ActionKind::waitGone;
+    const auto gone = lvt::perform_action(
+        *identity, lvt::UiaOptions{}, waitGone);
+    EXPECT_TRUE(gone.ok) << gone.message;
+    EXPECT_EQ(gone.method, "wait-gone");
 }
 
 TEST(UiaTargetIdentity, OneShotFallbackKeepsOriginalIdentity) {

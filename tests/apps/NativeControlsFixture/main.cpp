@@ -976,11 +976,16 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         }
         return FALSE;
     case fixture::kRecycleEventChildHwndMessage: {
-        const HWND original = g_controls.eventChild;
+        const bool recycleEdit =
+            lParam == fixture::kEditId;
+        HWND& target = recycleEdit
+            ? g_controls.edit
+            : g_controls.eventChild;
+        const HWND original = target;
         if (!original || !IsWindow(original))
             return 0;
         DestroyWindow(original);
-        g_controls.eventChild = nullptr;
+        target = nullptr;
 
         const DWORD maximumAttempts =
             wParam != 0
@@ -988,13 +993,26 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                 : 131072u;
         const auto originalIndex =
             reinterpret_cast<uintptr_t>(original) & 0xFFFFu;
-        const auto createCandidate = [&]() -> HWND {
+        const auto createCandidate = [&](bool asEdit = false) -> HWND {
             return CreateWindowExW(
-                0, fixture::kGenericChildClass,
-                L"Event child", WS_CHILD,
-                8, 8, 160, 24, hwnd,
+                asEdit ? WS_EX_CLIENTEDGE : 0,
+                asEdit ? WC_EDITW
+                       : fixture::kGenericChildClass,
+                asEdit ? L"Editable value"
+                       : L"Event child",
+                WS_CHILD |
+                    (asEdit
+                         ? WS_TABSTOP | ES_AUTOHSCROLL
+                         : 0),
+                asEdit ? 20 : 8,
+                asEdit ? 118 : 8,
+                asEdit ? 250 : 160,
+                24, hwnd,
                 reinterpret_cast<HMENU>(
-                    static_cast<INT_PTR>(1016)),
+                    static_cast<INT_PTR>(
+                        asEdit
+                            ? fixture::kEditId
+                            : 1016)),
                 GetModuleHandleW(nullptr), nullptr);
         };
         std::vector<HWND> heldWindows;
@@ -1012,22 +1030,62 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return nullptr;
         };
         HWND originalIndexWindow = acquireOriginalIndex();
+        uint16_t generationStep = 0;
         for (DWORD attempt = 0;
              originalIndexWindow && attempt < maximumAttempts;
              ++attempt) {
+            const auto currentValue =
+                static_cast<uint32_t>(
+                    reinterpret_cast<uintptr_t>(
+                        originalIndexWindow));
+            const uint16_t currentGeneration =
+                static_cast<uint16_t>(currentValue >> 16);
+            const uint16_t originalGeneration =
+                static_cast<uint16_t>(
+                    static_cast<uint32_t>(
+                        reinterpret_cast<uintptr_t>(
+                            original)) >>
+                    16);
+            const bool createFinalEdit =
+                recycleEdit && generationStep != 0 &&
+                static_cast<uint16_t>(
+                    currentGeneration + generationStep) ==
+                    originalGeneration;
             DestroyWindow(originalIndexWindow);
-            HWND candidate = createCandidate();
+            HWND candidate =
+                createCandidate(createFinalEdit);
             if (!candidate)
                 return 0;
             if (candidate == original) {
-                g_controls.eventChild = candidate;
+                target = candidate;
                 ShowWindow(candidate, SW_SHOWNA);
                 for (HWND held : heldWindows)
                     DestroyWindow(held);
                 return reinterpret_cast<LRESULT>(candidate);
             }
+            if (createFinalEdit) {
+                // The allocator did not reuse the expected slot. Resume cheap
+                // generic churn rather than paying EDIT initialization cost
+                // for the rest of the generation cycle.
+                DestroyWindow(candidate);
+                originalIndexWindow = acquireOriginalIndex();
+                generationStep = 0;
+                continue;
+            }
             if ((reinterpret_cast<uintptr_t>(candidate) & 0xFFFFu) ==
                 originalIndex) {
+                const uint16_t candidateGeneration =
+                    static_cast<uint16_t>(
+                        static_cast<uint32_t>(
+                            reinterpret_cast<uintptr_t>(
+                                candidate)) >>
+                        16);
+                const uint16_t observedStep =
+                    static_cast<uint16_t>(
+                        candidateGeneration -
+                        currentGeneration);
+                if (observedStep != 0)
+                    generationStep = observedStep;
                 originalIndexWindow = candidate;
             } else {
                 heldWindows.push_back(candidate);
@@ -1038,9 +1096,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             DestroyWindow(originalIndexWindow);
         for (HWND held : heldWindows)
             DestroyWindow(held);
-        g_controls.eventChild = create_child(
-            hwnd, 0, fixture::kGenericChildClass,
-            L"Event child", 0, 8, 8, 160, 24, 1016);
+        target = createCandidate(recycleEdit);
+        if (target)
+            ShowWindow(target, SW_SHOWNA);
         return 0;
     }
     case fixture::kHangMessage:

@@ -110,19 +110,21 @@ jobs:
             build/lvt_winforms_tap_x64.dll
             build/LvtWinFormsTap.dll
             build/LvtWinFormsTap.runtimeconfig.json
+            build/lvt_native_controls_fixture.exe
             build/plugins/
 
   x86-integration:
     name: x86 integration
     runs-on: windows-latest
+    needs: build-and-test
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up MSVC for x64 fixture
+      - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: x64
+          arch: amd64_x86
 
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
@@ -137,18 +139,18 @@ jobs:
       - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
         run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
 
-      - name: Build opposite-architecture native fixture
-        run: |
-          cmake --preset default `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DLVT_BUILD_MANAGED=OFF `
-            -DLVT_ENABLE_MCP=OFF
-          cmake --build build --target lvt_native_controls_fixture
-
-      - name: Set up MSVC for x86 tests
-        uses: ilammy/msvc-dev-cmd@v1
+      - name: Download x64 native fixture
+        uses: actions/download-artifact@v4
         with:
-          arch: amd64_x86
+          name: lvt-binaries
+          path: cross-x64
+
+      - name: Stage x64 native fixture for cross-bitness tests
+        run: |
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          Copy-Item `
+            cross-x64\lvt_native_controls_fixture.exe `
+            build\lvt_native_controls_fixture.exe
 
       - name: Set up Rust (for the x86 MCP server)
         run: rustup target add i686-pc-windows-msvc

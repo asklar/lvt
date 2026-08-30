@@ -214,12 +214,8 @@ lvt::UiaTargetIdentity uia_identity_for_session(
 
 bool uia_identity_is_current(const Session& session) {
     const auto expected = uia_identity_for_session(session);
-    const auto current = lvt::capture_uia_target_identity(
-        expected.hwnd, expected.pid,
-        expected.processCreationIdentity);
-    return current &&
-           current->rootRuntimeId ==
-               expected.rootRuntimeId;
+    return SUCCEEDED(
+        lvt::validate_uia_target_identity(expected));
 }
 #endif
 
@@ -1840,8 +1836,7 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
         if (!connection || !connection->is_alive() ||
             !connection->matches_target(session.hwnd)) {
             if (!uia_identity_is_current(session)) {
-                throw_typed_property_error(
-                    "ownershipLost", "terminal", false,
+                throw_typed_property_session_disconnected(
                     "the UI Automation target window or process identity changed");
             }
             throw_typed_property_error(
@@ -1965,10 +1960,36 @@ uint64_t resolve_property_handle(
 #endif
 }
 
+bool typed_property_ownership_lost(
+    const Session& session, const std::string& provider,
+    HRESULT hresult) {
+    if (hresult == HRESULT_FROM_WIN32(ERROR_INVALID_OWNER) ||
+        hresult == HRESULT_FROM_WIN32(
+            ERROR_INVALID_WINDOW_HANDLE)) {
+        return true;
+    }
+#ifdef LVT_ENABLE_UIA
+    return provider == "uia" &&
+           !uia_identity_is_current(session);
+#else
+    (void)session;
+    (void)provider;
+    return false;
+#endif
+}
+
 json property_snapshot_result(
+    const Session& session,
     const std::string& element, const std::string& provider,
     const lvt::PropertySnapshotResult& result) {
     if (!result.ok) {
+        if (typed_property_ownership_lost(
+                session, provider, result.hresult)) {
+            throw_typed_property_session_disconnected(
+                result.error.empty()
+                    ? "the typed-property target identity changed while reading properties"
+                    : result.error);
+        }
         const bool unsupported =
             result.hresult == E_NOTIMPL &&
             !provider_supports_typed_properties(provider);
@@ -2043,9 +2064,17 @@ json property_snapshot_result(
 }
 
 json property_mutation_result(
+    const Session& session, const std::string& provider,
     const std::string& element, const std::string& descriptorId,
     const lvt::PropertyMutationResult& result) {
     if (!result.ok) {
+        if (typed_property_ownership_lost(
+                session, provider, result.hresult)) {
+            throw_typed_property_session_disconnected(
+                result.error.empty()
+                    ? "the typed-property target identity changed during mutation"
+                    : result.error);
+        }
         throw std::runtime_error(json{
             {"error", result.error.empty() ? "typed property mutation failed" : result.error},
             {"hresult", format_hresult(result.hresult)},
@@ -2090,6 +2119,7 @@ json method_get_editable_properties(const json& params) {
             "the typed-property session disconnected while reading properties");
     }
     return property_snapshot_result(
+        session,
         get_string(params, "element"),
         target.provider,
         result);
@@ -2128,6 +2158,7 @@ json method_set_property(const json& params, bool allowInput) {
             "the typed-property session disconnected while setting a property");
     }
     return property_mutation_result(
+        session, target.provider,
         get_string(params, "element"), descriptorId,
         result);
 }
@@ -2161,6 +2192,7 @@ json method_clear_property(const json& params, bool allowInput) {
             "the typed-property session disconnected while clearing a property");
     }
     return property_mutation_result(
+        session, target.provider,
         get_string(params, "element"), descriptorId,
         result);
 }
@@ -2587,9 +2619,119 @@ json action_result_to_json(const lvt::ActionResult& result, const std::string& a
 // so there are no patterns to invoke — a click is a real click at the
 // element's centre and typing is real keystrokes.
 //
-// Nothing here consults UI Automation. That separation is the point: a
-// reference is resolved against the tree it came from, so it can never be
-// matched to something else.
+// Reference resolution never consults UI Automation. The session's captured
+// UIA target identity is still checked as a safety boundary before native
+// window commands and geometry-based SendInput, so numeric HWND reuse cannot
+// redirect a visual action to another window.
+[[noreturn]] void throw_action_ownership_lost(
+    const std::string& message) {
+    throw std::runtime_error(json{
+        {"error", message},
+        {"code", "ownershipLost"},
+    }.dump());
+}
+
+HWND action_root_window(HWND hwnd) {
+    const HWND root = GetAncestor(hwnd, GA_ROOT);
+    return root ? root : hwnd;
+}
+
+bool visual_input_test_override() {
+    char success[8]{};
+    char stats[MAX_PATH]{};
+    char suppress[8]{};
+    return GetEnvironmentVariableA(
+               "LVT_TEST_VISUAL_FOREGROUND_SUCCESS",
+               success, static_cast<DWORD>(_countof(success))) != 0 &&
+           strtoul(success, nullptr, 10) != 0 &&
+           GetEnvironmentVariableA(
+               "LVT_TEST_VISUAL_SEND_INPUT_STATS",
+               stats, static_cast<DWORD>(_countof(stats))) != 0 &&
+           GetEnvironmentVariableA(
+               "LVT_TEST_VISUAL_SUPPRESS_SEND_INPUT",
+               suppress, static_cast<DWORD>(_countof(suppress))) != 0 &&
+           strtoul(suppress, nullptr, 10) != 0;
+}
+
+bool action_target_is_foreground(HWND hwnd) {
+    if (visual_input_test_override())
+        return true;
+    return GetForegroundWindow() ==
+           action_root_window(hwnd);
+}
+
+bool activate_visual_target_window(HWND hwnd) {
+    return visual_input_test_override() ||
+           lvt::bring_to_foreground(hwnd);
+}
+
+bool suppress_visual_input_for_testing() {
+    char value[8]{};
+    return GetEnvironmentVariableA(
+               "LVT_TEST_VISUAL_SUPPRESS_SEND_INPUT",
+               value, static_cast<DWORD>(_countof(value))) != 0 &&
+           strtoul(value, nullptr, 10) != 0;
+}
+
+void record_visual_input_test_attempt(const char* operation) {
+    char path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_VISUAL_SEND_INPUT_STATS",
+        path, static_cast<DWORD>(_countof(path)));
+    if (length == 0 || length >= _countof(path))
+        return;
+    wil::unique_handle file(CreateFileA(
+        path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file)
+        return;
+    char line[64]{};
+    const int written = snprintf(
+        line, sizeof(line), "%s\r\n", operation);
+    if (written <= 0)
+        return;
+    DWORD ignored = 0;
+    WriteFile(
+        file.get(), line,
+        static_cast<DWORD>(
+            (std::min)(written, static_cast<int>(sizeof(line) - 1))),
+        &ignored, nullptr);
+}
+
+void validate_visual_action_identity(
+    const Session& session) {
+#ifdef LVT_ENABLE_UIA
+    if (FAILED(lvt::validate_uia_target_identity(
+            uia_identity_for_session(session)))) {
+        throw_action_ownership_lost(
+            "ownershipLost: the visual session target identity changed");
+    }
+#else
+    if (!IsWindow(session.hwnd))
+        throw_action_ownership_lost(
+            "ownershipLost: the visual session target window closed");
+#endif
+}
+
+void activate_visual_action_target(
+    const Session& session, bool force = false) {
+    validate_visual_action_identity(session);
+    if ((force || !action_target_is_foreground(session.hwnd)) &&
+        !activate_visual_target_window(session.hwnd)) {
+        throw std::runtime_error(
+            "the target window could not be brought to the foreground, so "
+            "synthetic input would go somewhere else");
+    }
+    if (force)
+        record_visual_input_test_attempt("reactivate");
+    validate_visual_action_identity(session);
+    if (!action_target_is_foreground(session.hwnd)) {
+        throw std::runtime_error(
+            "the target window lost foreground activation before input");
+    }
+}
+
 json visual_mode_action(const Session& session, const json& params, lvt::ActionKind kind,
                         const char* actionName) {
     const auto ref = get_string(params, "element");
@@ -2649,13 +2791,22 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
         const auto deadline =
             GetTickCount64() + static_cast<ULONGLONG>((std::max)(0, get_int(params, "timeoutMs", 5000)));
         for (;;) {
-            if (!IsWindow(session.hwnd)) {
+            const bool identityCurrent =
+#ifdef LVT_ENABLE_UIA
+                SUCCEEDED(lvt::validate_uia_target_identity(
+                    uia_identity_for_session(session)));
+#else
+                IsWindow(session.hwnd) != FALSE;
+#endif
+            if (!identityCurrent) {
                 if (!wantPresent) {
                     out["ok"] = true;
                     out["method"] = "window-closed";
                     return out;
                 }
-                throw std::runtime_error("the window closed while waiting for '" + ref + "'");
+                throw_action_ownership_lost(
+                    "ownershipLost: the window closed or was replaced while waiting for '" +
+                    ref + "'");
             }
             lvt::Element tree;
             std::string error;
@@ -2685,9 +2836,10 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
     // prerequisite rather than a nicety — and it must happen *before* the tree
     // is read, or the bounds captured are the ones the window had while
     // minimized and the first click of a session always misses.
-    if (injects && !lvt::bring_to_foreground(session.hwnd))
-        throw std::runtime_error("the target window could not be brought to the foreground, so "
-                                 "synthetic input would go somewhere else");
+    if (injects)
+        activate_visual_action_target(session);
+    else
+        validate_visual_action_identity(session);
 
     // No TargetGuard here: build_tree_for takes it for the read, and the mutex
     // is not recursive. Injection afterwards is desktop-wide anyway — it goes
@@ -2779,11 +2931,42 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
         return centre;
     };
 
+    int syntheticDispatchIndex = 0;
+    const auto prepareSyntheticDispatch = [&] {
+        validate_visual_action_identity(session);
+        ++syntheticDispatchIndex;
+        char stealAtText[16]{};
+        const int stealAt =
+            GetEnvironmentVariableA(
+                "LVT_TEST_VISUAL_FOREGROUND_STEAL_AT",
+                stealAtText,
+                static_cast<DWORD>(_countof(stealAtText))) != 0
+                ? static_cast<int>(
+                      strtol(stealAtText, nullptr, 10))
+                : 0;
+        const bool foregroundStolen =
+            stealAt > 0 &&
+            syntheticDispatchIndex == stealAt;
+        if (foregroundStolen ||
+            !action_target_is_foreground(session.hwnd)) {
+            activate_visual_action_target(
+                session, foregroundStolen);
+        }
+        validate_visual_action_identity(session);
+        if (!action_target_is_foreground(session.hwnd)) {
+            throw std::runtime_error(
+                "the target window lost foreground before synthetic input");
+        }
+    };
+
     switch (kind) {
     case lvt::ActionKind::click: {
         const auto centre = centreOf(requireElement());
         const int button = get_int(params, "button", 0);
-        if (!lvt::send_click(centre, button, 1))
+        prepareSyntheticDispatch();
+        record_visual_input_test_attempt("click");
+        if (!suppress_visual_input_for_testing() &&
+            !lvt::send_click(centre, button, 1))
             throw std::runtime_error("the click could not be delivered");
         out["method"] = "SendInput";
         out["at"] = {{"x", centre.x}, {"y", centre.y}};
@@ -2797,7 +2980,10 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
         const bool horizontal = direction == "left" || direction == "right";
         const bool negative = direction == "down" || direction == "left";
         const int delta = WHEEL_DELTA * amount * (negative ? -1 : 1);
-        if (!lvt::send_wheel(centre, delta, horizontal))
+        prepareSyntheticDispatch();
+        record_visual_input_test_attempt("scroll");
+        if (!suppress_visual_input_for_testing() &&
+            !lvt::send_wheel(centre, delta, horizontal))
             throw std::runtime_error("the scroll could not be delivered");
         out["method"] = "SendInput";
         break;
@@ -2808,13 +2994,19 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
         // element the text goes wherever focus already is.
         if (element) {
             const auto centre = centreOf(*element);
-            if (!lvt::send_click(centre, 0, 1))
+            prepareSyntheticDispatch();
+            record_visual_input_test_attempt("type-focus-click");
+            if (!suppress_visual_input_for_testing() &&
+                !lvt::send_click(centre, 0, 1))
                 throw std::runtime_error("could not click the element to type into it");
         }
         const auto text = get_string(params, "text");
         if (text.empty())
             throw std::runtime_error("type needs some text");
-        if (!lvt::send_text(text))
+        prepareSyntheticDispatch();
+        record_visual_input_test_attempt("type-text");
+        if (!suppress_visual_input_for_testing() &&
+            !lvt::send_text(text))
             throw std::runtime_error("the text could not be delivered");
         out["method"] = "SendInput";
         break;
@@ -2823,14 +3015,20 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
     case lvt::ActionKind::pressKey: {
         if (element) {
             const auto centre = centreOf(*element);
-            if (!lvt::send_click(centre, 0, 1))
+            prepareSyntheticDispatch();
+            record_visual_input_test_attempt("key-focus-click");
+            if (!suppress_visual_input_for_testing() &&
+                !lvt::send_click(centre, 0, 1))
                 throw std::runtime_error("could not click the element to send keys to it");
         }
         std::vector<lvt::KeyChord> chords;
         if (!lvt::parse_key_chords(get_string(params, "text"), chords))
             throw std::runtime_error("could not understand that key chord");
         for (const auto& chord : chords) {
-            if (!lvt::send_key_chord(chord))
+            prepareSyntheticDispatch();
+            record_visual_input_test_attempt("press-key");
+            if (!suppress_visual_input_for_testing() &&
+                !lvt::send_key_chord(chord))
                 throw std::runtime_error("the key chord could not be delivered");
         }
         out["method"] = "SendInput";
@@ -2839,7 +3037,10 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
 
     case lvt::ActionKind::focus: {
         const auto centre = centreOf(requireElement());
-        if (!lvt::send_click(centre, 0, 1))
+        prepareSyntheticDispatch();
+        record_visual_input_test_attempt("focus-click");
+        if (!suppress_visual_input_for_testing() &&
+            !lvt::send_click(centre, 0, 1))
             throw std::runtime_error("could not click the element to focus it");
         out["method"] = "SendInput";
         break;
@@ -2854,6 +3055,7 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
         const int command = kind == lvt::ActionKind::windowMinimize  ? SW_MINIMIZE
                             : kind == lvt::ActionKind::windowMaximize ? SW_MAXIMIZE
                                                                       : SW_RESTORE;
+        validate_visual_action_identity(session);
         if (kind == lvt::ActionKind::windowClose)
             PostMessageW(session.hwnd, WM_CLOSE, 0, 0);
         else

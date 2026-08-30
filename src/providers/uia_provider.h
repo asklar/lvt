@@ -37,6 +37,8 @@ struct UiaTargetIdentity {
 std::optional<UiaTargetIdentity> capture_uia_target_identity(
     HWND hwnd, DWORD expectedPid,
     uint64_t expectedProcessCreationIdentity = 0);
+HRESULT validate_uia_target_identity(
+    const UiaTargetIdentity& identity);
 
 HRESULT get_validated_uia_root(
     IUIAutomation* automation,
