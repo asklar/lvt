@@ -833,6 +833,14 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         return ListView_InsertItem(
             g_controls.listView, &item) == 0;
     }
+    case fixture::kInsertAlphaFirstListItemMessage: {
+        LVITEMW item{};
+        item.mask = LVIF_TEXT;
+        item.iItem = 0;
+        item.pszText = const_cast<LPWSTR>(L"Alpha row");
+        return ListView_InsertItem(
+            g_controls.listView, &item) == 0;
+    }
     case fixture::kReparentGenericOutOfTreeMessage: {
         const HWND oldParent = SetParent(
             g_controls.genericText, g_controls.outOfTree);

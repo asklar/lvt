@@ -1086,13 +1086,48 @@ struct WatchScopeAnchor {
     std::string key;
     std::string baseIdentity;
     std::string durableIdentity;
+    std::string uiaRuntimeId;
     std::string parentKey;
+    std::string parentCardinality;
     std::string path;
+    std::string framework;
     uintptr_t nativeHandle = 0;
     uint64_t providerHandle = 0;
+    bool nativeIdentity = false;
     bool durableProviderIdentity = false;
     bool processWideProviderIdentity = false;
+    bool providerReplacementMapping = false;
+    bool authoritativeContinuity = false;
 };
+
+static const char* watch_scope_cardinality_property(
+    const lvt::Element& element) {
+    if (element.framework != "comctl")
+        return nullptr;
+    if (element.type == "ListViewItem")
+        return "itemCount";
+    if (element.type == "ToolbarButton" ||
+        element.type == "ToolbarSeparator")
+        return "buttonCount";
+    if (element.type == "StatusBarPart")
+        return "partCount";
+    if (element.type == "Tab")
+        return "tabCount";
+    return nullptr;
+}
+
+static std::string watch_scope_parent_cardinality(
+    const lvt::Element& element,
+    const lvt::Element* parent) {
+    const auto* property =
+        watch_scope_cardinality_property(element);
+    if (!property || !parent)
+        return {};
+    const auto found = parent->properties.find(property);
+    return found == parent->properties.end()
+        ? std::string()
+        : found->second;
+}
 
 static void update_watch_scope_anchor(
     WatchScopeAnchor& anchor,
@@ -1102,9 +1137,19 @@ static void update_watch_scope_anchor(
         lvt::base_identity_key(*location.element);
     anchor.durableIdentity =
         location.element->durableIdentity;
+    const auto runtimeId =
+        location.element->properties.find("RuntimeId");
+    anchor.uiaRuntimeId =
+        runtimeId == location.element->properties.end()
+            ? std::string()
+            : runtimeId->second;
     anchor.parentKey =
         location.parent ? location.parent->key : std::string();
+    anchor.parentCardinality =
+        watch_scope_parent_cardinality(
+            *location.element, location.parent);
     anchor.path = location.path;
+    anchor.framework = location.element->framework;
     anchor.nativeHandle =
         location.element->nativeHandle;
     anchor.providerHandle =
@@ -1112,9 +1157,24 @@ static void update_watch_scope_anchor(
     anchor.durableProviderIdentity =
         lvt::has_durable_provider_identity(
             *location.element);
+    anchor.nativeIdentity =
+        anchor.nativeHandle != 0 &&
+        (anchor.framework == "win32" ||
+         anchor.framework == "comctl");
     anchor.processWideProviderIdentity =
         lvt::has_process_wide_provider_identity(
             *location.element);
+    anchor.providerReplacementMapping =
+        location.element->providerHandle != 0 &&
+        !anchor.parentCardinality.empty() &&
+        watch_scope_cardinality_property(
+            *location.element) != nullptr;
+    anchor.authoritativeContinuity =
+        !anchor.durableIdentity.empty() ||
+        !anchor.uiaRuntimeId.empty() ||
+        anchor.nativeIdentity ||
+        anchor.durableProviderIdentity ||
+        anchor.processWideProviderIdentity;
 }
 
 static bool watch_scope_parent_matches(
@@ -1125,6 +1185,92 @@ static bool watch_scope_parent_matches(
     const auto parentKey =
         location.parent ? location.parent->key : std::string();
     return parentKey == anchor.parentKey;
+}
+
+static bool watch_scope_direct_identity_matches(
+    const WatchScopeAnchor& anchor,
+    const WatchElementLocation& location) {
+    if (!anchor.durableIdentity.empty() &&
+        location.element->durableIdentity ==
+            anchor.durableIdentity) {
+        return true;
+    }
+    if (!anchor.uiaRuntimeId.empty()) {
+        const auto runtimeId =
+            location.element->properties.find("RuntimeId");
+        if (runtimeId !=
+                location.element->properties.end() &&
+            runtimeId->second == anchor.uiaRuntimeId) {
+            return true;
+        }
+    }
+    if (anchor.nativeIdentity &&
+        location.element->nativeHandle ==
+            anchor.nativeHandle) {
+        return true;
+    }
+    if ((anchor.durableProviderIdentity ||
+         anchor.processWideProviderIdentity) &&
+        location.element->providerHandle ==
+            anchor.providerHandle) {
+        return true;
+    }
+    return false;
+}
+
+static bool watch_scope_provider_replacement_matches(
+    const WatchScopeAnchor& anchor,
+    const WatchElementLocation& location) {
+    return anchor.authoritativeContinuity &&
+           anchor.providerReplacementMapping &&
+           location.element->providerHandle ==
+               anchor.providerHandle &&
+           watch_scope_parent_cardinality(
+               *location.element, location.parent) ==
+               anchor.parentCardinality;
+}
+
+static std::string watch_parent_path(
+    const std::string& path) {
+    const auto separator = path.rfind('.');
+    return separator == std::string::npos
+        ? std::string()
+        : path.substr(0, separator);
+}
+
+static bool watch_scope_has_ambiguous_sibling_change(
+    const WatchScopeAnchor& anchor,
+    const std::vector<lvt::ChangeEvent>& fullEvents) {
+    const auto parentPath = watch_parent_path(anchor.path);
+    for (const auto& event : fullEvents) {
+        if (lvt::base_identity_key(event.element) !=
+            anchor.baseIdentity) {
+            continue;
+        }
+        if ((event.type ==
+                 lvt::ChangeEvent::Type::Added ||
+             event.type ==
+                 lvt::ChangeEvent::Type::Removed) &&
+            watch_parent_path(event.path) == parentPath) {
+            return true;
+        }
+        if (event.type !=
+            lvt::ChangeEvent::Type::Changed) {
+            continue;
+        }
+        const auto changedPath =
+            event.fields.find("path");
+        if (changedPath != event.fields.end() &&
+            (watch_parent_path(
+                 changedPath->second.oldValue) ==
+                 parentPath ||
+             watch_parent_path(
+                 changedPath->second.newValue) ==
+                 parentPath)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 enum class WatchScopeTransition {
@@ -1144,17 +1290,25 @@ static WatchScopeTransition resolve_watch_scope(
             current, anchor.key, exact) &&
         lvt::base_identity_key(*exact.element) ==
             anchor.baseIdentity &&
-        (anchor.durableIdentity.empty() ||
-         exact.element->durableIdentity ==
-             anchor.durableIdentity) &&
-        (wasPresent ||
-         anchor.processWideProviderIdentity ||
-         exact.path == anchor.path) &&
         watch_scope_parent_matches(anchor, exact)) {
-        location = exact;
-        return wasPresent
-            ? WatchScopeTransition::same
-            : WatchScopeTransition::reappeared;
+        if (anchor.authoritativeContinuity) {
+            if (watch_scope_direct_identity_matches(
+                    anchor, exact) &&
+                (wasPresent ||
+                 anchor.processWideProviderIdentity ||
+                 exact.path == anchor.path)) {
+                location = exact;
+                return wasPresent
+                    ? WatchScopeTransition::same
+                    : WatchScopeTransition::reappeared;
+            }
+        } else if (wasPresent &&
+                   exact.path == anchor.path &&
+                   !watch_scope_has_ambiguous_sibling_change(
+                       anchor, fullEvents)) {
+            location = exact;
+            return WatchScopeTransition::same;
+        }
     }
 
     if (!wasPresent)
@@ -1189,14 +1343,10 @@ static WatchScopeTransition resolve_watch_scope(
             !watch_scope_parent_matches(anchor, candidate)) {
             continue;
         }
-        if (anchor.nativeHandle != 0 &&
-            candidate.element->nativeHandle !=
-                anchor.nativeHandle) {
-            continue;
-        }
-        if (anchor.durableProviderIdentity &&
-            candidate.element->providerHandle !=
-                anchor.providerHandle) {
+        if (!watch_scope_direct_identity_matches(
+                anchor, candidate) &&
+            !watch_scope_provider_replacement_matches(
+                anchor, candidate)) {
             continue;
         }
         location = candidate;

@@ -75,6 +75,7 @@ inline constexpr UINT kDuplicateSecondListIdentityMessage = WM_APP + 0x127;
 inline constexpr UINT kRestoreSecondListIdentityMessage = WM_APP + 0x128;
 inline constexpr UINT kDeleteFirstListItemMessage = WM_APP + 0x129;
 inline constexpr UINT kInsertExternalFirstListItemMessage = WM_APP + 0x12A;
+inline constexpr UINT kInsertAlphaFirstListItemMessage = WM_APP + 0x12B;
 inline constexpr LRESULT kSummaryProtocolVersion = 2;
 inline constexpr size_t kLongToolbarTextLength = 6000;
 inline constexpr size_t kLongItemTextLength = 5000;

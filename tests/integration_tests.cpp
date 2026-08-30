@@ -328,6 +328,148 @@ static FirstWatchEvent capture_first_watch_event(
     return result;
 }
 
+class LiveWatchCapture {
+public:
+    ~LiveWatchCapture() {
+        stop();
+    }
+
+    bool start(std::string command) {
+        SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+        wil::unique_handle writeEnd;
+        if (!CreatePipe(
+                readEnd_.put(), writeEnd.put(), &security, 0) ||
+            !SetHandleInformation(
+                readEnd_.get(), HANDLE_FLAG_INHERIT, 0)) {
+            return false;
+        }
+        STARTUPINFOA startup{sizeof(startup)};
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdOutput = writeEnd.get();
+        startup.hStdError = writeEnd.get();
+        PROCESS_INFORMATION processInfo{};
+        if (!CreateProcessA(
+                nullptr, command.data(), nullptr, nullptr, TRUE,
+                CREATE_NO_WINDOW, nullptr, nullptr,
+                &startup, &processInfo)) {
+            return false;
+        }
+        process_.reset(processInfo.hProcess);
+        thread_.reset(processInfo.hThread);
+        return true;
+    }
+
+    size_t mark() {
+        read_available();
+        return output_.size();
+    }
+
+    bool wait_for_event(
+        size_t offset, const std::string& type,
+        const std::string& key, DWORD timeoutMs) {
+        const auto deadline = GetTickCount64() + timeoutMs;
+        while (GetTickCount64() < deadline) {
+            read_available();
+            if (event_seen(offset, type, key))
+                return true;
+            if (process_ &&
+                WaitForSingleObject(
+                    process_.get(), 0) == WAIT_OBJECT_0) {
+                break;
+            }
+            Sleep(20);
+        }
+        read_available();
+        return event_seen(offset, type, key);
+    }
+
+    bool event_seen(
+        size_t offset, const std::string& type,
+        const std::string& key = {}) const {
+        size_t cursor = offset;
+        if (cursor > 0 && cursor <= output_.size() &&
+            output_[cursor - 1] != '\n') {
+            const auto next = output_.find('\n', cursor);
+            if (next == std::string::npos)
+                return false;
+            cursor = next + 1;
+        }
+        while (cursor < output_.size()) {
+            const auto newline = output_.find('\n', cursor);
+            if (newline == std::string::npos)
+                break;
+            const auto event = json::parse(
+                output_.substr(cursor, newline - cursor),
+                nullptr, false);
+            if (!event.is_discarded() &&
+                event.value("event", "") == type &&
+                (key.empty() ||
+                 event.value("key", "") == key)) {
+                return true;
+            }
+            cursor = newline + 1;
+        }
+        return false;
+    }
+
+    void drain() {
+        read_available();
+    }
+
+    void stop() {
+        if (!process_)
+            return;
+        if (WaitForSingleObject(
+                process_.get(), 0) != WAIT_OBJECT_0) {
+            TerminateProcess(process_.get(), 0);
+            WaitForSingleObject(process_.get(), 5000);
+        }
+        read_available();
+        process_.reset();
+        thread_.reset();
+        readEnd_.reset();
+    }
+
+    const std::string& output() const {
+        return output_;
+    }
+
+    bool running() const {
+        return process_ &&
+               WaitForSingleObject(
+                   process_.get(), 0) == WAIT_TIMEOUT;
+    }
+
+private:
+    void read_available() {
+        if (!readEnd_)
+            return;
+        for (;;) {
+            DWORD available = 0;
+            if (!PeekNamedPipe(
+                    readEnd_.get(), nullptr, 0, nullptr,
+                    &available, nullptr) ||
+                available == 0) {
+                return;
+            }
+            std::string chunk(available, '\0');
+            DWORD read = 0;
+            if (!ReadFile(
+                    readEnd_.get(), chunk.data(), available,
+                    &read, nullptr) ||
+                read == 0) {
+                return;
+            }
+            output_.append(chunk, 0, read);
+        }
+    }
+
+    wil::unique_handle readEnd_;
+    wil::unique_handle process_;
+    wil::unique_handle thread_;
+    std::string output_;
+};
+
 // Build a command string
 static std::string make_cmd(const std::string& lvt, const std::string& args) {
     return "\"" + lvt + "\" " + args;
@@ -4240,6 +4382,36 @@ TEST_F(
     ASSERT_NE(
         send_native_fixture_message(
             s_hwnd,
+            native_fixture::kDeleteFirstListItemMessage),
+        0);
+    ASSERT_TRUE(waitFor(
+        [&] {
+            return eventSeen(
+                phaseStart, "removed", alphaKey);
+        },
+        10000)) << output;
+    Sleep(250);
+    readAvailable();
+    EXPECT_FALSE(eventSeen(
+        phaseStart, "added", std::string()));
+
+    phaseStart = output.size();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kInsertAlphaFirstListItemMessage),
+        0);
+    ASSERT_TRUE(waitFor(
+        [&] {
+            return eventSeen(
+                phaseStart, "added", alphaKey);
+        },
+        10000)) << output;
+
+    phaseStart = output.size();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
             native_fixture::kMutateListViewIdentityMessage),
         0);
     auto changed = dump_tree();
@@ -4280,57 +4452,104 @@ TEST_F(
         },
         10000)) << output;
 
-    phaseStart = output.size();
-    ASSERT_NE(
-        send_native_fixture_message(
-            s_hwnd,
-            native_fixture::kRestoreSecondListIdentityMessage),
-        0);
-    ASSERT_TRUE(waitFor(
-        [&] {
-            return eventSeen(
-                       phaseStart, "removed", ambiguousKey) &&
-                   eventSeen(
-                       phaseStart, "added", replacementKey);
-        },
-        10000)) << output;
-
-    phaseStart = output.size();
-    ASSERT_NE(
-        send_native_fixture_message(
-            s_hwnd,
-            native_fixture::kDeleteFirstListItemMessage),
-        0);
-    ASSERT_TRUE(waitFor(
-        [&] {
-            return eventSeen(
-                phaseStart, "removed", replacementKey);
-        },
-        10000)) << output;
-    Sleep(250);
-    readAvailable();
-    EXPECT_FALSE(eventSeen(
-        phaseStart, "added", std::string()))
-        << "a sibling moving into the removed root's slot was adopted";
-
-    phaseStart = output.size();
-    ASSERT_NE(
-        send_native_fixture_message(
-            s_hwnd,
-            native_fixture::kInsertExternalFirstListItemMessage),
-        0);
-    ASSERT_TRUE(waitFor(
-        [&] {
-            return eventSeen(
-                phaseStart, "added", replacementKey);
-        },
-        10000)) << output;
-
     TerminateProcess(process.get(), 0);
     WaitForSingleObject(process.get(), 5000);
     readAvailable();
     EXPECT_EQ(output.find("element '"), std::string::npos)
         << output;
+}
+
+TEST_F(
+    NativeControlsFixture,
+    AmbiguousPositionalScopeDoesNotAdoptShiftedSibling) {
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kRestoreDefaultListMessage),
+        0);
+    auto restore = wil::scope_exit([&] {
+        send_native_fixture_message(
+            s_hwnd, native_fixture::kRestoreDefaultListMessage);
+    });
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kMutateListViewIdentityMessage),
+        0);
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kDuplicateSecondListIdentityMessage),
+        0);
+
+    auto tree = dump_tree();
+    auto* listView = find_element_by_hwnd(
+        tree["root"], control(native_fixture::kListViewId));
+    ASSERT_NE(listView, nullptr);
+    auto* item0 = find_element_by_type_property(
+        *listView, "ListViewItem", "index", "0");
+    ASSERT_NE(item0, nullptr);
+    const auto ambiguousKey = item0->value("key", "");
+    ASSERT_FALSE(ambiguousKey.empty());
+    EXPECT_EQ(
+        ambiguousKey.find("identity:"),
+        std::string::npos);
+
+    LiveWatchCapture watch;
+    ASSERT_TRUE(watch.start(make_cmd(
+        get_lvt_path(),
+        get_hwnd_arg() + " watch --interval 50 --element \"" +
+            ambiguousKey + "\"")));
+    ASSERT_TRUE(watch.wait_for_event(
+        0, "added", ambiguousKey, 10000))
+        << watch.output();
+
+    const auto removedAt = watch.mark();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kDeleteFirstListItemMessage),
+        0);
+    ASSERT_TRUE(watch.wait_for_event(
+        removedAt, "removed", ambiguousKey, 10000))
+        << watch.output();
+    Sleep(250);
+    watch.drain();
+    EXPECT_FALSE(watch.event_seen(
+        removedAt, "added"))
+        << "the identical sibling that shifted into slot 0 was adopted:\n"
+        << watch.output();
+    EXPECT_TRUE(watch.running());
+
+    const auto reinsertedAt = watch.mark();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kInsertExternalFirstListItemMessage),
+        0);
+    Sleep(350);
+    watch.drain();
+    EXPECT_FALSE(watch.event_seen(
+        reinsertedAt, "added"))
+        << "an ambiguous scope without a continuity token reappeared:\n"
+        << watch.output();
+    EXPECT_TRUE(watch.running());
+
+    const auto restoredAt = watch.mark();
+    ASSERT_NE(
+        send_native_fixture_message(
+            s_hwnd,
+            native_fixture::kRestoreSecondListIdentityMessage),
+        0);
+    Sleep(350);
+    watch.drain();
+    EXPECT_FALSE(watch.event_seen(
+        restoredAt, "added"))
+        << "restoring uniqueness silently resuscitated an absent positional scope:\n"
+        << watch.output();
+    EXPECT_EQ(
+        watch.output().find("element '"),
+        std::string::npos)
+        << watch.output();
 }
 
 TEST_F(NativeControlsFixture, NativeWatchDoesNotDuplicateStructuralDiffs) {

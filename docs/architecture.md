@@ -131,11 +131,16 @@ and provider identity, then builds and reconciles complete trees on every
 later tick before deriving the reported scoped snapshot. An authoritative
 durable-identity replacement at the anchored parent/path is surfaced as a
 Removed subtree followed by an Added subtree with the fresh key. A moved
-sibling merely occupying the old slot is not adopted, and removal without an
-explicit replacement keeps the watch alive until the anchored identity validly
-reappears. Full-tree reconciliation preserves process-wide XAML/WinUI reparent
-matching, while incomplete provider markers continue to preserve the previous
-snapshot rather than reporting false removals.
+sibling merely occupying the old slot is not adopted: replacement requires
+continuity from a durable identity, supported native/provider handle,
+normalized UIA RuntimeId, or an explicit provider mapping whose parent
+cardinality is unchanged. A positional/ambiguous scope has no such token, so a
+sibling-set structural change removes it and later slot occupants are ignored
+until the caller rescopes. Removal with a retained token keeps the watch alive
+until that anchored identity validly reappears. Full-tree reconciliation
+preserves process-wide XAML/WinUI reparent matching, while incomplete provider
+markers continue to preserve the previous snapshot rather than reporting false
+removals.
 
 ### Native typed-property safety (`native_message.*`,
 `native_property_connection.*`)

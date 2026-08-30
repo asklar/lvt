@@ -466,7 +466,9 @@ ambiguous, watch emits removal of the old scoped tree and addition of the
 replacement with its fresh key, then follows that replacement. A plain
 structural removal emits removal and keeps the watch alive; only the same
 anchored identity may reappear later, so an unrelated sibling moving into the
-old slot is not silently adopted.
+old slot is not silently adopted. Positional/ambiguous scopes have no
+continuity token: once a sibling-set structural change makes their slot
+uncertain, they remain absent and the caller must rescope.
 
 `--fast` applies to `watch` too: every tick collects the cheaper property set
 instead of the full XAML/WinUI3 property chain, so `changed` events on an
