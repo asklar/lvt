@@ -748,23 +748,30 @@ lvt_add_version_resource(lvt_avalonia_tap
 if(LVT_BUILD_MANAGED)
 set(LVT_AVALONIA_RID "win-${TAP_ARCH_SUFFIX}")
 set(LVT_AVALONIA_PUBLISH_DIR "${CMAKE_CURRENT_BINARY_DIR}/avalonia-publish-${TAP_ARCH_SUFFIX}")
+set(LVT_AVALONIA_STAGE_STAMP "${CMAKE_CURRENT_BINARY_DIR}/avalonia-stage-${TAP_ARCH_SUFFIX}.stamp")
 add_custom_target(lvt_avalonia_tree_walker
+    BYPRODUCTS "${LVT_AVALONIA_STAGE_STAMP}"
     COMMAND ${CMAKE_COMMAND} -E remove_directory "${LVT_AVALONIA_PUBLISH_DIR}"
     COMMAND dotnet publish "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj"
         -c Release -r "${LVT_AVALONIA_RID}" --self-contained false
+        -p:DebugSymbols=false -p:DebugType=None
         -o "${LVT_AVALONIA_PUBLISH_DIR}"
     COMMAND ${CMAKE_COMMAND} -E remove_directory
-        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/runtimes"
+        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${LVT_AVALONIA_PUBLISH_DIR}"
         "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
         "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+    COMMAND ${CMAKE_COMMAND} -E touch "${LVT_AVALONIA_STAGE_STAMP}"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Publishing managed Avalonia tree walker for ${LVT_AVALONIA_RID}"
 )
 add_dependencies(lvt_avalonia_tap lvt_avalonia_tree_walker)
+# Staging removes the prior native TAP, so force an incremental relink after
+# the matching RID publish has replaced the directory.
+set_property(TARGET lvt_avalonia_tap APPEND PROPERTY LINK_DEPENDS "${LVT_AVALONIA_STAGE_STAMP}")
 endif()
 endif()
 

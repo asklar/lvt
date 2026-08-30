@@ -23,7 +23,16 @@ if ($PackageMode -eq "Viewer" -and $Architecture -ne "x64") {
     throw "The Viewer release is x64-only; architecture '$Architecture' is not valid."
 }
 
-$rootPath = [System.IO.Path]::GetFullPath($Root)
+try {
+    $unresolvedRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Root)
+}
+catch {
+    throw "Release artifact root '$Root' is not a valid file-system path: $($_.Exception.Message)"
+}
+if (-not (Test-Path -LiteralPath $unresolvedRoot -PathType Container)) {
+    throw "Release artifact root '$Root' does not exist or is not a directory."
+}
+$rootPath = (Resolve-Path -LiteralPath $unresolvedRoot).ProviderPath
 $requirements = [System.Collections.Generic.List[object]]::new()
 $issues = [System.Collections.Generic.List[object]]::new()
 $expectedMachine = @{
