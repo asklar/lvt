@@ -25,6 +25,7 @@ inline constexpr int kStatusBarId = 1012;
 inline constexpr int kTabControlId = 1013;
 inline constexpr int kGenericTextId = 1014;
 inline constexpr int kStateSummaryId = 1015;
+inline constexpr int kEventChildId = 1016;
 
 inline constexpr int kToolbarApplyCommand = 2001;
 inline constexpr int kToolbarPinCommand = 2002;
@@ -80,6 +81,12 @@ inline constexpr UINT kPopulateAdjacentToolbarSeparatorsMessage = WM_APP + 0x12C
 inline constexpr UINT kDeleteFirstToolbarSeparatorMessage = WM_APP + 0x12D;
 // Kept after the native-key/scoped-watch fixture range during series rebase.
 inline constexpr UINT kRecycleEventChildHwndMessage = WM_APP + 0x12E;
+inline constexpr WPARAM kForceExactHwndRecycleUnavailable =
+    static_cast<WPARAM>(~static_cast<WPARAM>(0));
+inline constexpr DWORD kExactHwndRecycleMaximumAttempts = 131072;
+inline constexpr DWORD kExactHwndRecycleMaximumHeldWindows = 4096;
+inline constexpr DWORD kExactHwndRecycleSearchBudgetMs = 5000;
+inline constexpr DWORD kExactHwndRecycleMessageTimeoutMs = 20000;
 inline constexpr LRESULT kSummaryProtocolVersion = 2;
 inline constexpr size_t kLongToolbarTextLength = 6000;
 inline constexpr size_t kLongItemTextLength = 5000;

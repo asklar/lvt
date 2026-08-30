@@ -898,7 +898,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             child = create_child(
                 parent, 0, fixture::kGenericChildClass,
                 outOfTree ? L"Out-of-tree event child" : L"Event child",
-                0, 8, 8, 160, 24, outOfTree ? 1017 : 1016);
+                0, 8, 8, 160, 24,
+                outOfTree ? 1017 : fixture::kEventChildId);
         }
         if (child) {
             NotifyWinEvent(
@@ -984,13 +985,20 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         const HWND original = target;
         if (!original || !IsWindow(original))
             return 0;
-        DestroyWindow(original);
+        if (!DestroyWindow(original))
+            return 0;
         target = nullptr;
 
+        const bool forceUnavailable =
+            wParam ==
+            fixture::kForceExactHwndRecycleUnavailable;
         const DWORD maximumAttempts =
-            wParam != 0
+            !forceUnavailable && wParam != 0
                 ? static_cast<DWORD>(wParam)
-                : 131072u;
+                : fixture::kExactHwndRecycleMaximumAttempts;
+        const ULONGLONG deadline =
+            GetTickCount64() +
+            fixture::kExactHwndRecycleSearchBudgetMs;
         const auto originalIndex =
             reinterpret_cast<uintptr_t>(original) & 0xFFFFu;
         const auto createCandidate = [&](bool asEdit = false) -> HWND {
@@ -1012,12 +1020,16 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                     static_cast<INT_PTR>(
                         asEdit
                             ? fixture::kEditId
-                            : 1016)),
+                            : fixture::kEventChildId)),
                 GetModuleHandleW(nullptr), nullptr);
         };
         std::vector<HWND> heldWindows;
         const auto acquireOriginalIndex = [&]() -> HWND {
-            for (DWORD attempt = 0; attempt < 16384u; ++attempt) {
+            for (DWORD attempt = 0;
+                 attempt <
+                     fixture::kExactHwndRecycleMaximumHeldWindows &&
+                 GetTickCount64() < deadline;
+                 ++attempt) {
                 HWND candidate = createCandidate();
                 if (!candidate)
                     return nullptr;
@@ -1029,10 +1041,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             }
             return nullptr;
         };
-        HWND originalIndexWindow = acquireOriginalIndex();
+        HWND originalIndexWindow =
+            forceUnavailable ? nullptr : acquireOriginalIndex();
         uint16_t generationStep = 0;
         for (DWORD attempt = 0;
-             originalIndexWindow && attempt < maximumAttempts;
+             originalIndexWindow &&
+             attempt < maximumAttempts &&
+             GetTickCount64() < deadline;
              ++attempt) {
             const auto currentValue =
                 static_cast<uint32_t>(
@@ -1055,7 +1070,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             HWND candidate =
                 createCandidate(createFinalEdit);
             if (!candidate)
-                return 0;
+                break;
             if (candidate == original) {
                 target = candidate;
                 ShowWindow(candidate, SW_SHOWNA);
@@ -1097,8 +1112,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         for (HWND held : heldWindows)
             DestroyWindow(held);
         target = createCandidate(recycleEdit);
-        if (target)
+        if (target) {
             ShowWindow(target, SW_SHOWNA);
+            if (target == original)
+                return reinterpret_cast<LRESULT>(target);
+        }
         return 0;
     }
     case fixture::kHangMessage:

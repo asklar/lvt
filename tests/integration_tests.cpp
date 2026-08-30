@@ -37,6 +37,7 @@
 #include "tree_builder.h"
 
 #include "apps/NativeControlsFixture/native_controls_fixture_ids.h"
+#include "exact_hwnd_recycle_test_support.h"
 #include "element_key.h"
 #include "framework_detector.h"
 #include "input.h"
@@ -4023,22 +4024,6 @@ static LRESULT send_native_fixture_message(
     return sent ? static_cast<LRESULT>(result) : 0;
 }
 
-static HWND recycle_event_child_exact(
-    HWND fixtureRoot, HWND original,
-    int targetId = 0) {
-    DWORD_PTR recycled = 0;
-    const LRESULT sent = SendMessageTimeoutW(
-        fixtureRoot,
-        native_fixture::kRecycleEventChildHwndMessage,
-        131072, targetId,
-        SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
-        120000, &recycled);
-    EXPECT_NE(sent, 0);
-    const HWND result = reinterpret_cast<HWND>(recycled);
-    EXPECT_EQ(result, original);
-    return sent ? result : nullptr;
-}
-
 static bool wait_for_native_snapshot(
     lvt::IFrameworkConnection& connection,
     std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
@@ -4323,9 +4308,100 @@ TEST(UiaEventLifecycle, RejectsReplacementProcessWithStaleExpectedPid) {
         nullptr);
 }
 
+TEST(
+    UiaTargetIdentity,
+    UnavailableExactRecycleRestoresDifferentValidReplacement) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const HWND original =
+        GetDlgItem(fixture.hwnd, native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(original));
+    const auto identity = lvt::capture_uia_target_identity(
+        original, fixture.pid,
+        lvt::process_creation_identity(fixture.pid));
+    ASSERT_TRUE(identity.has_value());
+
+    lvt::test_support::ExactHwndRecycleOptions options;
+    options.forceUnavailable = true;
+    options.rememberUnavailable = false;
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            fixture.hwnd, original,
+            native_fixture::kEditId, options);
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::unavailable)
+        << recycled.reason;
+    ASSERT_TRUE(IsWindow(recycled.replacement));
+    EXPECT_NE(recycled.replacement, original);
+    EXPECT_EQ(
+        GetDlgItem(fixture.hwnd, native_fixture::kEditId),
+        recycled.replacement);
+
+    EXPECT_TRUE(FAILED(lvt::validate_uia_target_identity(*identity)));
+    lvt::UiaProvider provider;
+    bool ownershipLost = false;
+    EXPECT_FALSE(provider.build(
+        *identity, lvt::UiaOptions{}, nullptr,
+        &ownershipLost));
+    EXPECT_TRUE(ownershipLost);
+}
+
+TEST(
+    UiaTargetIdentity,
+    GuidWindowLifetimeSentinelRejectsRemovedProperty) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const HWND edit =
+        GetDlgItem(fixture.hwnd, native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(edit));
+    const auto identity = lvt::capture_uia_target_identity(
+        edit, fixture.pid,
+        lvt::process_creation_identity(fixture.pid));
+    ASSERT_TRUE(identity.has_value());
+
+    struct PropertySearch {
+        std::wstring name;
+        HANDLE value = nullptr;
+    } property;
+    EnumPropsExW(
+        edit,
+        [](HWND, PWSTR name, HANDLE value, ULONG_PTR parameter) -> int {
+            auto* property =
+                reinterpret_cast<PropertySearch*>(parameter);
+            constexpr wchar_t prefix[] = L"lvt.uia.window.";
+            if (!IS_INTRESOURCE(name) &&
+                wcsncmp(name, prefix, _countof(prefix) - 1) == 0) {
+                property->name = name;
+                property->value = value;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&property));
+    ASSERT_FALSE(property.name.empty())
+        << "the GUID window-lifetime property was not installed";
+    ASSERT_NE(property.value, nullptr);
+    EXPECT_EQ(
+        RemovePropW(edit, property.name.c_str()),
+        property.value);
+
+    EXPECT_TRUE(FAILED(lvt::validate_uia_target_identity(*identity)));
+    lvt::UiaProvider provider;
+    bool ownershipLost = false;
+    EXPECT_FALSE(provider.build(
+        *identity, lvt::UiaOptions{}, nullptr,
+        &ownershipLost));
+    EXPECT_TRUE(ownershipLost);
+}
+
 TEST_F(
     NativeControlsFixture,
     ExactRecycledHwndIsRejectedEvenWhenRuntimeIdMatches) {
+    if (lvt::test_support::exact_hwnd_recycle_search_suppressed()) {
+        GTEST_SKIP()
+            << lvt::test_support::exact_hwnd_recycle_unavailable_reason();
+    }
     send_native_fixture_message(
         s_hwnd, native_fixture::kDestroyEventChildMessage);
     const HWND original = reinterpret_cast<HWND>(
@@ -4338,14 +4414,23 @@ TEST_F(
     auto connection = lvt::UiaConnection::connect(*identity);
     ASSERT_NE(connection, nullptr);
 
-    const HWND recycled =
-        recycle_event_child_exact(s_hwnd, original);
-    ASSERT_EQ(recycled, original);
-    ASSERT_TRUE(IsWindow(recycled));
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            s_hwnd, original);
+    if (recycled.outcome ==
+        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+        GTEST_SKIP() << recycled.reason;
+    }
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::achieved)
+        << recycled.reason;
+    ASSERT_EQ(recycled.replacement, original);
+    ASSERT_TRUE(IsWindow(recycled.replacement));
 
     const auto replacement =
         lvt::capture_uia_target_identity(
-            recycled, s_pid,
+            recycled.replacement, s_pid,
             identity->processCreationIdentity);
     ASSERT_TRUE(replacement.has_value());
     EXPECT_EQ(
@@ -4395,6 +4480,10 @@ TEST_F(
 TEST_F(
     NativeControlsFixture,
     SyntheticInputRevalidatesAfterForegroundBeforeSendInput) {
+    if (lvt::test_support::exact_hwnd_recycle_search_suppressed()) {
+        GTEST_SKIP()
+            << lvt::test_support::exact_hwnd_recycle_unavailable_reason();
+    }
     send_native_fixture_message(
         s_hwnd, native_fixture::kDestroyEventChildMessage);
     const HWND original = reinterpret_cast<HWND>(
@@ -4444,20 +4533,32 @@ TEST_F(
                  " type should-not-reach-replacement")] {
             return run_command(command);
         });
+    lvt::test_support::ScopedEventSignal releaseOnExit(
+        release.get());
 
     ASSERT_EQ(
         WaitForSingleObject(entered.get(), 15000),
         WAIT_OBJECT_0)
         << "the synthetic action did not reach foreground activation";
-    ASSERT_EQ(
-        recycle_event_child_exact(s_hwnd, original),
-        original);
-    SetEvent(release.get());
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            s_hwnd, original);
+    releaseOnExit.signal();
 
     const auto output = pending.get();
     const auto result =
         json::parse(output, nullptr, false);
     ASSERT_FALSE(result.is_discarded()) << output;
+    if (recycled.outcome ==
+        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+        fs::remove(statsPath, ec);
+        GTEST_SKIP() << recycled.reason;
+    }
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::achieved)
+        << recycled.reason;
+    ASSERT_EQ(recycled.replacement, original);
     EXPECT_FALSE(result.value("ok", true));
     EXPECT_EQ(result.value("code", ""), "ownershipLost")
         << result.dump(2);
@@ -4724,6 +4825,10 @@ TEST(UiaTargetIdentity, ReplacementAfterElementFromHandleIsRejected) {
 TEST_F(
     NativeControlsFixture,
     CacheRefreshRevalidatesAfterBuildUpdatedCacheBoundary) {
+    if (lvt::test_support::exact_hwnd_recycle_search_suppressed()) {
+        GTEST_SKIP()
+            << lvt::test_support::exact_hwnd_recycle_unavailable_reason();
+    }
     send_native_fixture_message(
         s_hwnd, native_fixture::kDestroyEventChildMessage);
     const HWND original = reinterpret_cast<HWND>(
@@ -4759,15 +4864,26 @@ TEST_F(
             return std::make_pair(
                 tree.has_value(), ownershipLost);
         });
+    lvt::test_support::ScopedEventSignal releaseOnExit(
+        release.get());
     ASSERT_EQ(
         WaitForSingleObject(entered.get(), 10000),
         WAIT_OBJECT_0);
-    ASSERT_EQ(
-        recycle_event_child_exact(s_hwnd, original),
-        original);
-    SetEvent(release.get());
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            s_hwnd, original);
+    releaseOnExit.signal();
 
     const auto result = pending.get();
+    if (recycled.outcome ==
+        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+        GTEST_SKIP() << recycled.reason;
+    }
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::achieved)
+        << recycled.reason;
+    ASSERT_EQ(recycled.replacement, original);
     EXPECT_FALSE(result.first);
     EXPECT_TRUE(result.second)
         << "cache success/failure must be followed by identity validation";
@@ -4776,6 +4892,10 @@ TEST_F(
 TEST_F(
     NativeControlsFixture,
     PatternMutationRevalidatesAfterProviderBoundary) {
+    if (lvt::test_support::exact_hwnd_recycle_search_suppressed()) {
+        GTEST_SKIP()
+            << lvt::test_support::exact_hwnd_recycle_unavailable_reason();
+    }
     const HWND original = control(native_fixture::kEditId);
     ASSERT_TRUE(IsWindow(original));
     const auto identity = lvt::capture_uia_target_identity(
@@ -4808,16 +4928,26 @@ TEST_F(
             return lvt::perform_action(
                 *identity, lvt::UiaOptions{}, request);
         });
+    lvt::test_support::ScopedEventSignal releaseOnExit(
+        release.get());
     ASSERT_EQ(
         WaitForSingleObject(entered.get(), 10000),
         WAIT_OBJECT_0);
-    ASSERT_EQ(
-        recycle_event_child_exact(
-            s_hwnd, original, native_fixture::kEditId),
-        original);
-    SetEvent(release.get());
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            s_hwnd, original, native_fixture::kEditId);
+    releaseOnExit.signal();
 
     const auto result = pending.get();
+    if (recycled.outcome ==
+        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+        GTEST_SKIP() << recycled.reason;
+    }
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::achieved)
+        << recycled.reason;
+    ASSERT_EQ(recycled.replacement, original);
     EXPECT_FALSE(result.ok);
     EXPECT_EQ(result.errorCode, "ownershipLost")
         << result.message;

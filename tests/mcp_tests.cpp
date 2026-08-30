@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "apps/NativeControlsFixture/native_controls_fixture_ids.h"
+#include "exact_hwnd_recycle_test_support.h"
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -1393,9 +1394,8 @@ TEST(McpUiaIdentity, TypedMutationsDetectOwnershipLossAfterInitialCheck) {
     runMutation("clear_property");
 }
 
-TEST(McpUiaIdentity, TypedReferenceResolutionRacesAreStructured) {
-    const auto runRace = [](
-        const std::string& tool, bool recycleTarget) {
+TEST(McpUiaIdentity, NonRecycleTypedReferenceResolutionRacesAreStructured) {
+    const auto runRace = [](const std::string& tool) {
         ManagedSampleProcess sample;
         ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
         struct FixtureWindow {
@@ -1490,21 +1490,7 @@ TEST(McpUiaIdentity, TypedReferenceResolutionRacesAreStructured) {
             WAIT_OBJECT_0)
             << tool << " did not reach reference resolution";
 
-        if (recycleTarget) {
-            DWORD_PTR recycled = 0;
-            ASSERT_NE(
-                SendMessageTimeoutW(
-                    fixture.root,
-                    native_fixture::kRecycleEventChildHwndMessage,
-                    131072, native_fixture::kEditId,
-                    SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
-                    120000, &recycled),
-                0);
-            ASSERT_EQ(
-                reinterpret_cast<HWND>(recycled), edit);
-        } else {
-            sample.stop();
-        }
+        sample.stop();
         SetEvent(release.get());
 
         const auto response = client.await_response(request);
@@ -1529,9 +1515,147 @@ TEST(McpUiaIdentity, TypedReferenceResolutionRacesAreStructured) {
         expect_typed_property_session_disconnected(error);
     };
 
-    runRace("get_editable_properties", false);
-    runRace("set_property", true);
-    runRace("clear_property", false);
+    runRace("get_editable_properties");
+    runRace("clear_property");
+}
+
+TEST(
+    McpUiaIdentity,
+    ExactRecycledHwndTypedReferenceResolutionRaceIsStructured) {
+    if (lvt::test_support::exact_hwnd_recycle_search_suppressed()) {
+        GTEST_SKIP()
+            << lvt::test_support::exact_hwnd_recycle_unavailable_reason();
+    }
+
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner == fixture->pid &&
+                GetDlgItem(candidate, native_fixture::kEditId)) {
+                fixture->root = candidate;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+    const HWND edit = GetDlgItem(
+        fixture.root, native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(edit));
+    char editHwnd[32]{};
+    snprintf(
+        editHwnd, sizeof(editHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(edit)));
+
+    const std::string gateBase =
+        "Local\\LvtTypedReferenceExact_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (gateBase + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (gateBase + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable referenceGate(
+        "LVT_TEST_UIA_BEFORE_PROPERTY_REFERENCE_GATE",
+        gateBase);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", editHwnd}, {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    const auto tree = client.call_tool(
+        "get_uia_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto runtimeId =
+        tree["root"]
+            .value("properties", json::object())
+            .value("RuntimeId", "");
+    ASSERT_FALSE(runtimeId.empty()) << tree.dump(2);
+    const auto inputRef = "uia:" + runtimeId;
+
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", inputRef}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* value = find_property_descriptor(
+        properties, "Value.Value");
+    ASSERT_NE(value, nullptr);
+
+    const int request = client.send_request(
+        "tools/call",
+        json{
+            {"name", "set_property"},
+            {"arguments",
+             json{{"session", session},
+                  {"element", inputRef},
+                  {"descriptorId",
+                   value->value("descriptorId", "")},
+                  {"value", "must-not-set"}}}});
+    lvt::test_support::ScopedEventSignal releaseOnExit(
+        release.get());
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0)
+        << "set_property did not reach reference resolution";
+
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            fixture.root, edit, native_fixture::kEditId);
+    releaseOnExit.signal();
+    const auto response = client.await_response(request);
+    ASSERT_TRUE(response.contains("result"))
+        << response.dump(2);
+
+    if (recycled.outcome ==
+        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+        client.shutdown();
+        sample.stop();
+        GTEST_SKIP() << recycled.reason;
+    }
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::achieved)
+        << recycled.reason;
+    ASSERT_EQ(recycled.replacement, edit);
+
+    EXPECT_TRUE(
+        response["result"].value("isError", false))
+        << response.dump(2);
+    json error;
+    for (const auto& block :
+         response["result"].value(
+             "content", json::array())) {
+        if (block.value("type", "") == "text") {
+            error = json::parse(
+                block.value("text", "{}"),
+                nullptr, false);
+            break;
+        }
+    }
+    ASSERT_FALSE(error.is_discarded())
+        << response.dump(2);
+    expect_typed_property_session_disconnected(error);
 }
 
 TEST(McpUiaIdentity, AltTabSequenceRechecksForegroundBeforeDelete) {
@@ -1708,6 +1832,10 @@ TEST(McpUiaIdentity, WindowPatternCloseSucceedsWhenTargetDisappears) {
 }
 
 TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
+    if (lvt::test_support::exact_hwnd_recycle_search_suppressed()) {
+        GTEST_SKIP()
+            << lvt::test_support::exact_hwnd_recycle_unavailable_reason();
+    }
     ManagedSampleProcess sample;
     ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
     struct FixtureWindow {
@@ -1777,18 +1905,21 @@ TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
     const auto descriptorId =
         value->value("descriptorId", "");
 
-    DWORD_PTR recycledValue = 0;
-    ASSERT_NE(
-        SendMessageTimeoutW(
-            fixture.root,
-            native_fixture::kRecycleEventChildHwndMessage,
-            131072, native_fixture::kEditId,
-            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
-            120000, &recycledValue),
-        0);
-    EXPECT_EQ(
-        reinterpret_cast<HWND>(recycledValue),
-        original);
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            fixture.root, original,
+            native_fixture::kEditId);
+    if (recycled.outcome ==
+        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+        client.shutdown();
+        sample.stop();
+        GTEST_SKIP() << recycled.reason;
+    }
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::achieved)
+        << recycled.reason;
+    ASSERT_EQ(recycled.replacement, original);
 
     bool treeError = false;
     const auto tree = client.call_tool(
