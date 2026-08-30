@@ -117,6 +117,43 @@ bool exact_window_matches(HWND hwnd, DWORD pid) {
     return currentPid != 0 && currentPid == pid;
 }
 
+void append_uia_event_test_stat(
+    const char* operation, HWND hwnd, DWORD pid,
+    bool snapshotRequired = false) {
+    char path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_EVENT_STATS", path,
+        static_cast<DWORD>(_countof(path)));
+    if (length == 0 || length >= _countof(path))
+        return;
+
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    wil::unique_handle file(CreateFileA(
+        path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file)
+        return;
+
+    char line[160]{};
+    const int written = snprintf(
+        line, sizeof(line), "%s hwnd=0x%llX pid=%lu snapshot=%d\r\n",
+        operation,
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(hwnd)),
+        static_cast<unsigned long>(pid),
+        snapshotRequired ? 1 : 0);
+    if (written <= 0)
+        return;
+    DWORD ignored = 0;
+    WriteFile(
+        file.get(), line,
+        static_cast<DWORD>(
+            (std::min)(written, static_cast<int>(sizeof(line) - 1))),
+        &ignored, nullptr);
+}
+
 class UiaEventHandler final
     : public IUIAutomationStructureChangedEventHandler,
       public IUIAutomationPropertyChangedEventHandler,
@@ -918,6 +955,9 @@ struct UiaConnection::State {
 
 private:
     HRESULT initialize_on_mta() {
+        RETURN_HR_IF(
+            HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE),
+            !exact_window_matches(targetHwnd, targetPid));
         UiaOptions connectOptions;
         connectOptions.timeoutMs = 0;
         RETURN_IF_FAILED(create_automation(connectOptions, &automation));
@@ -1405,16 +1445,17 @@ bool validate_number(
 
 } // namespace
 
-UiaConnection::UiaConnection(HWND hwnd)
-    : m_hwnd(hwnd) {
-    GetWindowThreadProcessId(hwnd, &m_pid);
-    m_state = std::make_unique<State>(hwnd, m_pid);
+UiaConnection::UiaConnection(HWND hwnd, DWORD expectedPid)
+    : m_hwnd(hwnd), m_pid(expectedPid),
+      m_state(std::make_unique<State>(hwnd, expectedPid)) {
 }
 
-std::shared_ptr<UiaConnection> UiaConnection::connect(HWND hwnd) {
-    if (!hwnd || !IsWindow(hwnd))
+std::shared_ptr<UiaConnection> UiaConnection::connect(
+    HWND hwnd, DWORD expectedPid) {
+    if (!expectedPid || !exact_window_matches(hwnd, expectedPid))
         return {};
-    auto connection = std::shared_ptr<UiaConnection>(new UiaConnection(hwnd));
+    auto connection = std::shared_ptr<UiaConnection>(
+        new UiaConnection(hwnd, expectedPid));
     if (!connection->m_state->connected()) {
         return {};
     }
@@ -1724,6 +1765,10 @@ std::vector<ConnectionEvent> UiaConnection::poll_events() {
         event.mutation = ConnectionEvent::Mutation::snapshotRequired;
         result.push_back(std::move(event));
     }
+    if (SUCCEEDED(hr)) {
+        append_uia_event_test_stat(
+            "poll", m_hwnd, m_pid, snapshotRequired);
+    }
     return result;
 }
 
@@ -1731,15 +1776,15 @@ bool UiaConnection::refresh_events() {
     std::lock_guard<std::mutex> lock(m_state->operationMutex);
     if (!m_state->connected() || !matches_target(m_hwnd))
         return false;
-    return SUCCEEDED(m_state->invoke([] { return S_OK; }));
+    const bool refreshed =
+        SUCCEEDED(m_state->invoke([] { return S_OK; }));
+    if (refreshed)
+        append_uia_event_test_stat("refresh", m_hwnd, m_pid);
+    return refreshed;
 }
 
 bool UiaConnection::is_alive() const {
-    // The owning MTA thread performs the exact HWND/PID liveness check every
-    // 100 ms and sets this false only after event handlers and COM references
-    // have been torn down. Callers therefore never observe "dead" before
-    // RemoveAllEventHandlers has completed.
-    return m_state->connected();
+    return m_state->connected() && matches_target(m_hwnd);
 }
 
 } // namespace lvt

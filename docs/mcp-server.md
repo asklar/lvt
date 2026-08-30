@@ -177,9 +177,12 @@ of duplicate native add/remove events.
 UIA sessions similarly keep exact-HWND, subtree-scoped structure/property/
 automation handlers on their persistent `IUIAutomation` connection. Callback
 bursts allocate nothing and coalesce to one `snapshotRequired` hint. The MCP
-bridge drains that hint only after a successful UIA snapshot, so a failed
-refresh cannot consume the notification and plugin/native event sources are
-still polled exactly once in their existing phases. The resource scheduler
+bridge drains that hint only after a successful UIA snapshot. Visual snapshots
+exclude the `uia` label, including when a visual response later performs a UIA
+correlation walk; that correlation drains UIA separately and never polls
+visual plugins a second time. Consequently a failed or unrelated refresh
+cannot consume the notification and plugin/native event sources are still
+polled exactly once in their existing phases. The resource scheduler
 remains interval-based rather than waiting directly on provider event handles,
 so UIA notification latency is bounded by the same roughly 500 ms cadence.
 

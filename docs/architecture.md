@@ -150,7 +150,12 @@ removals.
 Each persistent `UiaConnection` creates its `IUIAutomation` client, root
 element, cache request, and event handlers on one connection-owned MTA thread.
 The subscriptions use `TreeScope_Subtree` from the exact `ElementFromHandle`
-root, whose PID is verified before registration; no desktop/global UIA
+root. `connect(hwnd, expectedPid)` treats the resolver/registry PID as
+authoritative: it rejects a numeric HWND currently owned by any other process
+before starting the worker, verifies the UIA root `ProcessId` during
+registration, and repeats the HWND/PID check before liveness, tree, property,
+and event operations. A stale registry key therefore cannot attach to a
+replacement process after Windows reuses an HWND. No desktop/global UIA
 subscription is installed. Structure changes, UIA property changes affecting
 tree shape/identity/bounds/enabled/offscreen state, pattern availability and
 Value/RangeValue/Toggle/ExpandCollapse/Selection/Scroll state, plus relevant
@@ -161,8 +166,13 @@ takes no lock, performs no tree walk or provider call, and allocates nothing.
 It atomically coalesces any burst to one bounded `snapshotRequired` bit.
 `refresh_events()` provides an MTA barrier and `poll_events()` exchanges that
 bit on the owning MTA. Watch and MCP consume the bit only after a successful
-authoritative UIA snapshot, so a failed walk cannot lose the wake-up needed by
-the retry and no duplicate native/plugin polling is introduced.
+authoritative UIA snapshot. MCP drain scopes are tree-specific: UIA snapshots
+poll only the `uia` connection, while visual snapshots poll injected, managed,
+and plugin connections but exclude UIA; native hints retain their pre-visual
+build phase. Thus correlation performs exactly one visual-provider drain and
+one UIA drain, a failed walk cannot lose the wake-up needed by its retry, and a
+UIA hint arriving after the last UIA snapshot stays queued across unrelated
+visual requests.
 
 The MTA worker checks the exact HWND/PID every 100 ms. On disconnect, target
 exit, or final release it first stops accepting callback hints, calls

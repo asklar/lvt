@@ -737,8 +737,9 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
                 reinterpret_cast<uintptr_t>(target.hwnd)));
         auto handle = lvt::ConnectionRegistry::instance().acquire(
             target.pid, target.hwnd, key,
-            [](HWND hwnd, DWORD) -> std::shared_ptr<lvt::IFrameworkConnection> {
-                return lvt::UiaConnection::connect(hwnd);
+            [](HWND hwnd, DWORD pid)
+                -> std::shared_ptr<lvt::IFrameworkConnection> {
+                return lvt::UiaConnection::connect(hwnd, pid);
             });
         // Retain a slot after a transient registration failure so the normal
         // watch reconciliation path retries instead of permanently falling

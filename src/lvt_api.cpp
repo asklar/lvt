@@ -488,14 +488,15 @@ void wait_for_native_publication_test_gate(
     WaitForSingleObject(release.get(), 10000);
 }
 
-enum class ConnectionEventDrainPhase {
+enum class ConnectionEventDrainScope {
     nativeBeforeBuild,
-    nonNativeAfterSuccess,
+    visualAfterSuccess,
+    uiaAfterSuccess,
 };
 
 void drain_session_connection_events(
     const std::string& sessionId,
-    ConnectionEventDrainPhase phase) {
+    ConnectionEventDrainScope scope) {
     std::vector<std::pair<std::string, std::shared_ptr<lvt::IFrameworkConnection>>>
         connections;
     {
@@ -518,7 +519,13 @@ void drain_session_connection_events(
             label == "comctl" ||
             dynamic_cast<lvt::NativePropertyConnection*>(
                 connection.get()) != nullptr;
-        if ((phase == ConnectionEventDrainPhase::nativeBeforeBuild) != native)
+        const bool selected =
+            scope == ConnectionEventDrainScope::nativeBeforeBuild
+                ? native
+                : scope == ConnectionEventDrainScope::uiaAfterSuccess
+                    ? label == "uia"
+                    : !native && label != "uia";
+        if (!selected)
             continue;
         if (!connection->is_alive())
             continue;
@@ -541,9 +548,11 @@ void drain_session_connection_events(
             "lvt: MCP drained %zu %s connection event(s)%s; "
             "this request's authoritative tree refresh will consume the signal\n",
             count,
-            phase == ConnectionEventDrainPhase::nativeBeforeBuild
+            scope == ConnectionEventDrainScope::nativeBeforeBuild
                 ? "pre-build native"
-                : "post-success",
+                : scope == ConnectionEventDrainScope::uiaAfterSuccess
+                    ? "post-success UIA"
+                    : "post-success visual",
             snapshotRequired ? " including snapshotRequired" : "");
     }
 }
@@ -579,9 +588,9 @@ std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& se
     auto handle = lvt::ConnectionRegistry::instance().acquire(
         session.pid, session.hwnd,
         uia_connection_registry_key(session.hwnd),
-        [](HWND hwnd, DWORD)
+        [](HWND hwnd, DWORD pid)
             -> std::shared_ptr<lvt::IFrameworkConnection> {
-            return lvt::UiaConnection::connect(hwnd);
+            return lvt::UiaConnection::connect(hwnd, pid);
         });
     if (!handle)
         return nullptr;
@@ -1096,7 +1105,7 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         // cannot consume the wake-up that should drive the next retry.
         drain_session_connection_events(
             session.id,
-            ConnectionEventDrainPhase::nonNativeAfterSuccess);
+            ConnectionEventDrainScope::uiaAfterSuccess);
         return true;
 #else
         error = "this build has UI Automation support compiled out";
@@ -1134,7 +1143,7 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         // of being discarded by a second poll of the same connection.
         drain_session_connection_events(
             session.id,
-            ConnectionEventDrainPhase::nativeBeforeBuild);
+            ConnectionEventDrainScope::nativeBeforeBuild);
         tree = lvt::build_tree(
             session.hwnd, session.pid, frameworks, -1,
             session.pluginOption, fastProperties, connectionLookup);
@@ -1147,7 +1156,7 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             publish_native_property_targets(session, tree);
             drain_session_connection_events(
                 session.id,
-                ConnectionEventDrainPhase::nonNativeAfterSuccess);
+                ConnectionEventDrainScope::visualAfterSuccess);
             return true;
         }
 

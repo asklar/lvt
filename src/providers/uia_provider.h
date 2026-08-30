@@ -172,11 +172,13 @@ public:
 
 // Reusable UIA client for callers that read the same target repeatedly (watch,
 // MCP sessions). Unlike the visual-tree connections this never injects into the
-// target; it simply amortizes CoCreateInstance(CUIAutomation[8]) across many
-// walks while keeping each walk's own view/property/timeout options.
+// target; it amortizes CoCreateInstance(CUIAutomation[8]) across many walks,
+// owns root-scoped event handlers, and validates every use against the
+// resolver-supplied expected PID.
 class UiaConnection : public IFrameworkConnection {
 public:
-    static std::shared_ptr<UiaConnection> connect(HWND hwnd);
+    static std::shared_ptr<UiaConnection> connect(
+        HWND hwnd, DWORD expectedPid);
     ~UiaConnection() override;
 
     bool get_tree(Element& root, bool fastProperties,
@@ -205,7 +207,7 @@ public:
     bool is_alive() const override;
 
 private:
-    explicit UiaConnection(HWND hwnd);
+    UiaConnection(HWND hwnd, DWORD expectedPid);
 
     struct State;
 

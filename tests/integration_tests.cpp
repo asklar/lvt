@@ -4054,7 +4054,7 @@ static void drain_uia_events(lvt::UiaConnection& connection) {
 TEST_F(NativeControlsFixture, UiaHandlersRegisterOnceAndRemoveOnce) {
     lvt::uia_eventing_detail::reset_subscription_counters();
     {
-        auto connection = lvt::UiaConnection::connect(s_hwnd);
+        auto connection = lvt::UiaConnection::connect(s_hwnd, s_pid);
         ASSERT_NE(connection, nullptr);
 
         lvt::Element tree;
@@ -4089,7 +4089,7 @@ TEST_F(NativeControlsFixture, UiaHandlersRegisterOnceAndRemoveOnce) {
 TEST_F(NativeControlsFixture, UiaEventsCoverValueStateAndStructureChanges) {
     send_native_fixture_message(
         s_hwnd, native_fixture::kDestroyEventChildMessage);
-    auto connection = lvt::UiaConnection::connect(s_hwnd);
+    auto connection = lvt::UiaConnection::connect(s_hwnd, s_pid);
     ASSERT_NE(connection, nullptr);
     drain_uia_events(*connection);
 
@@ -4144,8 +4144,8 @@ TEST_F(NativeControlsFixture, UiaSubscriptionsIsolateTwoWindowsInOneProcess) {
     send_native_fixture_message(
         s_hwnd, native_fixture::kDestroyEventChildMessage, 1);
 
-    auto rootConnection = lvt::UiaConnection::connect(s_hwnd);
-    auto otherConnection = lvt::UiaConnection::connect(other);
+    auto rootConnection = lvt::UiaConnection::connect(s_hwnd, s_pid);
+    auto otherConnection = lvt::UiaConnection::connect(other, s_pid);
     ASSERT_NE(rootConnection, nullptr);
     ASSERT_NE(otherConnection, nullptr);
     drain_uia_events(*rootConnection);
@@ -4181,8 +4181,9 @@ TEST_F(NativeControlsFixture, UiaSubscriptionsIsolateDifferentProcesses) {
     ScopedNativeFixtureProcess second;
     ASSERT_TRUE(second.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
 
-    auto firstConnection = lvt::UiaConnection::connect(s_hwnd);
-    auto secondConnection = lvt::UiaConnection::connect(second.hwnd);
+    auto firstConnection = lvt::UiaConnection::connect(s_hwnd, s_pid);
+    auto secondConnection =
+        lvt::UiaConnection::connect(second.hwnd, second.pid);
     ASSERT_NE(firstConnection, nullptr);
     ASSERT_NE(secondConnection, nullptr);
     drain_uia_events(*firstConnection);
@@ -4206,7 +4207,8 @@ TEST(UiaEventLifecycle, TargetExitRemovesHandlersAndStopsDelivery) {
     ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
     const auto before =
         lvt::uia_eventing_detail::subscription_counters();
-    auto connection = lvt::UiaConnection::connect(fixture.hwnd);
+    auto connection =
+        lvt::UiaConnection::connect(fixture.hwnd, fixture.pid);
     ASSERT_NE(connection, nullptr);
 
     fixture.stop();
@@ -4219,9 +4221,36 @@ TEST(UiaEventLifecycle, TargetExitRemovesHandlersAndStopsDelivery) {
     EXPECT_FALSE(connection->is_alive());
     EXPECT_TRUE(connection->poll_events().empty());
 
-    const auto after =
-        lvt::uia_eventing_detail::subscription_counters();
+    auto after = lvt::uia_eventing_detail::subscription_counters();
+    while (after.removeAllCalls < before.removeAllCalls + 1 &&
+           std::chrono::steady_clock::now() < deadline) {
+        Sleep(20);
+        after = lvt::uia_eventing_detail::subscription_counters();
+    }
     EXPECT_GE(after.removeAllCalls, before.removeAllCalls + 1);
+}
+
+TEST(UiaEventLifecycle, RejectsReplacementProcessWithStaleExpectedPid) {
+    DWORD stalePid = 0;
+    {
+        ScopedNativeFixtureProcess original;
+        ASSERT_TRUE(original.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+        stalePid = original.pid;
+    }
+
+    ScopedNativeFixtureProcess replacement;
+    ASSERT_TRUE(replacement.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    ASSERT_NE(replacement.pid, stalePid);
+
+    EXPECT_EQ(
+        lvt::UiaConnection::connect(replacement.hwnd, stalePid),
+        nullptr)
+        << "a valid replacement window must not be accepted under the stale "
+           "registry PID, even if Windows reuses the numeric HWND";
+    EXPECT_NE(
+        lvt::UiaConnection::connect(
+            replacement.hwnd, replacement.pid),
+        nullptr);
 }
 #endif
 
@@ -6837,7 +6866,8 @@ TEST(NativeCrossBitness, UiaPersistentEventsRemainAvailable) {
         lvt::detect_process_architecture(fixture.pid),
         lvt::get_host_architecture());
 
-    auto connection = lvt::UiaConnection::connect(fixture.hwnd);
+    auto connection =
+        lvt::UiaConnection::connect(fixture.hwnd, fixture.pid);
     ASSERT_NE(connection, nullptr);
     drain_uia_events(*connection);
 
@@ -7576,7 +7606,7 @@ TEST_F(
     SkipIfNotReady();
     const HWND hwnd = visible_window_for_pid(s_pid);
     ASSERT_NE(hwnd, nullptr);
-    auto connection = lvt::UiaConnection::connect(hwnd);
+    auto connection = lvt::UiaConnection::connect(hwnd, s_pid);
     ASSERT_NE(connection, nullptr);
     drain_uia_events(*connection);
 

@@ -141,9 +141,10 @@ public:
 
     // Give a provider with an unsolicited event stream a chance to move bytes
     // already waiting on its transport into the queue returned by
-    // poll_events(). The default is a no-op so UIA/plugins remain compatible.
-    // XAML uses a lightweight same-pipe acknowledgment rather than rebuilding
-    // the tree or opening another diagnostics connection.
+    // poll_events(). The default is a no-op so plugins/providers without a
+    // transport refresh remain compatible. XAML uses a lightweight same-pipe
+    // acknowledgment rather than rebuilding the tree or opening another
+    // diagnostics connection; UIA uses an owning-MTA synchronization barrier.
     virtual bool refresh_events() {
         return true;
     }

@@ -866,6 +866,172 @@ TEST(McpPluginPersistent, ReusesPollsReconnectsAndDisconnectsConcurrently) {
     fs::remove(statsPath, ec);
 }
 
+TEST(McpPluginPersistent, CorrelationScopesVisualAndUiaEventPolling) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto pluginStatsPath =
+        plugin_stats_path("correlation-scope-plugin");
+    const auto uiaStatsPath =
+        plugin_stats_path("correlation-scope-uia");
+    std::error_code ec;
+    fs::remove(pluginStatsPath, ec);
+    fs::remove(uiaStatsPath, ec);
+    ScopedEnvironmentVariable uiaStats(
+        "LVT_TEST_UIA_EVENT_STATS", uiaStatsPath.string());
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_V2_DIR, pluginStatsPath,
+        "0", "0", "0", "1");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+        HWND edit = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner != fixture->pid)
+                return TRUE;
+            const HWND edit = GetDlgItem(
+                candidate, native_fixture::kEditId);
+            if (!edit)
+                return TRUE;
+            fixture->root = candidate;
+            fixture->edit = edit;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+    ASSERT_TRUE(IsWindow(fixture.edit));
+    char fixtureHwnd[32]{};
+    snprintf(
+        fixtureHwnd, sizeof(fixtureHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(fixture.root)));
+
+    const auto visualConnect = client->call_tool(
+        "connect",
+        json{{"hwnd", fixtureHwnd},
+             {"mode", "visual"}});
+    const auto uiaConnect = client->call_tool(
+        "connect",
+        json{{"hwnd", fixtureHwnd},
+             {"mode", "uia"}});
+    const auto visualSession =
+        visualConnect.value("session", "");
+    const auto uiaSession = uiaConnect.value("session", "");
+    ASSERT_FALSE(visualSession.empty()) << visualConnect.dump(2);
+    ASSERT_FALSE(uiaSession.empty()) << uiaConnect.dump(2);
+
+    auto initialUia = client->call_tool(
+        "get_uia_tree", json{{"session", uiaSession}});
+    ASSERT_TRUE(initialUia.contains("root")) << initialUia.dump(2);
+
+    auto pluginBefore = read_plugin_stats(pluginStatsPath);
+    auto uiaBefore = read_plugin_stats(uiaStatsPath);
+    auto correlated = client->call_tool(
+        "get_visual_tree",
+        json{{"session", visualSession}, {"correlate", true}});
+    ASSERT_TRUE(correlated.contains("root")) << correlated.dump(2);
+    auto pluginAfterCorrelation =
+        read_plugin_stats(pluginStatsPath);
+    auto uiaAfterCorrelation =
+        read_plugin_stats(uiaStatsPath);
+    EXPECT_EQ(
+        count_plugin_stats(pluginAfterCorrelation, "poll") -
+            count_plugin_stats(pluginBefore, "poll"),
+        1u)
+        << "one correlated visual request must poll visual plugins once, "
+           "not again during its UIA correlation walk";
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterCorrelation, "poll") -
+            count_plugin_stats(uiaBefore, "poll"),
+        1u);
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterCorrelation, "refresh") -
+            count_plugin_stats(uiaBefore, "refresh"),
+        1u);
+
+    HWND edit = fixture.edit;
+    ASSERT_TRUE(IsWindow(edit));
+    wchar_t original[256]{};
+    GetWindowTextW(
+        edit, original, static_cast<int>(_countof(original)));
+    ASSERT_TRUE(SetWindowTextW(
+        edit, L"queued UIA event must survive visual polling"));
+    NotifyWinEvent(
+        EVENT_OBJECT_VALUECHANGE, edit,
+        OBJID_CLIENT, CHILDID_SELF);
+    Sleep(500);
+
+    pluginBefore = pluginAfterCorrelation;
+    uiaBefore = uiaAfterCorrelation;
+    auto plainVisual = client->call_tool(
+        "get_visual_tree",
+        json{{"session", visualSession}});
+    ASSERT_TRUE(plainVisual.contains("root"))
+        << plainVisual.dump(2);
+    const auto pluginAfterVisual =
+        read_plugin_stats(pluginStatsPath);
+    const auto uiaAfterVisual =
+        read_plugin_stats(uiaStatsPath);
+    EXPECT_EQ(
+        count_plugin_stats(pluginAfterVisual, "poll") -
+            count_plugin_stats(pluginBefore, "poll"),
+        1u);
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterVisual, "poll"),
+        count_plugin_stats(uiaBefore, "poll"))
+        << "a visual-only snapshot consumed a retained UIA hint";
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterVisual, "refresh"),
+        count_plugin_stats(uiaBefore, "refresh"));
+
+    auto refreshedUia = client->call_tool(
+        "get_uia_tree", json{{"session", uiaSession}});
+    ASSERT_TRUE(refreshedUia.contains("root"))
+        << refreshedUia.dump(2);
+    const auto pluginAfterUia =
+        read_plugin_stats(pluginStatsPath);
+    const auto uiaAfterUia =
+        read_plugin_stats(uiaStatsPath);
+    EXPECT_EQ(
+        count_plugin_stats(pluginAfterUia, "poll"),
+        count_plugin_stats(pluginAfterVisual, "poll"))
+        << "a UIA snapshot polled a visual plugin";
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterUia, "poll") -
+            count_plugin_stats(uiaAfterVisual, "poll"),
+        1u);
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterUia, "refresh") -
+            count_plugin_stats(uiaAfterVisual, "refresh"),
+        1u);
+    bool retainedSnapshot = false;
+    for (size_t index = uiaAfterVisual.size();
+         index < uiaAfterUia.size(); ++index) {
+        retainedSnapshot =
+            retainedSnapshot ||
+            (uiaAfterUia[index].rfind("poll ", 0) == 0 &&
+             uiaAfterUia[index].find("snapshot=1") !=
+                 std::string::npos);
+    }
+    EXPECT_TRUE(retainedSnapshot)
+        << "the UIA hint queued after correlation was not retained "
+           "until the next UIA snapshot";
+
+    SetWindowTextW(edit, original);
+    client->shutdown();
+    fs::remove(pluginStatsPath, ec);
+    fs::remove(uiaStatsPath, ec);
+}
+
 TEST(McpPluginPersistent, SharesRegistryConnectionAcrossSessions) {
     ManagedSampleProcess sample;
     ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
