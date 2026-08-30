@@ -5642,6 +5642,69 @@ TEST_F(McpSampleFixture, UiaTypedPropertiesPreserveOriginatingViewIdentity) {
         rawProperties.value("schemaId", ""));
 }
 
+TEST_F(McpSampleFixture, UiaIdentityScopeIgnoresTimeoutAndPropertyChurn) {
+    SkipIfNotReady();
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto raw = client.call_tool(
+        "find_elements",
+        json{{"session", session},
+             {"automationId", "RawOnlyInput"},
+             {"view", "raw"}});
+    ASSERT_EQ(raw["elements"].size(), 1u) << raw.dump(2);
+    const auto rawKey = raw["elements"][0].value("key", "");
+    ASSERT_FALSE(rawKey.empty());
+
+    const std::array<const char*, 4> properties{
+        "Name", "AutomationId", "HelpText", "RuntimeId"};
+    bool isError = false;
+    for (int i = 0; i < 24; ++i) {
+        auto requested = json::array(
+            {properties[static_cast<size_t>(i) % properties.size()]});
+        if (i % 3 == 0)
+            requested.push_back("RuntimeId");
+        auto tree = client.call_tool(
+            "get_uia_tree",
+            json{{"session", session},
+                 {"view", "raw"},
+                 {"depth", 0},
+                 {"timeoutMs", 10000 + i},
+                 {"properties", std::move(requested)}},
+            &isError);
+        ASSERT_FALSE(isError)
+            << "UIA identity scope was exhausted by non-identity option "
+               "combinations at iteration "
+            << i << ": " << tree.dump(2);
+        ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    }
+
+    for (const auto* view : {"control", "content"}) {
+        auto tree = client.call_tool(
+            "get_uia_tree",
+            json{{"session", session},
+                 {"view", view},
+                 {"depth", 0},
+                 {"timeoutMs", 10100},
+                 {"properties", json::array({"Name"})}},
+            &isError);
+        ASSERT_FALSE(isError) << view << ": " << tree.dump(2);
+        ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    }
+
+    auto rawProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", rawKey}},
+        &isError);
+    ASSERT_FALSE(isError) << rawProperties.dump(2);
+    EXPECT_NE(
+        find_property_descriptor(rawProperties, "Value.Value"), nullptr);
+}
+
 TEST_F(McpSampleFixture, TypedScrollRejectsAStaleMissingScrollPattern) {
     SkipIfNotReady();
     McpClient client(true);

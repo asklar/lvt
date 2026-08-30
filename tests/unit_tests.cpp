@@ -3033,6 +3033,113 @@ TEST(UiaProperties, RawIdentitySurvivesControlAndContentWalks) {
     EXPECT_EQ(*resolved, rawHandle);
 }
 
+TEST(UiaProperties, IdentityScopeUsesOnlyTheUiaView) {
+    UiaPropertyIdentityCache identities;
+    Element raw;
+    raw.type = "Edit";
+    raw.framework = "uia";
+    raw.properties["AutomationId"] = "RawOnly";
+    raw.properties["RuntimeId"] = "42.850.1";
+
+    UiaOptions options;
+    options.view = UiaView::raw;
+    std::string rawKey;
+    uint64_t rawHandle = 0;
+    for (int i = 0; i < 32; ++i) {
+        options.timeoutMs = 1000 + i;
+        options.extraProperties = {
+            i % 2 == 0 ? "Name" : "AutomationId",
+            "RuntimeId",
+        };
+        EXPECT_EQ(uia_identity_scope(options), "raw");
+        ASSERT_TRUE(identities.attach(
+            raw, uia_identity_scope(options)));
+        assign_element_keys(raw);
+        ASSERT_TRUE(identities.remember(
+            raw, uia_identity_scope(options)));
+        rawKey = raw.key;
+        rawHandle = raw.providerHandle;
+    }
+    EXPECT_EQ(identities.scope_count(), 1u);
+
+    for (const auto view :
+         {UiaView::control, UiaView::content}) {
+        Element other;
+        other.type = "Text";
+        other.framework = "uia";
+        other.properties["AutomationId"] =
+            std::string(uia_view_name(view)) + "-element";
+        other.properties["RuntimeId"] =
+            view == UiaView::control
+                ? "42.851.1"
+                : "42.852.1";
+        options.view = view;
+        options.timeoutMs += 100;
+        options.extraProperties = {"HelpText"};
+        ASSERT_TRUE(identities.attach(
+            other, uia_identity_scope(options)));
+        assign_element_keys(other);
+        ASSERT_TRUE(identities.remember(
+            other, uia_identity_scope(options)));
+    }
+    EXPECT_EQ(identities.scope_count(), 3u);
+
+    std::string error;
+    const auto resolved = identities.resolve(rawKey, error);
+    ASSERT_TRUE(resolved.has_value()) << error;
+    EXPECT_EQ(*resolved, rawHandle);
+}
+
+TEST(UiaProperties, OversizedAliasSnapshotPreservesCurrentKeys) {
+    UiaPropertyIdentityCache identities;
+    Element root;
+    root.type = "Window";
+    root.framework = "uia";
+    root.children.reserve(
+        UiaPropertyIdentityCache::kMaximumKeyAliases + 1);
+    for (size_t i = 0;
+         i <= UiaPropertyIdentityCache::kMaximumKeyAliases;
+         ++i) {
+        Element child;
+        child.type = "Text";
+        child.framework = "uia";
+        child.properties["AutomationId"] =
+            "alias-" + std::to_string(i);
+        child.properties["RuntimeId"] = "42.875.1";
+        root.children.push_back(std::move(child));
+    }
+
+    ASSERT_TRUE(identities.attach(root, "raw"));
+    assign_element_keys(root);
+    EXPECT_FALSE(identities.remember(root, "raw"));
+    EXPECT_EQ(identities.key_alias_count(), 0u);
+
+    root.children.pop_back();
+    ASSERT_TRUE(identities.remember(root, "raw"));
+    EXPECT_EQ(
+        identities.key_alias_count(),
+        UiaPropertyIdentityCache::kMaximumKeyAliases);
+    const auto currentKey = root.children.back().key;
+    const auto currentHandle = root.children.back().providerHandle;
+
+    Element additional;
+    additional.type = "Text";
+    additional.framework = "uia";
+    additional.properties["AutomationId"] = "additional-alias";
+    additional.properties["RuntimeId"] = "42.875.2";
+    ASSERT_TRUE(identities.attach(additional, "control"));
+    assign_element_keys(additional);
+    EXPECT_FALSE(identities.remember(additional, "control"));
+
+    std::string error;
+    const auto current = identities.resolve(currentKey, error);
+    ASSERT_TRUE(current.has_value()) << error;
+    EXPECT_EQ(*current, currentHandle);
+    EXPECT_EQ(
+        identities.key_alias_count(),
+        UiaPropertyIdentityCache::kMaximumKeyAliases);
+}
+
 TEST(UiaProperties, OversizedSnapshotIsRefusedBeforeReturningInvalidKeys) {
     UiaPropertyIdentityCache identities;
     Element root;
@@ -3066,17 +3173,46 @@ TEST(UiaProperties, OversizedSnapshotIsRefusedBeforeReturningInvalidKeys) {
         << "capacity handling evicted an identity from the current raw snapshot";
 
     UiaPropertyIdentityCache scoped;
-    Element one;
-    one.type = "Text";
-    one.framework = "uia";
-    one.properties["RuntimeId"] = "42.901.1";
+    std::string firstKey;
+    std::string newestKey;
+    uint64_t newestHandle = 0;
     for (size_t i = 0;
-         i < UiaPropertyIdentityCache::kMaximumScopes;
+         i <= UiaPropertyIdentityCache::kMaximumScopes;
          ++i) {
+        Element tree;
+        tree.type = "Window";
+        tree.framework = "uia";
+        tree.properties["RuntimeId"] =
+            "42.901." + std::to_string(i);
+        Element child;
+        child.type = "Text";
+        child.framework = "uia";
+        child.properties["AutomationId"] =
+            "scope-" + std::to_string(i);
+        child.properties["RuntimeId"] =
+            "42.901." + std::to_string(i) + ".1";
+        tree.children.push_back(std::move(child));
         EXPECT_TRUE(scoped.attach(
-            one, "scope-" + std::to_string(i)));
+            tree, "scope-" + std::to_string(i)));
+        assign_element_keys(tree);
+        EXPECT_TRUE(scoped.remember(
+            tree, "scope-" + std::to_string(i)));
+        if (i == 0)
+            firstKey = tree.children[0].key;
+        newestKey = tree.children[0].key;
+        newestHandle = tree.children[0].providerHandle;
     }
-    EXPECT_FALSE(scoped.attach(one, "one-scope-too-many"));
+    EXPECT_EQ(
+        scoped.scope_count(),
+        UiaPropertyIdentityCache::kMaximumScopes);
+
+    std::string error;
+    EXPECT_FALSE(scoped.resolve(firstKey, error).has_value());
+    EXPECT_NE(error.find("stale"), std::string::npos);
+    error.clear();
+    const auto newest = scoped.resolve(newestKey, error);
+    ASSERT_TRUE(newest.has_value()) << error;
+    EXPECT_EQ(*newest, newestHandle);
 }
 
 TEST(FindElementByRef, ResolvesUiaRuntimeIdReference) {

@@ -120,6 +120,11 @@ struct UiaOptions {
     int timeoutMs = 10000;
 };
 
+// Identity namespaces differ only when the UIA tree filter changes. Requested
+// properties and timeout policy affect how a snapshot is collected, not which
+// elements its RuntimeIds and durable keys identify.
+std::string uia_identity_scope(const UiaOptions& options);
+
 // Session-local identity adapter used both for persistent UIA walks and for
 // one-shot fallback trees. It stores only RuntimeIds/keys and opaque numeric
 // handles—never live values or COM objects.
@@ -140,8 +145,12 @@ public:
     std::optional<std::string> runtime_id(uint64_t handle) const;
     size_t runtime_id_count() const { return m_handlesByRuntimeId.size(); }
     size_t key_alias_count() const;
+    size_t scope_count() const { return m_scopes.size(); }
 
 private:
+    using KeyAliases = std::unordered_map<
+        std::string, std::unordered_set<std::string>>;
+
     struct RuntimeIdentity {
         uint64_t handle = 0;
         uint64_t lastUsed = 0;
@@ -157,12 +166,15 @@ private:
     void collect_runtime_ids(
         const Element& element,
         std::unordered_set<std::string>& runtimeIds) const;
-    void collect_keys(
+    void collect_key_aliases(
         const Element& element,
-        std::unordered_set<std::string>& keys) const;
+        KeyAliases& aliases) const;
+    std::optional<std::string> scope_to_evict(
+        const std::string& incomingScope) const;
+    void evict_scope(const std::string& scope);
     void prune(
         const std::unordered_set<std::string>& protectedRuntimeIds = {},
-        const std::unordered_set<std::string>& protectedKeys = {});
+        const KeyAliases& protectedAliases = {});
 
     uint64_t m_nextHandle = 1;
     uint64_t m_clock = 0;
@@ -173,8 +185,8 @@ private:
         std::string, std::unordered_set<std::string>>
         m_currentRuntimeIdsByScope;
     std::unordered_map<
-        std::string, std::unordered_set<std::string>>
-        m_currentKeysByScope;
+        std::string, KeyAliases>
+        m_currentAliasesByScope;
     std::unordered_map<std::string, RuntimeIdentity> m_handlesByRuntimeId;
     std::unordered_map<uint64_t, std::string> m_runtimeIdsByHandle;
     std::unordered_map<
