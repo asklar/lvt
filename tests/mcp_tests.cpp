@@ -1669,6 +1669,44 @@ TEST(McpUiaIdentity, VisualMinimizedClickAlwaysRunsActivation) {
     fs::remove(statsPath, ec);
 }
 
+TEST(McpUiaIdentity, WindowPatternCloseSucceedsWhenTargetDisappears) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const HWND target = sample.hwnd();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()}, {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    const auto tree = client.call_tool(
+        "get_uia_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto runtimeId =
+        tree["root"]
+            .value("properties", json::object())
+            .value("RuntimeId", "");
+    ASSERT_FALSE(runtimeId.empty()) << tree.dump(2);
+
+    bool isError = false;
+    const auto closed = client.call_tool(
+        "window_action",
+        json{{"session", session},
+             {"element", "uia:" + runtimeId},
+             {"action", "close"}},
+        &isError);
+    EXPECT_FALSE(isError) << closed.dump(2);
+    EXPECT_TRUE(closed.value("ok", false)) << closed.dump(2);
+    EXPECT_EQ(closed.value("method", ""), "WindowPattern.Close")
+        << closed.dump(2);
+    const auto deadline = GetTickCount64() + 5000;
+    while (IsWindow(target) && GetTickCount64() < deadline)
+        Sleep(20);
+    EXPECT_FALSE(IsWindow(target));
+}
+
 TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
     ManagedSampleProcess sample;
     ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));

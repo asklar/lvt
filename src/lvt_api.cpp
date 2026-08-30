@@ -3144,6 +3144,13 @@ json method_action(const json& params, lvt::ActionKind kind, const char* actionN
     request.waitProperty = get_string(params, "waitProperty");
     request.waitValue = get_string(params, "waitValue");
     request.waitTimeoutMs = get_int(params, "timeoutMs", 5000);
+    if (request.elementRef.empty() &&
+        (kind == lvt::ActionKind::windowClose ||
+         kind == lvt::ActionKind::windowMinimize ||
+         kind == lvt::ActionKind::windowMaximize ||
+         kind == lvt::ActionKind::windowRestore)) {
+        request.elementRef = "e0";
+    }
 
     // A reference has to belong to the tree this session speaks. "uia:eN" /
     // "visual:eN" and durable keys say which tree they came from; a bare "eN"

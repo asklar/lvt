@@ -4541,6 +4541,114 @@ TEST(UiaTargetIdentity, WaitClosureIsStructuredButWaitGoneStillSucceeds) {
     EXPECT_EQ(gone.method, "wait-gone");
 }
 
+TEST(UiaTargetIdentity, CliWindowCloseReturnsSuccessAfterTargetDisappears) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    SECURITY_ATTRIBUTES security{
+        sizeof(security), nullptr, TRUE};
+    wil::unique_handle readEnd;
+    wil::unique_handle writeEnd;
+    ASSERT_TRUE(CreatePipe(
+        readEnd.put(), writeEnd.put(), &security, 0));
+    ASSERT_TRUE(SetHandleInformation(
+        readEnd.get(), HANDLE_FLAG_INHERIT, 0));
+
+    char hwndArgument[64]{};
+    snprintf(
+        hwndArgument, sizeof(hwndArgument),
+        "--hwnd 0x%llX close",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(fixture.hwnd)));
+    std::string command =
+        make_cmd(get_lvt_path(), hwndArgument);
+    STARTUPINFOA startup{sizeof(startup)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = writeEnd.get();
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION info{};
+    ASSERT_TRUE(CreateProcessA(
+        nullptr, command.data(), nullptr, nullptr,
+        TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+        &startup, &info));
+    wil::unique_handle process(info.hProcess);
+    wil::unique_handle thread(info.hThread);
+    writeEnd.reset();
+
+    ASSERT_EQ(
+        WaitForSingleObject(process.get(), 20000),
+        WAIT_OBJECT_0);
+    DWORD exitCode = 1;
+    ASSERT_TRUE(GetExitCodeProcess(
+        process.get(), &exitCode));
+    EXPECT_EQ(exitCode, 0u);
+
+    std::string output;
+    char buffer[1024];
+    DWORD read = 0;
+    while (ReadFile(
+               readEnd.get(), buffer,
+               static_cast<DWORD>(sizeof(buffer)),
+               &read, nullptr) &&
+           read != 0) {
+        output.append(buffer, read);
+    }
+    const auto result =
+        json::parse(output, nullptr, false);
+    ASSERT_FALSE(result.is_discarded()) << output;
+    EXPECT_TRUE(result.value("ok", false)) << result.dump(2);
+    EXPECT_EQ(
+        result.value("method", ""),
+        "WindowPattern.Close");
+    EXPECT_FALSE(IsWindow(fixture.hwnd));
+}
+
+TEST(UiaTargetIdentity, WindowCloseReplacementRaceIsOwnershipLost) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto identity = lvt::capture_uia_target_identity(
+        fixture.hwnd, fixture.pid,
+        lvt::process_creation_identity(fixture.pid));
+    ASSERT_TRUE(identity.has_value());
+    const std::string base =
+        "Local\\LvtClosePatternBoundary_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_UIA_BEFORE_PATTERN_OPERATION_GATE", base);
+
+    lvt::ActionRequest request;
+    request.kind = lvt::ActionKind::windowClose;
+    request.elementRef =
+        "uia:" + lvt::format_runtime_id(
+            identity->rootRuntimeId);
+    auto pending = std::async(
+        std::launch::async, [identity, request] {
+            return lvt::perform_action(
+                *identity, lvt::UiaOptions{}, request);
+        });
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0);
+    fixture.stop();
+    ScopedNativeFixtureProcess replacement;
+    ASSERT_TRUE(replacement.start(
+        NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    SetEvent(release.get());
+
+    const auto result = pending.get();
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.errorCode, "ownershipLost")
+        << result.message;
+}
+
 TEST(UiaTargetIdentity, OneShotFallbackKeepsOriginalIdentity) {
     ScopedNativeFixtureProcess fixture;
     ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));

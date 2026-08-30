@@ -408,6 +408,7 @@ struct PatternAttempt {
 
 struct MutationBoundary {
     std::function<HRESULT()> validate;
+    std::function<bool()> targetWindowExists;
 };
 
 thread_local MutationBoundary* g_mutationBoundary = nullptr;
@@ -435,6 +436,10 @@ HRESULT run_mutation_call(Fn&& operation) {
             return before;
         wait_action_test_gate(
             "LVT_TEST_UIA_BEFORE_PATTERN_OPERATION_GATE");
+        const HRESULT immediate =
+            g_mutationBoundary->validate();
+        if (FAILED(immediate))
+            return immediate;
     }
 
     const HRESULT providerResult = operation();
@@ -443,6 +448,49 @@ HRESULT run_mutation_call(Fn&& operation) {
 
     const HRESULT after =
         g_mutationBoundary->validate();
+    return FAILED(after) ? after : providerResult;
+}
+
+template <typename Fn>
+HRESULT run_close_call(Fn&& operation) {
+    if (!g_mutationBoundary)
+        return operation();
+
+    const HRESULT before =
+        g_mutationBoundary->validate();
+    if (FAILED(before))
+        return before;
+    wait_action_test_gate(
+        "LVT_TEST_UIA_BEFORE_PATTERN_OPERATION_GATE");
+    const HRESULT immediate =
+        g_mutationBoundary->validate();
+    if (FAILED(immediate))
+        return immediate;
+
+    const HRESULT providerResult = operation();
+    if (g_mutationBoundary->targetWindowExists &&
+        !g_mutationBoundary->targetWindowExists()) {
+        // Some providers invalidate their own proxy while synchronously
+        // closing and return UIA_E_ELEMENTNOTAVAILABLE after the close has
+        // already succeeded. The target was valid immediately before the call,
+        // so disappearance here is the intended result, not replacement.
+        return S_OK;
+    }
+
+    const HRESULT after =
+        g_mutationBoundary->validate();
+    if (FAILED(after) &&
+        g_mutationBoundary->targetWindowExists) {
+        for (int attempt = 0;
+             attempt < 20 &&
+             g_mutationBoundary->targetWindowExists();
+             ++attempt) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(25));
+        }
+        if (!g_mutationBoundary->targetWindowExists())
+            return S_OK;
+    }
     return FAILED(after) ? after : providerResult;
 }
 
@@ -776,7 +824,7 @@ PatternAttempt try_window_action(IUIAutomationElement* element, ActionKind kind,
 
     if (kind == ActionKind::windowClose) {
         PatternAttempt attempt{
-            true, run_mutation_call([&] {
+            true, run_close_call([&] {
                 return window->Close();
             })};
         LOG_IF_FAILED(attempt.hr);
@@ -869,7 +917,9 @@ PropertyMutationResult perform_uia_property_action(
         return get_validated_uia_root(
             automation, identity, retainedProcess, &root);
     };
-    MutationBoundary boundary{validateTarget};
+    MutationBoundary boundary{
+        validateTarget,
+        [&] { return IsWindow(identity.hwnd) != FALSE; }};
     MutationBoundaryScope boundaryScope(boundary);
     const HRESULT beforeRealize = validateTarget();
     if (FAILED(beforeRealize)) {
@@ -1248,7 +1298,9 @@ ActionResult perform_action(
             }
             return S_OK;
         };
-        MutationBoundary boundary{validate_target};
+        MutationBoundary boundary{
+            validate_target,
+            [&] { return IsWindow(identity.hwnd) != FALSE; }};
         MutationBoundaryScope boundaryScope(boundary);
         const auto checked_pattern =
             [&](auto&& operation) -> PatternAttempt {
@@ -1485,10 +1537,14 @@ ActionResult perform_action(
         case ActionKind::windowMinimize:
         case ActionKind::windowMaximize:
         case ActionKind::windowRestore: {
-            const auto attempt = checked_pattern([&] {
-                return try_window_action(
-                    element.get(), request.kind, method);
-            });
+            const auto attempt =
+                request.kind == ActionKind::windowClose
+                    ? try_window_action(
+                          element.get(), request.kind, method)
+                    : checked_pattern([&] {
+                          return try_window_action(
+                              element.get(), request.kind, method);
+                      });
             if (is_ownership_lost(attempt.hr))
                 return attempt.hr;
             if (attempt.succeeded())
