@@ -33,6 +33,18 @@ bool is_relevant_event(DWORD event) noexcept {
 
 } // namespace
 
+bool event_destroys_root_window(
+    HWND root, const NativeWinEventRecord& event,
+    bool rootIsWindow) noexcept {
+    if (event.event != EVENT_OBJECT_DESTROY ||
+        event.hwnd != root ||
+        event.childId != CHILDID_SELF) {
+        return false;
+    }
+
+    return event.objectId == OBJID_WINDOW || !rootIsWindow;
+}
+
 struct NativeWinEventSource::State {
     HWND root = nullptr;
     DWORD pid = 0;
@@ -196,14 +208,24 @@ void CALLBACK NativeWinEventSource::callback(
         return;
     }
 
-    if (event == EVENT_OBJECT_DESTROY && hwnd == state->root &&
-        (objectId == OBJID_WINDOW || objectId == OBJID_CLIENT)) {
+    const NativeWinEventRecord record{
+        event, hwnd, objectId, childId};
+    bool rootIsWindow = true;
+    // OBJID_CLIENT and non-self child IDs describe logical accessibility
+    // objects, not the HWND's lifetime.
+    if (event == EVENT_OBJECT_DESTROY &&
+        hwnd == state->root &&
+        childId == CHILDID_SELF &&
+        objectId != OBJID_WINDOW) {
+        rootIsWindow = IsWindow(state->root) != FALSE;
+    }
+    if (event_destroys_root_window(
+            state->root, record, rootIsWindow)) {
         state->rootDestroyed.store(true, std::memory_order_release);
         SetEvent(state->rootGone.get());
     }
 
-    const bool queued = state->queue.push(
-        NativeWinEventRecord{event, hwnd, objectId, childId});
+    const bool queued = state->queue.push(record);
     state->diagnostics
         ->queued.fetch_add(queued ? 1u : 0u, std::memory_order_relaxed);
     state->diagnostics

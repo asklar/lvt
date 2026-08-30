@@ -71,6 +71,10 @@ private:
 
 inline constexpr size_t kNativeWinEventQueueCapacity = 256;
 
+bool event_destroys_root_window(
+    HWND root, const NativeWinEventRecord& event,
+    bool rootIsWindow) noexcept;
+
 // Shared with integration tests so lifecycle assertions survive destruction of
 // the subscription they observe. Production code does not branch on these
 // counters.

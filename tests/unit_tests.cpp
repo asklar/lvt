@@ -1470,6 +1470,39 @@ TEST(NativeWinEventQueue, BurstOverflowIsBoundedAndRecoversAfterDrain) {
     EXPECT_EQ(drainedCount, 1u);
 }
 
+TEST(NativeWinEventRootLifecycle, OnlyTheRootWindowObjectMarksTheRootDestroyed) {
+    using namespace lvt::native_eventing_detail;
+    const HWND root =
+        reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1234));
+    const HWND other =
+        reinterpret_cast<HWND>(static_cast<uintptr_t>(0x5678));
+
+    EXPECT_FALSE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_CLIENT, 1},
+        true));
+    EXPECT_FALSE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_WINDOW, 1},
+        false));
+    EXPECT_FALSE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_CLIENT, CHILDID_SELF},
+        true));
+    EXPECT_TRUE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_WINDOW, CHILDID_SELF},
+        true));
+    EXPECT_TRUE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_CLIENT, CHILDID_SELF},
+        false));
+    EXPECT_FALSE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, other, OBJID_WINDOW, CHILDID_SELF},
+        false));
+}
+
 TEST(OverlappedIo, CancellationCompletesBeforeStackStorageIsReleased) {
     const auto pipeName =
         std::wstring(L"\\\\.\\pipe\\lvt_overlapped_test_") +

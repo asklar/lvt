@@ -3938,6 +3938,113 @@ TEST_F(NativeControlsFixture, NativeWatchDoesNotDuplicateStructuralDiffs) {
         << "WinEvent hints were emitted beside the authoritative remove diff";
 }
 
+TEST(NativeWinEventing, LogicalChildAndTabDeletionKeepRootConnectionsAlive) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+
+    auto rootConnection = lvt::NativePropertyConnection::connect(
+        fixture.hwnd, fixture.pid, "win32");
+    ASSERT_NE(rootConnection, nullptr);
+    ASSERT_TRUE(rootConnection->event_hook_active_for_testing());
+    auto rootDiagnostics =
+        rootConnection->event_diagnostics_for_testing();
+    ASSERT_NE(rootDiagnostics, nullptr);
+    publish_native_event_snapshot(
+        rootConnection, fixture.hwnd, fixture.pid);
+    drain_native_events(*rootConnection);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            fixture.hwnd,
+            native_fixture::kNotifyRootClientChildDestroyMessage,
+            0, 7),
+        0);
+    EXPECT_TRUE(wait_for_native_snapshot(*rootConnection))
+        << "a root HWND logical-child destroy did not request a snapshot";
+    EXPECT_TRUE(IsWindow(fixture.hwnd));
+    EXPECT_TRUE(rootConnection->is_alive())
+        << "a client logical-child destroy killed the root connection";
+    EXPECT_TRUE(rootConnection->event_hook_active_for_testing());
+    EXPECT_EQ(
+        rootDiagnostics->unhooks.load(std::memory_order_acquire), 0u);
+
+    const HWND tab = GetDlgItem(
+        fixture.hwnd, native_fixture::kTabControlId);
+    ASSERT_NE(tab, nullptr);
+    auto tabConnection = lvt::NativePropertyConnection::connect(
+        tab, fixture.pid, "win32");
+    ASSERT_NE(tabConnection, nullptr);
+    ASSERT_TRUE(tabConnection->event_hook_active_for_testing());
+    auto tabDiagnostics =
+        tabConnection->event_diagnostics_for_testing();
+    ASSERT_NE(tabDiagnostics, nullptr);
+    publish_native_event_snapshot(tabConnection, tab, fixture.pid);
+    drain_native_events(*tabConnection);
+
+    const LRESULT tabCountBefore =
+        SendMessageW(tab, TCM_GETITEMCOUNT, 0, 0);
+    ASSERT_GT(tabCountBefore, 0);
+    ASSERT_NE(
+        send_native_fixture_message(
+            fixture.hwnd, native_fixture::kDeleteFirstTabMessage),
+        0);
+    EXPECT_EQ(
+        SendMessageW(tab, TCM_GETITEMCOUNT, 0, 0),
+        tabCountBefore - 1);
+    EXPECT_TRUE(wait_for_native_snapshot(*tabConnection))
+        << "deleting a tab item did not request a native snapshot";
+    EXPECT_TRUE(IsWindow(tab));
+    EXPECT_TRUE(tabConnection->is_alive())
+        << "deleting a tab item killed the tab HWND connection";
+    EXPECT_TRUE(tabConnection->event_hook_active_for_testing());
+    EXPECT_EQ(
+        tabDiagnostics->unhooks.load(std::memory_order_acquire), 0u);
+
+    send_native_fixture_message(
+        fixture.hwnd, native_fixture::kRestoreTabsMessage);
+}
+
+TEST(NativeWinEventing, ActualRootWindowDestructionMarksDeadAndUnhooks) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+
+    const HWND sibling = reinterpret_cast<HWND>(
+        send_native_fixture_message(
+            fixture.hwnd,
+            native_fixture::kGetOutOfTreeHwndMessage));
+    ASSERT_NE(sibling, nullptr);
+    ASSERT_TRUE(IsWindow(sibling));
+
+    auto connection = lvt::NativePropertyConnection::connect(
+        sibling, fixture.pid, "win32");
+    ASSERT_NE(connection, nullptr);
+    ASSERT_TRUE(connection->event_hook_active_for_testing());
+    auto diagnostics = connection->event_diagnostics_for_testing();
+    ASSERT_NE(diagnostics, nullptr);
+    publish_native_event_snapshot(
+        connection, sibling, fixture.pid);
+    drain_native_events(*connection);
+
+    ASSERT_NE(
+        send_native_fixture_message(
+            fixture.hwnd,
+            native_fixture::kDestroyOutOfTreeWindowMessage),
+        0);
+    ASSERT_TRUE(wait_for_atomic_at_least(diagnostics->unhooks, 1))
+        << "root HWND destruction did not promptly stop the event hook";
+    EXPECT_FALSE(IsWindow(sibling));
+    EXPECT_FALSE(connection->is_alive());
+    EXPECT_EQ(
+        WaitForSingleObject(fixture.process.get(), 0),
+        WAIT_TIMEOUT)
+        << "destroying one root HWND unexpectedly exited the target process";
+
+    connection.reset();
+    EXPECT_EQ(
+        diagnostics->unhooks.load(std::memory_order_acquire), 1u)
+        << "root destruction and destructor unhooked the same hook twice";
+}
+
 TEST(NativeWinEventing, SimultaneousRootsAndProcessesDoNotLeakEvents) {
     ScopedNativeFixtureProcess first;
     ScopedNativeFixtureProcess second;

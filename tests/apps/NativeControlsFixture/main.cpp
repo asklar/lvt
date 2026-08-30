@@ -778,6 +778,26 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
         }
         return count;
     }
+    case fixture::kNotifyRootClientChildDestroyMessage: {
+        const HWND target =
+            wParam != 0 ? g_controls.tabControl : hwnd;
+        const LONG childId =
+            lParam != 0 ? static_cast<LONG>(lParam) : 1;
+        NotifyWinEvent(
+            EVENT_OBJECT_DESTROY, target,
+            OBJID_CLIENT, childId);
+        return TRUE;
+    }
+    case fixture::kDestroyOutOfTreeWindowMessage:
+        if (g_controls.outOfTree &&
+            IsWindow(g_controls.outOfTree)) {
+            const BOOL destroyed =
+                DestroyWindow(g_controls.outOfTree);
+            if (destroyed)
+                g_controls.outOfTree = nullptr;
+            return destroyed;
+        }
+        return FALSE;
     case fixture::kHangMessage:
         Sleep(2500);
         return TRUE;
