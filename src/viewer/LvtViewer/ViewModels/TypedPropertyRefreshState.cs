@@ -13,7 +13,9 @@ public sealed class TypedPropertyRefreshState
     public bool IsRunning => _active.HasValue;
     public long Epoch => _epoch;
     public bool IsCurrent(Token token) =>
-        token.Epoch == _epoch && _active == token;
+        token.Epoch == _epoch &&
+        token.Generation == _requestedGeneration &&
+        _active == token;
 
     public Token Request() =>
         new(_epoch, ++_requestedGeneration);

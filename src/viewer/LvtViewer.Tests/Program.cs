@@ -47,6 +47,30 @@ static PropertyRowViewModel TypedRowFromDescriptor(
     return row;
 }
 
+static async Task<bool> ApplyDelayedTypedSnapshotAsync(
+    Task release,
+    ElementNodeViewModel node,
+    long propertyVersion,
+    TypedPropertyRefreshState refreshState,
+    TypedPropertyRefreshState.Token refreshToken,
+    IReadOnlyList<PropertyRowViewModel> rows,
+    string? acceptedProviderName = null,
+    long? acceptedEditRevision = null)
+{
+    await release;
+    if (node.PropertyVersion != propertyVersion ||
+        !refreshState.IsCurrent(refreshToken))
+    {
+        return false;
+    }
+    node.ReplaceTypedPropertyRows(
+        rows,
+        preservePendingEdits: true,
+        acceptedProviderName: acceptedProviderName,
+        acceptedEditRevision: acceptedEditRevision);
+    return true;
+}
+
 var node = new ElementNodeViewModel();
 node.ReplacePropertyRows(
 [
@@ -104,6 +128,16 @@ Assert(acceptedValueRow.EditText == "accepted text", "submitted row did not rese
 Assert(unrelatedToggle.EditText == "On", "setting one row discarded another enum edit");
 Assert(unrelatedNumber.EditText == "12.5", "setting one row discarded another number edit");
 
+var exactReadbackRow = TypedRow("Value.Value", "Value", "old", "string");
+exactReadbackRow.EditText = "submitted";
+var exactReadbackRevision = exactReadbackRow.EditRevision;
+exactReadbackRow.ApplyMutationValue("submitted", exactReadbackRevision);
+Assert(exactReadbackRow.Value == "submitted" &&
+       exactReadbackRow.EditText == "submitted",
+    "direct set readback did not apply the accepted value");
+Assert(!exactReadbackRow.IsDirty && !exactReadbackRow.HasExternalConflict,
+    "direct set readback left stale dirty state before its follow-up refresh");
+
 var setRaceNode = new ElementNodeViewModel();
 var setRaceRow = TypedRow("Value.Value", "Value", "old", "string");
 setRaceNode.ReplaceTypedPropertyRows([setRaceRow]);
@@ -125,6 +159,28 @@ setRaceRow = setRaceNode.FindProperty("Value.Value")!;
 Assert(setRaceRow.Value == "A" && setRaceRow.EditText == "B",
     "follow-up set refresh suppressed preservation of a later edit");
 
+var revertedSetNode = new ElementNodeViewModel();
+var revertedSetRow = TypedRow("Value.Value", "Value", "old", "string");
+revertedSetNode.ReplaceTypedPropertyRows([revertedSetRow]);
+revertedSetRow.EditText = "A";
+var revertedSetRevision = revertedSetRow.EditRevision;
+revertedSetRow.EditText = "old";
+Assert(!revertedSetRow.IsDirty,
+    "set revision regression did not return to a clean provider value");
+revertedSetRow.ApplyMutationValue("A", revertedSetRevision);
+Assert(revertedSetRow.Value == "A" && revertedSetRow.EditText == "old",
+    "set completion overwrote a newer clean edit action");
+Assert(revertedSetRow.IsDirty && revertedSetRow.HasExternalConflict,
+    "set completion did not compare the newer action with direct readback");
+revertedSetNode.ReplaceTypedPropertyRows(
+    [TypedRow("Value.Value", "Value", "A", "string")],
+    preservePendingEdits: true,
+    acceptedProviderName: "Value.Value",
+    acceptedEditRevision: revertedSetRevision);
+revertedSetRow = revertedSetNode.FindProperty("Value.Value")!;
+Assert(revertedSetRow.EditText == "old" && revertedSetRow.IsDirty,
+    "set refresh ignored a newer revision because it was previously non-dirty");
+
 var clearRaceNode = new ElementNodeViewModel();
 var clearRaceRow = TypedRow("Value.Value", "Value", "effective", "string");
 clearRaceNode.ReplaceTypedPropertyRows([clearRaceRow]);
@@ -144,6 +200,61 @@ Assert(clearRaceRow.Value == "default" && clearRaceRow.EditText == "clear-B",
     "follow-up clear refresh overwrote a newer pending edit");
 Assert(clearRaceRow.IsDirty && clearRaceRow.HasExternalConflict,
     "clear race did not remain visible as a conflict");
+
+var revertedClearNode = new ElementNodeViewModel();
+var revertedClearRow = TypedRow(
+    "Value.Value", "Value", "effective", "string");
+revertedClearNode.ReplaceTypedPropertyRows([revertedClearRow]);
+var revertedClearRevision = revertedClearRow.EditRevision;
+revertedClearRow.EditText = "temporary";
+revertedClearRow.EditText = "effective";
+Assert(!revertedClearRow.IsDirty,
+    "clear revision regression did not return to a clean provider value");
+Assert(!revertedClearRow.TryDiscardSubmittedEdit(revertedClearRevision),
+    "clear completion discarded a newer clean edit action");
+revertedClearNode.ReplaceTypedPropertyRows(
+    [TypedRow("Value.Value", "Value", "default", "string")],
+    preservePendingEdits: true,
+    acceptedProviderName: "Value.Value",
+    acceptedEditRevision: revertedClearRevision);
+revertedClearRow = revertedClearNode.FindProperty("Value.Value")!;
+Assert(revertedClearRow.Value == "default" &&
+       revertedClearRow.EditText == "effective" &&
+       revertedClearRow.IsDirty,
+    "clear refresh ignored a newer revision because it was previously non-dirty");
+
+var commandNode = new ElementNodeViewModel();
+var commandRow = TypedRow(
+    "Selection.Command", "Selection", "", "command",
+    ("add", "Add"), ("remove", "Remove"));
+commandNode.ReplaceTypedPropertyRows([commandRow]);
+var submittedCommandRevision = commandRow.EditRevision;
+commandRow.EditText = "remove";
+commandRow.ApplyMutationValue("", submittedCommandRevision);
+Assert(commandRow.EditText == "remove" && !commandRow.IsDirty,
+    "command completion overwrote a newer non-dirty action");
+commandNode.ReplaceTypedPropertyRows(
+    [
+        TypedRow(
+            "Selection.Command", "Selection", "", "command",
+            ("add", "Add"), ("remove", "Remove")),
+    ],
+    preservePendingEdits: true,
+    acceptedProviderName: "Selection.Command",
+    acceptedEditRevision: submittedCommandRevision);
+commandRow = commandNode.FindProperty("Selection.Command")!;
+Assert(commandRow.EditText == "remove" && !commandRow.IsDirty,
+    "command refresh ignored a newer action because command rows are non-dirty");
+commandNode.ReplaceTypedPropertyRows(
+    [],
+    preservePendingEdits: true,
+    acceptedProviderName: "Selection.Command",
+    acceptedEditRevision: submittedCommandRevision);
+commandRow = commandNode.FindProperty("Selection.Command")!;
+Assert(commandRow.EditText == "remove",
+    "disappearing command descriptor lost a newer action");
+Assert(commandRow.Kind == PropertyEditorKind.ReadOnly,
+    "disappearing command descriptor was not retained");
 
 var refreshedValue = TypedRowFromDescriptor(
     new PropertyDescriptorDto
@@ -219,6 +330,125 @@ Assert(refreshState.HasPending, "ordinary value patch racing initial load lost i
 Assert(refreshState.TryBegin(out var retryAttempt), "stale schema refresh was not retried");
 refreshState.Complete(retryAttempt, applied: true);
 Assert(!refreshState.HasPending, "latest schema refresh was not marked applied");
+
+var latestWinsState = new TypedPropertyRefreshState();
+latestWinsState.Request();
+Assert(latestWinsState.TryBegin(out var supersededAttempt),
+    "superseded schema refresh did not start");
+var latestRequest = latestWinsState.Request();
+Assert(!latestWinsState.IsCurrent(supersededAttempt),
+    "newer schema request did not retire the active snapshot");
+Assert(latestWinsState.Complete(supersededAttempt, applied: false),
+    "retired schema refresh did not release the coordinator");
+Assert(latestWinsState.TryBegin(out var latestAttempt) &&
+       latestAttempt == latestRequest,
+    "latest schema request was not serialized after the retired snapshot");
+latestWinsState.Complete(latestAttempt, applied: true);
+
+var delayedSetNode = new ElementNodeViewModel();
+var delayedSetRow = TypedRow("Value.Value", "Value", "old", "string");
+delayedSetNode.ReplaceTypedPropertyRows([delayedSetRow]);
+var delayedSetState = new TypedPropertyRefreshState();
+delayedSetState.Request();
+Assert(delayedSetState.TryBegin(out var delayedSetOldToken),
+    "delayed pre-set refresh did not start");
+var delayedSetOldVersion = delayedSetNode.PropertyVersion;
+var releaseDelayedSet = new TaskCompletionSource(
+    TaskCreationOptions.RunContinuationsAsynchronously);
+var delayedSetOldSnapshot = ApplyDelayedTypedSnapshotAsync(
+    releaseDelayedSet.Task,
+    delayedSetNode,
+    delayedSetOldVersion,
+    delayedSetState,
+    delayedSetOldToken,
+    [TypedRow("Value.Value", "Value", "old", "string")]);
+delayedSetRow.EditText = "A";
+var delayedSetRevision = delayedSetRow.EditRevision;
+delayedSetRow.EditText = "newer";
+delayedSetRow.ApplyMutationValue("A", delayedSetRevision);
+delayedSetNode.InvalidatePropertySnapshots();
+var delayedSetFollowup = delayedSetState.Request();
+Assert(delayedSetNode.PropertyVersion != delayedSetOldVersion,
+    "set completion did not invalidate the pre-mutation property version");
+Assert(!delayedSetState.IsCurrent(delayedSetOldToken),
+    "set follow-up did not retire the pre-mutation refresh generation");
+releaseDelayedSet.SetResult();
+Assert(!await delayedSetOldSnapshot,
+    "delayed pre-set snapshot applied after direct mutation readback");
+Assert(delayedSetState.Complete(delayedSetOldToken, applied: false),
+    "delayed pre-set snapshot did not release the refresh coordinator");
+Assert(delayedSetState.TryBegin(out var delayedSetFollowupToken) &&
+       delayedSetFollowupToken == delayedSetFollowup,
+    "set follow-up was not queued behind the delayed snapshot");
+var delayedSetApplied = await ApplyDelayedTypedSnapshotAsync(
+    Task.CompletedTask,
+    delayedSetNode,
+    delayedSetNode.PropertyVersion,
+    delayedSetState,
+    delayedSetFollowupToken,
+    [TypedRow("Value.Value", "Value", "A", "string")],
+    "Value.Value",
+    delayedSetRevision);
+delayedSetState.Complete(delayedSetFollowupToken, delayedSetApplied);
+delayedSetRow = delayedSetNode.FindProperty("Value.Value")!;
+Assert(delayedSetRow.Value == "A" &&
+       delayedSetRow.EditText == "newer" &&
+       delayedSetRow.IsDirty &&
+       delayedSetRow.HasExternalConflict,
+    "serialized set follow-up lost provider readback or the newer edit");
+
+var delayedClearNode = new ElementNodeViewModel();
+var delayedClearRow = TypedRow(
+    "Value.Value", "Value", "effective", "string");
+delayedClearNode.ReplaceTypedPropertyRows([delayedClearRow]);
+var delayedClearState = new TypedPropertyRefreshState();
+delayedClearState.Request();
+Assert(delayedClearState.TryBegin(out var delayedClearOldToken),
+    "delayed pre-clear refresh did not start");
+var delayedClearOldVersion = delayedClearNode.PropertyVersion;
+var releaseDelayedClear = new TaskCompletionSource(
+    TaskCreationOptions.RunContinuationsAsynchronously);
+var delayedClearOldSnapshot = ApplyDelayedTypedSnapshotAsync(
+    releaseDelayedClear.Task,
+    delayedClearNode,
+    delayedClearOldVersion,
+    delayedClearState,
+    delayedClearOldToken,
+    [TypedRow("Value.Value", "Value", "effective", "string")]);
+var delayedClearRevision = delayedClearRow.EditRevision;
+delayedClearRow.EditText = "newer";
+Assert(!delayedClearRow.TryDiscardSubmittedEdit(delayedClearRevision),
+    "clear completion discarded the newer delayed-race edit");
+delayedClearNode.InvalidatePropertySnapshots();
+var delayedClearFollowup = delayedClearState.Request();
+Assert(delayedClearNode.PropertyVersion != delayedClearOldVersion,
+    "clear completion did not invalidate the pre-mutation property version");
+Assert(!delayedClearState.IsCurrent(delayedClearOldToken),
+    "clear follow-up did not retire the pre-mutation refresh generation");
+releaseDelayedClear.SetResult();
+Assert(!await delayedClearOldSnapshot,
+    "delayed pre-clear snapshot applied after mutation completion");
+Assert(delayedClearState.Complete(delayedClearOldToken, applied: false),
+    "delayed pre-clear snapshot did not release the refresh coordinator");
+Assert(delayedClearState.TryBegin(out var delayedClearFollowupToken) &&
+       delayedClearFollowupToken == delayedClearFollowup,
+    "clear follow-up was not queued behind the delayed snapshot");
+var delayedClearApplied = await ApplyDelayedTypedSnapshotAsync(
+    Task.CompletedTask,
+    delayedClearNode,
+    delayedClearNode.PropertyVersion,
+    delayedClearState,
+    delayedClearFollowupToken,
+    [TypedRow("Value.Value", "Value", "default", "string")],
+    "Value.Value",
+    delayedClearRevision);
+delayedClearState.Complete(delayedClearFollowupToken, delayedClearApplied);
+delayedClearRow = delayedClearNode.FindProperty("Value.Value")!;
+Assert(delayedClearRow.Value == "default" &&
+       delayedClearRow.EditText == "newer" &&
+       delayedClearRow.IsDirty &&
+       delayedClearRow.HasExternalConflict,
+    "serialized clear follow-up lost provider readback or the newer edit");
 
 var abaState = new TypedPropertyRefreshState();
 abaState.Request();

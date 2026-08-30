@@ -313,10 +313,15 @@ public sealed class ElementNodeViewModel : ObservableObject
                 row.ProviderName == acceptedProviderName &&
                 acceptedEditRevision.HasValue &&
                 existing.EditRevision == acceptedEditRevision.Value;
+            bool hasNewerAcceptedAction =
+                existing != null &&
+                row.ProviderName == acceptedProviderName &&
+                acceptedEditRevision.HasValue &&
+                existing.EditRevision != acceptedEditRevision.Value;
             if (preservePendingEdits &&
                 existing != null &&
                 !isExactAcceptedEdit &&
-                existing.IsDirty)
+                (existing.IsDirty || hasNewerAcceptedAction))
             {
                 row.PreservePendingEditFrom(existing);
             }
@@ -333,7 +338,11 @@ public sealed class ElementNodeViewModel : ObservableObject
                 .ToHashSet(StringComparer.Ordinal);
             foreach (var existing in existingTyped.Values)
             {
-                if (!existing.IsDirty ||
+                bool hasNewerAcceptedAction =
+                    existing.ProviderName == acceptedProviderName &&
+                    acceptedEditRevision.HasValue &&
+                    existing.EditRevision != acceptedEditRevision.Value;
+                if ((!existing.IsDirty && !hasNewerAcceptedAction) ||
                     (existing.ProviderName == acceptedProviderName &&
                      acceptedEditRevision.HasValue &&
                      existing.EditRevision == acceptedEditRevision.Value) ||
@@ -354,6 +363,11 @@ public sealed class ElementNodeViewModel : ObservableObject
         PropertyRows = new ObservableCollection<PropertyRowViewModel>(merged);
         PropertyVersion++;
         OnPropertyChanged(nameof(DisplayName));
+    }
+
+    public void InvalidatePropertySnapshots()
+    {
+        PropertyVersion++;
     }
 
     public void ReplacePropertyRows(IEnumerable<PropertyRowViewModel> rows)
