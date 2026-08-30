@@ -44,7 +44,11 @@ if (Test-Path $lvtExe) {
 
 if ($needsInstall) {
   New-Item -ItemType Directory -Path $lvtDir -Force | Out-Null
-  $asset = $release.assets | Where-Object { $_.name -like "lvt-*-x64.zip" } | Select-Object -First 1
+  $assetName = "lvt-$($release.tag_name)-x64.zip"
+  $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+  if (!$asset) {
+    throw "Release asset '$assetName' was not found."
+  }
   $zip = "$env:TEMP\lvt.zip"
   Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip
   Expand-Archive -Path $zip -DestinationPath $lvtDir -Force
@@ -58,6 +62,11 @@ Once up to date, `lvt.exe` persists in `~/.lvt/` — this check is cheap (one AP
 call plus a local `--version` call) and safe to run at the start of every
 session, so re-run it whenever picking lvt back up rather than assuming a
 previously-downloaded copy is still current.
+
+The GUI Viewer is published separately as
+`lvt-viewer-v<version>-x64.zip`. Do not select that archive when installing the
+CLI: the Viewer archive is larger because it contains the Viewer plus a complete
+matching lvt runtime.
 
 ## Usage
 
@@ -271,9 +280,8 @@ Pattern state is only emitted where the pattern is supported, so the presence of
 ## MCP server mode
 
 `lvt mcp` serves the Model Context Protocol over stdio, which is usually a
-better fit than shelling out repeatedly: it keeps a session open on the target,
-so it walks the tree once per request rather than once per command, and it
-returns screenshots as inline images.
+better fit than shelling out repeatedly: it keeps framework connections open,
+publishes subscribed tree resources, and returns screenshots as inline images.
 
 ```powershell
 lvt mcp                  # inspection only
@@ -282,9 +290,12 @@ lvt mcp --allow-input    # also expose click, type, set-value and the rest
 
 Configure it in an MCP host with `"command": "lvt.exe", "args": ["mcp", "--allow-input"]`.
 
-The flow is `connect` (returns a session id) → `get_uia_tree` or `find_elements`
-(returns element ids) → act on those ids. Without `--allow-input` the tools that
-change the target app are not registered at all.
+The flow is `connect` (returns a session id and a mode-specific tree resource) →
+`resources/subscribe` → `resources/read` when
+`notifications/resources/updated` arrives. Direct tools such as
+`get_uia_tree`, `get_visual_tree`, and `find_elements` remain available for
+one-off reads. Without `--allow-input` the tools that change the target app are
+not registered at all.
 
 **Pick a mode when you connect.** The default `mode: "uia"` acts through UI
 Automation patterns: no cursor movement, no focus stealing, and it works whatever
@@ -302,6 +313,19 @@ they are independent and cheap. A session's mode cannot be changed afterwards.
 `get_visual_tree` with `correlate: true` reports which visual elements UI
 Automation exposes (`uiaRef`) and which it does not - a quick way to tell whether
 something is automatable through patterns at all.
+
+Property editing is provider-driven and uses the same persistent session:
+
+- `get_editable_properties` returns an immutable typed schema plus current
+  values for one element.
+- `set_property` writes a value through an opaque provider-owned descriptor.
+- `clear_property` restores the provider's inherited, styled, default, or reset
+  value when that property supports clearing.
+
+Use the schema's editor kind, enum choices, numeric limits, writability, and
+clear capability exactly as reported. Do not infer conversion rules from a
+property name or send framework types, property indexes, Win32 messages, or
+other provider internals. Mutations require `--allow-input`.
 
 Every result carries `structuredContent` as well as the text block, and each tool
 declares an `outputSchema`, so answers can be consumed as data rather than
