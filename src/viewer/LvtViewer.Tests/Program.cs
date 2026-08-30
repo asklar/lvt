@@ -689,6 +689,134 @@ Assert(sameRow.Value == "default" &&
        !sameRow.IsDirty,
     "same-row latest operation did not deterministically win");
 
+var visualSetNode = new ElementNodeViewModel();
+var visualSetRow = TypedRow("Value.Value", "Value", "old", "string");
+visualSetNode.ReplaceTypedPropertyRows([visualSetRow]);
+visualSetRow.EditText = "visual set";
+var visualSetRevision = visualSetRow.EditRevision;
+var visualSetMutation = visualSetNode.BeginPropertyMutation(
+    "Value.Value", visualSetRevision);
+Assert(visualSetNode.TryCompletePropertyMutation(visualSetMutation),
+    "visual set mutation was unexpectedly superseded");
+visualSetRow.ApplyMutationValue("visual set", visualSetRevision);
+visualSetNode.ReplaceTypedPropertyRows(
+    [TypedRow("Value.Value", "Value", "visual set", "string")],
+    preservePendingEdits: true);
+visualSetNode.SettleCompletedPropertyMutations();
+visualSetRow = visualSetNode.FindProperty("Value.Value")!;
+Assert(visualSetRow.Value == "visual set" &&
+       visualSetRow.EditText == "visual set" &&
+       !visualSetRow.IsDirty,
+    "generic visual set refresh did not settle provider readback");
+
+var visualClearNode = new ElementNodeViewModel();
+var visualClearRow = TypedRow(
+    "Value.Value", "Value", "effective", "string");
+visualClearNode.ReplaceTypedPropertyRows([visualClearRow]);
+var visualClearRevision = visualClearRow.EditRevision;
+var visualClearMutation = visualClearNode.BeginPropertyMutation(
+    "Value.Value", visualClearRevision);
+Assert(visualClearNode.TryCompletePropertyMutation(visualClearMutation),
+    "visual clear mutation was unexpectedly superseded");
+Assert(visualClearRow.TryDiscardSubmittedEdit(visualClearRevision),
+    "visual clear did not discard its exact submitted revision");
+visualClearNode.ReplaceTypedPropertyRows(
+    [TypedRow("Value.Value", "Value", "visual default", "string")],
+    preservePendingEdits: true);
+visualClearNode.SettleCompletedPropertyMutations();
+visualClearRow = visualClearNode.FindProperty("Value.Value")!;
+Assert(visualClearRow.Value == "visual default" &&
+       visualClearRow.EditText == "visual default" &&
+       !visualClearRow.IsDirty,
+    "generic visual clear refresh left the stale effective value");
+
+var deselectedNode = new ElementNodeViewModel();
+var deselectedRow = TypedRow(
+    "Value.Value", "Value", "selected value", "string");
+deselectedNode.ReplaceTypedPropertyRows([deselectedRow]);
+var deselectedRevision = deselectedRow.EditRevision;
+var deselectedMutation = deselectedNode.BeginPropertyMutation(
+    "Value.Value", deselectedRevision);
+deselectedRow.EditText = "temporary";
+deselectedRow.EditText = "selected value";
+Assert(!deselectedRow.IsDirty,
+    "selection-change setup did not create a newer non-dirty action");
+deselectedNode.ClearPropertyMutations();
+Assert(!deselectedNode.TryCompletePropertyMutation(deselectedMutation),
+    "operation completion retained ownership after node deselection");
+deselectedNode.ReplaceTypedPropertyRows(
+    [TypedRow("Value.Value", "Value", "new owner", "string")],
+    preservePendingEdits: true);
+deselectedRow = deselectedNode.FindProperty("Value.Value")!;
+Assert(deselectedRow.Value == "new owner" &&
+       deselectedRow.EditText == "new owner" &&
+       !deselectedRow.IsDirty,
+    "deselected node retained stale mutation preservation state");
+
+var resetTree = new LiveTree();
+resetTree.Apply(new TreeChangeEventDto
+{
+    Event = "added",
+    Key = "reset-node",
+    Path = "0",
+    Element = new ElementDto { Type = "Edit", Framework = "uia" },
+});
+var resetNode = resetTree.Roots[0];
+var resetMutation = resetNode.BeginPropertyMutation("Value.Value", 0);
+resetTree.Reset();
+Assert(!resetNode.TryCompletePropertyMutation(resetMutation),
+    "LiveTree reset retained a mutation from the prior session");
+
+var failedRefreshNode = new ElementNodeViewModel();
+var failedRefreshRow = TypedRow(
+    "Value.Value", "Value", "effective", "string");
+failedRefreshNode.ReplaceTypedPropertyRows([failedRefreshRow]);
+var failedRefreshRevision = failedRefreshRow.EditRevision;
+var failedRefreshMutation = failedRefreshNode.BeginPropertyMutation(
+    "Value.Value", failedRefreshRevision);
+failedRefreshRow.EditText = "temporary";
+failedRefreshRow.EditText = "effective";
+Assert(!failedRefreshRow.IsDirty,
+    "failed-refresh setup did not return to a non-dirty newer action");
+Assert(failedRefreshNode.TryCompletePropertyMutation(
+        failedRefreshMutation),
+    "failed-refresh mutation was unexpectedly superseded");
+Assert(!failedRefreshRow.TryDiscardSubmittedEdit(failedRefreshRevision),
+    "failed refresh setup discarded the newer non-dirty action");
+var failedRefreshState = new TypedPropertyRefreshState();
+failedRefreshState.Request();
+Assert(failedRefreshState.TryBegin(out var failedRefreshAttempt),
+    "failed typed refresh did not start");
+Assert(failedRefreshState.Complete(
+        failedRefreshAttempt, applied: false),
+    "failed typed refresh did not release the retry coordinator");
+Assert(failedRefreshState.HasPending,
+    "failed typed refresh was incorrectly marked applied");
+Assert(failedRefreshState.TryBegin(out var successfulRetry),
+    "failed typed refresh did not retry");
+var successfulRetryApplied = await ApplyDelayedTypedSnapshotAsync(
+    Task.CompletedTask,
+    failedRefreshNode,
+    failedRefreshNode.PropertyVersion,
+    failedRefreshState,
+    successfulRetry,
+    [TypedRow("Value.Value", "Value", "default", "string")]);
+Assert(failedRefreshState.Complete(
+        successfulRetry, successfulRetryApplied),
+    "successful typed retry did not complete");
+failedRefreshNode.SettleCompletedPropertyMutations();
+failedRefreshRow =
+    failedRefreshNode.FindProperty("Value.Value")!;
+Assert(failedRefreshRow.Value == "default" &&
+       failedRefreshRow.EditText == "effective" &&
+       failedRefreshRow.IsDirty,
+    "successful retry did not preserve the action retained by the failure");
+failedRefreshRow.EditText = "default";
+failedRefreshNode.SetProperty("Value.Value", "after retry");
+Assert(failedRefreshRow.EditText == "after retry" &&
+       !failedRefreshRow.IsDirty,
+    "successful retry did not settle its completed mutation context");
+
 var abaState = new TypedPropertyRefreshState();
 abaState.Request();
 Assert(abaState.TryBegin(out var selectionA), "selection A refresh did not start");

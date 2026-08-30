@@ -424,6 +424,14 @@ public sealed class ElementNodeViewModel : ObservableObject
         }
     }
 
+    public void ClearPropertyMutations()
+    {
+        if (_propertyMutations.Count == 0)
+            return;
+        _propertyMutations.Clear();
+        PropertyVersion++;
+    }
+
     private bool IsExactCompletedMutation(PropertyRowViewModel row)
     {
         return _propertyMutations.TryGetValue(

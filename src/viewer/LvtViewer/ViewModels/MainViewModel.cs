@@ -80,9 +80,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             bool applied = false;
             try
             {
-                if (UseUia && node != null)
+                if (node != null)
                 {
-                    applied = fullUiaLoad
+                    applied = UseUia && fullUiaLoad
                         ? await RefreshUiaPropertiesAsync(
                             node, preservePendingEdits, refreshToken)
                         : await RefreshTypedPropertiesAsync(
@@ -110,7 +110,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                         : Math.Min(_typedPropertyRefreshDelayMs * 2, 1000);
                 if (completionAccepted &&
                     _typedPropertyRefreshState.HasPending &&
-                    UseUia && SelectedElement != null)
+                    SelectedElement != null)
                 {
                     _typedPropertyRefreshTimer.Interval =
                         TimeSpan.FromMilliseconds(_typedPropertyRefreshDelayMs);
@@ -281,7 +281,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (ReferenceEquals(_selectedElement, value))
                 return;
             if (_selectedElement != null)
+            {
                 _selectedElement.PropertyChanged -= OnSelectedElementPropertyChanged;
+                _selectedElement.ClearPropertyMutations();
+            }
             SetField(ref _selectedElement, value);
             if (_selectedElement != null)
                 _selectedElement.PropertyChanged += OnSelectedElementPropertyChanged;
@@ -291,17 +294,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _typedRefreshNeedsFullUiaLoad = false;
             _typedRefreshPreservePendingEdits = false;
             IsPropertyPanelLoading = value != null;
-            if (UseUia)
+            if (value != null)
             {
-                if (value != null)
-                {
-                    RequestTypedPropertySchemaRefresh(
-                        fullUiaLoad: true,
-                        preservePendingEdits: false);
-                }
+                RequestTypedPropertySchemaRefresh(
+                    fullUiaLoad: UseUia,
+                    preservePendingEdits: false);
             }
-            else
-                _ = RefreshTypedPropertiesAsync(value);
         }
     }
 
@@ -665,7 +663,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (node == null)
         {
             IsPropertyPanelLoading = false;
-            return true;
+            return false;
         }
 
         long propertyVersion = node.PropertyVersion;
@@ -681,13 +679,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (!result.Ok)
         {
             StatusText = $"Could not read UI Automation properties: {result.Error}";
-            return true;
+            return false;
         }
 
-        if (result.Payload.TryGetProperty("element", out var element) &&
-            element.ValueKind == System.Text.Json.JsonValueKind.Object &&
-            element.TryGetProperty("properties", out var properties) &&
-            properties.ValueKind == System.Text.Json.JsonValueKind.Object)
+        if (!result.Payload.TryGetProperty("element", out var element) ||
+            element.ValueKind != System.Text.Json.JsonValueKind.Object ||
+            !element.TryGetProperty("properties", out var properties) ||
+            properties.ValueKind != System.Text.Json.JsonValueKind.Object)
+        {
+            Logger.Log(
+                "properties",
+                $"UI Automation property response for {node.Key} had no property snapshot");
+            return false;
+        }
+
+        try
         {
             string propertyJson = properties.GetRawText();
             var rows = await System.Threading.Tasks.Task.Run(() =>
@@ -710,6 +716,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
             node.ReplacePropertyRows(
                 rows, preserveTypedRows: preservePendingEdits);
+        }
+        catch (Exception ex) when (
+            ex is System.Text.Json.JsonException or
+                InvalidOperationException or
+                NotSupportedException)
+        {
+            Logger.LogException(
+                "properties", "Could not parse UI Automation properties", ex);
+            return false;
         }
         Logger.Log("properties", $"Loaded UIA properties in {stopwatch.ElapsedMilliseconds} ms");
         return await RefreshTypedPropertiesAsync(
@@ -743,7 +758,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (node == null)
         {
             IsPropertyPanelLoading = false;
-            return true;
+            return false;
         }
 
         long propertyVersion = node.PropertyVersion;
@@ -759,15 +774,26 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Logger.Log(
                 "properties",
                 $"No typed property provider for {node.Key}: {result.Error}");
-            if (clearLoadingOnCompletion)
-                IsPropertyPanelLoading = false;
-            return true;
+            return false;
         }
 
-        string snapshotJson = result.Payload.GetRawText();
-        var snapshot = await System.Threading.Tasks.Task.Run(() =>
-            System.Text.Json.JsonSerializer.Deserialize<PropertySnapshotDto>(
-                snapshotJson, JsonDefaults.Options));
+        PropertySnapshotDto? snapshot;
+        try
+        {
+            string snapshotJson = result.Payload.GetRawText();
+            snapshot = await System.Threading.Tasks.Task.Run(() =>
+                System.Text.Json.JsonSerializer.Deserialize<PropertySnapshotDto>(
+                    snapshotJson, JsonDefaults.Options));
+        }
+        catch (Exception ex) when (
+            ex is System.Text.Json.JsonException or
+                InvalidOperationException or
+                NotSupportedException)
+        {
+            Logger.LogException(
+                "properties", "Could not parse typed property snapshot", ex);
+            return false;
+        }
         if (SelectedElement != node ||
             node.PropertyVersion != propertyVersion ||
             (refreshToken.HasValue &&
@@ -775,40 +801,54 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return false;
         if (snapshot == null || string.IsNullOrWhiteSpace(snapshot.SchemaId))
         {
-            if (clearLoadingOnCompletion)
-                IsPropertyPanelLoading = false;
-            return true;
+            Logger.Log(
+                "properties",
+                $"Typed property response for {node.Key} had no schema");
+            return false;
         }
 
-        if (!_propertySchemas.TryGet(snapshot.SchemaId, out var descriptors))
+        try
         {
-            foreach (var descriptor in snapshot.Descriptors)
-                descriptor.PreparePresentation();
-            descriptors = snapshot.Descriptors;
-            _propertySchemas.Store(
-                snapshot.SchemaId, descriptors, snapshot.SchemaId);
-        }
-
-        var values = snapshot.Values.ToDictionary(
-            value => value.DescriptorId, StringComparer.Ordinal);
-        var rows = descriptors
-            .Where(descriptor => values.ContainsKey(descriptor.DescriptorId))
-            .Select(descriptor =>
+            if (!_propertySchemas.TryGet(snapshot.SchemaId, out var descriptors))
             {
-                var value = values[descriptor.DescriptorId];
-                var row = new PropertyRowViewModel(descriptor.Name, value.Value);
-                row.UpdateTypedProperty(descriptor, value);
-                return row;
-            })
-            .ToList();
+                foreach (var descriptor in snapshot.Descriptors)
+                    descriptor.PreparePresentation();
+                descriptors = snapshot.Descriptors;
+                _propertySchemas.Store(
+                    snapshot.SchemaId, descriptors, snapshot.SchemaId);
+            }
 
-        node.ReplaceTypedPropertyRows(rows, preservePendingEdits);
+            var values = snapshot.Values.ToDictionary(
+                value => value.DescriptorId, StringComparer.Ordinal);
+            var rows = descriptors
+                .Where(descriptor => values.ContainsKey(descriptor.DescriptorId))
+                .Select(descriptor =>
+                {
+                    var value = values[descriptor.DescriptorId];
+                    var row = new PropertyRowViewModel(
+                        descriptor.Name, value.Value);
+                    row.UpdateTypedProperty(descriptor, value);
+                    return row;
+                })
+                .ToList();
+
+            node.ReplaceTypedPropertyRows(rows, preservePendingEdits);
+            Logger.Log(
+                "properties",
+                $"Loaded {rows.Count} typed properties from schema {snapshot.SchemaId} " +
+                $"in {stopwatch.ElapsedMilliseconds} ms");
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException or
+                InvalidOperationException or
+                NullReferenceException)
+        {
+            Logger.LogException(
+                "properties", "Invalid typed property snapshot", ex);
+            return false;
+        }
         if (clearLoadingOnCompletion)
             IsPropertyPanelLoading = false;
-        Logger.Log(
-            "properties",
-            $"Loaded {rows.Count} typed properties from schema {snapshot.SchemaId} " +
-            $"in {stopwatch.ElapsedMilliseconds} ms");
         return true;
     }
 
@@ -825,8 +865,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             submittedProviderName, submittedRevision);
         RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
         StatusText = $"Setting {row.Name}…";
-        var result = await _mcp.SetPropertyAsync(
-            node.Key, row.DescriptorId, submittedValue);
+        McpToolResult result;
+        try
+        {
+            result = await _mcp.SetPropertyAsync(
+                node.Key, row.DescriptorId, submittedValue);
+        }
+        catch (Exception ex)
+        {
+            if (node.CancelPropertyMutation(mutation) &&
+                SelectedElement == node)
+            {
+                StatusText = $"Set failed: {ex.Message}";
+            }
+            return;
+        }
         if (SelectedElement != node)
         {
             node.CancelPropertyMutation(mutation);
@@ -865,7 +918,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             submittedProviderName, submittedRevision);
         RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
         StatusText = $"Clearing {row.Name}…";
-        var result = await _mcp.ClearPropertyAsync(node.Key, row.DescriptorId);
+        McpToolResult result;
+        try
+        {
+            result = await _mcp.ClearPropertyAsync(
+                node.Key, row.DescriptorId);
+        }
+        catch (Exception ex)
+        {
+            if (node.CancelPropertyMutation(mutation) &&
+                SelectedElement == node)
+            {
+                StatusText = $"Clear failed: {ex.Message}";
+            }
+            return;
+        }
         if (SelectedElement != node)
         {
             node.CancelPropertyMutation(mutation);

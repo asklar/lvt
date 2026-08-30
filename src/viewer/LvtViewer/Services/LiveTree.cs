@@ -55,6 +55,8 @@ public sealed class LiveTree
     public void Reset()
     {
         Logger.Log("tree", $"Reset() — clearing {_byKey.Count} known nodes");
+        foreach (var node in _byKey.Values)
+            node.ClearPropertyMutations();
         _byKey.Clear();
         _byPath.Clear();
         _attachedKeys.Clear();
