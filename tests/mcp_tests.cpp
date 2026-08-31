@@ -3171,6 +3171,21 @@ void verify_managed_window_property_authorization(
             movedProperties, propertyName),
         originalPrimaryValue)
         << "the denied old-session mutation changed the moved element";
+
+    auto primaryAfterMove = client.call_tool(
+        "get_visual_tree",
+        json{{"session", primarySession}},
+        &isError);
+    ASSERT_FALSE(isError) << primaryAfterMove.dump(2);
+    auto revokedAfterSnapshot = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession},
+             {"element", primaryKey}},
+        &isError);
+    ASSERT_TRUE(isError)
+        << revokedAfterSnapshot.dump(2);
+    expect_typed_property_target_not_authorized(
+        revokedAfterSnapshot);
 }
 
 void verify_managed_mcp_connection(

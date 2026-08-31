@@ -250,14 +250,8 @@ bool session_target_ownership_lost(HRESULT hresult) {
 #endif
 }
 
-void ensure_session_target_identity_current(
-    const Session& session,
-    const std::string& operation) {
-    const HRESULT status =
-        session_target_identity_status(session);
-    if (SUCCEEDED(status))
-        return;
-
+[[noreturn]] void throw_session_target_identity_failure(
+    HRESULT status, const std::string& operation) {
     const bool ownershipLost =
         session_target_ownership_lost(status);
     const std::string message =
@@ -277,16 +271,32 @@ void ensure_session_target_identity_current(
     }.dump());
 }
 
+void ensure_session_target_identity_current(
+    const Session& session,
+    const std::string& operation) {
+    const HRESULT status =
+        session_target_identity_status(session);
+    if (FAILED(status)) {
+        throw_session_target_identity_failure(
+            status, operation);
+    }
+}
+
 using AuthorizedPropertyTarget =
     std::pair<std::string, uint64_t>;
 
 std::mutex g_propertyAuthorizationMutex;
-std::map<
-    std::string, std::set<AuthorizedPropertyTarget>>
+struct SessionPropertyAuthorization {
+    std::set<AuthorizedPropertyTarget> targets;
+    uint64_t generation = 0;
+};
+std::map<std::string, SessionPropertyAuthorization>
     g_sessionAuthorizedPropertyTargets;
+std::atomic<uint64_t> g_nextPropertyAuthorizationGeneration{1};
 
 struct StagedPropertyAuthorization {
     std::set<AuthorizedPropertyTarget> targets;
+    uint64_t generation = 0;
     bool complete = false;
 };
 
@@ -323,6 +333,9 @@ StagedPropertyAuthorization stage_session_property_authorization(
     StagedPropertyAuthorization staged;
     collect_session_property_targets(
         session, root, true, staged.targets);
+    staged.generation =
+        g_nextPropertyAuthorizationGeneration.fetch_add(
+            1);
     staged.complete = true;
     return staged;
 }
@@ -337,8 +350,12 @@ void commit_session_property_authorization(
 
     std::lock_guard<std::mutex> lock(
         g_propertyAuthorizationMutex);
-    g_sessionAuthorizedPropertyTargets[session.id] =
-        std::move(staged.targets);
+    auto& current =
+        g_sessionAuthorizedPropertyTargets[session.id];
+    if (staged.generation < current.generation)
+        return;
+    current.targets = std::move(staged.targets);
+    current.generation = staged.generation;
 }
 
 bool session_authorizes_property_target(
@@ -350,7 +367,7 @@ bool session_authorizes_property_target(
         g_sessionAuthorizedPropertyTargets.find(session.id);
     return sessionTargets !=
                g_sessionAuthorizedPropertyTargets.end() &&
-           sessionTargets->second.contains(
+           sessionTargets->second.targets.contains(
                {provider, handle});
 }
 
@@ -1734,8 +1751,12 @@ Session require_session(const json& params) {
     Session session;
     if (!find_session(id, session))
         throw std::runtime_error("unknown session '" + id + "'; call connect first");
-    ensure_session_target_identity_current(
-        session, "while opening the session");
+    if (!IsWindow(session.hwnd)) {
+        throw_session_target_identity_failure(
+            HRESULT_FROM_WIN32(
+                ERROR_INVALID_WINDOW_HANDLE),
+            "while opening the session");
+    }
     return session;
 }
 
