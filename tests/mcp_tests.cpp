@@ -6461,6 +6461,25 @@ TEST_F(
     ASSERT_FALSE(newer.value("events", json::array()).empty())
         << newer.dump(2);
 
+    char revokedKeyBuffer[64]{};
+    snprintf(
+        revokedKeyBuffer, sizeof(revokedKeyBuffer),
+        "win32:0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(generic)));
+    const std::string revokedKey = revokedKeyBuffer;
+    DWORD_PTR reparented = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kReparentGenericOutOfTreeMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &reparented),
+        0);
+    auto revokingTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << revokingTree.dump(2);
     SetEvent(release.get());
     const auto olderResponse =
         client.await_response(older);
@@ -6482,6 +6501,11 @@ TEST_F(
         olderPayload.value(
             "events", json::array()).empty())
         << olderPayload.dump(2);
+    for (const auto& event :
+         olderPayload.value("events", json::array())) {
+        EXPECT_NE(event.value("key", ""), revokedKey)
+            << "stale reset returned a key revoked by a later visual read";
+    }
 
     auto next = client.call_tool(
         "get_visual_tree_changes",
@@ -6490,6 +6514,11 @@ TEST_F(
     EXPECT_TRUE(next.value("events", json::array()).empty())
         << "an older walk reversed the newer baseline: "
         << next.dump(2);
+    SendMessageTimeoutW(
+        s_hwnd,
+        native_fixture::kRestoreGenericParentMessage,
+        0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+        2000, &reparented);
     SetWindowTextW(generic, original.c_str());
 }
 

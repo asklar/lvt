@@ -159,6 +159,7 @@ struct TreeSnapshot {
     lvt::Element tree;
     std::string optionsKey;
     uint64_t generation = 0;
+    uint64_t authorizationGeneration = 0;
 };
 
 std::mutex g_treeSnapshotsMutex;
@@ -484,6 +485,18 @@ bool session_authorizes_property_target(
                g_sessionAuthorizedPropertyTargets.end() &&
            sessionTargets->second.targets.contains(
                {provider, handle});
+}
+
+uint64_t session_property_authorization_generation(
+    const std::string& sessionId) {
+    std::lock_guard<std::mutex> lock(
+        g_propertyAuthorizationMutex);
+    const auto found =
+        g_sessionAuthorizedPropertyTargets.find(sessionId);
+    return found ==
+               g_sessionAuthorizedPropertyTargets.end()
+        ? 0
+        : found->second.generation;
 }
 
 lvt::PropertyOperationContext property_operation_context(
@@ -2970,7 +2983,11 @@ json method_get_tree_changes(const json& params, bool uia) {
             walkGeneration < found->second.generation) {
             publishAuthorization = false;
             if (reset &&
-                found->second.optionsKey == optionsKey) {
+                found->second.optionsKey == optionsKey &&
+                (uia ||
+                 found->second.authorizationGeneration ==
+                     session_property_authorization_generation(
+                         session.id))) {
                 snapshot = true;
                 changes =
                     lvt::snapshot_added_events(
@@ -3002,7 +3019,8 @@ json method_get_tree_changes(const json& params, bool uia) {
                     changes = lvt::snapshot_added_events(current);
                     g_treeSnapshots[key] = TreeSnapshot{
                         std::move(current), optionsKey,
-                        walkGeneration};
+                        walkGeneration,
+                        uia ? 0 : walkGeneration};
                 }
             } else {
                 if (!uia &&
