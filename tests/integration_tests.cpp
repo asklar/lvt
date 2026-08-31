@@ -1696,27 +1696,57 @@ private:
 class ScopedSampleProcess {
 public:
     bool start(const fs::path& executable) {
-        STARTUPINFOA startup{sizeof(startup)};
-        PROCESS_INFORMATION info{};
-        std::string command = "\"" + executable.string() + "\"";
-        if (!CreateProcessA(
-                nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr,
-                executable.parent_path().string().c_str(), &startup, &info))
-            return false;
-        process_.reset(info.hProcess);
-        thread_.reset(info.hThread);
-        pid_ = info.dwProcessId;
-        WaitForInputIdle(process_.get(), 5000);
-        for (int attempt = 0; attempt < 100 && !hwnd_; ++attempt) {
-            if (WaitForSingleObject(process_.get(), 0) !=
-                WAIT_TIMEOUT) {
-                break;
+        for (int launchAttempt = 0;
+             launchAttempt < 3; ++launchAttempt) {
+            hwnd_ = nullptr;
+            pid_ = 0;
+            process_.reset();
+            thread_.reset();
+
+            STARTUPINFOA startup{sizeof(startup)};
+            PROCESS_INFORMATION info{};
+            std::string command =
+                "\"" + executable.string() + "\"";
+            if (!CreateProcessA(
+                    nullptr, command.data(), nullptr, nullptr,
+                    FALSE, 0, nullptr,
+                    executable.parent_path().string().c_str(),
+                    &startup, &info)) {
+                return false;
             }
-            hwnd_ = visible_window_for_pid(pid_);
-            if (!hwnd_)
-                Sleep(100);
+            process_.reset(info.hProcess);
+            thread_.reset(info.hThread);
+            pid_ = info.dwProcessId;
+            WaitForInputIdle(process_.get(), 5000);
+            for (int attempt = 0;
+                 attempt < 100 && !hwnd_; ++attempt) {
+                if (WaitForSingleObject(
+                        process_.get(), 0) !=
+                    WAIT_TIMEOUT) {
+                    break;
+                }
+                hwnd_ = visible_window_for_pid(pid_);
+                if (!hwnd_)
+                    Sleep(100);
+            }
+            if (hwnd_)
+                return true;
+
+            DWORD exitCode = STILL_ACTIVE;
+            GetExitCodeProcess(process_.get(), &exitCode);
+            fprintf(
+                stderr,
+                "managed sample '%s' did not create a visible window "
+                "(attempt %d, exit 0x%08lX)\n",
+                executable.string().c_str(),
+                launchAttempt + 1, exitCode);
+            if (exitCode == STILL_ACTIVE) {
+                TerminateProcess(process_.get(), 1);
+                WaitForSingleObject(process_.get(), 5000);
+            }
+            Sleep(250);
         }
-        return hwnd_ != nullptr;
+        return false;
     }
 
     ~ScopedSampleProcess() {
