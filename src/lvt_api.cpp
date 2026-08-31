@@ -4091,7 +4091,8 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
             throw std::runtime_error("element '" + ref +
                                      "' has no on-screen bounds, so there is nothing to aim at");
         const POINT centre{b.x + b.width / 2, b.y + b.height / 2};
-        if (!lvt::point_is_on_screen(centre))
+        if (!visual_input_test_override() &&
+            !lvt::point_is_on_screen(centre))
             throw std::runtime_error("element '" + ref +
                                      "' is not on any monitor, so it cannot be clicked");
 
