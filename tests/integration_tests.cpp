@@ -4322,7 +4322,9 @@ TEST(
     ASSERT_TRUE(identity.has_value());
 
     lvt::test_support::ExactHwndRecycleOptions options;
-    options.forceUnavailable = true;
+    options.testMode =
+        lvt::test_support::ExactHwndRecycleTestMode::
+            forceUnavailable;
     options.rememberUnavailable = false;
     const auto recycled =
         lvt::test_support::recycle_event_child_exact(
@@ -4330,7 +4332,8 @@ TEST(
             native_fixture::kEditId, options);
     ASSERT_EQ(
         recycled.outcome,
-        lvt::test_support::ExactHwndRecycleOutcome::unavailable)
+        lvt::test_support::ExactHwndRecycleOutcome::
+            forcedUnavailable)
         << recycled.reason;
     ASSERT_TRUE(IsWindow(recycled.replacement));
     EXPECT_NE(recycled.replacement, original);
@@ -4345,6 +4348,88 @@ TEST(
         *identity, lvt::UiaOptions{}, nullptr,
         &ownershipLost));
     EXPECT_TRUE(ownershipLost);
+}
+
+TEST(
+    UiaTargetIdentity,
+    ExactRecycleGlobalHeldWindowCapIsEnforced) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const HWND original =
+        GetDlgItem(fixture.hwnd, native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(original));
+    const bool suppressedBefore =
+        lvt::test_support::exact_hwnd_recycle_search_suppressed();
+
+    lvt::test_support::ExactHwndRecycleOptions options;
+    options.testMode =
+        lvt::test_support::ExactHwndRecycleTestMode::
+            forceGlobalCap;
+    options.rememberUnavailable = false;
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            fixture.hwnd, original,
+            native_fixture::kEditId, options);
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::
+            searchUnavailable)
+        << recycled.reason;
+    EXPECT_EQ(
+        recycled.peakHeldWindows,
+        native_fixture::kExactHwndRecycleMaximumHeldWindows);
+    EXPECT_EQ(recycled.remainingHeldWindows, 0u);
+    ASSERT_TRUE(IsWindow(recycled.replacement));
+    EXPECT_NE(recycled.replacement, original);
+    EXPECT_EQ(
+        lvt::test_support::exact_hwnd_recycle_search_suppressed(),
+        suppressedBefore);
+    EXPECT_TRUE(lvt::capture_uia_target_identity(
+        recycled.replacement, fixture.pid,
+        lvt::process_creation_identity(fixture.pid))
+                    .has_value());
+}
+
+TEST(
+    UiaTargetIdentity,
+    ExactRecycleHardFailureIsNotSkippableOrCached) {
+    ScopedNativeFixtureProcess fixture;
+    ASSERT_TRUE(fixture.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const HWND original =
+        GetDlgItem(fixture.hwnd, native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(original));
+    const bool suppressedBefore =
+        lvt::test_support::exact_hwnd_recycle_search_suppressed();
+
+    lvt::test_support::ExactHwndRecycleOptions options;
+    options.testMode =
+        lvt::test_support::ExactHwndRecycleTestMode::
+            forceHardFailure;
+    options.rememberUnavailable = true;
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            fixture.hwnd, original,
+            native_fixture::kEditId, options);
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::hardFailure)
+        << recycled.reason;
+    EXPECT_EQ(
+        recycled.failureStage,
+        native_fixture::ExactHwndRecycleFailureStage::
+            createSearchCandidate);
+    EXPECT_EQ(recycled.win32Error, ERROR_NOT_ENOUGH_MEMORY);
+    EXPECT_EQ(recycled.peakHeldWindows, 0u);
+    EXPECT_EQ(recycled.remainingHeldWindows, 0u);
+    ASSERT_TRUE(IsWindow(recycled.replacement));
+    EXPECT_NE(recycled.replacement, original);
+    EXPECT_EQ(
+        lvt::test_support::exact_hwnd_recycle_search_suppressed(),
+        suppressedBefore);
+    EXPECT_TRUE(lvt::capture_uia_target_identity(
+        recycled.replacement, fixture.pid,
+        lvt::process_creation_identity(fixture.pid))
+                    .has_value());
 }
 
 TEST(
@@ -4417,8 +4502,8 @@ TEST_F(
     const auto recycled =
         lvt::test_support::recycle_event_child_exact(
             s_hwnd, original);
-    if (recycled.outcome ==
-        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+    if (lvt::test_support::exact_hwnd_recycle_is_unavailable(
+            recycled)) {
         GTEST_SKIP() << recycled.reason;
     }
     ASSERT_EQ(
@@ -4549,8 +4634,8 @@ TEST_F(
     const auto result =
         json::parse(output, nullptr, false);
     ASSERT_FALSE(result.is_discarded()) << output;
-    if (recycled.outcome ==
-        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+    if (lvt::test_support::exact_hwnd_recycle_is_unavailable(
+            recycled)) {
         fs::remove(statsPath, ec);
         GTEST_SKIP() << recycled.reason;
     }
@@ -4875,8 +4960,8 @@ TEST_F(
     releaseOnExit.signal();
 
     const auto result = pending.get();
-    if (recycled.outcome ==
-        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+    if (lvt::test_support::exact_hwnd_recycle_is_unavailable(
+            recycled)) {
         GTEST_SKIP() << recycled.reason;
     }
     ASSERT_EQ(
@@ -4939,8 +5024,8 @@ TEST_F(
     releaseOnExit.signal();
 
     const auto result = pending.get();
-    if (recycled.outcome ==
-        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+    if (lvt::test_support::exact_hwnd_recycle_is_unavailable(
+            recycled)) {
         GTEST_SKIP() << recycled.reason;
     }
     ASSERT_EQ(

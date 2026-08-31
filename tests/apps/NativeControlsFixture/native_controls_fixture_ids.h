@@ -81,12 +81,45 @@ inline constexpr UINT kPopulateAdjacentToolbarSeparatorsMessage = WM_APP + 0x12C
 inline constexpr UINT kDeleteFirstToolbarSeparatorMessage = WM_APP + 0x12D;
 // Kept after the native-key/scoped-watch fixture range during series rebase.
 inline constexpr UINT kRecycleEventChildHwndMessage = WM_APP + 0x12E;
+inline constexpr UINT kGetExactHwndRecycleResultMessage = WM_APP + 0x12F;
 inline constexpr WPARAM kForceExactHwndRecycleUnavailable =
     static_cast<WPARAM>(~static_cast<WPARAM>(0));
+inline constexpr WPARAM kForceExactHwndRecycleHardFailure =
+    kForceExactHwndRecycleUnavailable - 1;
+inline constexpr WPARAM kForceExactHwndRecycleGlobalCap =
+    kForceExactHwndRecycleUnavailable - 2;
 inline constexpr DWORD kExactHwndRecycleMaximumAttempts = 131072;
-inline constexpr DWORD kExactHwndRecycleMaximumHeldWindows = 4096;
+inline constexpr DWORD kExactHwndRecycleMaximumHeldWindows = 1024;
 inline constexpr DWORD kExactHwndRecycleSearchBudgetMs = 5000;
 inline constexpr DWORD kExactHwndRecycleMessageTimeoutMs = 20000;
+
+enum class ExactHwndRecycleStatus : LRESULT {
+    notRun = 0,
+    achieved = 1,
+    searchUnavailable = 2,
+    forcedUnavailable = 3,
+    hardFailure = 4,
+};
+
+enum class ExactHwndRecycleFailureStage : LRESULT {
+    none = 0,
+    invalidTarget = 1,
+    destroyOriginal = 2,
+    createSearchCandidate = 3,
+    destroySearchCandidate = 4,
+    cleanupHeldWindow = 5,
+    restoreTarget = 6,
+    protocol = 7,
+};
+
+enum class ExactHwndRecycleResultField : WPARAM {
+    replacement = 0,
+    peakHeldWindows = 1,
+    remainingHeldWindows = 2,
+    failureStage = 3,
+    win32Error = 4,
+};
+
 inline constexpr LRESULT kSummaryProtocolVersion = 2;
 inline constexpr size_t kLongToolbarTextLength = 6000;
 inline constexpr size_t kLongItemTextLength = 5000;

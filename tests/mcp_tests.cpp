@@ -1131,6 +1131,133 @@ TEST(McpUiaIdentity, ReplacementDuringFallbackFailsOwnershipLost) {
         << response.dump(2);
 }
 
+TEST(
+    McpUiaIdentity,
+    ExactRecycleHardFailureDrainsPendingRequestAndServerRecovers) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner == fixture->pid &&
+                GetDlgItem(candidate, native_fixture::kEditId)) {
+                fixture->root = candidate;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+    const HWND edit =
+        GetDlgItem(fixture.root, native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(edit));
+    char editHwnd[32]{};
+    snprintf(
+        editHwnd, sizeof(editHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(edit)));
+
+    const std::string base =
+        "Local\\LvtMcpHardRecycle_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable failConnected(
+        "LVT_TEST_UIA_FAIL_CONNECTED_TREE_ONCE", "1");
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_UIA_ONE_SHOT_AFTER_ELEMENT_GATE", base);
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", editHwnd}, {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    const int request = client.send_request(
+        "tools/call",
+        json{{"name", "get_uia_tree"},
+             {"arguments", json{{"session", session}}}});
+    lvt::test_support::ScopedEventSignal releaseOnExit(
+        release.get());
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0)
+        << "the MCP fallback did not reach ElementFromHandle";
+
+    const bool suppressedBefore =
+        lvt::test_support::exact_hwnd_recycle_search_suppressed();
+    lvt::test_support::ExactHwndRecycleOptions options;
+    options.testMode =
+        lvt::test_support::ExactHwndRecycleTestMode::
+            forceHardFailure;
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            fixture.root, edit, native_fixture::kEditId,
+            options);
+    releaseOnExit.signal();
+    const auto response = client.await_response(request);
+
+    ASSERT_TRUE(response.contains("result"))
+        << response.dump(2);
+    EXPECT_TRUE(response["result"].value("isError", false))
+        << response.dump(2);
+    EXPECT_NE(
+        response.dump().find("ownershipLost"),
+        std::string::npos)
+        << response.dump(2);
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::hardFailure)
+        << recycled.reason;
+    EXPECT_EQ(
+        recycled.failureStage,
+        native_fixture::ExactHwndRecycleFailureStage::
+            createSearchCandidate);
+    EXPECT_EQ(recycled.peakHeldWindows, 0u);
+    EXPECT_EQ(recycled.remainingHeldWindows, 0u);
+    ASSERT_TRUE(IsWindow(recycled.replacement));
+    EXPECT_NE(recycled.replacement, edit);
+    EXPECT_EQ(
+        lvt::test_support::exact_hwnd_recycle_search_suppressed(),
+        suppressedBefore);
+
+    char replacementHwnd[32]{};
+    snprintf(
+        replacementHwnd, sizeof(replacementHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(
+                recycled.replacement)));
+    const auto replacementConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", replacementHwnd}, {"mode", "uia"}});
+    const auto replacementSession =
+        replacementConnected.value("session", "");
+    ASSERT_FALSE(replacementSession.empty())
+        << replacementConnected.dump(2);
+    const auto replacementTree = client.call_tool(
+        "get_uia_tree",
+        json{{"session", replacementSession}});
+    EXPECT_TRUE(replacementTree.contains("root"))
+        << replacementTree.dump(2);
+}
+
 TEST(McpUiaIdentity, ElementlessKeyboardActionsReturnStructuredOwnershipLost) {
     ManagedSampleProcess sample;
     ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
@@ -1627,8 +1754,8 @@ TEST(
     ASSERT_TRUE(response.contains("result"))
         << response.dump(2);
 
-    if (recycled.outcome ==
-        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+    if (lvt::test_support::exact_hwnd_recycle_is_unavailable(
+            recycled)) {
         client.shutdown();
         sample.stop();
         GTEST_SKIP() << recycled.reason;
@@ -1909,8 +2036,8 @@ TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
         lvt::test_support::recycle_event_child_exact(
             fixture.root, original,
             native_fixture::kEditId);
-    if (recycled.outcome ==
-        lvt::test_support::ExactHwndRecycleOutcome::unavailable) {
+    if (lvt::test_support::exact_hwnd_recycle_is_unavailable(
+            recycled)) {
         client.shutdown();
         sample.stop();
         GTEST_SKIP() << recycled.reason;

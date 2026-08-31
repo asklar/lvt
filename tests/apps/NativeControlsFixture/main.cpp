@@ -1,6 +1,7 @@
 #include "native_controls_fixture_ids.h"
 
 #include <CommCtrl.h>
+#include <algorithm>
 #include <array>
 #include <sstream>
 #include <string>
@@ -39,6 +40,17 @@ LONG g_delayedPointerState = 0;
 bool g_ownerDrawStatusStable = true;
 int g_ownerDrawStatusPaints = 0;
 size_t g_tabExtraBytes = 0;
+
+struct ExactHwndRecycleResultState {
+    fixture::ExactHwndRecycleStatus status =
+        fixture::ExactHwndRecycleStatus::notRun;
+    HWND replacement = nullptr;
+    DWORD peakHeldWindows = 0;
+    DWORD remainingHeldWindows = 0;
+    fixture::ExactHwndRecycleFailureStage failureStage =
+        fixture::ExactHwndRecycleFailureStage::none;
+    DWORD win32Error = ERROR_SUCCESS;
+} g_exactHwndRecycleResult;
 
 bool committed_pointer(const void* pointer) {
     if (!pointer)
@@ -976,24 +988,83 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             return destroyed;
         }
         return FALSE;
+    case fixture::kGetExactHwndRecycleResultMessage:
+        switch (
+            static_cast<fixture::ExactHwndRecycleResultField>(
+                wParam)) {
+        case fixture::ExactHwndRecycleResultField::replacement:
+            return reinterpret_cast<LRESULT>(
+                g_exactHwndRecycleResult.replacement);
+        case fixture::ExactHwndRecycleResultField::peakHeldWindows:
+            return static_cast<LRESULT>(
+                g_exactHwndRecycleResult.peakHeldWindows);
+        case fixture::ExactHwndRecycleResultField::remainingHeldWindows:
+            return static_cast<LRESULT>(
+                g_exactHwndRecycleResult.remainingHeldWindows);
+        case fixture::ExactHwndRecycleResultField::failureStage:
+            return static_cast<LRESULT>(
+                g_exactHwndRecycleResult.failureStage);
+        case fixture::ExactHwndRecycleResultField::win32Error:
+            return static_cast<LRESULT>(
+                g_exactHwndRecycleResult.win32Error);
+        }
+        return 0;
     case fixture::kRecycleEventChildHwndMessage: {
+        g_exactHwndRecycleResult = {};
         const bool recycleEdit =
             lParam == fixture::kEditId;
         HWND& target = recycleEdit
             ? g_controls.edit
             : g_controls.eventChild;
         const HWND original = target;
-        if (!original || !IsWindow(original))
-            return 0;
-        if (!DestroyWindow(original))
-            return 0;
+        const auto recordHardFailure = [&](
+            fixture::ExactHwndRecycleFailureStage stage,
+            DWORD error) {
+            if (g_exactHwndRecycleResult.failureStage ==
+                fixture::ExactHwndRecycleFailureStage::none) {
+                g_exactHwndRecycleResult.failureStage = stage;
+                g_exactHwndRecycleResult.win32Error =
+                    error != ERROR_SUCCESS
+                        ? error
+                        : ERROR_GEN_FAILURE;
+            }
+        };
+        if (!original || !IsWindow(original)) {
+            recordHardFailure(
+                fixture::ExactHwndRecycleFailureStage::invalidTarget,
+                ERROR_INVALID_WINDOW_HANDLE);
+            g_exactHwndRecycleResult.status =
+                fixture::ExactHwndRecycleStatus::hardFailure;
+            g_exactHwndRecycleResult.replacement =
+                IsWindow(target) ? target : nullptr;
+            return static_cast<LRESULT>(
+                g_exactHwndRecycleResult.status);
+        }
+        SetLastError(ERROR_SUCCESS);
+        if (!DestroyWindow(original)) {
+            recordHardFailure(
+                fixture::ExactHwndRecycleFailureStage::destroyOriginal,
+                GetLastError());
+            g_exactHwndRecycleResult.status =
+                fixture::ExactHwndRecycleStatus::hardFailure;
+            g_exactHwndRecycleResult.replacement = original;
+            return static_cast<LRESULT>(
+                g_exactHwndRecycleResult.status);
+        }
         target = nullptr;
 
         const bool forceUnavailable =
             wParam ==
             fixture::kForceExactHwndRecycleUnavailable;
+        const bool forceHardFailure =
+            wParam ==
+            fixture::kForceExactHwndRecycleHardFailure;
+        const bool forceGlobalCap =
+            wParam ==
+            fixture::kForceExactHwndRecycleGlobalCap;
         const DWORD maximumAttempts =
-            !forceUnavailable && wParam != 0
+            !forceUnavailable && !forceHardFailure &&
+                    !forceGlobalCap && wParam != 0
                 ? static_cast<DWORD>(wParam)
                 : fixture::kExactHwndRecycleMaximumAttempts;
         const ULONGLONG deadline =
@@ -1001,8 +1072,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
             fixture::kExactHwndRecycleSearchBudgetMs;
         const auto originalIndex =
             reinterpret_cast<uintptr_t>(original) & 0xFFFFu;
-        const auto createCandidate = [&](bool asEdit = false) -> HWND {
-            return CreateWindowExW(
+        const auto createCandidate = [&](
+            bool asEdit,
+            fixture::ExactHwndRecycleFailureStage stage) -> HWND {
+            SetLastError(ERROR_SUCCESS);
+            const HWND candidate = CreateWindowExW(
                 asEdit ? WS_EX_CLIENTEDGE : 0,
                 asEdit ? WC_EDITW
                        : fixture::kGenericChildClass,
@@ -1022,30 +1096,94 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                             ? fixture::kEditId
                             : fixture::kEventChildId)),
                 GetModuleHandleW(nullptr), nullptr);
+            if (!candidate)
+                recordHardFailure(stage, GetLastError());
+            return candidate;
         };
         std::vector<HWND> heldWindows;
+        std::vector<HWND> cleanupOnlyWindows;
+        HWND originalIndexWindow = nullptr;
+        bool boundedSearchExhausted = false;
+        bool achieved = false;
+        const auto destroyTracked = [&](
+            HWND& window,
+            fixture::ExactHwndRecycleFailureStage stage) {
+            if (!window)
+                return true;
+            if (!IsWindow(window)) {
+                recordHardFailure(
+                    stage, ERROR_INVALID_WINDOW_HANDLE);
+                window = nullptr;
+                return false;
+            }
+            SetLastError(ERROR_SUCCESS);
+            if (!DestroyWindow(window)) {
+                recordHardFailure(stage, GetLastError());
+                return false;
+            }
+            window = nullptr;
+            return true;
+        };
+        const auto holdWindow = [&](HWND& candidate) {
+            if (!candidate)
+                return false;
+            if (heldWindows.size() >=
+                fixture::kExactHwndRecycleMaximumHeldWindows) {
+                boundedSearchExhausted = true;
+                destroyTracked(
+                    candidate,
+                    fixture::ExactHwndRecycleFailureStage::
+                        destroySearchCandidate);
+                if (candidate) {
+                    cleanupOnlyWindows.push_back(candidate);
+                    candidate = nullptr;
+                }
+                return false;
+            }
+            heldWindows.push_back(candidate);
+            candidate = nullptr;
+            g_exactHwndRecycleResult.peakHeldWindows =
+                std::max(
+                    g_exactHwndRecycleResult.peakHeldWindows,
+                    static_cast<DWORD>(heldWindows.size()));
+            return true;
+        };
         const auto acquireOriginalIndex = [&]() -> HWND {
-            for (DWORD attempt = 0;
-                 attempt <
-                     fixture::kExactHwndRecycleMaximumHeldWindows &&
-                 GetTickCount64() < deadline;
-                 ++attempt) {
-                HWND candidate = createCandidate();
+            while (
+                heldWindows.size() <
+                    fixture::kExactHwndRecycleMaximumHeldWindows &&
+                (forceGlobalCap ||
+                 GetTickCount64() < deadline)) {
+                HWND candidate = createCandidate(
+                    false,
+                    fixture::ExactHwndRecycleFailureStage::
+                        createSearchCandidate);
                 if (!candidate)
                     return nullptr;
-                if ((reinterpret_cast<uintptr_t>(candidate) & 0xFFFFu) ==
-                    originalIndex) {
+                if (!forceGlobalCap &&
+                    (reinterpret_cast<uintptr_t>(candidate) &
+                     0xFFFFu) == originalIndex) {
                     return candidate;
                 }
-                heldWindows.push_back(candidate);
+                if (!holdWindow(candidate))
+                    return nullptr;
             }
+            boundedSearchExhausted = true;
             return nullptr;
         };
-        HWND originalIndexWindow =
-            forceUnavailable ? nullptr : acquireOriginalIndex();
+        if (forceHardFailure) {
+            recordHardFailure(
+                fixture::ExactHwndRecycleFailureStage::
+                    createSearchCandidate,
+                ERROR_NOT_ENOUGH_MEMORY);
+        } else if (!forceUnavailable) {
+            originalIndexWindow = acquireOriginalIndex();
+        }
         uint16_t generationStep = 0;
         for (DWORD attempt = 0;
              originalIndexWindow &&
+             g_exactHwndRecycleResult.failureStage ==
+                 fixture::ExactHwndRecycleFailureStage::none &&
              attempt < maximumAttempts &&
              GetTickCount64() < deadline;
              ++attempt) {
@@ -1066,23 +1204,38 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                 static_cast<uint16_t>(
                     currentGeneration + generationStep) ==
                     originalGeneration;
-            DestroyWindow(originalIndexWindow);
+            if (!destroyTracked(
+                    originalIndexWindow,
+                    fixture::ExactHwndRecycleFailureStage::
+                        destroySearchCandidate)) {
+                break;
+            }
             HWND candidate =
-                createCandidate(createFinalEdit);
+                createCandidate(
+                    createFinalEdit,
+                    fixture::ExactHwndRecycleFailureStage::
+                        createSearchCandidate);
             if (!candidate)
                 break;
             if (candidate == original) {
                 target = candidate;
-                ShowWindow(candidate, SW_SHOWNA);
-                for (HWND held : heldWindows)
-                    DestroyWindow(held);
-                return reinterpret_cast<LRESULT>(candidate);
+                candidate = nullptr;
+                ShowWindow(target, SW_SHOWNA);
+                achieved = true;
+                break;
             }
             if (createFinalEdit) {
                 // The allocator did not reuse the expected slot. Resume cheap
                 // generic churn rather than paying EDIT initialization cost
                 // for the rest of the generation cycle.
-                DestroyWindow(candidate);
+                if (!destroyTracked(
+                        candidate,
+                        fixture::ExactHwndRecycleFailureStage::
+                            destroySearchCandidate)) {
+                    cleanupOnlyWindows.push_back(candidate);
+                    candidate = nullptr;
+                    break;
+                }
                 originalIndexWindow = acquireOriginalIndex();
                 generationStep = 0;
                 continue;
@@ -1103,21 +1256,106 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                     generationStep = observedStep;
                 originalIndexWindow = candidate;
             } else {
-                heldWindows.push_back(candidate);
+                if (!holdWindow(candidate))
+                    break;
                 originalIndexWindow = acquireOriginalIndex();
             }
         }
-        if (originalIndexWindow)
-            DestroyWindow(originalIndexWindow);
-        for (HWND held : heldWindows)
-            DestroyWindow(held);
-        target = createCandidate(recycleEdit);
-        if (target) {
-            ShowWindow(target, SW_SHOWNA);
-            if (target == original)
-                return reinterpret_cast<LRESULT>(target);
+        if (!achieved &&
+            g_exactHwndRecycleResult.failureStage ==
+                fixture::ExactHwndRecycleFailureStage::none) {
+            boundedSearchExhausted = true;
         }
-        return 0;
+
+        for (int cleanupAttempt = 0;
+             cleanupAttempt < 3 && originalIndexWindow;
+             ++cleanupAttempt) {
+            destroyTracked(
+                originalIndexWindow,
+                fixture::ExactHwndRecycleFailureStage::
+                    destroySearchCandidate);
+        }
+        for (int cleanupAttempt = 0; cleanupAttempt < 3;
+             ++cleanupAttempt) {
+            for (HWND& held : heldWindows) {
+                destroyTracked(
+                    held,
+                    fixture::ExactHwndRecycleFailureStage::
+                        cleanupHeldWindow);
+            }
+            for (HWND& held : cleanupOnlyWindows) {
+                destroyTracked(
+                    held,
+                    fixture::ExactHwndRecycleFailureStage::
+                        cleanupHeldWindow);
+            }
+        }
+        g_exactHwndRecycleResult.remainingHeldWindows =
+            static_cast<DWORD>(std::count_if(
+                heldWindows.begin(), heldWindows.end(),
+                [](HWND held) {
+                    return held && IsWindow(held);
+                }) +
+            std::count_if(
+                cleanupOnlyWindows.begin(),
+                cleanupOnlyWindows.end(),
+                [](HWND held) {
+                    return held && IsWindow(held);
+                }) +
+            (originalIndexWindow &&
+                     IsWindow(originalIndexWindow)
+                 ? 1
+                 : 0));
+
+        if (!target) {
+            target = createCandidate(
+                recycleEdit,
+                fixture::ExactHwndRecycleFailureStage::
+                    restoreTarget);
+        }
+        if (forceUnavailable && target == original) {
+            if (destroyTracked(
+                    target,
+                    fixture::ExactHwndRecycleFailureStage::
+                        restoreTarget)) {
+                target = createCandidate(
+                    recycleEdit,
+                    fixture::ExactHwndRecycleFailureStage::
+                        restoreTarget);
+            }
+        }
+        if (target)
+            ShowWindow(target, SW_SHOWNA);
+
+        if (g_exactHwndRecycleResult.remainingHeldWindows != 0) {
+            recordHardFailure(
+                fixture::ExactHwndRecycleFailureStage::
+                    cleanupHeldWindow,
+                ERROR_BUSY);
+        }
+        g_exactHwndRecycleResult.replacement = target;
+        if (g_exactHwndRecycleResult.failureStage !=
+            fixture::ExactHwndRecycleFailureStage::none) {
+            g_exactHwndRecycleResult.status =
+                fixture::ExactHwndRecycleStatus::hardFailure;
+        } else if (achieved || target == original) {
+            g_exactHwndRecycleResult.status =
+                fixture::ExactHwndRecycleStatus::achieved;
+        } else if (forceUnavailable) {
+            g_exactHwndRecycleResult.status =
+                fixture::ExactHwndRecycleStatus::forcedUnavailable;
+        } else if (boundedSearchExhausted) {
+            g_exactHwndRecycleResult.status =
+                fixture::ExactHwndRecycleStatus::searchUnavailable;
+        } else {
+            recordHardFailure(
+                fixture::ExactHwndRecycleFailureStage::protocol,
+                ERROR_INVALID_DATA);
+            g_exactHwndRecycleResult.status =
+                fixture::ExactHwndRecycleStatus::hardFailure;
+        }
+        return static_cast<LRESULT>(
+            g_exactHwndRecycleResult.status);
     }
     case fixture::kHangMessage:
         Sleep(2500);
