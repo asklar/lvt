@@ -275,13 +275,18 @@ from their root/descendant tree; compact handles do not authorize arbitrary
 same-process top-level windows, and every operation repeats the root/descendant
 check so reparented controls stop being actionable. Publishing a new visual
 snapshot replaces, rather than accumulates, the session allow-list.
-Connection lookup rechecks session liveness under the connection-map lock so a
-disconnect cannot recreate an erased session entry.
+Connection lookup validates session liveness before and after connection-map
+work, never while holding the connection-map lock, so disconnect cannot
+recreate an erased entry and authorization publication cannot deadlock against
+property connection acquisition.
 
 Native durable keys are deliberately independent of those mutation handles.
 Every HWND-backed Win32/common-control node uses the same compact
 `win32:0x…`/`comctl:0x…` key in one-shot and persistent trees, derived from its
-HWND. Logical common-control children use public-safe identities: unique
+HWND plus an architecture-neutral window-lifetime sentinel. Exact numeric HWND
+reuse receives a fresh key. When UIPI prevents sentinel installation, the node
+remains inspectable but receives no mutable provider handle. Logical
+common-control children use public-safe identities scoped to that lifetime: unique
 list/tab text fingerprints, a fingerprint of the documented tree-item handle,
 and unique toolbar command ids. Duplicate/unsafe identities, toolbar
 separators, and status-bar parts fall back to parent-local structural slots;
