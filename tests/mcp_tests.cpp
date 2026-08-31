@@ -152,7 +152,8 @@ private:
 
 class NativePublicationGate {
 public:
-    explicit NativePublicationGate(const char* method) {
+    explicit NativePublicationGate(
+        const char* method, bool initiallyArmed = true) {
         const auto serial = nextSerial_.fetch_add(1);
         base_ =
             "Local\\lvt-native-publication-" +
@@ -162,7 +163,10 @@ public:
             nullptr, TRUE, FALSE, (base_ + "-entered").c_str()));
         release_.reset(CreateEventA(
             nullptr, TRUE, FALSE, (base_ + "-release").c_str()));
-        if (entered_ && release_) {
+        armed_.reset(CreateEventA(
+            nullptr, TRUE, initiallyArmed,
+            (base_ + "-armed").c_str()));
+        if (entered_ && release_ && armed_) {
             gateVariable_ = std::make_unique<ScopedEnvironmentVariable>(
                 "LVT_TEST_NATIVE_PUBLICATION_GATE", base_);
             methodVariable_ = std::make_unique<ScopedEnvironmentVariable>(
@@ -175,8 +179,13 @@ public:
     }
 
     bool valid() const {
-        return entered_ && release_ &&
+        return entered_ && release_ && armed_ &&
                gateVariable_ && methodVariable_;
+    }
+
+    void arm() {
+        if (armed_)
+            SetEvent(armed_.get());
     }
 
     bool wait_until_entered() const {
@@ -195,8 +204,69 @@ private:
     std::string base_;
     wil::unique_handle entered_;
     wil::unique_handle release_;
+    wil::unique_handle armed_;
     std::unique_ptr<ScopedEnvironmentVariable> gateVariable_;
     std::unique_ptr<ScopedEnvironmentVariable> methodVariable_;
+};
+
+class AuthorizationTestGate {
+public:
+    explicit AuthorizationTestGate(
+        const char* environmentVariable) {
+        const auto serial = nextSerial_.fetch_add(1);
+        base_ =
+            "Local\\lvt-authorization-" +
+            std::to_string(GetCurrentProcessId()) + "-" +
+            std::to_string(serial);
+        entered_.reset(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (base_ + "-entered").c_str()));
+        release_.reset(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (base_ + "-release").c_str()));
+        armed_.reset(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (base_ + "-armed").c_str()));
+        if (entered_ && release_ && armed_) {
+            variable_ =
+                std::make_unique<ScopedEnvironmentVariable>(
+                    environmentVariable, base_);
+        }
+    }
+
+    ~AuthorizationTestGate() {
+        release();
+    }
+
+    bool valid() const {
+        return entered_ && release_ && armed_ &&
+               variable_;
+    }
+
+    void arm() {
+        if (armed_)
+            SetEvent(armed_.get());
+    }
+
+    bool wait_until_entered() const {
+        return entered_ &&
+               WaitForSingleObject(
+                   entered_.get(), 10000) ==
+                   WAIT_OBJECT_0;
+    }
+
+    void release() {
+        if (release_)
+            SetEvent(release_.get());
+    }
+
+private:
+    inline static std::atomic<uint64_t> nextSerial_{1};
+    std::string base_;
+    wil::unique_handle entered_;
+    wil::unique_handle release_;
+    wil::unique_handle armed_;
+    std::unique_ptr<ScopedEnvironmentVariable> variable_;
 };
 
 fs::path plugin_stats_path(const std::string& testName) {
@@ -6814,6 +6884,86 @@ TEST_F(
     EXPECT_TRUE(isError)
         << "disconnect leaked published targets into a replacement session: "
         << unpublished.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    NativePropertyLeaseDoesNotDeadlockSnapshotPublication) {
+    AuthorizationTestGate propertyGate(
+        "LVT_TEST_NATIVE_PROPERTY_LEASE_GATE");
+    AuthorizationTestGate publicationGate(
+        "LVT_TEST_AUTHORIZATION_PUBLICATION_GATE");
+    NativePublicationGate treeGate(
+        "get_visual_tree", false);
+    ASSERT_TRUE(propertyGate.valid());
+    ASSERT_TRUE(publicationGate.valid());
+    ASSERT_TRUE(treeGate.valid());
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto* generic =
+        find_by_class(
+            tree["root"],
+            "LvtNativePropertyFixtureText");
+    ASSERT_NE(generic, nullptr);
+    const auto genericKey = generic->value("key", "");
+    ASSERT_EQ(genericKey.rfind("win32:0x", 0), 0u);
+
+    bool isError = false;
+    auto baseline = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+
+    propertyGate.arm();
+    publicationGate.arm();
+    treeGate.arm();
+
+    const int refresh = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_TRUE(treeGate.wait_until_entered())
+        << "the refresh did not finish its target-guarded tree walk";
+
+    const int property = client.send_request(
+        "tools/call",
+        json{{"name", "get_editable_properties"},
+             {"arguments",
+              json{{"session", session},
+                   {"element", genericKey}}}});
+    ASSERT_TRUE(propertyGate.wait_until_entered())
+        << "the native property request did not acquire its authorization lease";
+
+    treeGate.release();
+    ASSERT_TRUE(publicationGate.wait_until_entered())
+        << "the completed snapshot did not reach authorization publication";
+
+    publicationGate.release();
+    propertyGate.release();
+
+    const auto propertyResponse =
+        client.await_response(property);
+    const auto refreshResponse =
+        client.await_response(refresh);
+    ASSERT_TRUE(propertyResponse.contains("result"))
+        << propertyResponse.dump(2);
+    ASSERT_TRUE(refreshResponse.contains("result"))
+        << refreshResponse.dump(2);
+    EXPECT_FALSE(
+        propertyResponse["result"].value("isError", true))
+        << propertyResponse.dump(2);
+    EXPECT_FALSE(
+        refreshResponse["result"].value("isError", true))
+        << refreshResponse.dump(2);
 }
 
 TEST_F(NativeMcpFixture, DisconnectRacingNativePropertyReadDoesNotRecreateSession) {

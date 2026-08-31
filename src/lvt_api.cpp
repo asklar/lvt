@@ -402,11 +402,44 @@ void signal_skipped_authorization_commit_for_testing() {
         SetEvent(event.get());
 }
 
+void wait_for_authorization_test_gate(
+    const char* environmentVariable) {
+    char base[192]{};
+    const DWORD length = GetEnvironmentVariableA(
+        environmentVariable, base,
+        static_cast<DWORD>(_countof(base)));
+    if (length == 0 || length >= _countof(base))
+        return;
+    const std::string enteredName =
+        std::string(base) + "-entered";
+    const std::string releaseName =
+        std::string(base) + "-release";
+    const std::string armedName =
+        std::string(base) + "-armed";
+    wil::unique_handle armed(OpenEventA(
+        SYNCHRONIZE, FALSE, armedName.c_str()));
+    if (!armed ||
+        WaitForSingleObject(armed.get(), 0) !=
+            WAIT_OBJECT_0) {
+        return;
+    }
+    wil::unique_handle entered(OpenEventA(
+        EVENT_MODIFY_STATE, FALSE, enteredName.c_str()));
+    wil::unique_handle release(OpenEventA(
+        SYNCHRONIZE, FALSE, releaseName.c_str()));
+    if (!entered || !release)
+        return;
+    SetEvent(entered.get());
+    WaitForSingleObject(release.get(), 10000);
+}
+
 bool publish_session_property_authorization_locked(
     const Session& session,
     StagedPropertyAuthorization& staged) {
     if (!staged.complete)
         return true;
+    wait_for_authorization_test_gate(
+        "LVT_TEST_AUTHORIZATION_PUBLICATION_GATE");
     std::lock_guard<std::mutex> authorizationLock(
         g_propertyAuthorizationMutex);
     auto& current =
@@ -849,6 +882,14 @@ void wait_for_native_publication_test_gate(
     if (baseLength == 0 || baseLength >= _countof(base))
         return;
 
+    const std::string armedName = std::string(base) + "-armed";
+    wil::unique_handle armed(OpenEventA(
+        SYNCHRONIZE, FALSE, armedName.c_str()));
+    if (armed &&
+        WaitForSingleObject(armed.get(), 0) !=
+            WAIT_OBJECT_0) {
+        return;
+    }
     const std::string enteredName = std::string(base) + "-entered";
     const std::string releaseName = std::string(base) + "-release";
     wil::unique_handle entered(OpenEventA(
@@ -2819,24 +2860,31 @@ json method_get_editable_properties(const json& params) {
     const auto operationContext =
         property_operation_context(
             session, target.provider);
-    std::unique_lock<std::mutex> nativeAuthorizationLease;
-    if (target.provider == "win32" ||
-        target.provider == "comctl") {
-        nativeAuthorizationLease =
-            std::unique_lock<std::mutex>(
-                g_propertyAuthorizationMutex);
-    }
     ensure_typed_property_session_active(session);
-    auto result = connection->get_property_snapshot(
-        handle, operationContext);
+    const bool nativeProvider =
+        target.provider == "win32" ||
+        target.provider == "comctl";
+    const auto readProperties = [&] {
+        std::unique_lock<std::mutex>
+            nativeAuthorizationLease;
+        if (nativeProvider) {
+            nativeAuthorizationLease =
+                std::unique_lock<std::mutex>(
+                    g_propertyAuthorizationMutex);
+            wait_for_authorization_test_gate(
+                "LVT_TEST_NATIVE_PROPERTY_LEASE_GATE");
+        }
+        return connection->get_property_snapshot(
+            handle, operationContext);
+    };
+    auto result = readProperties();
     if (!result.ok && !connection->is_alive() &&
         session_is_active(session.id)) {
         ensure_typed_property_session_active(session);
         connection = typed_property_connection(session, target);
         handle = resolve_property_handle(session, target, connection);
         ensure_typed_property_session_active(session);
-        result = connection->get_property_snapshot(
-            handle, operationContext);
+        result = readProperties();
     }
     ensure_typed_property_session_active(session);
     if (!result.ok &&
@@ -2879,18 +2927,23 @@ json method_set_property(const json& params, bool allowInput) {
     const auto operationContext =
         property_operation_context(
             session, target.provider);
-    std::unique_lock<std::mutex> nativeAuthorizationLease;
-    if (target.provider == "win32" ||
-        target.provider == "comctl") {
-        nativeAuthorizationLease =
-            std::unique_lock<std::mutex>(
-                g_propertyAuthorizationMutex);
-    }
     ensure_typed_property_session_active(session);
-    const auto result =
-        connection->set_property(
+    lvt::PropertyMutationResult result;
+    {
+        std::unique_lock<std::mutex>
+            nativeAuthorizationLease;
+        if (target.provider == "win32" ||
+            target.provider == "comctl") {
+            nativeAuthorizationLease =
+                std::unique_lock<std::mutex>(
+                    g_propertyAuthorizationMutex);
+            wait_for_authorization_test_gate(
+                "LVT_TEST_NATIVE_PROPERTY_LEASE_GATE");
+        }
+        result = connection->set_property(
             handle, descriptorId, value,
             operationContext);
+    }
     ensure_typed_property_session_active(session);
     if (!result.ok &&
         !session_is_active(session.id)) {
@@ -2927,18 +2980,23 @@ json method_clear_property(const json& params, bool allowInput) {
     const auto operationContext =
         property_operation_context(
             session, target.provider);
-    std::unique_lock<std::mutex> nativeAuthorizationLease;
-    if (target.provider == "win32" ||
-        target.provider == "comctl") {
-        nativeAuthorizationLease =
-            std::unique_lock<std::mutex>(
-                g_propertyAuthorizationMutex);
-    }
     ensure_typed_property_session_active(session);
-    const auto result =
-        connection->clear_property(
+    lvt::PropertyMutationResult result;
+    {
+        std::unique_lock<std::mutex>
+            nativeAuthorizationLease;
+        if (target.provider == "win32" ||
+            target.provider == "comctl") {
+            nativeAuthorizationLease =
+                std::unique_lock<std::mutex>(
+                    g_propertyAuthorizationMutex);
+            wait_for_authorization_test_gate(
+                "LVT_TEST_NATIVE_PROPERTY_LEASE_GATE");
+        }
+        result = connection->clear_property(
             handle, descriptorId,
             operationContext);
+    }
     ensure_typed_property_session_active(session);
     if (!result.ok &&
         !session_is_active(session.id)) {
