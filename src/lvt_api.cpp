@@ -314,9 +314,13 @@ struct StagedPropertyAuthorization {
     std::map<std::string, std::set<uint64_t>>
         providerRoots;
     std::map<std::string, bool> injectedHosts;
+    std::shared_ptr<lvt::Element> nativeTree;
     uint64_t generation = 0;
     bool complete = false;
 };
+
+void publish_native_property_targets(
+    const Session& session, const lvt::Element& root);
 
 void collect_injected_host_state(
     const lvt::Element& element,
@@ -379,6 +383,8 @@ StagedPropertyAuthorization stage_session_property_authorization(
         session, root, true, std::nullopt, staged);
     collect_injected_host_state(
         root, staged.injectedHosts);
+    staged.nativeTree =
+        std::make_shared<lvt::Element>(root);
     staged.complete = true;
     return staged;
 }
@@ -407,6 +413,10 @@ bool publish_session_property_authorization_locked(
         g_sessionAuthorizedPropertyTargets[session.id];
     if (staged.generation < current.generation)
         return false;
+    if (staged.nativeTree) {
+        publish_native_property_targets(
+            session, *staged.nativeTree);
+    }
     current.targets = std::move(staged.targets);
     current.providerRoots =
         std::move(staged.providerRoots);
@@ -1789,9 +1799,6 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             }
             if (stagedAuthorization)
                 *stagedAuthorization = std::move(staged);
-            ensure_session_target_identity_current(
-                session, "before publishing native property targets");
-            publish_native_property_targets(session, tree);
             drain_session_connection_events(
                 session.id,
                 ConnectionEventDrainScope::visualAfterSuccess);
@@ -2812,6 +2819,13 @@ json method_get_editable_properties(const json& params) {
     const auto operationContext =
         property_operation_context(
             session, target.provider);
+    std::unique_lock<std::mutex> nativeAuthorizationLease;
+    if (target.provider == "win32" ||
+        target.provider == "comctl") {
+        nativeAuthorizationLease =
+            std::unique_lock<std::mutex>(
+                g_propertyAuthorizationMutex);
+    }
     ensure_typed_property_session_active(session);
     auto result = connection->get_property_snapshot(
         handle, operationContext);
@@ -2865,6 +2879,13 @@ json method_set_property(const json& params, bool allowInput) {
     const auto operationContext =
         property_operation_context(
             session, target.provider);
+    std::unique_lock<std::mutex> nativeAuthorizationLease;
+    if (target.provider == "win32" ||
+        target.provider == "comctl") {
+        nativeAuthorizationLease =
+            std::unique_lock<std::mutex>(
+                g_propertyAuthorizationMutex);
+    }
     ensure_typed_property_session_active(session);
     const auto result =
         connection->set_property(
@@ -2906,6 +2927,13 @@ json method_clear_property(const json& params, bool allowInput) {
     const auto operationContext =
         property_operation_context(
             session, target.provider);
+    std::unique_lock<std::mutex> nativeAuthorizationLease;
+    if (target.provider == "win32" ||
+        target.provider == "comctl") {
+        nativeAuthorizationLease =
+            std::unique_lock<std::mutex>(
+                g_propertyAuthorizationMutex);
+    }
     ensure_typed_property_session_active(session);
     const auto result =
         connection->clear_property(
