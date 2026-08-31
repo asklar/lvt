@@ -26,7 +26,9 @@ jobs:
       - name: Set up .NET 10 (for the Viewer)
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: |
+            10.0.x
+            6.0.x
 
       - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
         run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
@@ -129,7 +131,9 @@ jobs:
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: |
+            10.0.x
+            6.0.x
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
@@ -263,7 +267,9 @@ jobs:
         if: matrix.arch == 'arm64'
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: |
+            10.0.x
+            6.0.x
 
       # This configuration builds without managed helpers, tests, or Rust,
       # exactly as it does inside vcpkg. The ARM64 leg uses dotnet only in a

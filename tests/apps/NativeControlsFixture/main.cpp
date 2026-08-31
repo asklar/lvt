@@ -1099,7 +1099,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
                 asEdit ? WS_EX_CLIENTEDGE : 0,
                 asEdit ? WC_EDITW
                        : fixture::kGenericChildClass,
-                asEdit ? L"Editable value"
+                asEdit ? L"Editable seed"
                        : L"Event child",
                 WS_CHILD |
                     (asEdit
