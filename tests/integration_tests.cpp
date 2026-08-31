@@ -1707,7 +1707,11 @@ public:
         thread_.reset(info.hThread);
         pid_ = info.dwProcessId;
         WaitForInputIdle(process_.get(), 5000);
-        for (int attempt = 0; attempt < 30 && !hwnd_; ++attempt) {
+        for (int attempt = 0; attempt < 100 && !hwnd_; ++attempt) {
+            if (WaitForSingleObject(process_.get(), 0) !=
+                WAIT_TIMEOUT) {
+                break;
+            }
             hwnd_ = visible_window_for_pid(pid_);
             if (!hwnd_)
                 Sleep(100);
@@ -8757,8 +8761,19 @@ TEST_F(WinUI3SampleFixture, RepeatedDumpCyclesPreserveTargetAndCleanUpResources)
     // Baseline before this test.  The fixture's SetUpTestSuite already ran
     // one or more dumps to verify readiness; those may have left entries for
     // this PID in the log.  We compare deltas, not absolute values.
-    const int created_before = count_pid_log("Created message window");
-    const int cleanup_before = count_pid_log("Cleanup: message window destroyed");
+    const ULONGLONG balancedDeadline =
+        GetTickCount64() + 5000;
+    while (count_pid_log("Created message window") !=
+           count_pid_log("Cleanup: message window destroyed")) {
+        ASSERT_LT(GetTickCount64(), balancedDeadline)
+            << "a prior connection did not finish cleanup before the "
+               "repeated-dump baseline";
+        Sleep(100);
+    }
+    const int created_before =
+        count_pid_log("Created message window");
+    const int cleanup_before =
+        count_pid_log("Cleanup: message window destroyed");
 
     // Poll until the PID-filtered cleanup count reaches `expected_total`, or
     // until `timeout_ms` elapses.  Returns true if the count was reached.
