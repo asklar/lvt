@@ -154,12 +154,16 @@ pub struct VisualTreeChangesArgs {
     /// Use the cheaper XAML/WinUI3 property set. Changing this setting resets
     /// the session's diff baseline and returns a fresh snapshot.
     pub fast: Option<bool>,
+    /// Force a complete snapshot baseline instead of an incremental diff.
+    pub reset: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UiaTreeChangesArgs {
     /// Session id returned by connect.
     pub session: String,
+    /// Force a complete snapshot baseline instead of an incremental diff.
+    pub reset: Option<bool>,
     /// UIA tree view: "control" (default), "content", or "raw". Changing it
     /// resets the session's diff baseline and returns a fresh snapshot.
     pub view: Option<String>,
@@ -1382,6 +1386,7 @@ impl LvtServer {
                 "view": a.view,
                 "properties": a.properties,
                 "timeoutMs": a.timeout_ms,
+                "reset": a.reset,
             })),
             self.allow_input,
         )
@@ -1423,7 +1428,11 @@ impl LvtServer {
     ) -> Result<CallToolResult, ErrorData> {
         forward(
             "get_visual_tree_changes",
-            compact(json!({ "session": a.session, "fast": a.fast })),
+            compact(json!({
+                "session": a.session,
+                "fast": a.fast,
+                "reset": a.reset
+            })),
             self.allow_input,
         )
         .await

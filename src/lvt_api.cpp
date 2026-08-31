@@ -2940,6 +2940,8 @@ json method_get_tree_changes(const json& params, bool uia) {
     const auto optionsKey = tree_snapshot_options_key(params, uia);
     const bool reset = get_bool(params, "reset", false);
     bool snapshot = false;
+    bool publishAuthorization = true;
+    bool retryReset = false;
     std::vector<lvt::ChangeEvent> changes;
     {
         // Keep the session lock through the baseline update. Disconnect removes
@@ -2954,7 +2956,18 @@ json method_get_tree_changes(const json& params, bool uia) {
         auto found = g_treeSnapshots.find(key);
         if (found != g_treeSnapshots.end() &&
             walkGeneration < found->second.generation) {
-            changes.clear();
+            publishAuthorization = false;
+            if (reset &&
+                found->second.optionsKey == optionsKey) {
+                snapshot = true;
+                changes =
+                    lvt::snapshot_added_events(
+                        found->second.tree);
+            } else if (reset) {
+                retryReset = true;
+            } else {
+                changes.clear();
+            }
         } else {
             if (!uia && !reset && found != g_treeSnapshots.end() &&
                 found->second.optionsKey == optionsKey &&
@@ -2976,6 +2989,19 @@ json method_get_tree_changes(const json& params, bool uia) {
                 found->second.generation = walkGeneration;
             }
         }
+
+        if (retryReset) {
+            const int retry =
+                get_int(params, "_generationRetry", 0);
+            if (retry >= 3) {
+                throw std::runtime_error(
+                    "could not obtain a generation-current reset snapshot; retry the request");
+            }
+            json retryParams = params;
+            retryParams["_generationRetry"] = retry + 1;
+            return method_get_tree_changes(
+                retryParams, uia);
+        }
     }
 
     json events = json::array();
@@ -2993,8 +3019,10 @@ json method_get_tree_changes(const json& params, bool uia) {
     if (!uia) {
         ensure_session_target_identity_current(
             session, "after completing the visual tree-change response");
-        commit_session_property_authorization(
-            session, std::move(stagedAuthorization));
+        if (publishAuthorization) {
+            commit_session_property_authorization(
+                session, std::move(stagedAuthorization));
+        }
     }
     return out;
 }

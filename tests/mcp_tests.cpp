@@ -6337,12 +6337,22 @@ TEST_F(
         "get_visual_tree_changes",
         json{{"session", session}}, &isError);
     ASSERT_FALSE(isError) << baseline.dump(2);
+    const auto resourceUri =
+        "lvt://session/" + session +
+        "/visual-tree";
+    auto initialResource = client.request(
+        "resources/read",
+        json{{"uri", resourceUri}});
+    ASSERT_TRUE(initialResource.contains("result"))
+        << initialResource.dump(2);
     ASSERT_TRUE(ResetEvent(entered.get()));
 
     const int older = client.send_request(
         "tools/call",
         json{{"name", "get_visual_tree_changes"},
-             {"arguments", json{{"session", session}}}});
+             {"arguments",
+              json{{"session", session},
+                   {"reset", true}}}});
     ASSERT_EQ(
         WaitForSingleObject(entered.get(), 10000),
         WAIT_OBJECT_0);
@@ -6354,8 +6364,12 @@ TEST_F(
         generic, L"newer baseline value"));
     auto newer = client.call_tool(
         "get_visual_tree_changes",
-        json{{"session", session}}, &isError);
+        json{{"session", session},
+             {"reset", true}},
+        &isError);
     ASSERT_FALSE(isError) << newer.dump(2);
+    EXPECT_TRUE(newer.value("snapshot", false))
+        << newer.dump(2);
     ASSERT_FALSE(newer.value("events", json::array()).empty())
         << newer.dump(2);
 
@@ -6367,6 +6381,19 @@ TEST_F(
     EXPECT_FALSE(
         olderResponse["result"].value("isError", true))
         << olderResponse.dump(2);
+    const auto olderPayload = json::parse(
+        olderResponse["result"]["content"][0]
+            .value("text", "{}"),
+        nullptr, false);
+    ASSERT_FALSE(olderPayload.is_discarded())
+        << olderResponse.dump(2);
+    EXPECT_TRUE(
+        olderPayload.value("snapshot", false))
+        << olderPayload.dump(2);
+    EXPECT_FALSE(
+        olderPayload.value(
+            "events", json::array()).empty())
+        << olderPayload.dump(2);
 
     auto next = client.call_tool(
         "get_visual_tree_changes",
