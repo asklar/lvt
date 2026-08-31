@@ -10508,28 +10508,44 @@ TEST_F(McpSampleFixture, AnOccludedElementNamesWhatIsInTheWay) {
     // the window in the way.
     auto tree = client.call_tool("get_visual_tree", json{{"session", session}});
     ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
-    const auto& rootBounds = tree["root"]["bounds"];
-    const int bottom = rootBounds.value("y", 0) + rootBounds.value("height", 0);
-
     std::vector<const json*> all;
     collect_json_elements(tree["root"], all);
     const json* below = nullptr;
     for (const auto* node : all) {
         const auto& b = (*node)["bounds"];
-        if (b.value("height", 0) > 0 && b.value("width", 0) > 0 && b.value("y", 0) > bottom &&
+        const POINT centre{
+            b.value("x", 0) + b.value("width", 0) / 2,
+            b.value("y", 0) + b.value("height", 0) / 2,
+        };
+        const HWND obstruction =
+            GetAncestor(WindowFromPoint(centre), GA_ROOT);
+        if (b.value("height", 0) > 0 &&
+            b.value("width", 0) > 0 &&
+            MonitorFromPoint(
+                centre, MONITOR_DEFAULTTONULL) &&
+            obstruction && obstruction != s_hwnd &&
             !node->value("ref", "").empty()) {
             below = node;
             break;
         }
     }
     if (!below)
-        GTEST_SKIP() << "no element sits outside the window, so nothing is occluded";
+        GTEST_SKIP()
+            << "no on-monitor element is currently covered by another window";
 
     bool isError = false;
     auto result = client.call_tool(
         "click", json{{"session", session}, {"element", below->value("ref", "")}}, &isError);
     ASSERT_TRUE(isError) << result.dump(2);
     const auto message = result.value("error", "");
+    if (message.find(
+            "could not be brought to the foreground") !=
+        std::string::npos) {
+        GTEST_SKIP()
+            << "Windows foreground policy prevented the occlusion "
+               "precondition: "
+            << message;
+    }
     EXPECT_NE(message.find("covered by"), std::string::npos) << message;
     EXPECT_EQ(message.find("covered by another window"), std::string::npos)
         << "the refusal must name the window in the way, not just say there is one: " << message;
