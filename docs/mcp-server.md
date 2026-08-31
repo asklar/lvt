@@ -198,13 +198,20 @@ PID/HWND/root replacement instead returns the structured code
 
 Visual tree walks validate that identity before connection acquisition, before
 and after every snapshot attempt, and again before publishing a response or
-diff baseline. A complete successful root snapshot also atomically replaces
-the session's authorized `(provider, providerHandle)` set. Compact
+diff baseline. Explicit window/process/lifetime mismatches return
+`ownershipLost`; transient UIA/COM validation failures remain retryable and do
+not invalidate the live session. A complete successful root snapshot stages a
+replacement for the session's authorized `(provider, providerHandle)` set and
+commits it only after the caller accepts the response or diff baseline. Compact
 XAML/WinUI/WPF/WinForms property keys must be present in that set, so a
 process-wide diagnostics connection cannot use another application window's
 registry entry. Scoped responses, failed/incomplete refreshes, and unrelated
 sessions never narrow or expand the set; disconnect clears it, and a new
 session must publish its own complete snapshot before compact keys are usable.
+WPF and WinForms operations additionally revalidate the live object's current
+top-level native window inside the managed TAP immediately before each read,
+mutation, and readback, so moving an object to another window revokes the old
+session without waiting for another tree snapshot.
 
 Visual-mode actions validate that same original identity rather than trusting
 only the current numeric HWND. Both visual and UIA synthetic input paths require

@@ -92,6 +92,10 @@ struct PropertyMutationResult {
     bool cleared = false;
 };
 
+struct PropertyOperationContext {
+    HWND expectedRootHwnd = nullptr;
+};
+
 // A live, reusable connection to one framework "island" (e.g. one XAML or
 // WinUI3 diagnostics session) inside a target process.
 //
@@ -153,15 +157,19 @@ public:
     // and WinForms use persistent diagnostics connections; Win32 and ComCtl
     // use curated native adapters. Other providers retain explicit unsupported
     // defaults until their provider-owned schema adapters are implemented.
-    virtual PropertySnapshotResult get_property_snapshot(uint64_t) {
+    virtual PropertySnapshotResult get_property_snapshot(
+        uint64_t,
+        const PropertyOperationContext& = {}) {
         return {};
     }
     virtual PropertyMutationResult set_property(
-        uint64_t, const std::string&, const std::string&) {
+        uint64_t, const std::string&, const std::string&,
+        const PropertyOperationContext& = {}) {
         return {};
     }
     virtual PropertyMutationResult clear_property(
-        uint64_t, const std::string&) {
+        uint64_t, const std::string&,
+        const PropertyOperationContext& = {}) {
         return {};
     }
 

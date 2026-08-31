@@ -585,6 +585,21 @@ void expect_typed_property_target_not_authorized(
         << result.dump(2);
 }
 
+void expect_typed_property_target_membership_lost(
+    const json& result) {
+    EXPECT_FALSE(result.value("ok", true)) << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorCode", ""),
+        "typed_property_target_not_authorized")
+        << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorDisposition", ""),
+        "terminal")
+        << result.dump(2);
+    EXPECT_FALSE(result.value("retryable", true))
+        << result.dump(2);
+}
+
 bool descriptor_has_choice(const json& descriptor, const std::string& value) {
     for (const auto& choice : descriptor.value("choices", json::array())) {
         if (choice.value("value", "") == value)
@@ -1116,6 +1131,114 @@ TEST(McpUiaIdentity, TransientPersistentFailureUsesIdentityBoundFallback) {
     EXPECT_TRUE(tree.contains("root"))
         << "an unchanged target must preserve one-shot fallback: "
         << tree.dump(2);
+}
+
+TEST(McpUiaIdentity, ConcurrentIdentityContentionIsTransientAndSessionRecovers) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(
+        NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const std::string eventName =
+        "Local\\LvtIdentityContention_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event contention(CreateEventA(
+        nullptr, TRUE, FALSE, eventName.c_str()));
+    ASSERT_TRUE(contention);
+    ScopedEnvironmentVariable contentionGate(
+        "LVT_TEST_UIA_IDENTITY_CONTENTION_EVENT",
+        eventName);
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "visual"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    bool isError = false;
+    auto tree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << tree.dump(2);
+    const auto key = tree["root"].value("key", "");
+    ASSERT_FALSE(key.empty());
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+
+    ASSERT_TRUE(SetEvent(contention.get()));
+    std::vector<std::pair<int, bool>> requests;
+    for (int index = 0; index < 3; ++index) {
+        requests.emplace_back(
+            client.send_request(
+                "tools/call",
+                json{{"name", "get_visual_tree"},
+                     {"arguments",
+                      json{{"session", session}}}}),
+            false);
+        requests.emplace_back(
+            client.send_request(
+                "tools/call",
+                json{{"name",
+                      "get_editable_properties"},
+                     {"arguments",
+                      json{{"session", session},
+                           {"element", key}}}}),
+            true);
+    }
+    for (const auto& [request, typed] : requests) {
+        const auto response =
+            client.await_response(request);
+        ASSERT_TRUE(response.contains("result"))
+            << response.dump(2);
+        const auto& result = response["result"];
+        ASSERT_TRUE(result.value("isError", false))
+            << response.dump(2);
+        ASSERT_TRUE(
+            result.contains("structuredContent"))
+            << response.dump(2);
+        const auto& error =
+            result["structuredContent"];
+        EXPECT_EQ(
+            error.value(
+                typed ? "errorCode" : "code", ""),
+            typed
+                ? "typed_property_identity_validation_failed"
+                : "targetIdentityValidationFailed")
+            << error.dump(2);
+        EXPECT_EQ(
+            error.value("errorDisposition", ""),
+            "transient")
+            << error.dump(2);
+        EXPECT_TRUE(
+            error.value("retryable", false))
+            << error.dump(2);
+        EXPECT_EQ(
+            error.value("hresult", ""),
+            "0x80010001")
+            << error.dump(2);
+    }
+    ASSERT_TRUE(ResetEvent(contention.get()));
+
+    auto recoveredTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError)
+        << "transient contention poisoned the visual session: "
+        << recoveredTree.dump(2);
+    auto recoveredProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "transient contention poisoned typed properties: "
+        << recoveredProperties.dump(2);
 }
 
 TEST(McpUiaIdentity, ReplacementDuringFallbackFailsOwnershipLost) {
@@ -2734,6 +2857,18 @@ void verify_managed_window_property_authorization(
         &isError);
     ASSERT_FALSE(isError)
         << primaryProperties.dump(2);
+    const auto* primaryDescriptor =
+        find_property_descriptor(
+            primaryProperties, propertyName);
+    ASSERT_NE(primaryDescriptor, nullptr)
+        << primaryProperties.dump(2);
+    const auto primaryDescriptorId =
+        primaryDescriptor->value(
+            "descriptorId", "");
+    const auto originalPrimaryValue =
+        typed_property_value(
+            primaryProperties, propertyName);
+    ASSERT_FALSE(primaryDescriptorId.empty());
     auto secondaryProperties = client.call_tool(
         "get_editable_properties",
         json{{"session", secondarySession},
@@ -2964,6 +3099,78 @@ void verify_managed_window_property_authorization(
         json{{"uri", resourceUri}});
     EXPECT_TRUE(unsubscribed.contains("result"))
         << unsubscribed.dump(2);
+    Sleep(750);
+    auto beforeReparent = client.call_tool(
+        "get_visual_tree",
+        json{{"session", primarySession}},
+        &isError);
+    ASSERT_FALSE(isError) << beforeReparent.dump(2);
+
+    DWORD_PTR reparented = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            primaryHwnd, 0x84D1, 0, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            5000, &reparented),
+        0);
+    ASSERT_EQ(reparented, 1u);
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"get_editable_properties",
+              json{{"session", primarySession},
+                   {"element", primaryKey}}},
+             {"set_property",
+              json{{"session", primarySession},
+                   {"element", primaryKey},
+                   {"descriptorId", primaryDescriptorId},
+                   {"value", "must-not-cross-window"}}},
+             {"clear_property",
+              json{{"session", primarySession},
+                   {"element", primaryKey},
+                   {"descriptorId", primaryDescriptorId}}}}) {
+        isError = false;
+        const auto denied = client.call_tool(
+            tool, arguments, &isError);
+        ASSERT_TRUE(isError) << denied.dump(2);
+        expect_typed_property_target_membership_lost(
+            denied);
+    }
+
+    auto siblingAfterReparent = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession},
+             {"element", siblingKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << "a moved element must not poison the live session: "
+        << siblingAfterReparent.dump(2);
+
+    auto movedTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", secondarySession}},
+        &isError);
+    ASSERT_FALSE(isError) << movedTree.dump(2);
+    const auto* movedElement =
+        find_managed_named_element(
+            movedTree["root"], primaryElementName);
+    ASSERT_NE(movedElement, nullptr)
+        << movedTree.dump(2);
+    EXPECT_EQ(
+        movedElement->value("key", ""),
+        primaryKey);
+    auto movedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession},
+             {"element", primaryKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << movedProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(
+            movedProperties, propertyName),
+        originalPrimaryValue)
+        << "the denied old-session mutation changed the moved element";
 }
 
 void verify_managed_mcp_connection(
@@ -3671,10 +3878,10 @@ TEST(McpManagedFrameworks, WinFormsPropertyHandlesStayInsideTheirSessionWindow) 
         "LVT_TEST_SECONDARY_WINFORMS_WINDOW",
         "LVT WinForms Sample",
         "LVT WinForms Secondary",
-        "MainForm",
+        "inputTextBox",
         "okButton",
-        "SecondaryForm",
-        "EditableText");
+        "secondaryInputTextBox",
+        "Text");
 }
 
 TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
@@ -6236,6 +6443,105 @@ TEST_F(McpSampleFixture, TypedPropertyConnectionErrorsHaveDisposition) {
     EXPECT_FALSE(isError) << recovered.dump(2);
     EXPECT_FALSE(recovered.value("schemaId", "").empty())
         << recovered.dump(2);
+}
+
+TEST_F(
+    McpSampleFixture,
+    RejectedPartialHostRefreshPreservesPropertyAuthorization) {
+    SkipIfNotReady();
+    const std::string eventName =
+        "Local\\LvtPartialXamlHost_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event partialHost(CreateEventA(
+        nullptr, TRUE, FALSE, eventName.c_str()));
+    ASSERT_TRUE(partialHost);
+    ScopedEnvironmentVariable partialHostGate(
+        "LVT_TEST_PARTIAL_XAML_HOST_EVENT",
+        eventName);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto tree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << tree.dump(2);
+    const auto* button =
+        find_managed_named_element(
+            tree["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr) << tree.dump(2);
+    const auto key = button->value("key", "");
+    ASSERT_EQ(key.rfind("winui3:0x", 0), 0u);
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+
+    auto baseline = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+    const auto resourceUri =
+        "lvt://session/" + session +
+        "/visual-tree";
+    auto resourceBaseline = client.request(
+        "resources/read",
+        json{{"uri", resourceUri}});
+    ASSERT_TRUE(resourceBaseline.contains("result"))
+        << resourceBaseline.dump(2);
+
+    ASSERT_TRUE(SetEvent(partialHost.get()));
+    auto rejected = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_TRUE(isError) << rejected.dump(2);
+    EXPECT_NE(
+        rejected.value("error", "")
+            .find("temporarily lost"),
+        std::string::npos)
+        << rejected.dump(2);
+    auto afterRejectedTool = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << "a rejected per-host tool snapshot replaced authorization: "
+        << afterRejectedTool.dump(2);
+
+    auto rejectedResource = client.request(
+        "resources/read",
+        json{{"uri", resourceUri}});
+    ASSERT_TRUE(rejectedResource.contains("error"))
+        << rejectedResource.dump(2);
+    auto afterRejectedResource = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << "a rejected per-host resource snapshot replaced authorization: "
+        << afterRejectedResource.dump(2);
+
+    ASSERT_TRUE(ResetEvent(partialHost.get()));
+    auto recovered = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << recovered.dump(2);
+    auto recoveredProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << recoveredProperties.dump(2);
 }
 
 TEST_F(McpSampleFixture, ResourcesMatchEachSessionsFixedTreeMode) {

@@ -2449,7 +2449,8 @@ NativePropertyConnection::event_diagnostics_for_testing() const {
 }
 
 PropertySnapshotResult NativePropertyConnection::get_property_snapshot(
-    uint64_t handle) {
+    uint64_t handle,
+    const PropertyOperationContext&) {
     PropertySnapshotResult result;
     Target target;
     if (!m_impl->get_target(handle, target)) {
@@ -2531,12 +2532,14 @@ PropertySnapshotResult NativePropertyConnection::get_property_snapshot(
 
 PropertyMutationResult NativePropertyConnection::set_property(
     uint64_t handle, const std::string& descriptorId,
-    const std::string& value) {
+    const std::string& value,
+    const PropertyOperationContext&) {
     return m_impl->apply(handle, descriptorId, value);
 }
 
 PropertyMutationResult NativePropertyConnection::clear_property(
-    uint64_t handle, const std::string& descriptorId) {
+    uint64_t handle, const std::string& descriptorId,
+    const PropertyOperationContext&) {
     return m_impl->apply(handle, descriptorId, std::nullopt);
 }
 

@@ -46,15 +46,23 @@ namespace WinFormsSample
 
     internal sealed class SampleForm : Form
     {
+        internal const int ReparentElementMessage = 0x84D1;
+        private static SampleForm primaryForm = null!;
+        private static SampleForm secondaryForm = null!;
         private readonly EventWaitHandle blockTrigger;
         private readonly EventWaitHandle blockEntered;
         private readonly EventWaitHandle blockRelease;
+        private readonly TextBox inputTextBox;
         private string editableText = "Default text";
         private int retryCount = 5;
         private SampleMode mode = SampleMode.Basic;
 
         public SampleForm(bool secondary)
         {
+            if (secondary)
+                secondaryForm = this;
+            else
+                primaryForm = this;
             Name = secondary ? "SecondaryForm" : "MainForm";
             Text = secondary
                 ? "LVT WinForms Secondary"
@@ -75,7 +83,7 @@ namespace WinFormsSample
                 Location = new Point(20, 20)
             };
 
-            var textBox = new TextBox
+            inputTextBox = new TextBox
             {
                 Name = secondary
                     ? "secondaryInputTextBox"
@@ -107,7 +115,7 @@ namespace WinFormsSample
             };
 
             Controls.Add(label);
-            Controls.Add(textBox);
+            Controls.Add(inputTextBox);
             Controls.Add(button);
             Controls.Add(checkBox);
 
@@ -130,6 +138,21 @@ namespace WinFormsSample
                     }));
                 }
             });
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == ReparentElementMessage &&
+                ReferenceEquals(this, primaryForm) &&
+                secondaryForm != null)
+            {
+                Controls.Remove(inputTextBox);
+                secondaryForm.Controls.Add(inputTextBox);
+                inputTextBox.Location = new Point(20, 55);
+                message.Result = new IntPtr(1);
+                return;
+            }
+            base.WndProc(ref message);
         }
 
         [Browsable(true)]

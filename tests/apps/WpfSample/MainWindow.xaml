@@ -11,7 +11,7 @@
       <Setter Property="HorizontalAlignment" Value="Left" />
     </Style>
   </Window.Resources>
-  <Grid Margin="16">
+  <Grid x:Name="RootLayout" Margin="16">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />

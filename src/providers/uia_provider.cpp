@@ -273,9 +273,18 @@ bool exact_window_matches(HWND hwnd, DWORD pid) {
     return currentPid != 0 && currentPid == pid;
 }
 
-bool is_uia_ownership_failure(HRESULT hr) {
-    return hr == HRESULT_FROM_WIN32(ERROR_INVALID_OWNER) ||
-           hr == HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
+bool force_identity_contention_for_testing() {
+    char eventName[192]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_IDENTITY_CONTENTION_EVENT",
+        eventName, static_cast<DWORD>(_countof(eventName)));
+    if (length == 0 || length >= _countof(eventName))
+        return false;
+    wil::unique_handle event(OpenEventA(
+        SYNCHRONIZE, FALSE, eventName));
+    return event &&
+           WaitForSingleObject(event.get(), 0) ==
+               WAIT_OBJECT_0;
 }
 
 bool target_process_matches(
@@ -1069,6 +1078,12 @@ HRESULT run_on_mta(Fn&& fn) {
 
 } // namespace
 
+bool is_uia_target_ownership_failure(HRESULT hr) {
+    return hr == HRESULT_FROM_WIN32(ERROR_INVALID_OWNER) ||
+           hr == HRESULT_FROM_WIN32(
+               ERROR_INVALID_WINDOW_HANDLE);
+}
+
 HRESULT get_validated_uia_root(
     IUIAutomation* automation,
     const UiaTargetIdentity& identity,
@@ -1190,6 +1205,8 @@ HRESULT validate_uia_target_identity(
     const UiaTargetIdentity& identity) {
     if (!identity.valid())
         return HRESULT_FROM_WIN32(ERROR_INVALID_OWNER);
+    if (force_identity_contention_for_testing())
+        return RPC_E_CALL_REJECTED;
     return run_on_mta([&]() -> HRESULT {
         wil::com_ptr<IUIAutomation> automation;
         UiaOptions options;
@@ -2009,7 +2026,7 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
                 state->automation.get(), state->targetIdentity,
                 state->process.get(), nullptr, options, built,
                 wasTruncated);
-            if (is_uia_ownership_failure(buildHr))
+            if (is_uia_target_ownership_failure(buildHr))
                 state->teardown_on_mta();
             return buildHr;
         });
@@ -2101,14 +2118,16 @@ bool UiaConnection::validate_target_identity_locked() const {
             const HRESULT validateHr = get_validated_uia_root(
                 state->automation.get(), state->targetIdentity,
                 state->process.get(), &root);
-            if (is_uia_ownership_failure(validateHr))
+            if (is_uia_target_ownership_failure(validateHr))
                 state->teardown_on_mta();
             return validateHr;
         });
     return SUCCEEDED(hr);
 }
 
-PropertySnapshotResult UiaConnection::get_property_snapshot(uint64_t handle) {
+PropertySnapshotResult UiaConnection::get_property_snapshot(
+    uint64_t handle,
+    const PropertyOperationContext&) {
     if (!matches_target(m_hwnd)) {
         PropertySnapshotResult result;
         result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
@@ -2151,8 +2170,10 @@ PropertySnapshotResult UiaConnection::get_property_snapshot(uint64_t handle) {
 
 PropertyMutationResult UiaConnection::set_property(
     uint64_t handle, const std::string& descriptorId,
-    const std::string& value) {
-    const auto snapshot = get_property_snapshot(handle);
+    const std::string& value,
+    const PropertyOperationContext& context) {
+    const auto snapshot =
+        get_property_snapshot(handle, context);
     if (!snapshot.ok || !snapshot.schema) {
         PropertyMutationResult result;
         result.hresult = snapshot.hresult;
@@ -2261,8 +2282,10 @@ PropertyMutationResult UiaConnection::set_property(
 }
 
 PropertyMutationResult UiaConnection::clear_property(
-    uint64_t handle, const std::string& descriptorId) {
-    const auto snapshot = get_property_snapshot(handle);
+    uint64_t handle, const std::string& descriptorId,
+    const PropertyOperationContext& context) {
+    const auto snapshot =
+        get_property_snapshot(handle, context);
     if (!snapshot.ok || !snapshot.schema) {
         PropertyMutationResult result;
         result.hresult = snapshot.hresult;
@@ -2313,7 +2336,7 @@ std::vector<ConnectionEvent> UiaConnection::poll_events() {
                 state->automation.get(), state->targetIdentity,
                 state->process.get(), &root);
             if (FAILED(validateHr)) {
-                if (is_uia_ownership_failure(validateHr))
+                if (is_uia_target_ownership_failure(validateHr))
                     state->teardown_on_mta();
                 return validateHr;
             }
@@ -2345,7 +2368,7 @@ bool UiaConnection::refresh_events() {
             const HRESULT validateHr = get_validated_uia_root(
                 state->automation.get(), state->targetIdentity,
                 state->process.get(), &root);
-            if (is_uia_ownership_failure(validateHr))
+            if (is_uia_target_ownership_failure(validateHr))
                 state->teardown_on_mta();
             return validateHr;
         }));

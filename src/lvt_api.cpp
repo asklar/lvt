@@ -212,40 +212,69 @@ lvt::UiaTargetIdentity uia_identity_for_session(
     };
 }
 
-bool uia_identity_is_current(const Session& session) {
-    const auto expected = uia_identity_for_session(session);
-    return SUCCEEDED(
-        lvt::validate_uia_target_identity(expected));
-}
 #endif
 
-bool session_target_identity_is_current(const Session& session) {
+std::string format_hresult(HRESULT hresult) {
+    char buffer[16];
+    snprintf(buffer, sizeof(buffer), "0x%08lX",
+             static_cast<unsigned long>(hresult));
+    return buffer;
+}
+
+HRESULT session_target_identity_status(
+    const Session& session) {
 #ifdef LVT_ENABLE_UIA
-    return uia_identity_is_current(session);
+    return lvt::validate_uia_target_identity(
+        uia_identity_for_session(session));
 #else
     if (!session.hwnd || !IsWindow(session.hwnd))
-        return false;
+        return HRESULT_FROM_WIN32(
+            ERROR_INVALID_WINDOW_HANDLE);
     DWORD currentPid = 0;
     GetWindowThreadProcessId(session.hwnd, &currentPid);
-    return currentPid == session.pid;
+    return currentPid == session.pid
+        ? S_OK
+        : HRESULT_FROM_WIN32(ERROR_INVALID_OWNER);
 #endif
 }
 
-[[noreturn]] void throw_session_ownership_lost(
-    const std::string& message) {
-    throw std::runtime_error(json{
-        {"error", message},
-        {"code", "ownershipLost"},
-    }.dump());
+bool session_target_ownership_lost(HRESULT hresult) {
+#ifdef LVT_ENABLE_UIA
+    return lvt::is_uia_target_ownership_failure(
+        hresult);
+#else
+    return hresult == HRESULT_FROM_WIN32(
+               ERROR_INVALID_OWNER) ||
+           hresult == HRESULT_FROM_WIN32(
+               ERROR_INVALID_WINDOW_HANDLE);
+#endif
 }
 
 void ensure_session_target_identity_current(
-    const Session& session, const char* operation) {
-    if (!session_target_identity_is_current(session)) {
-        throw_session_ownership_lost(
-            "ownershipLost: the session target identity changed " +
-            std::string(operation));
-    }
+    const Session& session,
+    const std::string& operation) {
+    const HRESULT status =
+        session_target_identity_status(session);
+    if (SUCCEEDED(status))
+        return;
+
+    const bool ownershipLost =
+        session_target_ownership_lost(status);
+    const std::string message =
+        ownershipLost
+            ? "ownershipLost: the session target identity changed "
+            : "the session target identity could not be validated ";
+    throw std::runtime_error(json{
+        {"error", message + operation},
+        {"code", ownershipLost
+                     ? "ownershipLost"
+                     : "targetIdentityValidationFailed"},
+        {"errorDisposition", ownershipLost
+                                 ? "ownershipLost"
+                                 : "transient"},
+        {"retryable", !ownershipLost},
+        {"hresult", format_hresult(status)},
+    }.dump());
 }
 
 using AuthorizedPropertyTarget =
@@ -255,6 +284,11 @@ std::mutex g_propertyAuthorizationMutex;
 std::map<
     std::string, std::set<AuthorizedPropertyTarget>>
     g_sessionAuthorizedPropertyTargets;
+
+struct StagedPropertyAuthorization {
+    std::set<AuthorizedPropertyTarget> targets;
+    bool complete = false;
+};
 
 void collect_session_property_targets(
     const Session& session, const lvt::Element& element,
@@ -284,18 +318,27 @@ void collect_session_property_targets(
     }
 }
 
-void replace_session_property_authorization(
+StagedPropertyAuthorization stage_session_property_authorization(
     const Session& session, const lvt::Element& root) {
-    std::set<AuthorizedPropertyTarget> targets;
+    StagedPropertyAuthorization staged;
     collect_session_property_targets(
-        session, root, true, targets);
+        session, root, true, staged.targets);
+    staged.complete = true;
+    return staged;
+}
+
+void commit_session_property_authorization(
+    const Session& session,
+    StagedPropertyAuthorization staged) {
+    if (!staged.complete)
+        return;
     ensure_session_target_identity_current(
         session, "before publishing visual property targets");
 
     std::lock_guard<std::mutex> lock(
         g_propertyAuthorizationMutex);
     g_sessionAuthorizedPropertyTargets[session.id] =
-        std::move(targets);
+        std::move(staged.targets);
 }
 
 bool session_authorizes_property_target(
@@ -710,7 +753,7 @@ void drain_session_connection_events(
 std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& session) {
     if (!session_is_active(session.id))
         return nullptr;
-    if (!session_target_identity_is_current(session))
+    if (FAILED(session_target_identity_status(session)))
         return nullptr;
     std::lock_guard<std::mutex> lock(g_connectionsMutex);
     auto& entry = g_sessionConnections[session.id];
@@ -732,7 +775,7 @@ std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& se
     }
 
     const auto identity = uia_identity_for_session(session);
-    if (!session_target_identity_is_current(session))
+    if (FAILED(session_target_identity_status(session)))
         return nullptr;
     auto handle = lvt::ConnectionRegistry::instance().acquire(
         session.pid, session.hwnd,
@@ -743,7 +786,7 @@ std::shared_ptr<lvt::UiaConnection> uia_connection_for_session(const Session& se
         });
     if (!handle)
         return nullptr;
-    if (!session_target_identity_is_current(session))
+    if (FAILED(session_target_identity_status(session)))
         return nullptr;
     auto connection =
         std::dynamic_pointer_cast<lvt::UiaConnection>(handle.shared());
@@ -1146,6 +1189,99 @@ bool lost_populated_injected_host(
     return false;
 }
 
+bool force_partial_injected_host_for_testing() {
+    char eventName[192]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_PARTIAL_XAML_HOST_EVENT",
+        eventName, static_cast<DWORD>(_countof(eventName)));
+    if (length == 0 || length >= _countof(eventName))
+        return false;
+    wil::unique_handle event(OpenEventA(
+        SYNCHRONIZE, FALSE, eventName));
+    return event &&
+           WaitForSingleObject(event.get(), 0) ==
+               WAIT_OBJECT_0;
+}
+
+bool remove_framework_content(
+    lvt::Element& element,
+    const std::string& framework) {
+    bool removed = false;
+    for (auto child = element.children.begin();
+         child != element.children.end();) {
+        const bool runtimeContent =
+            child->framework == framework &&
+            (child->className.rfind(
+                 "Windows.UI.Xaml.", 0) == 0 ||
+             child->className.rfind(
+                 "Microsoft.UI.Xaml.", 0) == 0);
+        if (runtimeContent) {
+            child = element.children.erase(child);
+            removed = true;
+        } else {
+            removed =
+                remove_framework_content(
+                    *child, framework) ||
+                removed;
+            ++child;
+        }
+    }
+    return removed;
+}
+
+bool inject_partial_host_for_testing(
+    lvt::Element& root) {
+    if (!force_partial_injected_host_for_testing())
+        return false;
+
+    lvt::Element* host = nullptr;
+    std::string framework;
+    const std::function<void(lvt::Element&)> findHost =
+        [&](lvt::Element& element) {
+            if (host)
+                return;
+            if (const char* candidate =
+                    injected_framework_for_host(element);
+                candidate &&
+                has_framework_descendant(
+                    element, candidate)) {
+                host = &element;
+                framework = candidate;
+                return;
+            }
+            for (auto& child : element.children)
+                findHost(child);
+        };
+    findHost(root);
+    if (!host ||
+        !remove_framework_content(*host, framework)) {
+        return false;
+    }
+
+    lvt::Element populatedHost;
+    populatedHost.framework = framework;
+    populatedHost.className = host->className;
+    populatedHost.type = host->type;
+    populatedHost.nativeHandle =
+        host->nativeHandle == 0
+            ? static_cast<uintptr_t>(1)
+            : host->nativeHandle + 1;
+    populatedHost.key =
+        host->key + "|test-partial-host";
+    lvt::Element content;
+    content.framework = framework;
+    content.className =
+        framework == "winui3"
+            ? "Microsoft.UI.Xaml.Controls.Grid"
+            : "Windows.UI.Xaml.Controls.Grid";
+    content.type = "Grid";
+    populatedHost.children.push_back(
+        std::move(content));
+    root.children.push_back(
+        std::move(populatedHost));
+    return true;
+}
+
 // Build the tree a request asked for. `uia` selects the view; the visual tree
 // still needs an architecture match because it injects.
 //
@@ -1156,9 +1292,13 @@ bool lost_populated_injected_host(
 bool build_tree_for(const Session& session, const json& params, bool uia,
                     lvt::Element& tree, std::string& error,
                     bool* truncated = nullptr,
-                    bool targetAlreadyLocked = false) {
+                    bool targetAlreadyLocked = false,
+                    StagedPropertyAuthorization*
+                        stagedAuthorization = nullptr) {
     if (truncated)
         *truncated = false;
+    if (stagedAuthorization)
+        *stagedAuthorization = {};
     // One walk of a given window at a time; see the note on g_targetLocks.
     std::optional<TargetGuard> guard;
     if (!targetAlreadyLocked)
@@ -1333,14 +1473,18 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             session.pluginOption, fastProperties, connectionLookup);
         ensure_session_target_identity_current(
             session, "after building the visual snapshot");
+        inject_partial_host_for_testing(tree);
         if (!missing_injected_framework_content(tree)) {
             // Publish the complete unscoped snapshot while the same target
             // guard that ordered the walk is still held. Response scoping,
             // depth trimming, correlation, diffing, and MCP delivery all
             // happen later and must never replace authorization with only the
             // subset one response happened to expose.
-            replace_session_property_authorization(
-                session, tree);
+            if (stagedAuthorization) {
+                *stagedAuthorization =
+                    stage_session_property_authorization(
+                        session, tree);
+            }
             ensure_session_target_identity_current(
                 session, "before publishing native property targets");
             publish_native_property_targets(session, tree);
@@ -1590,10 +1734,8 @@ Session require_session(const json& params) {
     Session session;
     if (!find_session(id, session))
         throw std::runtime_error("unknown session '" + id + "'; call connect first");
-    if (!IsWindow(session.hwnd))
-        throw_session_ownership_lost(
-            "ownershipLost: the window for session '" +
-            id + "' has closed");
+    ensure_session_target_identity_current(
+        session, "while opening the session");
     return session;
 }
 
@@ -1709,7 +1851,10 @@ json method_get_tree(const json& params, bool uia) {
     lvt::Element tree;
     std::string error;
     bool truncated = false;
-    if (!build_tree_for(session, params, uia, tree, error, &truncated))
+    StagedPropertyAuthorization stagedAuthorization;
+    if (!build_tree_for(
+            session, params, uia, tree, error, &truncated,
+            false, &stagedAuthorization))
         throw std::runtime_error(error);
 
     lvt::Element* root = &tree;
@@ -1791,15 +1936,10 @@ json method_get_tree(const json& params, bool uia) {
             "get_visual_tree", params);
         ensure_session_target_identity_current(
             session, "after completing the visual snapshot response");
+        commit_session_property_authorization(
+            session, std::move(stagedAuthorization));
     }
     return out;
-}
-
-std::string format_hresult(HRESULT hresult) {
-    char buffer[16];
-    snprintf(buffer, sizeof(buffer), "0x%08lX",
-             static_cast<unsigned long>(hresult));
-    return buffer;
 }
 
 [[noreturn]] void throw_typed_property_error(
@@ -1823,6 +1963,26 @@ std::string format_hresult(HRESULT hresult) {
         "ownershipLost",
         false,
         message);
+}
+
+void ensure_typed_property_target_identity_current(
+    const Session& session,
+    const std::string& operation) {
+    const HRESULT status =
+        session_target_identity_status(session);
+    if (SUCCEEDED(status))
+        return;
+    if (session_target_ownership_lost(status)) {
+        throw_typed_property_session_disconnected(
+            "the typed-property target identity changed " +
+            operation);
+    }
+    throw_typed_property_error(
+        "typed_property_identity_validation_failed",
+        "transient", true,
+        "the typed-property target identity could not be validated " +
+            operation,
+        status);
 }
 
 struct PropertyTarget {
@@ -1918,9 +2078,10 @@ PropertyTarget require_property_target(
     treeParams["fast"] = true;
     lvt::Element tree;
     std::string error;
+    StagedPropertyAuthorization stagedAuthorization;
     if (!build_tree_for(
             session, treeParams, uia, tree, error, nullptr,
-            targetAlreadyLocked))
+            targetAlreadyLocked, &stagedAuthorization))
         throw std::runtime_error(error);
     const auto* element = lvt::find_element_by_ref(tree, parsedRef.ref);
     if (!element)
@@ -1936,6 +2097,10 @@ PropertyTarget require_property_target(
     }
     target.provider = element->framework;
     target.handle = element->providerHandle;
+    if (!uia) {
+        commit_session_property_authorization(
+            session, std::move(stagedAuthorization));
+    }
     return target;
 }
 
@@ -1946,21 +2111,19 @@ Session require_typed_property_session(const json& params) {
         throw_typed_property_session_disconnected(
             "unknown or disconnecting typed-property session '" + id + "'");
     }
-    if (!session_target_identity_is_current(session)) {
-        throw_typed_property_session_disconnected(
-            "the target identity for typed-property session '" + id +
-            "' changed");
-    }
+    ensure_typed_property_target_identity_current(
+        session, "while opening session '" + id + "'");
     return session;
 }
 
 void ensure_typed_property_session_active(const Session& session) {
-    if (!session_is_active(session.id) ||
-        !session_target_identity_is_current(session)) {
+    if (!session_is_active(session.id)) {
         throw_typed_property_session_disconnected(
             "typed-property session '" + session.id +
-            "' disconnected or its target identity changed while the request was waiting");
+            "' disconnected while the request was waiting");
     }
+    ensure_typed_property_target_identity_current(
+        session, "while the request was waiting");
 }
 
 bool provider_supports_typed_properties(const std::string& provider) {
@@ -2002,10 +2165,8 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
         auto connection = uia_connection_for_session(session);
         if (!connection || !connection->is_alive() ||
             !connection->matches_target(session.hwnd)) {
-            if (!uia_identity_is_current(session)) {
-                throw_typed_property_session_disconnected(
-                    "the UI Automation target window or process identity changed");
-            }
+            ensure_typed_property_target_identity_current(
+                session, "while acquiring the UI Automation connection");
             throw_typed_property_error(
                 "typed_property_connection_unavailable", "transient", true,
                 "the UI Automation property connection is temporarily unavailable");
@@ -2144,10 +2305,8 @@ uint64_t resolve_property_handle(
 #ifdef LVT_ENABLE_UIA
     auto uia = std::dynamic_pointer_cast<lvt::UiaConnection>(connection);
     if (!uia || !uia->matches_target(session.hwnd)) {
-        if (!uia_identity_is_current(session)) {
-            throw_typed_property_session_disconnected(
-                "the UI Automation target identity changed while resolving a property reference");
-        }
+        ensure_typed_property_target_identity_current(
+            session, "while resolving a UI Automation property reference");
         throw std::runtime_error(
             "the UI Automation property connection does not match this session's target window");
     }
@@ -2157,10 +2316,8 @@ uint64_t resolve_property_handle(
     const auto handle =
         uia->resolve_property_reference(target.reference, error);
     if (!handle) {
-        if (!uia_identity_is_current(session)) {
-            throw_typed_property_session_disconnected(
-                "the UI Automation target identity changed while resolving a property reference");
-        }
+        ensure_typed_property_target_identity_current(
+            session, "while resolving a UI Automation property reference");
         throw std::runtime_error(error);
     }
     return *handle;
@@ -2179,7 +2336,10 @@ bool typed_property_ownership_lost(
         return true;
     }
     (void)provider;
-    return !session_target_identity_is_current(session);
+    const HRESULT status =
+        session_target_identity_status(session);
+    return FAILED(status) &&
+           session_target_ownership_lost(status);
 }
 
 json property_snapshot_result(
@@ -2193,6 +2353,15 @@ json property_snapshot_result(
                 result.error.empty()
                     ? "the typed-property target identity changed while reading properties"
                     : result.error);
+        }
+        if (result.hresult == E_ACCESSDENIED) {
+            throw_typed_property_error(
+                "typed_property_target_not_authorized",
+                "terminal", false,
+                result.error.empty()
+                    ? "the element no longer belongs to this session window"
+                    : result.error,
+                result.hresult);
         }
         const bool unsupported =
             result.hresult == E_NOTIMPL &&
@@ -2279,10 +2448,22 @@ json property_mutation_result(
                     ? "the typed-property target identity changed during mutation"
                     : result.error);
         }
-        throw std::runtime_error(json{
-            {"error", result.error.empty() ? "typed property mutation failed" : result.error},
-            {"hresult", format_hresult(result.hresult)},
-        }.dump());
+        if (result.hresult == E_ACCESSDENIED) {
+            throw_typed_property_error(
+                "typed_property_target_not_authorized",
+                "terminal", false,
+                result.error.empty()
+                    ? "the element no longer belongs to this session window"
+                    : result.error,
+                result.hresult);
+        }
+        throw_typed_property_error(
+            "typed_property_mutation_failed",
+            "transient", true,
+            result.error.empty()
+                ? "typed property mutation failed"
+                : result.error,
+            result.hresult);
     }
     json out{
         {"ok", true},
@@ -2310,20 +2491,24 @@ json method_get_editable_properties(const json& params) {
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
     auto handle = resolve_property_handle(session, target, connection);
+    const lvt::PropertyOperationContext operationContext{
+        .expectedRootHwnd = session.hwnd,
+    };
     ensure_typed_property_session_active(session);
-    auto result = connection->get_property_snapshot(handle);
+    auto result = connection->get_property_snapshot(
+        handle, operationContext);
     if (!result.ok && !connection->is_alive() &&
         session_is_active(session.id)) {
         ensure_typed_property_session_active(session);
         connection = typed_property_connection(session, target);
         handle = resolve_property_handle(session, target, connection);
         ensure_typed_property_session_active(session);
-        result = connection->get_property_snapshot(handle);
+        result = connection->get_property_snapshot(
+            handle, operationContext);
     }
     ensure_typed_property_session_active(session);
     if (!result.ok &&
-        (!session_is_active(session.id) ||
-         !session_target_identity_is_current(session))) {
+        !session_is_active(session.id)) {
         throw_typed_property_session_disconnected(
             "the typed-property session disconnected while reading properties");
     }
@@ -2359,13 +2544,17 @@ json method_set_property(const json& params, bool allowInput) {
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
     const auto handle = resolve_property_handle(session, target, connection);
+    const lvt::PropertyOperationContext operationContext{
+        .expectedRootHwnd = session.hwnd,
+    };
     ensure_typed_property_session_active(session);
     const auto result =
-        connection->set_property(handle, descriptorId, value);
+        connection->set_property(
+            handle, descriptorId, value,
+            operationContext);
     ensure_typed_property_session_active(session);
     if (!result.ok &&
-        (!session_is_active(session.id) ||
-         !session_target_identity_is_current(session))) {
+        !session_is_active(session.id)) {
         throw_typed_property_session_disconnected(
             "the typed-property session disconnected while setting a property");
     }
@@ -2396,13 +2585,17 @@ json method_clear_property(const json& params, bool allowInput) {
         require_property_target(session, params, true);
     auto connection = typed_property_connection(session, target);
     const auto handle = resolve_property_handle(session, target, connection);
+    const lvt::PropertyOperationContext operationContext{
+        .expectedRootHwnd = session.hwnd,
+    };
     ensure_typed_property_session_active(session);
     const auto result =
-        connection->clear_property(handle, descriptorId);
+        connection->clear_property(
+            handle, descriptorId,
+            operationContext);
     ensure_typed_property_session_active(session);
     if (!result.ok &&
-        (!session_is_active(session.id) ||
-         !session_target_identity_is_current(session))) {
+        !session_is_active(session.id)) {
         throw_typed_property_session_disconnected(
             "the typed-property session disconnected while clearing a property");
     }
@@ -2429,7 +2622,10 @@ json method_get_tree_changes(const json& params, bool uia) {
     lvt::Element current;
     std::string error;
     bool truncated = false;
-    if (!build_tree_for(session, params, uia, current, error, &truncated))
+    StagedPropertyAuthorization stagedAuthorization;
+    if (!build_tree_for(
+            session, params, uia, current, error, &truncated,
+            false, &stagedAuthorization))
         throw std::runtime_error(error);
     if (truncated) {
         throw std::runtime_error(
@@ -2493,6 +2689,8 @@ json method_get_tree_changes(const json& params, bool uia) {
     if (!uia) {
         ensure_session_target_identity_current(
             session, "after completing the visual tree-change response");
+        commit_session_property_authorization(
+            session, std::move(stagedAuthorization));
     }
     return out;
 }
@@ -2514,7 +2712,10 @@ json method_find_elements(const json& params) {
     lvt::Element tree;
     std::string error;
     bool truncated = false;
-    if (!build_tree_for(session, params, uia, tree, error, &truncated))
+    StagedPropertyAuthorization stagedAuthorization;
+    if (!build_tree_for(
+            session, params, uia, tree, error, &truncated,
+            false, &stagedAuthorization))
         throw std::runtime_error(error);
 
     const auto automationId = get_string(params, "automationId");
@@ -2568,6 +2769,10 @@ json method_find_elements(const json& params) {
     out["tree"] = tree_name(uia);
     if (truncated)
         out["truncated"] = truncation_note();
+    if (!uia) {
+        commit_session_property_authorization(
+            session, std::move(stagedAuthorization));
+    }
     return out;
 }
 
@@ -2583,7 +2788,10 @@ json method_get_element_properties(const json& params) {
     lvt::Element tree;
     std::string error;
     bool truncated = false;
-    if (!build_tree_for(session, params, uia, tree, error, &truncated))
+    StagedPropertyAuthorization stagedAuthorization;
+    if (!build_tree_for(
+            session, params, uia, tree, error, &truncated,
+            false, &stagedAuthorization))
         throw std::runtime_error(error);
 
     const auto* element = lvt::find_element_by_ref(tree, parsed.ref);
@@ -2603,6 +2811,10 @@ json method_get_element_properties(const json& params) {
         out["tree"] = tree_name(uia);
         if (truncated)
             out["truncated"] = truncation_note();
+        if (!uia) {
+            commit_session_property_authorization(
+                session, std::move(stagedAuthorization));
+        }
         return out;
     }
 
@@ -2624,6 +2836,10 @@ json method_get_element_properties(const json& params) {
         out["notPresent"] = missing;
     if (truncated)
         out["truncated"] = truncation_note();
+    if (!uia) {
+        commit_session_property_authorization(
+            session, std::move(stagedAuthorization));
+    }
     return out;
 }
 
@@ -2680,7 +2896,10 @@ json method_screenshot(const json& params, bool allowInput) {
                          : parsedScope.tree == RefTree::uia;
     bool annotated = true;
     bool truncated = false;
-    if (!build_tree_for(session, params, uia, tree, error, &truncated)) {
+    StagedPropertyAuthorization stagedAuthorization;
+    if (!build_tree_for(
+            session, params, uia, tree, error, &truncated,
+            false, &stagedAuthorization)) {
         // Annotation is a bonus; a plain capture is still useful. A requested
         // scope is not a bonus, though — silently returning the whole window
         // would reinterpret the request rather than answer it.
@@ -2715,6 +2934,10 @@ json method_screenshot(const json& params, bool allowInput) {
         out["imageBase64"] = base64_encode(read_file_bytes(path));
     else
         out["path"] = path;
+    if (!uia && annotated) {
+        commit_session_property_authorization(
+            session, std::move(stagedAuthorization));
+    }
     return out;
 }
 
@@ -2735,7 +2958,10 @@ json method_hit_test(const json& params) {
     std::string error;
     bool truncated = false;
     const bool uia = tree_for_session(session, params);
-    if (!build_tree_for(session, params, uia, tree, error, &truncated))
+    StagedPropertyAuthorization stagedAuthorization;
+    if (!build_tree_for(
+            session, params, uia, tree, error, &truncated,
+            false, &stagedAuthorization))
         throw std::runtime_error(error);
 
     std::vector<const lvt::Element*> all;
@@ -2775,6 +3001,10 @@ json method_hit_test(const json& params) {
             continue;
         if (x >= b.x && y >= b.y && x < b.x + b.width && y < b.y + b.height)
             out["ancestors"].push_back(element->id);
+    }
+    if (!uia) {
+        commit_session_property_authorization(
+            session, std::move(stagedAuthorization));
     }
     return out;
 }
@@ -2929,10 +3159,8 @@ void record_visual_input_test_attempt(const char* operation) {
 
 void validate_visual_action_identity(
     const Session& session) {
-    if (!session_target_identity_is_current(session)) {
-        throw_action_ownership_lost(
-            "ownershipLost: the visual session target identity changed");
-    }
+    ensure_session_target_identity_current(
+        session, "before the visual action");
 }
 
 void activate_visual_action_target(
@@ -3014,26 +3242,26 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
         const auto deadline =
             GetTickCount64() + static_cast<ULONGLONG>((std::max)(0, get_int(params, "timeoutMs", 5000)));
         for (;;) {
-            const bool identityCurrent =
-#ifdef LVT_ENABLE_UIA
-                SUCCEEDED(lvt::validate_uia_target_identity(
-                    uia_identity_for_session(session)));
-#else
-                IsWindow(session.hwnd) != FALSE;
-#endif
-            if (!identityCurrent) {
-                if (!wantPresent) {
+            const HRESULT identityStatus =
+                session_target_identity_status(session);
+            if (FAILED(identityStatus)) {
+                if (!wantPresent &&
+                    session_target_ownership_lost(
+                        identityStatus)) {
                     out["ok"] = true;
                     out["method"] = "window-closed";
                     return out;
                 }
-                throw_action_ownership_lost(
-                    "ownershipLost: the window closed or was replaced while waiting for '" +
-                    ref + "'");
+                ensure_session_target_identity_current(
+                    session, "while waiting for '" +
+                                 ref + "'");
             }
             lvt::Element tree;
             std::string error;
-            if (build_tree_for(session, params, false, tree, error)) {
+            StagedPropertyAuthorization stagedAuthorization;
+            if (build_tree_for(
+                    session, params, false, tree, error,
+                    nullptr, false, &stagedAuthorization)) {
                 const auto* found = lvt::find_element_by_ref(tree, parsed.ref);
                 bool satisfied = wantPresent ? found != nullptr : found == nullptr;
                 if (satisfied && wantPresent && found && !property.empty())
@@ -3043,6 +3271,9 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
                     out["method"] = wantPresent ? "wait-for" : "wait-gone";
                     if (found)
                         out["result"] = element_fields(*found, "visual");
+                    commit_session_property_authorization(
+                        session,
+                        std::move(stagedAuthorization));
                     return out;
                 }
             }

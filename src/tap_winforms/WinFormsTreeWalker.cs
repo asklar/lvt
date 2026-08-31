@@ -463,8 +463,10 @@ namespace LvtWinFormsTap
             ObjectRegistry registry, WinFormsPropertyCatalog catalog,
             string arguments)
         {
-            ulong handle = ParseHandle(
-                ManagedProtocol.SplitArguments(arguments, 1)[0]);
+            string[] parts =
+                ManagedProtocol.SplitArguments(arguments, 2);
+            ulong handle = ParseHandle(parts[0]);
+            ulong expectedRoot = ParseExpectedRoot(parts[1]);
             Control target;
             Control marshalControl;
             ResolveTarget(registry, handle, out target, out marshalControl);
@@ -473,6 +475,7 @@ namespace LvtWinFormsTap
                 () =>
                 {
                     EnsureTargetAvailable(target, marshalControl);
+                    ValidateTargetRoot(target, expectedRoot);
                     return BuildPropertySnapshot(target, catalog);
                 });
         }
@@ -481,10 +484,11 @@ namespace LvtWinFormsTap
             ObjectRegistry registry, WinFormsPropertyCatalog catalog,
             string arguments)
         {
-            string[] parts = ManagedProtocol.SplitArguments(arguments, 3);
+            string[] parts = ManagedProtocol.SplitArguments(arguments, 4);
             ulong handle = ParseHandle(parts[0]);
-            string descriptorId = ManagedProtocol.DecodeHex(parts[1]);
-            string value = ManagedProtocol.DecodeHex(parts[2]);
+            ulong expectedRoot = ParseExpectedRoot(parts[1]);
+            string descriptorId = ManagedProtocol.DecodeHex(parts[2]);
+            string value = ManagedProtocol.DecodeHex(parts[3]);
             Control target;
             Control marshalControl;
             ResolveTarget(registry, handle, out target, out marshalControl);
@@ -493,6 +497,7 @@ namespace LvtWinFormsTap
                 () =>
                 {
                     EnsureTargetAvailable(target, marshalControl);
+                    ValidateTargetRoot(target, expectedRoot);
                     SchemaContext context = catalog.GetContext(target);
                     WinFormsPropertyMetadata metadata =
                         ResolveProperty(context, descriptorId);
@@ -501,6 +506,7 @@ namespace LvtWinFormsTap
                     object converted =
                         ManagedProtocol.ConvertScalar(value, metadata.Scalar);
                     descriptor.SetValue(target, converted);
+                    ValidateTargetRoot(target, expectedRoot);
                     return BuildMutationResult(descriptor.GetValue(target), false);
                 });
         }
@@ -509,9 +515,10 @@ namespace LvtWinFormsTap
             ObjectRegistry registry, WinFormsPropertyCatalog catalog,
             string arguments)
         {
-            string[] parts = ManagedProtocol.SplitArguments(arguments, 2);
+            string[] parts = ManagedProtocol.SplitArguments(arguments, 3);
             ulong handle = ParseHandle(parts[0]);
-            string descriptorId = ManagedProtocol.DecodeHex(parts[1]);
+            ulong expectedRoot = ParseExpectedRoot(parts[1]);
+            string descriptorId = ManagedProtocol.DecodeHex(parts[2]);
             Control target;
             Control marshalControl;
             ResolveTarget(registry, handle, out target, out marshalControl);
@@ -520,6 +527,7 @@ namespace LvtWinFormsTap
                 () =>
                 {
                     EnsureTargetAvailable(target, marshalControl);
+                    ValidateTargetRoot(target, expectedRoot);
                     SchemaContext context = catalog.GetContext(target);
                     WinFormsPropertyMetadata metadata =
                         ResolveProperty(context, descriptorId);
@@ -533,6 +541,7 @@ namespace LvtWinFormsTap
                             ManagedProtocol.EInvalidArg);
                     }
                     descriptor.ResetValue(target);
+                    ValidateTargetRoot(target, expectedRoot);
                     return BuildMutationResult(descriptor.GetValue(target), true);
                 });
         }
@@ -549,6 +558,39 @@ namespace LvtWinFormsTap
                     ManagedProtocol.EInvalidArg);
             }
             return handle;
+        }
+
+        private static ulong ParseExpectedRoot(string text)
+        {
+            ulong handle;
+            if (!ulong.TryParse(
+                    text, NumberStyles.None,
+                    CultureInfo.InvariantCulture, out handle))
+            {
+                throw new CommandException(
+                    "The expected WinForms session root is invalid",
+                    ManagedProtocol.EInvalidArg);
+            }
+            return handle;
+        }
+
+        private static void ValidateTargetRoot(
+            Control target, ulong expectedRoot)
+        {
+            if (expectedRoot == 0)
+                return;
+            Control root = target.TopLevelControl;
+            ulong actualRoot =
+                root == null || root.IsDisposed ||
+                !root.IsHandleCreated
+                    ? 0
+                    : unchecked((ulong)root.Handle.ToInt64());
+            if (actualRoot != expectedRoot)
+            {
+                throw new CommandException(
+                    "The WinForms control no longer belongs to the authorized session window",
+                    ManagedProtocol.EAccessDenied);
+            }
         }
 
         private static void ResolveTarget(

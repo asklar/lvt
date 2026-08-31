@@ -60,12 +60,16 @@ public:
     }
     std::vector<ConnectionEvent> poll_events() override;
     bool is_alive() const override;
-    PropertySnapshotResult get_property_snapshot(uint64_t handle) override;
+    PropertySnapshotResult get_property_snapshot(
+        uint64_t handle,
+        const PropertyOperationContext& context = {}) override;
     PropertyMutationResult set_property(
         uint64_t handle, const std::string& descriptorId,
-        const std::string& value) override;
+        const std::string& value,
+        const PropertyOperationContext& context = {}) override;
     PropertyMutationResult clear_property(
-        uint64_t handle, const std::string& descriptorId) override;
+        uint64_t handle, const std::string& descriptorId,
+        const PropertyOperationContext& context = {}) override;
 
 private:
     struct Impl;

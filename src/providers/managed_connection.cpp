@@ -719,7 +719,9 @@ public:
         return connection_alive();
     }
 
-    PropertySnapshotResult get_property_snapshot(uint64_t handle) override {
+    PropertySnapshotResult get_property_snapshot(
+        uint64_t handle,
+        const PropertyOperationContext& context) override {
         std::lock_guard<std::mutex> lock(m_commandMutex);
         PropertySnapshotResult result;
         if (!supports_command("GET_PROPERTIES")) {
@@ -729,8 +731,13 @@ public:
             return result;
         }
 
+        const std::string arguments =
+            std::to_string(handle) + " " +
+            std::to_string(static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(
+                    context.expectedRootHwnd)));
         auto response = send_command_locked(
-            "GET_PROPERTIES", std::to_string(handle),
+            "GET_PROPERTIES", arguments,
             m_options.commandTimeoutMs);
         if (response.completed && !response.success) {
             PropertySnapshotResult firstFailure;
@@ -745,7 +752,7 @@ public:
                     "GET_TREE", "{}", m_options.commandTimeoutMs);
                 if (hydration.completed && hydration.success) {
                     response = send_command_locked(
-                        "GET_PROPERTIES", std::to_string(handle),
+                        "GET_PROPERTIES", arguments,
                         m_options.commandTimeoutMs);
                 }
             }
@@ -816,7 +823,8 @@ public:
 
     PropertyMutationResult set_property(
         uint64_t handle, const std::string& descriptorId,
-        const std::string& value) override {
+        const std::string& value,
+        const PropertyOperationContext& context) override {
         std::lock_guard<std::mutex> lock(m_commandMutex);
         PropertyMutationResult result;
         if (!supports_command("SET_PROPERTY")) {
@@ -826,7 +834,11 @@ public:
             return result;
         }
         const std::string arguments =
-            std::to_string(handle) + " " + hex_encode(descriptorId) + " " +
+            std::to_string(handle) + " " +
+            std::to_string(static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(
+                    context.expectedRootHwnd))) +
+            " " + hex_encode(descriptorId) + " " +
             hex_encode(value);
         return parse_mutation_response(
             send_command_locked(
@@ -835,7 +847,8 @@ public:
     }
 
     PropertyMutationResult clear_property(
-        uint64_t handle, const std::string& descriptorId) override {
+        uint64_t handle, const std::string& descriptorId,
+        const PropertyOperationContext& context) override {
         std::lock_guard<std::mutex> lock(m_commandMutex);
         PropertyMutationResult result;
         if (!supports_command("CLEAR_PROPERTY")) {
@@ -845,7 +858,11 @@ public:
             return result;
         }
         const std::string arguments =
-            std::to_string(handle) + " " + hex_encode(descriptorId);
+            std::to_string(handle) + " " +
+            std::to_string(static_cast<uint64_t>(
+                reinterpret_cast<uintptr_t>(
+                    context.expectedRootHwnd))) +
+            " " + hex_encode(descriptorId);
         return parse_mutation_response(
             send_command_locked(
                 "CLEAR_PROPERTY", arguments, m_options.commandTimeoutMs),

@@ -363,27 +363,36 @@ namespace LvtWpfTap
         private static string GetPropertySnapshot(
             ObjectRegistry registry, WpfPropertyCatalog catalog, string arguments)
         {
-            ulong handle = ParseHandle(
-                ManagedProtocol.SplitArguments(arguments, 1)[0]);
+            string[] parts =
+                ManagedProtocol.SplitArguments(arguments, 2);
+            ulong handle = ParseHandle(parts[0]);
+            ulong expectedRoot = ParseExpectedRoot(parts[1]);
             DependencyObject target = ResolveTarget(registry, handle);
-            return InvokeOnDispatcher(() => BuildPropertySnapshot(target, catalog));
+            return InvokeOnDispatcher(() =>
+            {
+                ValidateTargetRoot(target, expectedRoot);
+                return BuildPropertySnapshot(target, catalog);
+            });
         }
 
         private static string SetProperty(
             ObjectRegistry registry, WpfPropertyCatalog catalog, string arguments)
         {
-            string[] parts = ManagedProtocol.SplitArguments(arguments, 3);
+            string[] parts = ManagedProtocol.SplitArguments(arguments, 4);
             ulong handle = ParseHandle(parts[0]);
-            string descriptorId = ManagedProtocol.DecodeHex(parts[1]);
-            string value = ManagedProtocol.DecodeHex(parts[2]);
+            ulong expectedRoot = ParseExpectedRoot(parts[1]);
+            string descriptorId = ManagedProtocol.DecodeHex(parts[2]);
+            string value = ManagedProtocol.DecodeHex(parts[3]);
             DependencyObject target = ResolveTarget(registry, handle);
             return InvokeMutationOnDispatcher(() =>
             {
+                ValidateTargetRoot(target, expectedRoot);
                 WpfPropertyMetadata property =
                     ResolveProperty(target, catalog, descriptorId);
                 object converted =
                     ManagedProtocol.ConvertScalar(value, property.Scalar);
                 target.SetValue(property.Property, converted);
+                ValidateTargetRoot(target, expectedRoot);
                 return BuildMutationResult(
                     target.GetValue(property.Property), false);
             });
@@ -392,12 +401,14 @@ namespace LvtWpfTap
         private static string ClearProperty(
             ObjectRegistry registry, WpfPropertyCatalog catalog, string arguments)
         {
-            string[] parts = ManagedProtocol.SplitArguments(arguments, 2);
+            string[] parts = ManagedProtocol.SplitArguments(arguments, 3);
             ulong handle = ParseHandle(parts[0]);
-            string descriptorId = ManagedProtocol.DecodeHex(parts[1]);
+            ulong expectedRoot = ParseExpectedRoot(parts[1]);
+            string descriptorId = ManagedProtocol.DecodeHex(parts[2]);
             DependencyObject target = ResolveTarget(registry, handle);
             return InvokeMutationOnDispatcher(() =>
             {
+                ValidateTargetRoot(target, expectedRoot);
                 WpfPropertyMetadata property =
                     ResolveProperty(target, catalog, descriptorId);
                 if (target.ReadLocalValue(property.Property) ==
@@ -408,6 +419,7 @@ namespace LvtWpfTap
                         ManagedProtocol.EInvalidArg);
                 }
                 target.ClearValue(property.Property);
+                ValidateTargetRoot(target, expectedRoot);
                 return BuildMutationResult(
                     target.GetValue(property.Property), true);
             });
@@ -425,6 +437,41 @@ namespace LvtWpfTap
                     ManagedProtocol.EInvalidArg);
             }
             return handle;
+        }
+
+        private static ulong ParseExpectedRoot(string text)
+        {
+            ulong handle;
+            if (!ulong.TryParse(
+                    text, NumberStyles.None,
+                    CultureInfo.InvariantCulture, out handle))
+            {
+                throw new CommandException(
+                    "The expected WPF session root is invalid",
+                    ManagedProtocol.EInvalidArg);
+            }
+            return handle;
+        }
+
+        private static void ValidateTargetRoot(
+            DependencyObject target, ulong expectedRoot)
+        {
+            if (expectedRoot == 0)
+                return;
+            Window window = target as Window ?? Window.GetWindow(target);
+            HwndSource source = window == null
+                ? null
+                : PresentationSource.FromVisual(window) as HwndSource;
+            ulong actualRoot =
+                source == null || source.Handle == IntPtr.Zero
+                    ? 0
+                    : unchecked((ulong)source.Handle.ToInt64());
+            if (actualRoot != expectedRoot)
+            {
+                throw new CommandException(
+                    "The WPF element no longer belongs to the authorized session window",
+                    ManagedProtocol.EAccessDenied);
+            }
         }
 
         private static DependencyObject ResolveTarget(

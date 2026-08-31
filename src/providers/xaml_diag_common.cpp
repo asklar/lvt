@@ -609,7 +609,9 @@ public:
 
     bool is_alive() const override { return m_alive; }
 
-    PropertySnapshotResult get_property_snapshot(uint64_t handle) override {
+    PropertySnapshotResult get_property_snapshot(
+        uint64_t handle,
+        const PropertyOperationContext&) override {
         const auto commandId = next_command_id();
         auto raw = send_property_command(
             "GET_PROPERTIES " + std::to_string(commandId) + " " +
@@ -648,7 +650,8 @@ public:
 
     PropertyMutationResult set_property(
         uint64_t handle, const std::string& descriptorId,
-        const std::string& value) override {
+        const std::string& value,
+        const PropertyOperationContext&) override {
         PropertyMutationResult result;
         CachedMutation mutation;
         if (!resolve_mutation(handle, descriptorId, true, mutation, result))
@@ -700,7 +703,8 @@ public:
     }
 
     PropertyMutationResult clear_property(
-        uint64_t handle, const std::string& descriptorId) override {
+        uint64_t handle, const std::string& descriptorId,
+        const PropertyOperationContext&) override {
         PropertyMutationResult result;
         CachedMutation mutation;
         if (!resolve_mutation(handle, descriptorId, false, mutation, result))
