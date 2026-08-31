@@ -6895,6 +6895,34 @@ TEST_F(NativeControlsFixture, Win32TypedPropertiesRoundTripAndValidate) {
     EXPECT_FALSE(clearedCombo.overridden);
     ASSERT_TRUE(set(
         native, *combo, comboProperties, "SelectedIndex", "1").ok);
+    DWORD_PTR armed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kArmRefusedSelectionClearMessage,
+            0, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &armed),
+        0);
+    auto refusedClear =
+        clear(native, *combo, comboProperties, "SelectedIndex");
+    EXPECT_FALSE(refusedClear.ok);
+    EXPECT_FALSE(refusedClear.hasValue);
+    EXPECT_EQ(
+        refusedClear.errorCode,
+        "typed_property_mutation_failed");
+    EXPECT_EQ(
+        refusedClear.errorDisposition,
+        lvt::PropertyErrorDisposition::terminal);
+    EXPECT_FALSE(refusedClear.retryable);
+    auto afterRefusedClear = snapshot(native, *combo);
+    ASSERT_TRUE(afterRefusedClear.ok)
+        << afterRefusedClear.error;
+    const auto* selectedAfterRefusedClear =
+        native_value(
+            afterRefusedClear, "SelectedIndex");
+    ASSERT_NE(selectedAfterRefusedClear, nullptr);
+    EXPECT_EQ(selectedAfterRefusedClear->value, "1");
     auto invalidCombo = set(
         native, *combo, comboProperties, "SelectedIndex", "3");
     EXPECT_FALSE(invalidCombo.ok);

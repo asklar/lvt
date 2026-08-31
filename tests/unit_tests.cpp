@@ -2894,6 +2894,63 @@ TEST(UiaProperties, RangeReadbackFailureHasNoSuccessShapedValue) {
     EXPECT_EQ(std::stod(succeeded.value), 12.345678901234567);
 }
 
+TEST(UiaProperties, ValidationFailuresPreserveRetrySemantics) {
+    const auto transient =
+        uia_property_detail::target_validation_failure(
+            RPC_E_CALL_REJECTED);
+    EXPECT_FALSE(transient.ok);
+    EXPECT_EQ(transient.hresult, RPC_E_CALL_REJECTED);
+    EXPECT_EQ(
+        transient.errorCode,
+        "typed_property_identity_validation_failed");
+    EXPECT_EQ(
+        transient.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(transient.retryable);
+
+    const auto ownership =
+        uia_property_detail::target_validation_failure(
+            HRESULT_FROM_WIN32(ERROR_INVALID_OWNER));
+    EXPECT_EQ(
+        ownership.errorDisposition,
+        PropertyErrorDisposition::ownershipLost);
+    EXPECT_FALSE(ownership.retryable);
+
+    const auto stale =
+        uia_property_detail::element_resolution_failure(
+            static_cast<HRESULT>(
+                UIA_E_ELEMENTNOTAVAILABLE),
+            true);
+    EXPECT_EQ(stale.errorCode, "typed_property_stale_element");
+    EXPECT_EQ(
+        stale.errorDisposition,
+        PropertyErrorDisposition::terminal);
+    EXPECT_FALSE(stale.retryable);
+
+    const auto busy =
+        uia_property_detail::element_resolution_failure(
+            static_cast<HRESULT>(
+                UIA_E_ELEMENTNOTAVAILABLE),
+            false);
+    EXPECT_EQ(busy.errorCode, "typed_property_provider_busy");
+    EXPECT_EQ(
+        busy.hresult,
+        static_cast<HRESULT>(
+            UIA_E_ELEMENTNOTAVAILABLE));
+    EXPECT_EQ(
+        busy.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(busy.retryable);
+
+    const auto rejected =
+        uia_property_detail::element_resolution_failure(
+            RPC_E_SERVERCALL_RETRYLATER, false);
+    EXPECT_EQ(
+        rejected.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(rejected.retryable);
+}
+
 TEST(UiaProperties, OneShotFallbackTreeReceivesConnectionOwnedIdentities) {
     UiaPropertyIdentityCache identities;
     Element root;
@@ -2934,8 +2991,25 @@ TEST(UiaProperties, OneShotFallbackTreeReceivesConnectionOwnedIdentities) {
     identities.attach(conflicting);
     identities.remember(conflicting);
     error.clear();
-    EXPECT_FALSE(identities.resolve(conflicting.key, error).has_value());
+    const auto ambiguous =
+        identities.resolve(conflicting.key, error);
+    EXPECT_FALSE(ambiguous.has_value());
+    EXPECT_EQ(
+        ambiguous.failure,
+        UiaPropertyReferenceFailure::ambiguous);
+    EXPECT_EQ(
+        ambiguous.hresult,
+        HRESULT_FROM_WIN32(ERROR_DUP_NAME));
     EXPECT_NE(error.find("ambiguous"), std::string::npos);
+
+    error.clear();
+    const auto malformed =
+        identities.resolve("uia:not-a-runtime-id", error);
+    EXPECT_FALSE(malformed.has_value());
+    EXPECT_EQ(
+        malformed.failure,
+        UiaPropertyReferenceFailure::malformed);
+    EXPECT_EQ(malformed.hresult, E_INVALIDARG);
 }
 
 TEST(UiaProperties, IdentityCachePrunesVirtualizationChurnAndRejectsStaleAliases) {
@@ -3170,6 +3244,21 @@ TEST(UiaProperties, OversizedSnapshotIsRefusedBeforeReturningInvalidKeys) {
     root.children.pop_back();
     ASSERT_TRUE(identities.attach(root, "raw"));
     const auto protectedHandle = root.children.front().providerHandle;
+    std::string capacityError;
+    const auto capacity = identities.resolve(
+        "uia:42.999.1", capacityError);
+    EXPECT_FALSE(capacity.has_value());
+    EXPECT_EQ(
+        capacity.failure,
+        UiaPropertyReferenceFailure::capacity);
+    EXPECT_EQ(
+        capacity.hresult,
+        HRESULT_FROM_WIN32(
+            ERROR_NOT_ENOUGH_QUOTA));
+    EXPECT_NE(
+        capacityError.find("bounded identity cache"),
+        std::string::npos);
+
     Element additional;
     additional.type = "Text";
     additional.framework = "uia";
@@ -3482,6 +3571,15 @@ TEST(TypedPropertyContract, EditorKindWireNamesAreProviderNeutral) {
 }
 
 TEST(TypedPropertyContract, MutationFailuresHaveStableDispositions) {
+    EXPECT_NE(
+        LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION,
+        static_cast<HRESULT>(
+            UIA_E_ELEMENTNOTAVAILABLE));
+    EXPECT_EQ(
+        static_cast<uint32_t>(
+            LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION),
+        0xA0040201u);
+
     const auto invalid = property_mutation_failure(
         E_INVALIDARG, "invalid value");
     EXPECT_EQ(invalid.errorCode, "typed_property_invalid_value");

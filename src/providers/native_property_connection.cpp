@@ -2306,6 +2306,16 @@ struct NativePropertyConnection::Impl {
                 "typed_property_readback_failed",
                 PropertyErrorDisposition::terminal);
         }
+        if (!requested &&
+            mutation.operation ==
+                Operation::selectedIndex &&
+            readback.value != "-1") {
+            return property_mutation_failure(
+                E_FAIL,
+                "The control did not clear its selected index",
+                "typed_property_mutation_failed",
+                PropertyErrorDisposition::terminal);
+        }
 
         {
             std::lock_guard<std::mutex> lock(mutex);

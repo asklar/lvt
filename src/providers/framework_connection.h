@@ -12,7 +12,7 @@ namespace lvt {
 
 inline constexpr HRESULT
     LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION =
-        MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x201);
+        static_cast<HRESULT>(0xA0040201u);
 
 enum class PropertyEditorKind {
     readonly,

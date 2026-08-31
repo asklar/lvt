@@ -219,40 +219,67 @@ bool element_has_runtime_id(IUIAutomationElement* element, const std::vector<int
 
 // The same test against a cached RuntimeId, so a bulk FindAllBuildCache can be
 // scanned without a cross-process call per candidate.
-bool cached_runtime_id_matches(IUIAutomationElement* element, const std::vector<int>& runtimeId) {
+HRESULT cached_runtime_id_matches(
+    IUIAutomationElement* element,
+    const std::vector<int>& runtimeId,
+    bool& matches) {
+    matches = false;
+    RETURN_HR_IF_NULL(E_POINTER, element);
     wil::unique_variant value;
-    if (FAILED(element->GetCachedPropertyValue(UIA_RuntimeIdPropertyId, &value)))
-        return false;
-    if (value.vt != (VT_ARRAY | VT_I4))
-        return false;
-    return runtime_id_matches(value.parray, runtimeId);
+    RETURN_IF_FAILED(element->GetCachedPropertyValue(
+        UIA_RuntimeIdPropertyId, &value));
+    RETURN_HR_IF(
+        HRESULT_FROM_WIN32(ERROR_INVALID_DATA),
+        value.vt != (VT_ARRAY | VT_I4) ||
+        !value.parray);
+    matches =
+        runtime_id_matches(value.parray, runtimeId);
+    return S_OK;
 }
 
 // Depth-first search of a materialised cache for the element with this
 // RuntimeId. Purely in-process: the cross-process cost was paid by the
 // BuildUpdatedCache that produced `cachedRoot`.
-wil::com_ptr<IUIAutomationElement> find_in_cached_tree(IUIAutomationElement* node,
-                                                      const std::vector<int>& runtimeId) {
-    if (!node)
-        return {};
-    if (cached_runtime_id_matches(node, runtimeId))
-        return wil::com_ptr<IUIAutomationElement>(node);
+HRESULT find_in_cached_tree(
+    IUIAutomationElement* node,
+    const std::vector<int>& runtimeId,
+    IUIAutomationElement** match) {
+    RETURN_HR_IF_NULL(E_POINTER, node);
+    RETURN_HR_IF_NULL(E_POINTER, match);
+    *match = nullptr;
+    bool matches = false;
+    RETURN_IF_FAILED(cached_runtime_id_matches(
+        node, runtimeId, matches));
+    if (matches) {
+        node->AddRef();
+        *match = node;
+        return S_OK;
+    }
 
     wil::com_ptr<IUIAutomationElementArray> children;
-    if (FAILED(node->GetCachedChildren(&children)) || !children)
-        return {};
+    RETURN_IF_FAILED(
+        node->GetCachedChildren(&children));
+    if (!children)
+        return S_FALSE;
     int count = 0;
-    if (FAILED(children->get_Length(&count)))
-        return {};
+    RETURN_IF_FAILED(children->get_Length(&count));
 
     for (int i = 0; i < count; ++i) {
         wil::com_ptr<IUIAutomationElement> child;
-        if (FAILED(children->GetElement(i, &child)) || !child)
-            continue;
-        if (auto match = find_in_cached_tree(child.get(), runtimeId))
-            return match;
+        RETURN_IF_FAILED(
+            children->GetElement(i, &child));
+        RETURN_HR_IF_NULL(E_FAIL, child.get());
+        wil::com_ptr<IUIAutomationElement> found;
+        const HRESULT childHr =
+            find_in_cached_tree(
+                child.get(), runtimeId, &found);
+        RETURN_IF_FAILED(childHr);
+        if (childHr == S_OK) {
+            *match = found.detach();
+            return S_OK;
+        }
     }
-    return {};
+    return S_FALSE;
 }
 
 // Re-find the live element by RuntimeId. The walk produces plain data, so
@@ -263,7 +290,31 @@ HRESULT find_by_runtime_id(
     const UiaTargetIdentity& identity,
     HANDLE retainedProcess,
     const std::vector<int>& runtimeId,
-    IUIAutomationElement** out) {
+    IUIAutomationElement** out,
+    bool* confirmedMissing = nullptr) {
+    if (confirmedMissing)
+        *confirmedMissing = false;
+    char failureEventName[192]{};
+    const DWORD failureEventLength =
+        GetEnvironmentVariableA(
+            "LVT_TEST_UIA_PROPERTY_ACTION_ROOT_FAILURE_EVENT",
+            failureEventName,
+            static_cast<DWORD>(
+                _countof(failureEventName)));
+    if (failureEventLength != 0 &&
+        failureEventLength <
+            _countof(failureEventName)) {
+        wil::unique_handle failure(OpenEventA(
+            SYNCHRONIZE | EVENT_MODIFY_STATE,
+            FALSE, failureEventName));
+        if (failure &&
+            WaitForSingleObject(failure.get(), 0) ==
+                WAIT_OBJECT_0) {
+            ResetEvent(failure.get());
+            return static_cast<HRESULT>(
+                UIA_E_ELEMENTNOTAVAILABLE);
+        }
+    }
     wil::com_ptr<IUIAutomationElement> root;
     RETURN_IF_FAILED(get_validated_uia_root(
         automation, identity, retainedProcess, &root));
@@ -329,10 +380,21 @@ HRESULT find_by_runtime_id(
         RETURN_IF_FAILED(identityHr);
         RETURN_IF_FAILED(cacheHr);
         RETURN_HR_IF_NULL(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), cachedRoot.get());
-        found = find_in_cached_tree(cachedRoot.get(), runtimeId);
+        wil::com_ptr<IUIAutomationElement> cachedMatch;
+        const HRESULT searchHr =
+            find_in_cached_tree(
+                cachedRoot.get(), runtimeId,
+                &cachedMatch);
+        RETURN_IF_FAILED(searchHr);
+        if (searchHr == S_OK)
+            found = std::move(cachedMatch);
     }
 
-    RETURN_HR_IF_NULL(HRESULT_FROM_WIN32(ERROR_NOT_FOUND), found.get());
+    if (!found) {
+        if (confirmedMissing)
+            *confirmedMissing = true;
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    }
     *out = found.detach();
     return S_OK;
 }
@@ -1034,6 +1096,44 @@ PropertyMutationResult uia_property_detail::pattern_operation_failure(
             std::string(buffer) + ")");
 }
 
+PropertyMutationResult
+uia_property_detail::target_validation_failure(
+    HRESULT hresult) {
+    const bool ownershipLost = is_ownership_lost(hresult);
+    return property_mutation_failure(
+        hresult,
+        ownershipLost
+            ? "ownershipLost: the UI Automation target identity changed"
+            : "The UI Automation target identity could not be validated",
+        ownershipLost
+            ? "typed_property_ownership_lost"
+            : "typed_property_identity_validation_failed",
+        ownershipLost
+            ? PropertyErrorDisposition::ownershipLost
+            : PropertyErrorDisposition::transient);
+}
+
+PropertyMutationResult
+uia_property_detail::element_resolution_failure(
+    HRESULT hresult, bool confirmedMissing) {
+    if (confirmedMissing) {
+        return property_mutation_failure(
+            hresult,
+            "The UI Automation element changed or disappeared after its "
+            "properties were read",
+            "typed_property_stale_element",
+            PropertyErrorDisposition::terminal);
+    }
+    if (is_ownership_lost(hresult))
+        return target_validation_failure(hresult);
+    return property_mutation_failure(
+        hresult,
+        "The UI Automation element could not be resolved while the provider "
+        "was temporarily unavailable",
+        "typed_property_provider_busy",
+        PropertyErrorDisposition::transient);
+}
+
 PropertyMutationResult perform_uia_property_action(
     IUIAutomation* automation,
     const UiaTargetIdentity& identity,
@@ -1049,25 +1149,17 @@ PropertyMutationResult perform_uia_property_action(
     }
 
     wil::com_ptr<IUIAutomationElement> element;
+    bool confirmedMissing = false;
     const HRESULT findHr =
         find_by_runtime_id(
             automation, identity, retainedProcess,
-            runtimeId, &element);
+            runtimeId, &element, &confirmedMissing);
     if (FAILED(findHr) || !element) {
-        const bool ownershipLost = is_ownership_lost(findHr);
-        return property_mutation_failure(
+        return uia_property_detail::element_resolution_failure(
             FAILED(findHr)
                 ? findHr
                 : HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
-            ownershipLost
-                ? "ownershipLost: the UI Automation target identity changed"
-                : "The UI Automation element changed or disappeared after its properties were read",
-            ownershipLost
-                ? "typed_property_ownership_lost"
-                : "typed_property_stale_element",
-            ownershipLost
-                ? PropertyErrorDisposition::ownershipLost
-                : PropertyErrorDisposition::terminal);
+            confirmedMissing || SUCCEEDED(findHr));
     }
 
     const auto validateTarget = [&]() -> HRESULT {
@@ -1080,22 +1172,14 @@ PropertyMutationResult perform_uia_property_action(
         [&] { return IsWindow(identity.hwnd) != FALSE; }};
     MutationBoundaryScope boundaryScope(boundary);
     const HRESULT beforeRealize = validateTarget();
-    if (FAILED(beforeRealize)) {
-        return property_mutation_failure(
-            beforeRealize,
-            "ownershipLost: the UI Automation target identity changed",
-            "typed_property_ownership_lost",
-            PropertyErrorDisposition::ownershipLost);
-    }
+    if (FAILED(beforeRealize))
+        return uia_property_detail::target_validation_failure(
+            beforeRealize);
     (void)realize_if_virtualized(element.get());
     const HRESULT afterRealize = validateTarget();
-    if (FAILED(afterRealize)) {
-        return property_mutation_failure(
-            afterRealize,
-            "ownershipLost: the UI Automation target identity changed",
-            "typed_property_ownership_lost",
-            PropertyErrorDisposition::ownershipLost);
-    }
+    if (FAILED(afterRealize))
+        return uia_property_detail::target_validation_failure(
+            afterRealize);
 
     std::string method;
     PatternAttempt attempt;
@@ -1136,13 +1220,9 @@ PropertyMutationResult perform_uia_property_action(
 
     if (!attempt.succeeded()) {
         const HRESULT identityHr = validateTarget();
-        if (FAILED(identityHr)) {
-            return property_mutation_failure(
-                identityHr,
-                "ownershipLost: the UI Automation target identity changed",
-                "typed_property_ownership_lost",
-                PropertyErrorDisposition::ownershipLost);
-        }
+        if (FAILED(identityHr))
+            return uia_property_detail::target_validation_failure(
+                identityHr);
         if (!attempt.supported) {
             return property_mutation_failure(
                 E_NOTIMPL,
@@ -1168,13 +1248,9 @@ PropertyMutationResult perform_uia_property_action(
     }
 
     const HRESULT beforeReadback = validateTarget();
-    if (FAILED(beforeReadback)) {
-        return property_mutation_failure(
-            beforeReadback,
-            "ownershipLost: the UI Automation target identity changed",
-            "typed_property_ownership_lost",
-            PropertyErrorDisposition::ownershipLost);
-    }
+    if (FAILED(beforeReadback))
+        return uia_property_detail::target_validation_failure(
+            beforeReadback);
 
     HRESULT readbackResult = E_FAIL;
     std::string effectiveValue;
@@ -1210,13 +1286,9 @@ PropertyMutationResult perform_uia_property_action(
     }
 
     const HRESULT afterReadback = validateTarget();
-    if (FAILED(afterReadback)) {
-        return property_mutation_failure(
-            afterReadback,
-            "ownershipLost: the UI Automation target identity changed",
-            "typed_property_ownership_lost",
-            PropertyErrorDisposition::ownershipLost);
-    }
+    if (FAILED(afterReadback))
+        return uia_property_detail::target_validation_failure(
+            afterReadback);
     if (action == UiaPropertyAction::setRangeValue)
         return uia_range_readback_result(readbackResult, effectiveRange);
     return uia_readback_result(

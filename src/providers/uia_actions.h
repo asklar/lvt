@@ -117,6 +117,9 @@ PropertyMutationResult uia_range_readback_result(
 
 namespace uia_property_detail {
 PropertyMutationResult pattern_operation_failure(HRESULT hresult);
+PropertyMutationResult target_validation_failure(HRESULT hresult);
+PropertyMutationResult element_resolution_failure(
+    HRESULT hresult, bool confirmedMissing);
 }
 
 // Parse an action name as accepted on the command line.

@@ -82,6 +82,7 @@ inline constexpr UINT kDeleteFirstToolbarSeparatorMessage = WM_APP + 0x12D;
 // Kept after the native-key/scoped-watch fixture range during series rebase.
 inline constexpr UINT kRecycleEventChildHwndMessage = WM_APP + 0x12E;
 inline constexpr UINT kGetExactHwndRecycleResultMessage = WM_APP + 0x12F;
+inline constexpr UINT kArmRefusedSelectionClearMessage = WM_APP + 0x130;
 inline constexpr WPARAM kForceExactHwndRecycleUnavailable =
     static_cast<WPARAM>(~static_cast<WPARAM>(0));
 inline constexpr WPARAM kForceExactHwndRecycleHardFailure =

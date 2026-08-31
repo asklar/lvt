@@ -127,6 +127,29 @@ struct UiaOptions {
 // elements its RuntimeIds and durable keys identify.
 std::string uia_identity_scope(const UiaOptions& options);
 
+enum class UiaPropertyReferenceFailure {
+    none,
+    missing,
+    malformed,
+    ambiguous,
+    capacity,
+    validation,
+};
+
+struct UiaPropertyReferenceResult {
+    uint64_t handle = 0;
+    HRESULT hresult = S_OK;
+    UiaPropertyReferenceFailure failure =
+        UiaPropertyReferenceFailure::none;
+
+    bool has_value() const noexcept {
+        return handle != 0;
+    }
+    uint64_t operator*() const noexcept {
+        return handle;
+    }
+};
+
 // Session-local identity adapter used both for persistent UIA walks and for
 // one-shot fallback trees. It stores only RuntimeIds/keys and opaque numeric
 // handles—never live values or COM objects.
@@ -142,7 +165,7 @@ public:
     bool remember(
         const Element& root, const std::string& scope = "default",
         bool completeSnapshot = true);
-    std::optional<uint64_t> resolve(
+    UiaPropertyReferenceResult resolve(
         const std::string& reference, std::string& error);
     std::optional<std::string> runtime_id(uint64_t handle) const;
     size_t runtime_id_count() const { return m_handlesByRuntimeId.size(); }
@@ -247,7 +270,7 @@ public:
         const Element& root, const UiaOptions& options,
         bool completeSnapshot = true);
     std::string property_identity_error();
-    std::optional<uint64_t> resolve_property_reference(
+    UiaPropertyReferenceResult resolve_property_reference(
         const std::string& reference, std::string& error);
     HWND target_hwnd() const { return m_hwnd; }
     const UiaTargetIdentity& target_identity() const {

@@ -36,6 +36,7 @@ struct FixtureControls {
 } g_controls;
 
 bool g_delayNextToolbarPointerMessage = false;
+bool g_refuseNextComboClear = false;
 LONG g_delayedPointerState = 0;
 bool g_ownerDrawStatusStable = true;
 int g_ownerDrawStatusPaints = 0;
@@ -81,6 +82,19 @@ LRESULT CALLBACK toolbar_subclass_proc(
         return result;
     }
     return DefSubclassProc(hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK combo_subclass_proc(
+    HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam,
+    UINT_PTR, DWORD_PTR) {
+    if (message == CB_SETCURSEL &&
+        static_cast<INT_PTR>(wParam) == -1 &&
+        g_refuseNextComboClear) {
+        g_refuseNextComboClear = false;
+        return CB_ERR;
+    }
+    return DefSubclassProc(
+        hwnd, message, wParam, lParam);
 }
 
 std::wstring window_text(HWND hwnd) {
@@ -644,6 +658,8 @@ bool create_controls(HWND parent) {
         parent, 0, WC_COMBOBOXW, L"",
         WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
         20, 200, 240, 140, fixture::kComboBoxId);
+    SetWindowSubclass(
+        g_controls.comboBox, combo_subclass_proc, 2, 0);
     g_controls.listBox = create_child(
         parent, WS_EX_CLIENTEDGE, WC_LISTBOXW, L"",
         WS_TABSTOP | LBS_NOTIFY | WS_VSCROLL,
@@ -785,6 +801,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     case fixture::kGetDelayedPointerStateMessage:
         return InterlockedCompareExchange(
             &g_delayedPointerState, 0, 0);
+    case fixture::kArmRefusedSelectionClearMessage:
+        g_refuseNextComboClear = true;
+        return TRUE;
     case fixture::kGetOutOfTreeHwndMessage:
         return reinterpret_cast<LRESULT>(g_controls.outOfTree);
     case fixture::kDeleteFirstTabMessage:

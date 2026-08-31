@@ -668,6 +668,8 @@ void expect_typed_property_target_not_authorized(
         << result.dump(2);
     EXPECT_TRUE(result.value("retryable", false))
         << result.dump(2);
+    EXPECT_EQ(result.value("hresult", ""), "0xA0040201")
+        << result.dump(2);
 }
 
 void expect_typed_property_target_membership_lost(
@@ -682,6 +684,8 @@ void expect_typed_property_target_membership_lost(
         "terminal")
         << result.dump(2);
     EXPECT_FALSE(result.value("retryable", true))
+        << result.dump(2);
+    EXPECT_EQ(result.value("hresult", ""), "0xA0040201")
         << result.dump(2);
 }
 
@@ -7091,6 +7095,91 @@ TEST_F(
         << refreshResponse.dump(2);
 }
 
+TEST_F(
+    NativeMcpFixture,
+    DestroyedNativeChildRemainsAStaleElementNotSessionLoss) {
+    DWORD_PTR created = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kCreateEventChildMessage,
+            0, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &created),
+        0);
+    const HWND child = reinterpret_cast<HWND>(
+        static_cast<uintptr_t>(created));
+    ASSERT_TRUE(IsWindow(child));
+    auto cleanup = wil::scope_exit([&] {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kDestroyEventChildMessage,
+            0, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored);
+    });
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    bool isError = false;
+    auto tree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << tree.dump(2);
+
+    char keyBuffer[64]{};
+    snprintf(
+        keyBuffer, sizeof(keyBuffer),
+        "win32:0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(child)));
+    const std::string childKey = keyBuffer;
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", childKey}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* text =
+        find_property_descriptor(properties, "Text");
+    ASSERT_NE(text, nullptr) << properties.dump(2);
+
+    DWORD_PTR destroyed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kDestroyEventChildMessage,
+            0, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &destroyed),
+        0);
+    cleanup.release();
+
+    auto stale = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", childKey},
+             {"descriptorId",
+              text->value("descriptorId", "")},
+             {"value", "must not be written"}},
+        &isError);
+    ASSERT_TRUE(isError) << stale.dump(2);
+    expect_typed_property_failure(
+        stale, "typed_property_stale_element",
+        "terminal", false);
+
+    auto healthy = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    EXPECT_FALSE(isError)
+        << "a stale child invalidated the live root session: "
+        << healthy.dump(2);
+}
+
 TEST_F(NativeMcpFixture, DisconnectRacingNativePropertyReadDoesNotRecreateSession) {
     McpClient client(true);
     ASSERT_TRUE(client.started());
@@ -7242,6 +7331,108 @@ TEST_F(McpSampleFixture, TypedPropertyConnectionErrorsHaveDisposition) {
     EXPECT_FALSE(isError) << recovered.dump(2);
     EXPECT_FALSE(recovered.value("schemaId", "").empty())
         << recovered.dump(2);
+}
+
+TEST_F(
+    McpSampleFixture,
+    TransientUiaPropertyResolutionFailuresRemainRetryable) {
+    SkipIfNotReady();
+    const std::string referenceEventName =
+        "Local\\LvtUiaPropertyReferenceFailure_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    const std::string actionEventName =
+        "Local\\LvtUiaPropertyActionFailure_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event referenceFailure(CreateEventA(
+        nullptr, TRUE, FALSE,
+        referenceEventName.c_str()));
+    wil::unique_event actionFailure(CreateEventA(
+        nullptr, TRUE, FALSE,
+        actionEventName.c_str()));
+    ASSERT_TRUE(referenceFailure);
+    ASSERT_TRUE(actionFailure);
+    ScopedEnvironmentVariable referenceFailureEvent(
+        "LVT_TEST_UIA_PROPERTY_REFERENCE_FAILURE_EVENT",
+        referenceEventName);
+    ScopedEnvironmentVariable actionFailureEvent(
+        "LVT_TEST_UIA_PROPERTY_ACTION_ROOT_FAILURE_EVENT",
+        actionEventName);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    auto input = client.call_tool(
+        "find_elements",
+        json{{"session", session},
+             {"automationId", "InputBox"}});
+    ASSERT_EQ(input["elements"].size(), 1u)
+        << input.dump(2);
+    const auto key =
+        input["elements"][0].value("key", "");
+    bool isError = false;
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* value =
+        find_property_descriptor(
+            properties, "Value.Value");
+    ASSERT_NE(value, nullptr) << properties.dump(2);
+    const auto descriptorId =
+        value->value("descriptorId", "");
+    const auto original =
+        typed_property_value(
+            properties, "Value.Value");
+
+    ASSERT_TRUE(SetEvent(referenceFailure.get()));
+    auto referenceError = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", original}},
+        &isError);
+    ASSERT_TRUE(isError) << referenceError.dump(2);
+    expect_typed_property_failure(
+        referenceError,
+        "typed_property_connection_unavailable",
+        "transient", true);
+    EXPECT_EQ(
+        referenceError.value("hresult", ""),
+        "0x80010001")
+        << referenceError.dump(2);
+
+    ASSERT_TRUE(SetEvent(actionFailure.get()));
+    auto rootError = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", original}},
+        &isError);
+    ASSERT_TRUE(isError) << rootError.dump(2);
+    expect_typed_property_failure(
+        rootError, "typed_property_provider_busy",
+        "transient", true);
+    EXPECT_EQ(
+        rootError.value("hresult", ""),
+        "0x80040201")
+        << rootError.dump(2);
+
+    auto recovered = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", original}},
+        &isError);
+    EXPECT_FALSE(isError) << recovered.dump(2);
 }
 
 TEST_F(
@@ -8843,6 +9034,10 @@ TEST_F(McpSampleFixture, SessionsFailCleanlyOnceTheirWindowIsGone) {
             client.call_tool(tool, arguments, &isError);
         EXPECT_TRUE(isError) << tool << ": " << typedResult.dump(2);
         expect_typed_property_session_disconnected(typedResult);
+        EXPECT_EQ(
+            typedResult.value("hresult", ""),
+            "0x80070578")
+            << tool << ": " << typedResult.dump(2);
     }
 
     // And the server must still be usable for everything else.
@@ -10435,6 +10630,14 @@ TEST(McpServer, MutationFailureSchemasAdmitProviderSemantics) {
               {"error",
                "The UI Automation child element became unavailable"},
               {"hresult", "0x80040201"}}},
+        {"clear_property",
+         json{{"ok", false},
+              {"errorCode", "typed_property_target_not_authorized"},
+              {"errorDisposition", "transient"},
+              {"retryable", true},
+              {"error",
+               "The element was not published by this session"},
+              {"hresult", "0xA0040201"}}},
     };
 
     for (const auto& [tool, failure] : failures) {

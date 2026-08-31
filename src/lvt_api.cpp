@@ -2342,7 +2342,8 @@ void ensure_typed_property_target_identity_current(
                       session.id + "' has closed " +
                       operation
                 : "the typed-property target identity changed " +
-                      operation);
+                      operation,
+            status);
     }
     throw_typed_property_error(
         "typed_property_identity_validation_failed",
@@ -2447,7 +2448,8 @@ PropertyTarget require_property_target(
                 "element '" + elementRef +
                     "' was not published by this session's latest complete "
                     "visual snapshot; refresh get_visual_tree and use a key "
-                    "from this window");
+                    "from this window",
+                lvt::LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION);
         }
         return target;
     }
@@ -2718,19 +2720,55 @@ uint64_t resolve_property_handle(
     wait_for_property_reference_test_gate();
     ensure_typed_property_session_active(session);
     std::string error;
-    const auto handle =
-        uia->resolve_property_reference(target.reference, error);
-    if (!handle) {
+    const auto resolution =
+        uia->resolve_property_reference(
+            target.reference, error);
+    if (!resolution.has_value()) {
         ensure_typed_property_target_identity_current(
             session, "while resolving a UI Automation property reference");
+        if (resolution.failure ==
+                lvt::UiaPropertyReferenceFailure::validation &&
+            lvt::is_uia_target_ownership_failure(
+                resolution.hresult)) {
+            throw_typed_property_session_disconnected(
+                error.empty()
+                    ? "the UI Automation target identity changed while resolving a property reference"
+                    : error,
+                resolution.hresult);
+        }
+        if (resolution.failure ==
+            lvt::UiaPropertyReferenceFailure::validation) {
+            throw_typed_property_error(
+                "typed_property_connection_unavailable",
+                "transient", true,
+                error.empty()
+                    ? "the UI Automation property reference could not be resolved while the provider was temporarily unavailable"
+                    : error,
+                resolution.hresult);
+        }
+        const bool stale =
+            resolution.failure ==
+            lvt::UiaPropertyReferenceFailure::missing;
+        const bool capacity =
+            resolution.failure ==
+            lvt::UiaPropertyReferenceFailure::capacity;
         throw_typed_property_error(
-            "typed_property_stale_element", "terminal", false,
+            stale
+                ? "typed_property_stale_element"
+                : capacity
+                    ? "typed_property_identity_capacity"
+                    : "typed_property_invalid_target",
+            "terminal", false,
             error.empty()
-                ? "the UI Automation element is stale or unavailable"
+                ? stale
+                    ? "the UI Automation element is stale or unavailable"
+                    : capacity
+                        ? "the UI Automation identity cache is full; use a narrower view or element scope"
+                        : "the UI Automation property reference is malformed or ambiguous"
                 : error,
-            HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+            resolution.hresult);
     }
-    return *handle;
+    return *resolution;
 #else
     throw_typed_property_error(
         "typed_property_provider_unsupported", "terminal", false,
@@ -2756,11 +2794,13 @@ bool typed_property_ownership_lost(
 bool typed_property_mutation_ownership_lost(
     const Session& session, const std::string& provider,
     const lvt::PropertyMutationResult& result) {
-    if (result.errorDisposition ==
-            lvt::PropertyErrorDisposition::ownershipLost ||
-        !session_is_active(session.id)) {
-        return true;
+    if (result.errorDisposition !=
+        lvt::PropertyErrorDisposition::unspecified) {
+        return result.errorDisposition ==
+            lvt::PropertyErrorDisposition::ownershipLost;
     }
+    if (!session_is_active(session.id))
+        return true;
     return typed_property_ownership_lost(
         session, provider, result.hresult);
 }

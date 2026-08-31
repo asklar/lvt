@@ -1794,7 +1794,7 @@ void UiaPropertyIdentityCache::remember_element(const Element& element) {
         remember_element(child);
 }
 
-std::optional<uint64_t> UiaPropertyIdentityCache::resolve(
+UiaPropertyReferenceResult UiaPropertyIdentityCache::resolve(
     const std::string& reference, std::string& error) {
     std::string runtimeId;
     if (reference.rfind("uia:", 0) == 0) {
@@ -1802,7 +1802,11 @@ std::optional<uint64_t> UiaPropertyIdentityCache::resolve(
         std::vector<int> parsed;
         if (!parse_runtime_id(runtimeId, parsed)) {
             error = "The UI Automation RuntimeId reference is malformed";
-            return std::nullopt;
+            return {
+                .hresult = E_INVALIDARG,
+                .failure =
+                    UiaPropertyReferenceFailure::malformed,
+            };
         }
     } else {
         const auto found = m_runtimeIdsByKey.find(reference);
@@ -1810,13 +1814,23 @@ std::optional<uint64_t> UiaPropertyIdentityCache::resolve(
             error =
                 "The UI Automation key is stale or was not returned by this session; "
                 "refresh the originating raw/control/content tree and use its key or RuntimeId";
-            return std::nullopt;
+            return {
+                .hresult =
+                    HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+                .failure =
+                    UiaPropertyReferenceFailure::missing,
+            };
         }
         if (found->second.size() != 1) {
             error =
                 "The UI Automation key is ambiguous across trees or views; "
                 "refresh the originating tree and use uia:<RuntimeId>";
-            return std::nullopt;
+            return {
+                .hresult =
+                    HRESULT_FROM_WIN32(ERROR_DUP_NAME),
+                .failure =
+                    UiaPropertyReferenceFailure::ambiguous,
+            };
         }
         auto alias = found->second.begin();
         runtimeId = alias->first;
@@ -1826,7 +1840,7 @@ std::optional<uint64_t> UiaPropertyIdentityCache::resolve(
     auto existing = m_handlesByRuntimeId.find(runtimeId);
     if (existing != m_handlesByRuntimeId.end()) {
         existing->second.lastUsed = ++m_clock;
-        return existing->second.handle;
+        return {.handle = existing->second.handle};
     }
 
     std::unordered_set<std::string> currentRuntimeIds;
@@ -1837,7 +1851,13 @@ std::optional<uint64_t> UiaPropertyIdentityCache::resolve(
             "The UI Automation RuntimeId cannot be retained because current "
             "session trees already fill the bounded identity cache; use a "
             "narrower view or element scope";
-        return std::nullopt;
+        return {
+            .hresult =
+                HRESULT_FROM_WIN32(
+                    ERROR_NOT_ENOUGH_QUOTA),
+            .failure =
+                UiaPropertyReferenceFailure::capacity,
+        };
     }
 
     auto& scopeState = m_scopes[m_activeScope];
@@ -1857,7 +1877,7 @@ std::optional<uint64_t> UiaPropertyIdentityCache::resolve(
         });
     m_runtimeIdsByHandle.emplace(handle, runtimeId);
     prune();
-    return handle;
+    return {.handle = handle};
 }
 
 std::optional<std::string> UiaPropertyIdentityCache::runtime_id(
@@ -2289,12 +2309,41 @@ std::string UiaConnection::property_identity_error() {
     return m_state->identityError;
 }
 
-std::optional<uint64_t> UiaConnection::resolve_property_reference(
+UiaPropertyReferenceResult
+UiaConnection::resolve_property_reference(
     const std::string& reference, std::string& error) {
+    char eventName[192]{};
+    const DWORD eventLength = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_PROPERTY_REFERENCE_FAILURE_EVENT",
+        eventName, static_cast<DWORD>(_countof(eventName)));
+    if (eventLength != 0 &&
+        eventLength < _countof(eventName)) {
+        wil::unique_handle failure(OpenEventA(
+            SYNCHRONIZE | EVENT_MODIFY_STATE,
+            FALSE, eventName));
+        if (failure &&
+            WaitForSingleObject(failure.get(), 0) ==
+                WAIT_OBJECT_0) {
+            ResetEvent(failure.get());
+            error =
+                "The UI Automation property reference could not be validated";
+            return {
+                .hresult = RPC_E_CALL_REJECTED,
+                .failure =
+                    UiaPropertyReferenceFailure::validation,
+            };
+        }
+    }
     std::lock_guard<std::mutex> lock(m_state->operationMutex);
-    if (FAILED(validate_target_identity_locked())) {
+    const HRESULT validationHr =
+        validate_target_identity_locked();
+    if (FAILED(validationHr)) {
         error = "The UI Automation connection no longer matches this session's target window";
-        return std::nullopt;
+        return {
+            .hresult = validationHr,
+            .failure =
+                UiaPropertyReferenceFailure::validation,
+        };
     }
 
     return m_state->identities.resolve(reference, error);
