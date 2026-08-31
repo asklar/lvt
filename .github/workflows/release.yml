@@ -70,11 +70,13 @@ jobs:
       - name: Set up Rust (for the MCP server)
         run: rustup target add ${{ matrix.rust_target }}
 
-      - name: Set up .NET 10
+      - name: Set up .NET 10 and .NET 6
         if: matrix.build_winui_fixture == 'ON'
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: |
+            10.0.x
+            6.0.x
 
       # Runtime tests only run on x64, while every architecture still compiles
       # and statically validates its matching WinUI fixture.
