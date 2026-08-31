@@ -225,7 +225,9 @@ std::vector<FrameworkInfo> detect_frameworks(HWND hwnd, DWORD pid) {
     // Plugin-provided framework detection
     auto pluginFws = detect_plugin_frameworks(hwnd, pid);
     for (auto& pf : pluginFws) {
-        result.push_back({Framework::Plugin, pf.version, pf.name});
+        result.push_back({
+            Framework::Plugin, pf.version, pf.name,
+            reinterpret_cast<uintptr_t>(pf.plugin)});
     }
 
     return result;

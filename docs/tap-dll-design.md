@@ -4,6 +4,8 @@
 
 The TAP DLL (`lvt_tap.dll`) is a COM in-process server that gets injected into the target process to walk XAML visual trees. It uses the same diagnostic infrastructure that Visual Studio's Live Visual Tree uses. ("TAP" comes from the `wszTAPDllName` parameter of `InitializeXamlDiagnosticsEx`.)
 
+WPF and WinForms use separate native CLR-host TAP DLLs and managed walkers. They now follow the same persistent connection lifetime but not the XAML COM/message-window implementation described below. Their protocol, UI-thread marshaling, weak identity registry and unload sequence are documented in [Managed TAP connections](managed-tap-connections.md).
+
 `InitializeXamlDiagnosticsEx` and `AdviseVisualTreeChange` are a subscribe-and-react API: they are meant to be called **once** per debugging session, with `OnVisualTreeChange` then incrementally reporting Add/Remove mutations for as long as the subscription stays alive. The TAP DLL is built around that model — connect once, serve many tree refreshes over a persistent pipe, disconnect once when the session ends — not around reconnecting from scratch on every refresh. An earlier version of this file did the latter (calling `InitializeXamlDiagnosticsEx` fresh every `watch` tick); that caused a confirmed, unbounded resource leak (one message-only window created and never destroyed per tick) and was the root cause of a "tree refreshes/resets" bug reported against Microsoft Store. See `src/providers/framework_connection.h` and `connection_registry.h` for the caller-side half of this design.
 
 ## Connection lifecycle
@@ -24,6 +26,12 @@ sequenceDiagram
         lvt->>target: "GET_TREE" or "GET_TREE FAST"
         target->>target: dispatch CollectBounds/CollectPositionsAndText to UI thread
         target->>lvt: one JSON line (the current tree)
+    end
+
+    opt Persistent property request (for example, an MCP session)
+        lvt->>target: GET_PROPERTIES / SET_PROPERTY / CLEAR_PROPERTY
+        target->>target: dispatch xamlOM operation to SetSite's UI thread
+        target->>lvt: correlated PROPERTY_RESULT JSON line
     end
 
     lvt->>target: "DISCONNECT" (when the caller releases the connection)
@@ -183,11 +191,69 @@ Every message on the pipe is one line (UTF-8, `\n`-terminated). lvt.exe → TAP 
 | Direction | Message | Meaning |
 |-----------|---------|---------|
 | TAP → lvt | `READY` | Sent once, right after `AdviseVisualTreeChange` succeeds — before any bounds/property collection |
+| lvt → TAP | `GET_ENUMS <id>` | One-time request for the connection's cached XAML runtime enum catalog |
+| TAP → lvt | `{"type":"ENUM_RESULT","commandId":...}` | Enum type names plus ordered member names and exact machine values |
 | lvt → TAP | `GET_TREE` / `GET_TREE FAST` | Request a refresh; `FAST` overrides the connection's default fast-mode setting for this one response |
 | TAP → lvt | `[...]` | One JSON array of root nodes, in response to `GET_TREE` |
+| lvt → TAP | `GET_PROPERTIES <id> <handle>` | Request the deduplicated property chain for one XAML instance handle |
+| lvt → TAP | `SET_PROPERTY <id> <handle> <index> <valueHex>` | Resolve the declared property type, create a typed value, and set one dependency property |
+| lvt → TAP | `CLEAR_PROPERTY <id> <handle> <index>` | Clear a local value so inheritance/style/default resolution resumes |
+| TAP → lvt | `{"type":"PROPERTY_RESULT","commandId":...}` | Correlated typed property result with post-mutation effective-value readback; queued `CHANGE`/reset lines may precede it |
+| lvt → TAP | `POLL_EVENTS <id>` | Drain the bounded structural-event queue without collecting a tree |
+| TAP → lvt | `{"type":"EVENTS_OVERFLOW"}` | Queued deltas overflowed; discard them and require a fresh snapshot |
+| TAP → lvt | `{"type":"EVENTS_RESULT","commandId":...}` | Acknowledges `POLL_EVENTS`; preceding event records have been drained |
 | lvt → TAP | `DISCONNECT` | End the connection; TAP DLL replies `BYE`, then runs its cleanup |
 
-Parsed and grafted by `graft_xaml_tree_json()` in `xaml_diag_common.cpp`.
+Tree responses are parsed and grafted by `graft_xaml_tree_json()` in
+`xaml_diag_common.cpp`; typed property responses are returned through the
+session's `IFrameworkConnection`.
+`valueHex` is the UTF-8 value rendered as hexadecimal (with `-` for an empty
+string), so spaces, quotes, newlines, and non-ASCII values remain unambiguous
+without adding a JSON dependency to the injected DLL. The provider resolves
+the client-opaque descriptor id to an internal property index, while the TAP
+uses `PropertyChainValue.Type` as the authoritative declared conversion type.
+The pipe worker never invokes thread-affine xamlOM methods itself: it
+synchronously dispatches the operation through the existing message-only
+window, then writes the result from the command thread.
+
+After `SetProperty` or `ClearProperty` succeeds, the TAP immediately re-runs
+`GetPropertyValuesChain` on the target UI thread and returns the matching
+property's actual effective value, runtime type, source, and override state.
+If that readback fails or the property is absent, the mutation response is an
+explicit failure even though the underlying write may already have completed;
+the protocol never returns a success-shaped echo of caller input.
+
+`IVisualTreeService::GetEnums` is called once in `SetSite`, on the target XAML
+UI thread. The TAP deep-copies the returned enum type names, member names, and
+machine values, then releases each type-name BSTR, both SAFEARRAYs (including
+their BSTR elements), and the outer CoTaskMem array. The host fetches that
+cached catalog once with `GET_ENUMS`; subsequent property reads reuse it.
+Descriptor choice values are enum member names, which are the canonical strings
+passed to `CreateInstance`, while machine values are retained to translate
+numeric property snapshots and preserve aliases. `GetEnums` exposes no flags
+bit, so the TAP resolves each enum's WinRT metadata once and checks for
+`System.FlagsAttribute`, caching a per-type `yes`/`no`/`unknown`
+classification with the catalog. Ordinary enums are never inferred to be
+flags from power-of-two member values. Comma-separated values are accepted for
+confirmed flags types and, when metadata is unresolved, are safely deferred to
+`CreateInstance` after every token is checked against the catalog. Confirmed
+non-flags reject comma syntax consistently in host and TAP. Composite numeric
+readback is decomposed only for confirmed flags; unknown residual bits remain
+explicit as `0xXXXXXXXX`, while non-flags and unresolved types preserve the
+original numeric string.
+
+`OnVisualTreeChange` performs no pipe I/O. It only updates the tracked tree and
+enqueues a bounded in-memory structural record. `GET_TREE` and `POLL_EVENTS`
+drain and serialize that queue from the command thread. If the queue overflows,
+partial history is discarded and `EVENTS_OVERFLOW` tells the connection that a
+full snapshot is required; the target UI thread is never blocked on
+`WriteFile` or `FlushFileBuffers`.
+
+MCP resource subscriptions do not use `POLL_EVENTS` as their notification
+trigger. `AdviseVisualTreeChange` only reports structural additions/removals, so
+it cannot cover text, dependency-property, or bounds changes. The MCP server
+periodically requests and diffs complete mode-specific snapshots instead,
+caching the resulting patch before sending `notifications/resources/updated`.
 
 ## Static CRT
 
@@ -201,3 +267,52 @@ The TAP DLL is built with `/MT` (static CRT). This is essential because:
 - **Log file:** `%TEMP%\lvt_tap.log` for unpackaged targets, but `%LOCALAPPDATA%\Packages\<PackageFamilyName>\AC\Temp\lvt_tap.log` for AppContainer (UWP/MSIX-packaged) targets — the two are easy to confuse when debugging a packaged app. All TAP DLL operations are logged with millisecond timestamps and thread IDs. Because the TAP DLL never unloads (`DllCanUnloadNow` returns `S_FALSE`, see below), this file accumulates across every run against that target for as long as the target process lives, not just the most recent one.
 - **Debugger:** Use `C:\Debuggers\cdb.exe` to attach to the target process and debug injection issues
 - **File lock:** `lvt_tap.dll` is locked by the target process after injection. Kill the target before rebuilding. For AppContainer targets, the staged copy at `%TEMP%\lvt_tap\` can also be held open by an unrelated, long-lived AppContainer host process from an earlier test run — if a rebuilt DLL isn't taking effect, check for and kill stale processes still holding that staged file before assuming the build itself is broken.
+
+## Module lifetime and why DllCanUnloadNow returns S_FALSE
+
+`DllCanUnloadNow` unconditionally returns `S_FALSE`. This is correct and intentional. Safe unload of `lvt_tap.dll` from a still-running target is impossible without a runtime API that does not exist. This section documents the full evidence chain so the decision is not revisited without new information.
+
+### What InitializeXamlDiagnosticsEx does to the module
+
+`InitializeXamlDiagnosticsEx` (exported from `Windows.UI.Xaml.dll` / `FrameworkUdk.dll`) injects the TAP DLL into the target process by calling `LoadLibraryEx` on `lvt_tap.dll`. This is the **sole** module reference: refcount = 1. The function then calls `DllGetClassObject → IClassFactory::CreateInstance` to create an `LvtTap` object, and calls `SetSite(IXamlDiagnostics*)` on it. The runtime **retains** the resulting `IObjectWithSite*` COM pointer for the lifetime of the diagnostics session. That pointer's vtable points into the module's code segment.
+
+### What the runtime holds after DISCONNECT teardown
+
+After `DISCONNECT` or a broken pipe, `CleanupUIResources()` runs and releases every resource owned by a single connection:
+
+| Resource | Released in CleanupUIResources? |
+|---|---|
+| `IVisualTreeServiceCallback*` (AdviseVisualTreeChange) | ✅ UnadviseVisualTreeChange called |
+| Message-only window (`m_msgWnd`) | ✅ DestroyWindow dispatched to UI thread |
+| `IVisualTreeService*` (`m_vts`) | ✅ `m_vts.reset()` |
+| `IXamlDiagnostics*` (`m_diag`) | ✅ `m_diag.reset()` |
+| Pipe handle (`m_pipe`) | ✅ `m_pipe.reset()` |
+| **`IObjectWithSite*` held by the runtime** | ❌ Runtime never releases it |
+| **Module LoadLibrary refcount** | ❌ Not decremented |
+
+The runtime-held `IObjectWithSite*` — the pointer the runtime created during `InitializeXamlDiagnosticsEx` — persists. On a subsequent `lvt` connection to the **same diagnostics endpoint**, the runtime calls `SetSite(newSite)` on that existing object rather than creating a new one. Any call through that pointer (QueryInterface, AddRef, Release, SetSite) dispatches through a vtable that lives in the module's code segment.
+
+### Why FreeLibrary after DISCONNECT is unsafe
+
+Calling `FreeLibrary(GetCurrentModuleHandle())` after `CleanupUIResources` would decrement the module's LoadLibrary refcount from 1 to 0, unmapping the code segment. The runtime's retained `IObjectWithSite*` would then point at freed memory. The next vtable call from the runtime — whether `SetSite` on reconnect, `Release` on process shutdown, or any other method — would jump to an unmapped address and crash the target process. There is no documented way to force the runtime to release its reference early.
+
+### No public uninitialize API exists
+
+The Windows SDK headers confirm there is no teardown API. `xamlOM.idl` (Windows SDK 10.0.26410.0, `um/xamlOM.idl`) defines four interfaces — `IVisualTreeServiceCallback`, `IVisualTreeServiceCallback2`, `IVisualTreeService` (and its `-2`/`-3` extensions), `IXamlDiagnostics`, `IBitmapData` — plus the `InitializeXamlDiagnosticsEx` free function. None of these has a `Close()`, `Disconnect()`, `Shutdown()`, or `Uninitialize()` method. `IVisualTreeService::UnadviseVisualTreeChange` removes the mutation-event subscriber but does not terminate the session or release the `IObjectWithSite` reference.
+
+### Windhawk's FreeLibrary call is not a counterexample
+
+Windhawk mods call `FreeLibrary(GetCurrentModuleHandle())` inside `SetSite` to balance the LoadLibrary refcount. The key detail in the Windhawk comment preserved in `SetSite`: Windhawk's hook loader calls `LoadLibraryEx` on the mod DLL **in addition to** the `LoadLibraryEx` the diagnostics runtime performs during `InitializeXamlDiagnosticsEx`. That gives the module a refcount of 2. Windhawk's `FreeLibrary` in `SetSite` brings it back to 1 — the module **stays mapped**. Windhawk never attempts a second `FreeLibrary` that would bring the count to 0 while the process is alive. LVT does not have a second LoadLibrary reference, so `FreeLibrary` in `SetSite` would immediately unmap the DLL while `SetSite` itself is still executing — an instant crash.
+
+### The Microsoft XAML Profiler's approach is a forceful ejection, not clean unload
+
+The Microsoft WinUI 3 XAML Profiler (internal tool, `tools/XamlProfiler` in the `microsoft/microsoft-ui-xaml` repo) handles `CLOSE` by having the profiler app call `CreateRemoteThread(FreeLibrary, hTapModule)` in the target process after the TAP DLL has processed its teardown. This is a "burn it down" ejection used when the profiler session is fully ending and the profiler app itself is closing. It is explicitly not a clean mid-session unload: the runtime still holds the `IObjectWithSite*` when the remote `FreeLibrary` fires. This approach is acceptable in that context because the entire diagnostic session and typically the target process are being closed simultaneously, so no subsequent vtable call through the stale pointer occurs in practice.
+
+### What is needed for safe mid-session unload
+
+Safe unload requires the runtime to release its `IObjectWithSite` COM reference **before** the module is freed. That would require one of:
+
+1. A new `IXamlDiagnostics::Close()` (or equivalent) method added to the XAML OM that causes the runtime to call `SetSite(nullptr)` and `IObjectWithSite::Release()` synchronously, so the `LvtTap` object's refcount can reach zero and all vtable pointers can be safely invalidated before `FreeLibrary` is called.
+2. The runtime calling `SetSite(nullptr)` + `Release()` as a documented response to the pipe closing or the endpoint going idle — which it does not currently do.
+
+Until such an API exists, `DllCanUnloadNow` must return `S_FALSE` and the module must remain mapped for the target process's lifetime. This is a conscious design choice, not an oversight.

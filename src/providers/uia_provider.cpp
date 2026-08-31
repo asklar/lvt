@@ -1,4 +1,7 @@
 #include "uia_provider.h"
+#include "uia_actions.h"
+#include "native_win_event.h"
+#include "uia_property_adapter.h"
 #include "../debug.h"
 
 #include <wil/com.h>
@@ -9,20 +12,627 @@
 #include <UIAutomation.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <future>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace lvt {
+
+class UiaWindowLifetimeToken {
+public:
+    static std::shared_ptr<UiaWindowLifetimeToken> create(
+        HWND hwnd, DWORD pid,
+        uint64_t processCreationIdentity) {
+        auto token = std::shared_ptr<UiaWindowLifetimeToken>(
+            new (std::nothrow) UiaWindowLifetimeToken(
+                hwnd, pid, processCreationIdentity));
+        if (!token || !token->initialize())
+            return {};
+        return token;
+    }
+
+    ~UiaWindowLifetimeToken() {
+        if (!m_propertyInstalled)
+            return;
+        if (exact_owner_and_process() &&
+            GetPropW(m_hwnd, m_propertyName.c_str()) ==
+                m_propertyValue) {
+            RemovePropW(m_hwnd, m_propertyName.c_str());
+        }
+    }
+
+    bool matches() {
+        return SUCCEEDED(validation_status());
+    }
+
+    HRESULT validation_status() {
+        if (m_testInvalidation &&
+            WaitForSingleObject(
+                m_testInvalidation.get(), 0) ==
+                WAIT_OBJECT_0) {
+            return HRESULT_FROM_WIN32(
+                ERROR_INVALID_OWNER);
+        }
+        if (!m_hwnd || !IsWindow(m_hwnd))
+            return HRESULT_FROM_WIN32(
+                ERROR_INVALID_WINDOW_HANDLE);
+        if (!exact_owner_and_process())
+            return HRESULT_FROM_WIN32(
+                ERROR_INVALID_OWNER);
+        if (m_propertyInstalled) {
+            return GetPropW(
+                       m_hwnd, m_propertyName.c_str()) ==
+                       m_propertyValue
+                ? S_OK
+                : HRESULT_FROM_WIN32(
+                      ERROR_INVALID_OWNER);
+        }
+        if (!m_destroyWatcher)
+            return E_FAIL;
+        if (!m_destroyWatcher->synchronize())
+            return HRESULT_FROM_WIN32(ERROR_RETRY);
+        return (!m_destroyWatcher->root_destroyed() &&
+                !m_destroyWatcher->target_exited())
+            ? S_OK
+            : HRESULT_FROM_WIN32(
+                  ERROR_INVALID_OWNER);
+    }
+
+private:
+    UiaWindowLifetimeToken(
+        HWND hwnd, DWORD pid,
+        uint64_t processCreationIdentity)
+        : m_hwnd(hwnd), m_pid(pid),
+          m_processCreationIdentity(
+              processCreationIdentity),
+          m_propertyValue(
+              reinterpret_cast<HANDLE>(this)) {
+    }
+
+    bool exact_owner_and_process() const {
+        DWORD currentPid = 0;
+        return m_hwnd && IsWindow(m_hwnd) &&
+               GetWindowThreadProcessId(
+                   m_hwnd, &currentPid) != 0 &&
+               currentPid == m_pid &&
+               process_creation_identity(m_pid) ==
+                   m_processCreationIdentity;
+    }
+
+    bool initialize() {
+        if (!exact_owner_and_process())
+            return false;
+
+        char invalidationEvent[160]{};
+        const DWORD invalidationLength =
+            GetEnvironmentVariableA(
+                "LVT_TEST_UIA_LIFETIME_INVALIDATION_EVENT",
+                invalidationEvent,
+                static_cast<DWORD>(
+                    _countof(invalidationEvent)));
+        if (invalidationLength > 0 &&
+            invalidationLength < _countof(invalidationEvent)) {
+            m_testInvalidation.reset(OpenEventA(
+                SYNCHRONIZE, FALSE, invalidationEvent));
+            if (!m_testInvalidation)
+                return false;
+        }
+
+        GUID guid{};
+        if (SUCCEEDED(CoCreateGuid(&guid))) {
+            wchar_t guidText[64]{};
+            if (StringFromGUID2(
+                    guid, guidText,
+                    static_cast<int>(_countof(guidText))) > 0) {
+                m_propertyName =
+                    L"lvt.uia.window." +
+                    std::wstring(guidText);
+            }
+        }
+        if (m_propertyName.empty())
+            return false;
+
+        char forceFailure[8]{};
+        const bool forcePropertyFailure =
+            GetEnvironmentVariableA(
+                "LVT_TEST_UIA_FORCE_WINDOW_PROP_FAILURE",
+                forceFailure,
+                static_cast<DWORD>(
+                    _countof(forceFailure))) != 0 &&
+            strtoul(forceFailure, nullptr, 10) != 0;
+
+        SetLastError(ERROR_SUCCESS);
+        if (!forcePropertyFailure &&
+            SetPropW(
+                m_hwnd, m_propertyName.c_str(),
+                m_propertyValue) &&
+            GetPropW(m_hwnd, m_propertyName.c_str()) ==
+                m_propertyValue) {
+            m_propertyInstalled = true;
+            return true;
+        }
+
+        const DWORD propertyError = GetLastError();
+        if (GetPropW(m_hwnd, m_propertyName.c_str()) ==
+            m_propertyValue) {
+            RemovePropW(m_hwnd, m_propertyName.c_str());
+        }
+        m_destroyWatcher =
+            native_eventing_detail::NativeWinEventSource::create(
+                m_hwnd, m_pid);
+        if (m_destroyWatcher &&
+            m_destroyWatcher->hook_active()) {
+            return true;
+        }
+        if (g_debug) {
+            fprintf(
+                stderr,
+                "lvt: UIA window lifetime sentinel failed "
+                "(SetProp error %lu, WinEvent unavailable)\n",
+                static_cast<unsigned long>(propertyError));
+        }
+        m_destroyWatcher.reset();
+        return false;
+    }
+
+    HWND m_hwnd = nullptr;
+    DWORD m_pid = 0;
+    uint64_t m_processCreationIdentity = 0;
+    std::wstring m_propertyName;
+    HANDLE m_propertyValue = nullptr;
+    bool m_propertyInstalled = false;
+    std::unique_ptr<
+        native_eventing_detail::NativeWinEventSource>
+        m_destroyWatcher;
+    wil::unique_handle m_testInvalidation;
+};
+
 namespace {
 
 using clock_type = std::chrono::steady_clock;
 static constexpr DWORD kUiaDefaultTransactionTimeoutMs = 20000;
 static constexpr DWORD kUiaConnectionTimeoutCapMs = 2000;
+static constexpr auto kUiaTargetLivenessInterval = std::chrono::milliseconds(100);
+
+std::atomic_uint64_t g_uiaEventConnections = 0;
+std::atomic_uint64_t g_uiaStructureRegistrations = 0;
+std::atomic_uint64_t g_uiaPropertyRegistrations = 0;
+std::atomic_uint64_t g_uiaAutomationRegistrations = 0;
+std::atomic_uint64_t g_uiaEventCallbacks = 0;
+std::atomic_uint64_t g_uiaRemoveAllCalls = 0;
+
+const std::vector<int>& uia_event_property_ids() {
+    static const std::vector<int> ids = {
+        UIA_NamePropertyId,
+        UIA_AutomationIdPropertyId,
+        UIA_ClassNamePropertyId,
+        UIA_ControlTypePropertyId,
+        UIA_FrameworkIdPropertyId,
+        UIA_BoundingRectanglePropertyId,
+        UIA_IsOffscreenPropertyId,
+        UIA_IsEnabledPropertyId,
+        UIA_IsControlElementPropertyId,
+        UIA_IsContentElementPropertyId,
+        UIA_HasKeyboardFocusPropertyId,
+        UIA_IsKeyboardFocusablePropertyId,
+
+        UIA_IsValuePatternAvailablePropertyId,
+        UIA_ValueValuePropertyId,
+        UIA_ValueIsReadOnlyPropertyId,
+
+        UIA_IsRangeValuePatternAvailablePropertyId,
+        UIA_RangeValueValuePropertyId,
+        UIA_RangeValueMinimumPropertyId,
+        UIA_RangeValueMaximumPropertyId,
+        UIA_RangeValueSmallChangePropertyId,
+        UIA_RangeValueLargeChangePropertyId,
+        UIA_RangeValueIsReadOnlyPropertyId,
+
+        UIA_IsTogglePatternAvailablePropertyId,
+        UIA_ToggleToggleStatePropertyId,
+
+        UIA_IsExpandCollapsePatternAvailablePropertyId,
+        UIA_ExpandCollapseExpandCollapseStatePropertyId,
+
+        UIA_IsSelectionPatternAvailablePropertyId,
+        UIA_SelectionCanSelectMultiplePropertyId,
+        UIA_SelectionIsSelectionRequiredPropertyId,
+        UIA_IsSelectionItemPatternAvailablePropertyId,
+        UIA_SelectionItemIsSelectedPropertyId,
+
+        UIA_IsScrollPatternAvailablePropertyId,
+        UIA_ScrollHorizontalScrollPercentPropertyId,
+        UIA_ScrollVerticalScrollPercentPropertyId,
+        UIA_ScrollHorizontalViewSizePropertyId,
+        UIA_ScrollVerticalViewSizePropertyId,
+        UIA_ScrollHorizontallyScrollablePropertyId,
+        UIA_ScrollVerticallyScrollablePropertyId,
+    };
+    return ids;
+}
+
+const std::vector<int>& uia_automation_event_ids() {
+    static const std::vector<int> ids = {
+        UIA_Invoke_InvokedEventId,
+        UIA_SelectionItem_ElementAddedToSelectionEventId,
+        UIA_SelectionItem_ElementRemovedFromSelectionEventId,
+        UIA_SelectionItem_ElementSelectedEventId,
+        UIA_Text_TextChangedEventId,
+        UIA_Text_TextSelectionChangedEventId,
+        UIA_MenuOpenedEventId,
+        UIA_MenuClosedEventId,
+        UIA_LayoutInvalidatedEventId,
+    };
+    return ids;
+}
+
+bool exact_window_matches(HWND hwnd, DWORD pid) {
+    if (!hwnd || !IsWindow(hwnd))
+        return false;
+    DWORD currentPid = 0;
+    GetWindowThreadProcessId(hwnd, &currentPid);
+    return currentPid != 0 && currentPid == pid;
+}
+
+bool force_identity_contention_for_testing() {
+    char eventName[192]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_IDENTITY_CONTENTION_EVENT",
+        eventName, static_cast<DWORD>(_countof(eventName)));
+    if (length == 0 || length >= _countof(eventName))
+        return false;
+    wil::unique_handle event(OpenEventA(
+        SYNCHRONIZE, FALSE, eventName));
+    return event &&
+           WaitForSingleObject(event.get(), 0) ==
+               WAIT_OBJECT_0;
+}
+
+HRESULT target_process_status(
+    const UiaTargetIdentity& identity, HANDLE retainedProcess) {
+    if (retainedProcess) {
+        return process_identity_matches(
+                   retainedProcess, identity.pid,
+                   identity.processCreationIdentity)
+            ? S_OK
+            : HRESULT_FROM_WIN32(
+                  ERROR_INVALID_OWNER);
+    }
+    SetLastError(ERROR_SUCCESS);
+    wil::unique_process_handle process(OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+        FALSE, identity.pid));
+    if (!process) {
+        const DWORD error = GetLastError();
+        return HRESULT_FROM_WIN32(
+            error == ERROR_SUCCESS ? ERROR_OPEN_FAILED
+                                   : error);
+    }
+    return process_identity_matches(
+               process.get(), identity.pid,
+               identity.processCreationIdentity)
+        ? S_OK
+        : HRESULT_FROM_WIN32(
+              ERROR_INVALID_OWNER);
+}
+
+bool target_process_matches(
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess) {
+    return SUCCEEDED(target_process_status(
+        identity, retainedProcess));
+}
+
+HRESULT target_identity_status(
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess) {
+    if (!identity.valid())
+        return HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER);
+    if (!IsWindow(identity.hwnd))
+        return HRESULT_FROM_WIN32(
+            ERROR_INVALID_WINDOW_HANDLE);
+    if (!exact_window_matches(
+            identity.hwnd, identity.pid))
+        return HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER);
+    const HRESULT processStatus =
+        target_process_status(
+            identity, retainedProcess);
+    if (FAILED(processStatus))
+        return processStatus;
+    return identity.windowLifetime->validation_status();
+}
+
+bool target_identity_matches(
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess) {
+    return SUCCEEDED(target_identity_status(
+        identity, retainedProcess));
+}
+
+HRESULT forced_runtime_id_failure_for_testing(
+    const char* stage) {
+    char eventName[192]{};
+    const DWORD eventLength = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_RUNTIME_ID_FAILURE_EVENT",
+        eventName, static_cast<DWORD>(_countof(eventName)));
+    if (eventLength == 0 ||
+        eventLength >= _countof(eventName)) {
+        return S_OK;
+    }
+    wil::unique_handle event(OpenEventA(
+        SYNCHRONIZE, FALSE, eventName));
+    if (!event ||
+        WaitForSingleObject(event.get(), 0) !=
+            WAIT_OBJECT_0) {
+        return S_OK;
+    }
+    char configuredStage[32]{};
+    const DWORD stageLength = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_RUNTIME_ID_FAILURE_STAGE",
+        configuredStage,
+        static_cast<DWORD>(_countof(configuredStage)));
+    if (stageLength == 0 ||
+        stageLength >= _countof(configuredStage) ||
+        strcmp(configuredStage, stage) != 0) {
+        return S_OK;
+    }
+    if (strcmp(stage, "property") == 0)
+        return RPC_E_CALL_REJECTED;
+    if (strcmp(stage, "type") == 0)
+        return DISP_E_TYPEMISMATCH;
+    if (strcmp(stage, "bounds") == 0)
+        return DISP_E_BADINDEX;
+    if (strcmp(stage, "element") == 0)
+        return E_OUTOFMEMORY;
+    if (strcmp(stage, "process") == 0)
+        return RPC_E_SERVERCALL_RETRYLATER;
+    return E_FAIL;
+}
+
+HRESULT read_runtime_id(
+    IUIAutomationElement* element,
+    std::vector<int>& runtimeId) {
+    runtimeId.clear();
+    if (!element)
+        return E_POINTER;
+    HRESULT forced =
+        forced_runtime_id_failure_for_testing(
+            "property");
+    if (FAILED(forced))
+        return forced;
+    wil::unique_variant value;
+    const HRESULT propertyHr =
+        element->GetCurrentPropertyValue(
+            UIA_RuntimeIdPropertyId, &value);
+    if (FAILED(propertyHr))
+        return propertyHr;
+    forced =
+        forced_runtime_id_failure_for_testing("type");
+    if (FAILED(forced))
+        return forced;
+    if (value.vt != (VT_ARRAY | VT_I4) ||
+        !value.parray ||
+        SafeArrayGetDim(value.parray) != 1) {
+        return DISP_E_TYPEMISMATCH;
+    }
+    forced =
+        forced_runtime_id_failure_for_testing(
+            "bounds");
+    if (FAILED(forced))
+        return forced;
+    LONG lower = 0;
+    LONG upper = -1;
+    const HRESULT lowerHr = SafeArrayGetLBound(
+        value.parray, 1, &lower);
+    if (FAILED(lowerHr))
+        return lowerHr;
+    const HRESULT upperHr = SafeArrayGetUBound(
+        value.parray, 1, &upper);
+    if (FAILED(upperHr))
+        return upperHr;
+    if (upper < lower)
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    runtimeId.reserve(
+        static_cast<size_t>(upper - lower + 1));
+    for (LONG index = lower; index <= upper; ++index) {
+        forced =
+            forced_runtime_id_failure_for_testing(
+                "element");
+        if (FAILED(forced)) {
+            runtimeId.clear();
+            return forced;
+        }
+        int component = 0;
+        const HRESULT elementHr =
+            SafeArrayGetElement(
+                value.parray, &index, &component);
+        if (FAILED(elementHr)) {
+            runtimeId.clear();
+            return elementHr;
+        }
+        runtimeId.push_back(component);
+    }
+    return runtimeId.empty()
+        ? HRESULT_FROM_WIN32(ERROR_INVALID_DATA)
+        : S_OK;
+}
+
+void wait_after_element_from_handle_test_gate(
+    const char* environmentName) {
+    if (!environmentName)
+        return;
+    char base[160]{};
+    const DWORD length = GetEnvironmentVariableA(
+        environmentName, base,
+        static_cast<DWORD>(_countof(base)));
+    if (length == 0 || length >= _countof(base))
+        return;
+
+    char enteredName[192]{};
+    char releaseName[192]{};
+    snprintf(
+        enteredName, sizeof(enteredName), "%s-entered", base);
+    snprintf(
+        releaseName, sizeof(releaseName), "%s-release", base);
+    wil::unique_handle entered(OpenEventA(
+        EVENT_MODIFY_STATE, FALSE, enteredName));
+    wil::unique_handle release(OpenEventA(
+        SYNCHRONIZE, FALSE, releaseName));
+    if (!entered || !release)
+        return;
+    SetEvent(entered.get());
+    WaitForSingleObject(release.get(), 10000);
+}
+
+void append_uia_event_test_stat(
+    const char* operation, HWND hwnd, DWORD pid,
+    bool snapshotRequired = false) {
+    char path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_EVENT_STATS", path,
+        static_cast<DWORD>(_countof(path)));
+    if (length == 0 || length >= _countof(path))
+        return;
+
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    wil::unique_handle file(CreateFileA(
+        path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file)
+        return;
+
+    char line[160]{};
+    const int written = snprintf(
+        line, sizeof(line), "%s hwnd=0x%llX pid=%lu snapshot=%d\r\n",
+        operation,
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(hwnd)),
+        static_cast<unsigned long>(pid),
+        snapshotRequired ? 1 : 0);
+    if (written <= 0)
+        return;
+    DWORD ignored = 0;
+    WriteFile(
+        file.get(), line,
+        static_cast<DWORD>(
+            (std::min)(written, static_cast<int>(sizeof(line) - 1))),
+        &ignored, nullptr);
+}
+
+bool fail_connected_tree_for_testing() {
+    char value[16]{};
+    if (GetEnvironmentVariableA(
+            "LVT_TEST_UIA_FAIL_CONNECTED_TREE_ONCE",
+            value, static_cast<DWORD>(_countof(value))) == 0 ||
+        strtoul(value, nullptr, 10) == 0) {
+        return false;
+    }
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (GetEnvironmentVariableA(
+            "LVT_TEST_UIA_FAIL_CONNECTED_TREE_ONCE",
+            value, static_cast<DWORD>(_countof(value))) == 0 ||
+        strtoul(value, nullptr, 10) == 0) {
+        return false;
+    }
+    SetEnvironmentVariableA(
+        "LVT_TEST_UIA_FAIL_CONNECTED_TREE_ONCE", "0");
+    return true;
+}
+
+class UiaEventHandler final
+    : public IUIAutomationStructureChangedEventHandler,
+      public IUIAutomationPropertyChangedEventHandler,
+      public IUIAutomationEventHandler {
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(
+        REFIID iid, void** object) noexcept override {
+        if (!object)
+            return E_POINTER;
+        *object = nullptr;
+        if (iid == __uuidof(IUnknown) ||
+            iid == __uuidof(IUIAutomationStructureChangedEventHandler)) {
+            *object =
+                static_cast<IUIAutomationStructureChangedEventHandler*>(this);
+        } else if (iid ==
+                   __uuidof(IUIAutomationPropertyChangedEventHandler)) {
+            *object =
+                static_cast<IUIAutomationPropertyChangedEventHandler*>(this);
+        } else if (iid == __uuidof(IUIAutomationEventHandler)) {
+            *object = static_cast<IUIAutomationEventHandler*>(this);
+        } else {
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() noexcept override {
+        return m_references.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    ULONG STDMETHODCALLTYPE Release() noexcept override {
+        const ULONG remaining =
+            m_references.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (remaining == 0)
+            delete this;
+        return remaining;
+    }
+
+    HRESULT STDMETHODCALLTYPE HandleStructureChangedEvent(
+        IUIAutomationElement*, StructureChangeType, SAFEARRAY*) noexcept override {
+        signal();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE HandlePropertyChangedEvent(
+        IUIAutomationElement*, PROPERTYID, VARIANT) noexcept override {
+        signal();
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE HandleAutomationEvent(
+        IUIAutomationElement*, EVENTID) noexcept override {
+        signal();
+        return S_OK;
+    }
+
+    bool consume() noexcept {
+        return m_hint.consume();
+    }
+
+    void stop() noexcept {
+        m_hint.stop();
+    }
+
+private:
+    void signal() noexcept {
+        g_uiaEventCallbacks.fetch_add(1, std::memory_order_relaxed);
+        m_hint.signal();
+    }
+
+    std::atomic<ULONG> m_references{1};
+    uia_eventing_detail::SnapshotHint m_hint;
+};
 
 std::string narrow(BSTR bstr) {
     if (!bstr)
@@ -51,9 +661,17 @@ std::wstring widen(const std::string& text) {
     return out;
 }
 
-std::string trim_double(double value) {
+std::string format_double_round_trip(double value) {
     char buf[64];
-    snprintf(buf, sizeof(buf), "%g", value);
+    snprintf(buf, sizeof(buf), "%.*g",
+             std::numeric_limits<double>::max_digits10, value);
+    return buf;
+}
+
+std::string format_float_round_trip(float value) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.*g",
+             std::numeric_limits<float>::max_digits10, value);
     return buf;
 }
 
@@ -97,7 +715,7 @@ std::string variant_to_string(const VARIANT& v) {
                 return {};
             if (!out.empty())
                 out += ',';
-            out += trim_double(element);
+            out += format_double_round_trip(element);
         }
         return out;
     }
@@ -109,8 +727,8 @@ std::string variant_to_string(const VARIANT& v) {
     case VT_I4:   return std::to_string(v.lVal);
     case VT_INT:  return std::to_string(v.intVal);
     case VT_UI4:  return std::to_string(v.ulVal);
-    case VT_R4:   return trim_double(v.fltVal);
-    case VT_R8:   return trim_double(v.dblVal);
+    case VT_R4:   return format_float_round_trip(v.fltVal);
+    case VT_R8:   return format_double_round_trip(v.dblVal);
     default:      return {};
     }
 }
@@ -412,12 +1030,94 @@ HRESULT create_automation(const UiaOptions& options, IUIAutomation** out) {
     return S_OK;
 }
 
-HRESULT build_tree_with_automation(IUIAutomation* automation, HWND hwnd,
+struct UiaEventRegistration {
+    wil::com_ptr<IUIAutomationElement> root;
+    wil::com_ptr<IUIAutomationCacheRequest> cacheRequest;
+    wil::com_ptr<UiaEventHandler> handler;
+};
+
+HRESULT register_uia_event_handlers(
+    IUIAutomation* automation,
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess,
+    UiaEventRegistration& registration) {
+    RETURN_HR_IF_NULL(E_POINTER, automation);
+
+    wil::com_ptr<IUIAutomationElement> root;
+    RETURN_IF_FAILED(get_validated_uia_root(
+        automation, identity, retainedProcess, &root));
+
+    wil::com_ptr<IUIAutomationCacheRequest> cacheRequest;
+    RETURN_IF_FAILED(automation->CreateCacheRequest(&cacheRequest));
+    RETURN_IF_FAILED(cacheRequest->put_TreeScope(TreeScope_Element));
+    RETURN_IF_FAILED(
+        cacheRequest->put_AutomationElementMode(AutomationElementMode_None));
+    RETURN_IF_FAILED(cacheRequest->AddProperty(UIA_RuntimeIdPropertyId));
+    RETURN_IF_FAILED(cacheRequest->AddProperty(UIA_ProcessIdPropertyId));
+    RETURN_IF_FAILED(cacheRequest->AddProperty(UIA_NativeWindowHandlePropertyId));
+
+    wil::com_ptr<UiaEventHandler> handler;
+    handler.attach(new (std::nothrow) UiaEventHandler());
+    RETURN_IF_NULL_ALLOC(handler);
+
+    const HRESULT structureHr =
+        automation->AddStructureChangedEventHandler(
+            root.get(), TreeScope_Subtree, cacheRequest.get(),
+            static_cast<IUIAutomationStructureChangedEventHandler*>(
+                handler.get()));
+    if (FAILED(structureHr))
+        RETURN_HR(structureHr);
+    g_uiaStructureRegistrations.fetch_add(1, std::memory_order_relaxed);
+
+    const auto& properties = uia_event_property_ids();
+    const HRESULT propertyHr =
+        automation->AddPropertyChangedEventHandlerNativeArray(
+            root.get(), TreeScope_Subtree, cacheRequest.get(),
+            static_cast<IUIAutomationPropertyChangedEventHandler*>(
+                handler.get()),
+            const_cast<PROPERTYID*>(properties.data()),
+            static_cast<int>(properties.size()));
+    if (FAILED(propertyHr)) {
+        (void)automation->RemoveAllEventHandlers();
+        RETURN_HR(propertyHr);
+    }
+    g_uiaPropertyRegistrations.fetch_add(1, std::memory_order_relaxed);
+
+    uint64_t automationRegistrations = 0;
+    for (const EVENTID eventId : uia_automation_event_ids()) {
+        const HRESULT eventHr = automation->AddAutomationEventHandler(
+            eventId, root.get(), TreeScope_Subtree, cacheRequest.get(),
+            static_cast<IUIAutomationEventHandler*>(handler.get()));
+        if (SUCCEEDED(eventHr)) {
+            ++automationRegistrations;
+        } else {
+            LOG_IF_FAILED(eventHr);
+        }
+    }
+    if (automationRegistrations == 0) {
+        (void)automation->RemoveAllEventHandlers();
+        RETURN_HR(E_FAIL);
+    }
+    g_uiaAutomationRegistrations.fetch_add(
+        automationRegistrations, std::memory_order_relaxed);
+    g_uiaEventConnections.fetch_add(1, std::memory_order_relaxed);
+
+    registration.root = std::move(root);
+    registration.cacheRequest = std::move(cacheRequest);
+    registration.handler = std::move(handler);
+    return S_OK;
+}
+
+HRESULT build_tree_with_automation(IUIAutomation* automation,
+                                   const UiaTargetIdentity& identity,
+                                   HANDLE retainedProcess,
+                                   const char* testGateEnvironment,
                                    const UiaOptions& options,
                                    Element& out, bool& truncated) {
     wil::com_ptr<IUIAutomationElement> root;
-    RETURN_IF_FAILED(automation->ElementFromHandle(hwnd, &root));
-    RETURN_HR_IF_NULL(E_FAIL, root.get());
+    RETURN_IF_FAILED(get_validated_uia_root(
+        automation, identity, retainedProcess, &root,
+        testGateEnvironment));
 
     std::set<long> requested;
     auto properties = resolve_properties(options, &requested);
@@ -425,8 +1125,16 @@ HRESULT build_tree_with_automation(IUIAutomation* automation, HWND hwnd,
     wil::com_ptr<IUIAutomationCacheRequest> request;
     RETURN_IF_FAILED(make_cache_request(automation, options, properties, &request));
 
+    wait_after_element_from_handle_test_gate(
+        "LVT_TEST_UIA_BEFORE_BUILD_CACHE_GATE");
     wil::com_ptr<IUIAutomationElement> cachedRoot;
-    RETURN_IF_FAILED(root->BuildUpdatedCache(request.get(), &cachedRoot));
+    const HRESULT cacheHr =
+        root->BuildUpdatedCache(request.get(), &cachedRoot);
+    wil::com_ptr<IUIAutomationElement> currentRoot;
+    const HRESULT identityHr = get_validated_uia_root(
+        automation, identity, retainedProcess, &currentRoot);
+    RETURN_IF_FAILED(identityHr);
+    RETURN_IF_FAILED(cacheHr);
     RETURN_HR_IF_NULL(E_FAIL, cachedRoot.get());
 
     WalkContext ctx;
@@ -451,22 +1159,26 @@ HRESULT build_tree_with_automation(IUIAutomation* automation, HWND hwnd,
     return S_OK;
 }
 
-HRESULT build_tree_on_mta(HWND hwnd, const UiaOptions& options,
+HRESULT build_tree_on_mta(
+                          const UiaTargetIdentity& identity,
+                          const UiaOptions& options,
                           Element& out, bool& truncated) {
     wil::com_ptr<IUIAutomation> automation;
     RETURN_IF_FAILED(create_automation(options, &automation));
-    return build_tree_with_automation(automation.get(), hwnd, options, out, truncated);
+    return build_tree_with_automation(
+        automation.get(), identity, nullptr,
+        "LVT_TEST_UIA_ONE_SHOT_AFTER_ELEMENT_GATE",
+        options, out, truncated);
 }
 
 // UIA clients belong in an MTA. screenshot.cpp initializes an STA on the calling
 // thread, and a thread cannot be in both, so all UIA work is marshalled onto a
 // dedicated MTA thread.
 //
-// One-shot callers still create and release their COM objects inside `fn`.
-// UiaConnection is the deliberate exception: it creates IUIAutomation once on
-// one run_on_mta call and reuses that pointer on later run_on_mta calls. That
-// is still the SAME apartment because COINIT_MULTITHREADED joins the single,
-// process-wide MTA rather than inventing a per-thread apartment.
+// One-shot callers create and release their COM objects inside `fn`.
+// UiaConnection instead owns one long-lived MTA worker (see State below), so
+// its client, handlers, tree reads, event drains, and teardown all stay on one
+// exact thread.
 //
 // The body is wrapped in CATCH_RETURN because an exception escaping a thread
 // function calls std::terminate: building the Element tree allocates freely, so
@@ -489,6 +1201,228 @@ HRESULT run_on_mta(Fn&& fn) {
 }
 
 } // namespace
+
+bool is_uia_target_ownership_failure(HRESULT hr) {
+    return hr == HRESULT_FROM_WIN32(ERROR_INVALID_OWNER) ||
+           hr == HRESULT_FROM_WIN32(
+               ERROR_INVALID_WINDOW_HANDLE);
+}
+
+HRESULT get_validated_uia_root(
+    IUIAutomation* automation,
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess,
+    IUIAutomationElement** root,
+    const char* testGateEnvironment) {
+    RETURN_HR_IF_NULL(E_POINTER, automation);
+    RETURN_HR_IF_NULL(E_POINTER, root);
+    *root = nullptr;
+    RETURN_HR_IF(E_INVALIDARG, !identity.valid());
+    RETURN_IF_FAILED(target_identity_status(
+        identity, retainedProcess));
+
+    wil::com_ptr<IUIAutomationElement> candidate;
+    const HRESULT elementHr = automation->ElementFromHandle(
+        identity.hwnd, &candidate);
+    if (FAILED(elementHr)) {
+        const HRESULT currentStatus =
+            target_identity_status(
+                identity, retainedProcess);
+        if (FAILED(currentStatus))
+            return currentStatus;
+        RETURN_HR(elementHr);
+    }
+    RETURN_HR_IF_NULL(E_FAIL, candidate.get());
+
+    // This is deliberately the first work after ElementFromHandle. A window
+    // can be destroyed and its numeric HWND recycled between the caller's
+    // precheck and this cross-process acquisition.
+    wait_after_element_from_handle_test_gate(
+        testGateEnvironment);
+    RETURN_IF_FAILED(target_identity_status(
+        identity, retainedProcess));
+
+    const HRESULT processIdFailure =
+        forced_runtime_id_failure_for_testing(
+            "process");
+    if (FAILED(processIdFailure))
+        return processIdFailure;
+    int rootPid = 0;
+    RETURN_IF_FAILED(candidate->get_CurrentProcessId(&rootPid));
+    RETURN_HR_IF(
+        HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
+        rootPid <= 0 ||
+        static_cast<DWORD>(rootPid) != identity.pid);
+
+    std::vector<int> runtimeId;
+    RETURN_IF_FAILED(
+        read_runtime_id(candidate.get(), runtimeId));
+    RETURN_HR_IF(
+        HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
+        runtimeId != identity.rootRuntimeId);
+
+    *root = candidate.detach();
+    return S_OK;
+}
+
+std::optional<UiaTargetIdentity> capture_uia_target_identity(
+    HWND hwnd, DWORD expectedPid,
+    uint64_t expectedProcessCreationIdentity,
+    HRESULT* status) {
+    if (status)
+        *status = S_OK;
+    const auto fail =
+        [status](HRESULT hresult)
+            -> std::optional<UiaTargetIdentity> {
+            if (status)
+                *status = hresult;
+            return std::nullopt;
+        };
+    if (!expectedPid)
+        return fail(HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER));
+    if (!IsWindow(hwnd))
+        return fail(HRESULT_FROM_WIN32(
+            ERROR_INVALID_WINDOW_HANDLE));
+    if (!exact_window_matches(hwnd, expectedPid))
+        return fail(HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER));
+
+    SetLastError(ERROR_SUCCESS);
+    wil::unique_process_handle process(OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+        FALSE, expectedPid));
+    if (!process) {
+        const DWORD error = GetLastError();
+        if (!exact_window_matches(hwnd, expectedPid)) {
+            return fail(HRESULT_FROM_WIN32(
+                ERROR_INVALID_OWNER));
+        }
+        return fail(HRESULT_FROM_WIN32(
+            error == ERROR_SUCCESS ? ERROR_OPEN_FAILED
+                                   : error));
+    }
+    const uint64_t creationIdentity =
+        expectedProcessCreationIdentity
+            ? expectedProcessCreationIdentity
+            : process_creation_identity(process.get());
+    if (!process_identity_matches(
+            process.get(), expectedPid, creationIdentity)) {
+        return fail(HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER));
+    }
+
+    UiaTargetIdentity identity;
+    identity.hwnd = hwnd;
+    identity.pid = expectedPid;
+    identity.processCreationIdentity = creationIdentity;
+    identity.windowLifetime =
+        UiaWindowLifetimeToken::create(
+            hwnd, expectedPid, creationIdentity);
+    if (!identity.windowLifetime) {
+        const HRESULT processStatus =
+            target_process_status(
+                identity, process.get());
+        return fail(
+            FAILED(processStatus)
+                ? processStatus
+                : E_FAIL);
+    }
+    const HRESULT hr = run_on_mta([&]() -> HRESULT {
+        wil::com_ptr<IUIAutomation> automation;
+        UiaOptions options;
+        options.timeoutMs = 0;
+        RETURN_IF_FAILED(create_automation(options, &automation));
+
+        wil::com_ptr<IUIAutomationElement> root;
+        RETURN_IF_FAILED(automation->ElementFromHandle(
+            identity.hwnd, &root));
+        RETURN_HR_IF_NULL(E_FAIL, root.get());
+        RETURN_HR_IF(
+            HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
+            !exact_window_matches(
+                identity.hwnd, identity.pid));
+        RETURN_IF_FAILED(target_process_status(
+            identity, process.get()));
+        RETURN_IF_FAILED(
+            identity.windowLifetime->validation_status());
+
+        int rootPid = 0;
+        RETURN_IF_FAILED(root->get_CurrentProcessId(&rootPid));
+        RETURN_HR_IF(
+            HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
+            rootPid <= 0 ||
+            static_cast<DWORD>(rootPid) != identity.pid);
+        RETURN_IF_FAILED(read_runtime_id(
+            root.get(), identity.rootRuntimeId));
+        return S_OK;
+    });
+    if (FAILED(hr))
+        return fail(hr);
+    if (!identity.valid())
+        return fail(E_FAIL);
+    return identity;
+}
+
+HRESULT validate_uia_target_identity(
+    const UiaTargetIdentity& identity) {
+    if (!identity.valid())
+        return HRESULT_FROM_WIN32(ERROR_INVALID_OWNER);
+    if (force_identity_contention_for_testing())
+        return RPC_E_CALL_REJECTED;
+    return run_on_mta([&]() -> HRESULT {
+        wil::com_ptr<IUIAutomation> automation;
+        UiaOptions options;
+        options.timeoutMs = 0;
+        RETURN_IF_FAILED(create_automation(
+            options, &automation));
+        wil::com_ptr<IUIAutomationElement> root;
+        return get_validated_uia_root(
+            automation.get(), identity, nullptr, &root);
+    });
+}
+
+namespace uia_eventing_detail {
+
+SubscriptionCounters subscription_counters() {
+    return {
+        .connections =
+            g_uiaEventConnections.load(std::memory_order_relaxed),
+        .structureRegistrations =
+            g_uiaStructureRegistrations.load(std::memory_order_relaxed),
+        .propertyRegistrations =
+            g_uiaPropertyRegistrations.load(std::memory_order_relaxed),
+        .automationRegistrations =
+            g_uiaAutomationRegistrations.load(std::memory_order_relaxed),
+        .callbacks =
+            g_uiaEventCallbacks.load(std::memory_order_relaxed),
+        .removeAllCalls =
+            g_uiaRemoveAllCalls.load(std::memory_order_relaxed),
+    };
+}
+
+void reset_subscription_counters() {
+    g_uiaEventConnections.store(0, std::memory_order_relaxed);
+    g_uiaStructureRegistrations.store(0, std::memory_order_relaxed);
+    g_uiaPropertyRegistrations.store(0, std::memory_order_relaxed);
+    g_uiaAutomationRegistrations.store(0, std::memory_order_relaxed);
+    g_uiaEventCallbacks.store(0, std::memory_order_relaxed);
+    g_uiaRemoveAllCalls.store(0, std::memory_order_relaxed);
+}
+
+const std::vector<int>& subscribed_property_ids() {
+    return uia_event_property_ids();
+}
+
+const std::vector<int>& subscribed_automation_event_ids() {
+    return uia_automation_event_ids();
+}
+
+} // namespace uia_eventing_detail
+
+std::string format_uia_double(double value) {
+    return format_double_round_trip(value);
+}
 
 std::string format_runtime_id(const std::vector<int>& runtimeId) {
     std::string out;
@@ -532,18 +1466,34 @@ bool parse_runtime_id(const std::string& text, std::vector<int>& out) {
     return !out.empty();
 }
 
-std::optional<Element> UiaProvider::build(HWND hwnd, const UiaOptions& options, bool* truncated) {
+std::optional<Element> UiaProvider::build(
+    const UiaTargetIdentity& identity,
+    const UiaOptions& options,
+    bool* truncated,
+    bool* ownershipLost,
+    HRESULT* status) {
     Element root;
     bool wasTruncated = false;
+    if (ownershipLost)
+        *ownershipLost = false;
+    if (status)
+        *status = S_OK;
 
     const HRESULT hr = run_on_mta([&] {
-        return build_tree_on_mta(hwnd, options, root, wasTruncated);
+        return build_tree_on_mta(
+            identity, options, root, wasTruncated);
     });
 
     if (truncated)
         *truncated = wasTruncated;
+    if (status)
+        *status = hr;
 
     if (FAILED(hr)) {
+        if (ownershipLost) {
+            *ownershipLost =
+                is_uia_target_ownership_failure(hr);
+        }
         LOG_IF_FAILED(hr);
         return std::nullopt;
     }
@@ -555,70 +1505,678 @@ std::optional<Element> UiaProvider::build(HWND hwnd, const UiaOptions& options, 
 }
 
 struct UiaConnection::State {
-    std::mutex mutex;
+    explicit State(UiaTargetIdentity target)
+        : targetIdentity(std::move(target)),
+          worker([this] { worker_main(); }) {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        readyCondition.wait(lock, [this] { return ready; });
+    }
+
+    ~State() {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            stopping = true;
+        }
+        queueCondition.notify_one();
+        if (worker.joinable())
+            worker.join();
+    }
+
+    HRESULT invoke(std::function<HRESULT()> operation) {
+        auto completion = std::make_shared<std::promise<HRESULT>>();
+        auto future = completion->get_future();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (stopping)
+                return HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED);
+            if (FAILED(initializeResult))
+                return initializeResult;
+            operations.emplace_back(
+                [operation = std::move(operation),
+                 completion = std::move(completion)]() mutable {
+                    const HRESULT result = [&]() -> HRESULT {
+                        try {
+                            return operation();
+                        }
+                        CATCH_RETURN();
+                    }();
+                    completion->set_value(result);
+                });
+        }
+        queueCondition.notify_one();
+        return future.get();
+    }
+
+    bool connected() const noexcept {
+        return alive.load(std::memory_order_acquire);
+    }
+
+    std::mutex operationMutex;
+    std::atomic<bool> failNextTree{false};
+    UiaPropertyIdentityCache identities;
+    UiaPropertySchemaCache schemaCache;
+    std::string identityError;
+
+private:
+    HRESULT initialize_on_mta() {
+        process.reset(OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            FALSE, targetIdentity.pid));
+        RETURN_HR_IF(
+            HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
+            !process ||
+            !target_identity_matches(
+                targetIdentity, process.get()));
+        UiaOptions connectOptions;
+        connectOptions.timeoutMs = 0;
+        RETURN_IF_FAILED(create_automation(connectOptions, &automation));
+        const HRESULT eventHr = register_uia_event_handlers(
+            automation.get(), targetIdentity, process.get(),
+            eventRegistration);
+        if (FAILED(eventHr)) {
+            automation.reset();
+            RETURN_HR(eventHr);
+        }
+        alive.store(true, std::memory_order_release);
+        return S_OK;
+    }
+
+    void teardown_on_mta() noexcept {
+        if (eventRegistration.handler)
+            eventRegistration.handler->stop();
+        if (automation && eventRegistration.handler) {
+            g_uiaRemoveAllCalls.fetch_add(1, std::memory_order_relaxed);
+            LOG_IF_FAILED(automation->RemoveAllEventHandlers());
+        }
+        eventRegistration.handler.reset();
+        eventRegistration.cacheRequest.reset();
+        eventRegistration.root.reset();
+        automation.reset();
+        alive.store(false, std::memory_order_release);
+    }
+
+    void worker_main() {
+        const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        HRESULT result = coHr;
+        if (SUCCEEDED(coHr)) {
+            result = [&]() -> HRESULT {
+                try {
+                    return initialize_on_mta();
+                }
+                CATCH_RETURN();
+            }();
+        }
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            initializeResult = result;
+            ready = true;
+        }
+        readyCondition.notify_one();
+
+        if (SUCCEEDED(coHr)) {
+            for (;;) {
+                std::function<void()> operation;
+                {
+                    std::unique_lock<std::mutex> lock(queueMutex);
+                    queueCondition.wait_for(
+                        lock, kUiaTargetLivenessInterval,
+                        [this] {
+                            return stopping || !operations.empty();
+                        });
+                    if (stopping && operations.empty())
+                        break;
+                    if (!operations.empty()) {
+                        operation = std::move(operations.front());
+                        operations.pop_front();
+                    }
+                }
+
+                if (operation)
+                    operation();
+
+                if (connected() &&
+                    !target_identity_matches(
+                        targetIdentity, process.get())) {
+                    teardown_on_mta();
+                }
+            }
+            teardown_on_mta();
+            CoUninitialize();
+        }
+    }
+
+    UiaTargetIdentity targetIdentity;
+    std::mutex queueMutex;
+    std::condition_variable queueCondition;
+    std::condition_variable readyCondition;
+    std::deque<std::function<void()>> operations;
+    bool ready = false;
+    bool stopping = false;
+    HRESULT initializeResult = E_PENDING;
+    std::thread worker;
+    std::atomic<bool> alive{false};
+    wil::unique_process_handle process;
     wil::com_ptr<IUIAutomation> automation;
-    CO_MTA_USAGE_COOKIE mtaCookie = nullptr;
+    UiaEventRegistration eventRegistration;
+
+    friend class UiaConnection;
 };
 
-UiaConnection::UiaConnection(HWND hwnd)
-    : m_hwnd(hwnd), m_state(std::make_unique<State>()) {
+std::string uia_identity_scope(const UiaOptions& options) {
+    return uia_view_name(options.view);
 }
 
-std::shared_ptr<UiaConnection> UiaConnection::connect(HWND hwnd) {
-    auto connection = std::shared_ptr<UiaConnection>(new UiaConnection(hwnd));
-    const HRESULT hr = run_on_mta([&]() -> HRESULT {
-        CO_MTA_USAGE_COOKIE cookie = nullptr;
-        RETURN_IF_FAILED(CoIncrementMTAUsage(&cookie));
+bool UiaPropertyIdentityCache::attach(
+    Element& root, const std::string& scope, bool completeSnapshot) {
+    std::unordered_set<std::string> snapshotRuntimeIds;
+    collect_runtime_ids(root, snapshotRuntimeIds);
+    if (snapshotRuntimeIds.size() > kMaximumRuntimeIds)
+        return false;
 
-        wil::com_ptr<IUIAutomation> automation;
-        UiaOptions connectOptions;
-        // connect() is not itself a tree walk; the very next get_tree call
-        // re-applies that walk's own timeout anyway, so create the client with
-        // the default-effective setting rather than baking in an arbitrary
-        // caller-specific budget up front.
-        connectOptions.timeoutMs = 0;
-        const HRESULT createHr = create_automation(connectOptions, &automation);
-        if (FAILED(createHr)) {
-            CoDecrementMTAUsage(cookie);
-            RETURN_HR(createHr);
+    const auto evictedScope = scope_to_evict(scope);
+    std::unordered_set<std::string> protectedRuntimeIds;
+    for (const auto& [knownScope, current] :
+         m_currentRuntimeIdsByScope) {
+        if (completeSnapshot && knownScope == scope)
+            continue;
+        if (evictedScope && knownScope == *evictedScope)
+            continue;
+        protectedRuntimeIds.insert(current.begin(), current.end());
+    }
+    protectedRuntimeIds.insert(
+        snapshotRuntimeIds.begin(), snapshotRuntimeIds.end());
+    if (protectedRuntimeIds.size() > kMaximumRuntimeIds)
+        return false;
+
+    if (evictedScope)
+        evict_scope(*evictedScope);
+    if (completeSnapshot)
+        m_currentRuntimeIdsByScope[scope] = snapshotRuntimeIds;
+
+    auto& scopeState = m_scopes[scope];
+    scopeState.lastUsed = ++m_clock;
+    if (completeSnapshot)
+        ++scopeState.generation;
+    else if (scopeState.generation == 0)
+        scopeState.generation = 1;
+    m_activeScope = scope;
+    m_activeGeneration = scopeState.generation;
+    attach_element(root);
+    prune(protectedRuntimeIds);
+    return true;
+}
+
+void UiaPropertyIdentityCache::attach_element(Element& element) {
+    const auto runtime = element.properties.find("RuntimeId");
+    if (runtime != element.properties.end() && !runtime->second.empty()) {
+        auto found = m_handlesByRuntimeId.find(runtime->second);
+        if (found != m_handlesByRuntimeId.end()) {
+            found->second.lastUsed = ++m_clock;
+            found->second.lastSeenByScope[m_activeScope] =
+                m_activeGeneration;
+            element.providerHandle = found->second.handle;
+        } else {
+            const auto handle = m_nextHandle++;
+            m_handlesByRuntimeId.emplace(
+                runtime->second,
+                RuntimeIdentity{
+                    .handle = handle,
+                    .lastUsed = ++m_clock,
+                    .lastSeenByScope = {
+                        {m_activeScope, m_activeGeneration},
+                    },
+                });
+            m_runtimeIdsByHandle.emplace(handle, runtime->second);
+            element.providerHandle = handle;
         }
+    }
+    for (auto& child : element.children)
+        attach_element(child);
+}
 
-        std::lock_guard<std::mutex> lock(connection->m_state->mutex);
-        connection->m_state->automation = std::move(automation);
-        connection->m_state->mtaCookie = cookie;
-        return S_OK;
-    });
+bool UiaPropertyIdentityCache::remember(
+    const Element& root, const std::string& scope,
+    bool completeSnapshot) {
+    KeyAliases snapshotAliases;
+    collect_key_aliases(root, snapshotAliases);
 
-    if (FAILED(hr)) {
-        LOG_IF_FAILED(hr);
+    const auto evictedScope = scope_to_evict(scope);
+    KeyAliases protectedAliases;
+    const auto merge_aliases = [](
+        KeyAliases& destination, const KeyAliases& source) {
+        for (const auto& [key, runtimeIds] : source) {
+            auto& destinationRuntimeIds = destination[key];
+            destinationRuntimeIds.insert(
+                runtimeIds.begin(), runtimeIds.end());
+        }
+    };
+    for (const auto& [knownScope, current] :
+         m_currentAliasesByScope) {
+        if (completeSnapshot && knownScope == scope)
+            continue;
+        if (evictedScope && knownScope == *evictedScope)
+            continue;
+        merge_aliases(protectedAliases, current);
+    }
+    merge_aliases(protectedAliases, snapshotAliases);
+    size_t protectedAliasCount = 0;
+    for (const auto& [_, runtimeIds] : protectedAliases)
+        protectedAliasCount += runtimeIds.size();
+    if (protectedAliasCount > kMaximumKeyAliases)
+        return false;
+
+    if (evictedScope)
+        evict_scope(*evictedScope);
+    if (completeSnapshot)
+        m_currentAliasesByScope[scope] = snapshotAliases;
+
+    auto& scopeState = m_scopes[scope];
+    scopeState.lastUsed = ++m_clock;
+    if (scopeState.generation == 0)
+        scopeState.generation = 1;
+    m_activeScope = scope;
+    m_activeGeneration = scopeState.generation;
+    remember_element(root);
+    std::unordered_set<std::string> protectedRuntimeIds;
+    for (const auto& [_, current] : m_currentRuntimeIdsByScope)
+        protectedRuntimeIds.insert(current.begin(), current.end());
+    prune(protectedRuntimeIds, protectedAliases);
+    return true;
+}
+
+void UiaPropertyIdentityCache::remember_element(const Element& element) {
+    const auto runtime = element.properties.find("RuntimeId");
+    if (!element.key.empty() &&
+        runtime != element.properties.end() && !runtime->second.empty()) {
+        m_runtimeIdsByKey[element.key][runtime->second] = ++m_clock;
+    }
+    for (const auto& child : element.children)
+        remember_element(child);
+}
+
+UiaPropertyReferenceResult UiaPropertyIdentityCache::resolve(
+    const std::string& reference, std::string& error) {
+    std::string runtimeId;
+    if (reference.rfind("uia:", 0) == 0) {
+        runtimeId = reference.substr(4);
+        std::vector<int> parsed;
+        if (!parse_runtime_id(runtimeId, parsed)) {
+            error = "The UI Automation RuntimeId reference is malformed";
+            return {
+                .hresult = E_INVALIDARG,
+                .failure =
+                    UiaPropertyReferenceFailure::malformed,
+            };
+        }
+    } else {
+        const auto found = m_runtimeIdsByKey.find(reference);
+        if (found == m_runtimeIdsByKey.end()) {
+            error =
+                "The UI Automation key is stale or was not returned by this session; "
+                "refresh the originating raw/control/content tree and use its key or RuntimeId";
+            return {
+                .hresult =
+                    HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+                .failure =
+                    UiaPropertyReferenceFailure::missing,
+            };
+        }
+        if (found->second.size() != 1) {
+            error =
+                "The UI Automation key is ambiguous across trees or views; "
+                "refresh the originating tree and use uia:<RuntimeId>";
+            return {
+                .hresult =
+                    HRESULT_FROM_WIN32(ERROR_DUP_NAME),
+                .failure =
+                    UiaPropertyReferenceFailure::ambiguous,
+            };
+        }
+        auto alias = found->second.begin();
+        runtimeId = alias->first;
+        alias->second = ++m_clock;
+    }
+
+    auto existing = m_handlesByRuntimeId.find(runtimeId);
+    if (existing != m_handlesByRuntimeId.end()) {
+        existing->second.lastUsed = ++m_clock;
+        return {.handle = existing->second.handle};
+    }
+
+    std::unordered_set<std::string> currentRuntimeIds;
+    for (const auto& [_, current] : m_currentRuntimeIdsByScope)
+        currentRuntimeIds.insert(current.begin(), current.end());
+    if (currentRuntimeIds.size() >= kMaximumRuntimeIds) {
+        error =
+            "The UI Automation RuntimeId cannot be retained because current "
+            "session trees already fill the bounded identity cache; use a "
+            "narrower view or element scope";
+        return {
+            .hresult =
+                HRESULT_FROM_WIN32(
+                    ERROR_NOT_ENOUGH_QUOTA),
+            .failure =
+                UiaPropertyReferenceFailure::capacity,
+        };
+    }
+
+    auto& scopeState = m_scopes[m_activeScope];
+    if (scopeState.generation == 0)
+        scopeState.generation = 1;
+    scopeState.lastUsed = ++m_clock;
+
+    const auto handle = m_nextHandle++;
+    m_handlesByRuntimeId.emplace(
+        runtimeId,
+        RuntimeIdentity{
+            .handle = handle,
+            .lastUsed = ++m_clock,
+            .lastSeenByScope = {
+                {m_activeScope, scopeState.generation},
+            },
+        });
+    m_runtimeIdsByHandle.emplace(handle, runtimeId);
+    prune();
+    return {.handle = handle};
+}
+
+std::optional<std::string> UiaPropertyIdentityCache::runtime_id(
+    uint64_t handle) const {
+    const auto found = m_runtimeIdsByHandle.find(handle);
+    if (found == m_runtimeIdsByHandle.end())
+        return std::nullopt;
+    return found->second;
+}
+
+size_t UiaPropertyIdentityCache::key_alias_count() const {
+    size_t count = 0;
+    for (const auto& [_, aliases] : m_runtimeIdsByKey)
+        count += aliases.size();
+    return count;
+}
+
+void UiaPropertyIdentityCache::collect_runtime_ids(
+    const Element& element,
+    std::unordered_set<std::string>& runtimeIds) const {
+    const auto runtime = element.properties.find("RuntimeId");
+    if (runtime != element.properties.end() && !runtime->second.empty())
+        runtimeIds.insert(runtime->second);
+    for (const auto& child : element.children)
+        collect_runtime_ids(child, runtimeIds);
+}
+
+void UiaPropertyIdentityCache::collect_key_aliases(
+    const Element& element,
+    KeyAliases& aliases) const {
+    const auto runtime = element.properties.find("RuntimeId");
+    if (!element.key.empty() &&
+        runtime != element.properties.end() && !runtime->second.empty()) {
+        aliases[element.key].insert(runtime->second);
+    }
+    for (const auto& child : element.children)
+        collect_key_aliases(child, aliases);
+}
+
+std::optional<std::string>
+UiaPropertyIdentityCache::scope_to_evict(
+    const std::string& incomingScope) const {
+    if (m_scopes.contains(incomingScope) ||
+        m_scopes.size() < kMaximumScopes) {
+        return std::nullopt;
+    }
+
+    auto oldest = m_scopes.end();
+    for (auto scope = m_scopes.begin(); scope != m_scopes.end(); ++scope) {
+        if (oldest == m_scopes.end() ||
+            scope->second.lastUsed < oldest->second.lastUsed) {
+            oldest = scope;
+        }
+    }
+    if (oldest == m_scopes.end())
+        return std::nullopt;
+    return oldest->first;
+}
+
+void UiaPropertyIdentityCache::evict_scope(
+    const std::string& scope) {
+    m_scopes.erase(scope);
+    m_currentRuntimeIdsByScope.erase(scope);
+    m_currentAliasesByScope.erase(scope);
+    for (auto& [_, identity] : m_handlesByRuntimeId)
+        identity.lastSeenByScope.erase(scope);
+    if (m_activeScope == scope) {
+        m_activeScope = "default";
+        m_activeGeneration = 0;
+    }
+}
+
+void UiaPropertyIdentityCache::prune(
+    const std::unordered_set<std::string>& extraProtectedRuntimeIds,
+    const KeyAliases& extraProtectedAliases) {
+    std::unordered_set<std::string> protectedRuntimeIds =
+        extraProtectedRuntimeIds;
+    for (const auto& [_, current] : m_currentRuntimeIdsByScope)
+        protectedRuntimeIds.insert(current.begin(), current.end());
+    KeyAliases protectedAliases = extraProtectedAliases;
+    for (const auto& [_, current] : m_currentAliasesByScope) {
+        for (const auto& [key, runtimeIds] : current) {
+            auto& protectedRuntimeIdsForKey = protectedAliases[key];
+            protectedRuntimeIdsForKey.insert(
+                runtimeIds.begin(), runtimeIds.end());
+        }
+    }
+    const auto remove_runtime = [&](const std::string& runtimeId) {
+        const auto found = m_handlesByRuntimeId.find(runtimeId);
+        if (found == m_handlesByRuntimeId.end())
+            return;
+        m_runtimeIdsByHandle.erase(found->second.handle);
+        m_handlesByRuntimeId.erase(found);
+    };
+
+    std::vector<std::string> staleRuntimeIds;
+    for (const auto& [runtimeId, identity] : m_handlesByRuntimeId) {
+        bool fresh = false;
+        for (const auto& [scope, lastSeen] : identity.lastSeenByScope) {
+            const auto state = m_scopes.find(scope);
+            if (state != m_scopes.end() &&
+                lastSeen + 1 >= state->second.generation) {
+                fresh = true;
+                break;
+            }
+        }
+        if (!fresh && !protectedRuntimeIds.contains(runtimeId))
+            staleRuntimeIds.push_back(runtimeId);
+    }
+    for (const auto& runtimeId : staleRuntimeIds)
+        remove_runtime(runtimeId);
+
+    while (m_handlesByRuntimeId.size() > kMaximumRuntimeIds) {
+        auto oldest = m_handlesByRuntimeId.end();
+        for (auto it = m_handlesByRuntimeId.begin();
+             it != m_handlesByRuntimeId.end(); ++it) {
+            if (protectedRuntimeIds.contains(it->first))
+                continue;
+            if (oldest == m_handlesByRuntimeId.end() ||
+                it->second.lastUsed < oldest->second.lastUsed) {
+                oldest = it;
+            }
+        }
+        if (oldest == m_handlesByRuntimeId.end())
+            break;
+        const auto runtimeId = oldest->first;
+        remove_runtime(runtimeId);
+    }
+
+    for (auto key = m_runtimeIdsByKey.begin();
+         key != m_runtimeIdsByKey.end();) {
+        for (auto alias = key->second.begin();
+             alias != key->second.end();) {
+            if (!m_handlesByRuntimeId.contains(alias->first))
+                alias = key->second.erase(alias);
+            else
+                ++alias;
+        }
+        if (key->second.empty())
+            key = m_runtimeIdsByKey.erase(key);
+        else
+            ++key;
+    }
+
+    while (key_alias_count() > kMaximumKeyAliases) {
+        auto oldestKey = m_runtimeIdsByKey.end();
+        std::unordered_map<std::string, uint64_t>::iterator oldestAlias;
+        uint64_t oldestGeneration = (std::numeric_limits<uint64_t>::max)();
+        for (auto key = m_runtimeIdsByKey.begin();
+             key != m_runtimeIdsByKey.end(); ++key) {
+            for (auto alias = key->second.begin();
+                 alias != key->second.end(); ++alias) {
+                const auto protectedKey =
+                    protectedAliases.find(key->first);
+                if (protectedKey != protectedAliases.end() &&
+                    protectedKey->second.contains(alias->first)) {
+                    continue;
+                }
+                if (alias->second < oldestGeneration) {
+                    oldestGeneration = alias->second;
+                    oldestKey = key;
+                    oldestAlias = alias;
+                }
+            }
+        }
+        if (oldestKey == m_runtimeIdsByKey.end())
+            break;
+        oldestKey->second.erase(oldestAlias);
+        if (oldestKey->second.empty())
+            m_runtimeIdsByKey.erase(oldestKey);
+    }
+}
+
+namespace {
+
+bool has_supported_pattern(const Element& element, const char* wanted) {
+    const auto found = element.properties.find("SupportedPatterns");
+    if (found == element.properties.end())
+        return false;
+    size_t start = 0;
+    while (start < found->second.size()) {
+        const auto comma = found->second.find(',', start);
+        const auto token = found->second.substr(
+            start, comma == std::string::npos ? std::string::npos : comma - start);
+        if (token == wanted)
+            return true;
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return false;
+}
+
+bool bool_property(const Element& element, const char* name, bool fallback) {
+    const auto found = element.properties.find(name);
+    if (found == element.properties.end())
+        return fallback;
+    return found->second == "true";
+}
+
+struct LocatedPropertyElement {
+    const Element* element = nullptr;
+    UiaSelectionCapabilities selection;
+};
+
+bool locate_property_element(
+    const Element& current, uint64_t handle,
+    UiaSelectionCapabilities inheritedSelection,
+    LocatedPropertyElement& result) {
+    if (has_supported_pattern(current, "Selection")) {
+        inheritedSelection.known = true;
+        inheritedSelection.canSelectMultiple =
+            bool_property(current, "Selection.CanSelectMultiple", false);
+        inheritedSelection.isSelectionRequired =
+            bool_property(current, "Selection.IsSelectionRequired", true);
+    }
+
+    if (current.providerHandle == handle) {
+        result.element = &current;
+        result.selection = inheritedSelection;
+        return true;
+    }
+    for (const auto& child : current.children) {
+        if (locate_property_element(
+                child, handle, inheritedSelection, result)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const PropertyDescriptor* find_descriptor(
+    const PropertySchema& schema, const std::string& descriptorId) {
+    for (const auto& descriptor : schema.descriptors) {
+        if (descriptor.descriptorId == descriptorId)
+            return &descriptor;
+    }
+    return nullptr;
+}
+
+bool is_choice(
+    const PropertyDescriptor& descriptor, const std::string& value) {
+    return std::any_of(
+        descriptor.choices.begin(), descriptor.choices.end(),
+        [&](const PropertyChoice& choice) { return choice.value == value; });
+}
+
+bool validate_number(
+    const PropertyDescriptor& descriptor, const std::string& text,
+    std::string& error) {
+    char* end = nullptr;
+    const double value = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || *end != '\0' || !std::isfinite(value)) {
+        error = "The property value must be a finite number";
+        return false;
+    }
+    if (descriptor.minimum && value < *descriptor.minimum) {
+        error = "The property value is below the provider-supplied minimum";
+        return false;
+    }
+    if (descriptor.maximum && value > *descriptor.maximum) {
+        error = "The property value is above the provider-supplied maximum";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+UiaConnection::UiaConnection(UiaTargetIdentity identity)
+    : m_hwnd(identity.hwnd), m_pid(identity.pid),
+      m_identity(std::move(identity)),
+      m_state(std::make_unique<State>(m_identity)) {
+}
+
+std::shared_ptr<UiaConnection> UiaConnection::connect(
+    const UiaTargetIdentity& identity) {
+    if (!identity.valid() ||
+        !target_identity_matches(identity, nullptr)) {
+        return {};
+    }
+    auto connection = std::shared_ptr<UiaConnection>(
+        new UiaConnection(identity));
+    if (!connection->m_state->connected()) {
         return {};
     }
     return connection;
 }
 
-UiaConnection::~UiaConnection() {
-    wil::com_ptr<IUIAutomation> automation;
-    CO_MTA_USAGE_COOKIE cookie = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(m_state->mutex);
-        automation = std::move(m_state->automation);
-        cookie = m_state->mtaCookie;
-        m_state->mtaCookie = nullptr;
-    }
-    if (automation) {
-        // connect() took an MTA-usage cookie specifically so the process-wide
-        // MTA stays alive even between our short-lived worker threads. Release
-        // the automation object before dropping that cookie, otherwise the last
-        // CoDecrementMTAUsage could tear the apartment down while this pointer
-        // still belongs to it.
-        (void)run_on_mta([&]() -> HRESULT {
-            automation.reset();
-            return S_OK;
-        });
-    }
-    if (cookie)
-        CoDecrementMTAUsage(cookie);
+std::shared_ptr<UiaConnection> UiaConnection::connect(
+    HWND hwnd, DWORD expectedPid,
+    uint64_t expectedProcessCreationIdentity) {
+    const auto identity = capture_uia_target_identity(
+        hwnd, expectedPid, expectedProcessCreationIdentity);
+    return identity ? connect(*identity)
+                    : std::shared_ptr<UiaConnection>{};
 }
+
+UiaConnection::~UiaConnection() = default;
 
 bool UiaConnection::get_tree(Element& root, bool fastProperties,
                              const std::string& /*providerOption*/) {
@@ -627,39 +2185,82 @@ bool UiaConnection::get_tree(Element& root, bool fastProperties,
 }
 
 bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& options,
-                                          bool* truncated) {
+                                          bool* truncated,
+                                          HRESULT* status) {
     if (truncated)
         *truncated = false;
+    if (status)
+        *status = S_OK;
 
-    // One live walk at a time against the reused client. Parallel reads buy
-    // nothing here — the target's UI thread still answers them serially — and
-    // holding the lock across the whole run also keeps teardown from releasing
-    // the shared automation object while this call is still using it. Read
-    // only the raw pointer here; even com_ptr's AddRef would execute on the
-    // caller's thread, which may be STA or not in COM at all.
-    std::unique_lock<std::mutex> lock(m_state->mutex);
-    IUIAutomation* automation = m_state->automation.get();
-    if (!automation)
+    // All COM work is dispatched to the connection's one persistent MTA
+    // thread. The operation lock serializes tree/property/event consumers
+    // before they enqueue work, while the worker owns every COM reference.
+    std::unique_lock<std::mutex> lock(m_state->operationMutex);
+    if (m_hwnd != m_identity.hwnd) {
+        if (status) {
+            *status = HRESULT_FROM_WIN32(
+                ERROR_INVALID_OWNER);
+        }
         return false;
+    }
+    const HRESULT localStatus =
+        target_identity_status(m_identity, nullptr);
+    if (FAILED(localStatus)) {
+        if (status)
+            *status = localStatus;
+        return false;
+    }
+    if (!m_state->connected()) {
+        if (status) {
+            *status = HRESULT_FROM_WIN32(
+                ERROR_CONNECTION_INVALID);
+        }
+        return false;
+    }
+    if (m_state->failNextTree.exchange(
+            false, std::memory_order_acq_rel) ||
+        fail_connected_tree_for_testing()) {
+        if (status)
+            *status = E_FAIL;
+        return false;
+    }
 
     Element built;
     bool wasTruncated = false;
-    const HWND hwnd = m_hwnd;
-    const HRESULT hr = run_on_mta([automation, hwnd, &options, &built, &wasTruncated]() -> HRESULT {
-        // connect() created this automation object on one thread that had
-        // joined the process-wide MTA. Every get_tree_with_options call joins
-        // that same single MTA before touching it, so the raw pointer stays in
-        // one apartment throughout its whole life and needs no marshal/proxy.
-        // connect() also took an MTA-usage cookie, so that apartment survives
-        // between our short-lived worker threads instead of being torn down
-        // when the creating thread exits.
-        apply_automation_timeouts(automation, options);
-        return build_tree_with_automation(automation, hwnd, options, built, wasTruncated);
-    });
+    const HRESULT hr = m_state->invoke(
+        [state = m_state.get(), &options, &built,
+         &wasTruncated]() -> HRESULT {
+            RETURN_HR_IF_NULL(E_FAIL, state->automation.get());
+            apply_automation_timeouts(state->automation.get(), options);
+            const HRESULT buildHr = build_tree_with_automation(
+                state->automation.get(), state->targetIdentity,
+                state->process.get(), nullptr, options, built,
+                wasTruncated);
+            if (is_uia_target_ownership_failure(buildHr))
+                state->teardown_on_mta();
+            return buildHr;
+        });
+    if (SUCCEEDED(hr)) {
+        if (!m_state->identities.attach(
+                built, uia_identity_scope(options), !wasTruncated)) {
+            m_state->identityError =
+                "The UI Automation tree exceeds lvt's bounded identity capacity; "
+                "use a narrower view or element scope";
+            if (status) {
+                *status = HRESULT_FROM_WIN32(
+                    ERROR_BUFFER_OVERFLOW);
+            }
+            lock.unlock();
+            return false;
+        }
+        m_state->identityError.clear();
+    }
     lock.unlock();
 
     if (truncated)
         *truncated = wasTruncated;
+    if (status)
+        *status = hr;
 
     if (FAILED(hr)) {
         LOG_IF_FAILED(hr);
@@ -673,13 +2274,423 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
     return true;
 }
 
+bool UiaConnection::attach_property_identities(
+    Element& root, const UiaOptions& options, bool completeSnapshot) {
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    if (FAILED(validate_target_identity_locked()))
+        return false;
+    const bool attached = m_state->identities.attach(
+        root, uia_identity_scope(options), completeSnapshot);
+    m_state->identityError = attached
+        ? std::string()
+        : "The UI Automation tree exceeds lvt's bounded identity capacity; "
+          "use a narrower view or element scope";
+    return attached;
+}
+
+bool UiaConnection::remember_property_references(
+    const Element& root, const UiaOptions& options,
+    bool completeSnapshot) {
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    if (FAILED(validate_target_identity_locked()))
+        return false;
+    const bool remembered =
+        m_state->identities.remember(
+            root, uia_identity_scope(options), completeSnapshot);
+    m_state->identityError = remembered
+        ? std::string()
+        : "The UI Automation tree has too many keys for lvt's bounded "
+          "identity cache; use a narrower view or element scope";
+    return remembered;
+}
+
+std::string UiaConnection::property_identity_error() {
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    return m_state->identityError;
+}
+
+UiaPropertyReferenceResult
+UiaConnection::resolve_property_reference(
+    const std::string& reference, std::string& error) {
+    char eventName[192]{};
+    const DWORD eventLength = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_PROPERTY_REFERENCE_FAILURE_EVENT",
+        eventName, static_cast<DWORD>(_countof(eventName)));
+    if (eventLength != 0 &&
+        eventLength < _countof(eventName)) {
+        wil::unique_handle failure(OpenEventA(
+            SYNCHRONIZE | EVENT_MODIFY_STATE,
+            FALSE, eventName));
+        if (failure &&
+            WaitForSingleObject(failure.get(), 0) ==
+                WAIT_OBJECT_0) {
+            ResetEvent(failure.get());
+            error =
+                "The UI Automation property reference could not be validated";
+            return {
+                .hresult = RPC_E_CALL_REJECTED,
+                .failure =
+                    UiaPropertyReferenceFailure::validation,
+            };
+        }
+    }
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    const HRESULT validationHr =
+        validate_target_identity_locked();
+    if (FAILED(validationHr)) {
+        error = "The UI Automation connection no longer matches this session's target window";
+        return {
+            .hresult = validationHr,
+            .failure =
+                UiaPropertyReferenceFailure::validation,
+        };
+    }
+
+    return m_state->identities.resolve(reference, error);
+}
+
+bool UiaConnection::matches_target(HWND hwnd) const {
+    return hwnd == m_hwnd &&
+           target_identity_matches(m_identity, nullptr);
+}
+
+HRESULT UiaConnection::validate_target_identity_locked() const {
+    if (!m_state->connected())
+        return HRESULT_FROM_WIN32(
+            ERROR_CONNECTION_INVALID);
+    if (m_hwnd != m_identity.hwnd)
+        return HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER);
+    const HRESULT localStatus =
+        target_identity_status(m_identity, nullptr);
+    if (FAILED(localStatus))
+        return localStatus;
+    return m_state->invoke(
+        [state = m_state.get()]() -> HRESULT {
+            wil::com_ptr<IUIAutomationElement> root;
+            const HRESULT validateHr = get_validated_uia_root(
+                state->automation.get(), state->targetIdentity,
+                state->process.get(), &root);
+            if (is_uia_target_ownership_failure(validateHr))
+                state->teardown_on_mta();
+            return validateHr;
+        });
+}
+
+PropertySnapshotResult UiaConnection::get_property_snapshot(
+    uint64_t handle,
+    const PropertyOperationContext&) {
+    const HRESULT localStatus =
+        m_hwnd == m_identity.hwnd
+            ? target_identity_status(
+                  m_identity, nullptr)
+            : HRESULT_FROM_WIN32(
+                  ERROR_INVALID_OWNER);
+    if (FAILED(localStatus)) {
+        PropertySnapshotResult result;
+        result.hresult = localStatus;
+        result.error =
+            is_uia_target_ownership_failure(localStatus)
+                ? "The UI Automation connection no longer matches this session's target window"
+                : "The UI Automation target identity could not be validated";
+        return result;
+    }
+
+    Element tree;
+    bool refreshed = false;
+    HRESULT refreshStatus = E_FAIL;
+    UiaOptions options;
+    options.view = UiaView::raw;
+    for (int attempt = 0; attempt < 3 && !refreshed; ++attempt) {
+        if (attempt > 0)
+            Sleep(static_cast<DWORD>(120 * attempt));
+        refreshed = get_tree_with_options(
+            tree, options, nullptr, &refreshStatus);
+        if (is_uia_target_ownership_failure(
+                refreshStatus)) {
+            break;
+        }
+    }
+    if (!refreshed) {
+        PropertySnapshotResult result;
+        result.hresult = refreshStatus;
+        result.error = "Could not refresh the UI Automation tree";
+        return result;
+    }
+
+    LocatedPropertyElement located;
+    if (!locate_property_element(
+            tree, handle, UiaSelectionCapabilities{}, located) ||
+        !located.element) {
+        PropertySnapshotResult result;
+        result.hresult = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+        result.error =
+            "The UI Automation element is stale or does not belong to this session";
+        return result;
+    }
+
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    return make_uia_property_snapshot(
+        *located.element, located.selection, m_state->schemaCache);
+}
+
+PropertyMutationResult UiaConnection::set_property(
+    uint64_t handle, const std::string& descriptorId,
+    const std::string& value,
+    const PropertyOperationContext& context) {
+    const auto snapshot =
+        get_property_snapshot(handle, context);
+    if (!snapshot.ok || !snapshot.schema) {
+        return property_mutation_failure(
+            snapshot.hresult, snapshot.error,
+            snapshot.hresult == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+                ? "typed_property_stale_element"
+                : std::string{});
+    }
+
+    const auto* descriptor =
+        find_descriptor(*snapshot.schema, descriptorId);
+    if (!descriptor) {
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The property descriptor is unknown, stale, or belongs to a different UI Automation element",
+            "typed_property_invalid_descriptor",
+            PropertyErrorDisposition::terminal);
+    }
+    if (!descriptor->writable) {
+        return property_mutation_failure(
+            E_ACCESSDENIED,
+            "The UI Automation property descriptor is read-only",
+            "typed_property_read_only",
+            PropertyErrorDisposition::terminal);
+    }
+    if (!descriptor->choices.empty() && !is_choice(*descriptor, value)) {
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The selected value is not one of the provider-supplied choices",
+            "typed_property_invalid_value",
+            PropertyErrorDisposition::terminal);
+    }
+    if (descriptor->kind == PropertyEditorKind::number) {
+        std::string error;
+        if (!validate_number(*descriptor, value, error)) {
+            const bool bounds =
+                error.find("minimum") != std::string::npos ||
+                error.find("maximum") != std::string::npos;
+            return property_mutation_failure(
+                E_INVALIDARG, std::move(error),
+                bounds
+                    ? "typed_property_out_of_bounds"
+                    : "typed_property_invalid_value",
+                PropertyErrorDisposition::terminal);
+        }
+    }
+
+    UiaPropertyAction action;
+    if (descriptor->name == "Value.Value") {
+        action = UiaPropertyAction::setValue;
+    } else if (descriptor->name == "RangeValue.Value") {
+        action = UiaPropertyAction::setRangeValue;
+    } else if (descriptor->name == "Toggle.ToggleState") {
+        action = UiaPropertyAction::setToggleState;
+    } else if (descriptor->name == "ExpandCollapse.State") {
+        action = UiaPropertyAction::setExpandCollapseState;
+    } else if (descriptor->name == "SelectionItem.Action") {
+        if (value == "select")
+            action = UiaPropertyAction::replaceSelection;
+        else if (value == "add")
+            action = UiaPropertyAction::addToSelection;
+        else
+            action = UiaPropertyAction::removeFromSelection;
+    } else if (descriptor->name == "Scroll.Action") {
+        action = UiaPropertyAction::scroll;
+    } else {
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The property descriptor has no UI Automation mutation adapter",
+            "typed_property_unsupported",
+            PropertyErrorDisposition::terminal);
+    }
+
+    wait_after_element_from_handle_test_gate(
+        "LVT_TEST_UIA_BEFORE_PROPERTY_MUTATION_GATE");
+    std::unique_lock<std::mutex> lock(m_state->operationMutex);
+    const HRESULT validationHr =
+        validate_target_identity_locked();
+    if (FAILED(validationHr)) {
+        return property_mutation_failure(
+            validationHr,
+            is_uia_target_ownership_failure(validationHr)
+                ? "The UI Automation connection no longer matches this session's target window"
+                : "The UI Automation target identity could not be validated",
+            is_uia_target_ownership_failure(validationHr)
+                ? "typed_property_ownership_lost"
+                : "typed_property_identity_validation_failed",
+            is_uia_target_ownership_failure(validationHr)
+                ? PropertyErrorDisposition::ownershipLost
+                : PropertyErrorDisposition::transient);
+    }
+    const auto runtime = m_state->identities.runtime_id(handle);
+    if (!runtime) {
+        return property_mutation_failure(
+            HRESULT_FROM_WIN32(ERROR_NOT_FOUND),
+            "The UI Automation element is no longer available",
+            "typed_property_stale_element",
+            PropertyErrorDisposition::terminal);
+    }
+    std::vector<int> runtimeId;
+    if (!parse_runtime_id(*runtime, runtimeId)) {
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The UI Automation element has an invalid RuntimeId",
+            "typed_property_stale_element",
+            PropertyErrorDisposition::terminal);
+    }
+
+    PropertyMutationResult result;
+    const HRESULT hr = m_state->invoke([&, state = m_state.get()]() -> HRESULT {
+        RETURN_HR_IF_NULL(E_FAIL, state->automation.get());
+        result = perform_uia_property_action(
+            state->automation.get(), state->targetIdentity,
+            state->process.get(), runtimeId, action, value);
+        return S_OK;
+    });
+    if (FAILED(hr)) {
+        result = property_mutation_failure(
+            hr,
+            "The UI Automation property action could not run",
+            "typed_property_provider_busy",
+            PropertyErrorDisposition::transient);
+    }
+    if (result.ok) {
+        if (!result.hasValue) {
+            return property_mutation_failure(
+                E_FAIL,
+                "The UI Automation property action completed without an effective-state readback",
+                "typed_property_readback_failed",
+                PropertyErrorDisposition::transient);
+        }
+        result.runtimeType = descriptor->propertyType;
+        result.canClear = false;
+        result.overridden = false;
+        result.source = descriptor->declaringType;
+    }
+    return result;
+}
+
+PropertyMutationResult UiaConnection::clear_property(
+    uint64_t handle, const std::string& descriptorId,
+    const PropertyOperationContext& context) {
+    const auto snapshot =
+        get_property_snapshot(handle, context);
+    if (!snapshot.ok || !snapshot.schema) {
+        return property_mutation_failure(
+            snapshot.hresult, snapshot.error,
+            snapshot.hresult == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+                ? "typed_property_stale_element"
+                : std::string{});
+    }
+    if (!find_descriptor(*snapshot.schema, descriptorId)) {
+        return property_mutation_failure(
+            E_INVALIDARG,
+            "The property descriptor is unknown, stale, or belongs to a different UI Automation element",
+            "typed_property_invalid_descriptor",
+            PropertyErrorDisposition::terminal);
+    }
+
+    wait_after_element_from_handle_test_gate(
+        "LVT_TEST_UIA_BEFORE_PROPERTY_MUTATION_GATE");
+    {
+        std::lock_guard<std::mutex> lock(
+            m_state->operationMutex);
+        const HRESULT validationHr =
+            validate_target_identity_locked();
+        if (FAILED(validationHr)) {
+            return property_mutation_failure(
+                validationHr,
+                is_uia_target_ownership_failure(validationHr)
+                    ? "ownershipLost: the UI Automation target identity changed"
+                    : "The UI Automation target identity could not be validated",
+                is_uia_target_ownership_failure(validationHr)
+                    ? "typed_property_ownership_lost"
+                    : "typed_property_identity_validation_failed",
+                is_uia_target_ownership_failure(validationHr)
+                    ? PropertyErrorDisposition::ownershipLost
+                    : PropertyErrorDisposition::transient);
+        }
+    }
+
+    return property_mutation_failure(
+        E_NOTIMPL,
+        "UI Automation does not expose a generic clear/reset operation for this property",
+        "typed_property_unsupported",
+        PropertyErrorDisposition::terminal);
+}
+
 std::vector<ConnectionEvent> UiaConnection::poll_events() {
-    return {};
+    std::vector<ConnectionEvent> result;
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    if (!m_state->connected() || !matches_target(m_hwnd))
+        return result;
+
+    bool snapshotRequired = false;
+    const HRESULT hr = m_state->invoke(
+        [state = m_state.get(), &snapshotRequired]() -> HRESULT {
+            wil::com_ptr<IUIAutomationElement> root;
+            const HRESULT validateHr = get_validated_uia_root(
+                state->automation.get(), state->targetIdentity,
+                state->process.get(), &root);
+            if (FAILED(validateHr)) {
+                if (is_uia_target_ownership_failure(validateHr))
+                    state->teardown_on_mta();
+                return validateHr;
+            }
+            if (!state->eventRegistration.handler)
+                return E_FAIL;
+            snapshotRequired =
+                state->eventRegistration.handler->consume();
+            return S_OK;
+        });
+    if (SUCCEEDED(hr) && snapshotRequired) {
+        ConnectionEvent event;
+        event.mutation = ConnectionEvent::Mutation::snapshotRequired;
+        result.push_back(std::move(event));
+    }
+    if (SUCCEEDED(hr)) {
+        append_uia_event_test_stat(
+            "poll", m_hwnd, m_pid, snapshotRequired);
+    }
+    return result;
+}
+
+bool UiaConnection::refresh_events() {
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    if (!m_state->connected() || !matches_target(m_hwnd))
+        return false;
+    const bool refreshed = SUCCEEDED(m_state->invoke(
+        [state = m_state.get()]() -> HRESULT {
+            wil::com_ptr<IUIAutomationElement> root;
+            const HRESULT validateHr = get_validated_uia_root(
+                state->automation.get(), state->targetIdentity,
+                state->process.get(), &root);
+            if (is_uia_target_ownership_failure(validateHr))
+                state->teardown_on_mta();
+            return validateHr;
+        }));
+    if (refreshed)
+        append_uia_event_test_stat("refresh", m_hwnd, m_pid);
+    return refreshed;
 }
 
 bool UiaConnection::is_alive() const {
-    std::lock_guard<std::mutex> lock(m_state->mutex);
-    return m_state->automation != nullptr;
+    std::lock_guard<std::mutex> lock(m_state->operationMutex);
+    return SUCCEEDED(
+        validate_target_identity_locked());
+}
+
+void UiaConnection::fail_next_tree_for_testing() {
+    m_state->failNextTree.store(
+        true, std::memory_order_release);
 }
 
 } // namespace lvt

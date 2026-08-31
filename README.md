@@ -53,6 +53,10 @@ This gives Copilot the ability to inspect any running Windows app's UI when you 
 cmake --preset default
 cmake --build build
 
+# x86 build
+cmake --preset x86
+cmake --build build-x86
+
 # ARM64 build
 cmake --preset arm64
 cmake --build build-arm64
@@ -81,8 +85,20 @@ Framework support is per-provider, so you can drop pieces you don't need. Win32 
 | `LVT_BUILD_TOOL` | ON | Build the `lvt` CLI as well as the library |
 | `LVT_BUILD_MANAGED` | ON | Build the managed .NET helper assemblies |
 | `LVT_BUILD_TESTS` | ON | Build the test executables |
+| `LVT_BUILD_WINUI3_TEST_FIXTURE` | same as `LVT_BUILD_TESTS` | Publish and statically validate the architecture-matched WinUI test app |
 
-`LVT_BUILD_MANAGED` is the only thing that requires the .NET SDK. WPF, WinForms and Avalonia each have a native half that hosts the CLR plus a managed tree-walker assembly; only the latter needs `dotnet`. With `-DLVT_BUILD_MANAGED=OFF` the whole native build still works, including those TAP DLLs — you just lose managed enrichment for those three frameworks. XAML and WinUI 3 are pure C++ either way.
+`LVT_BUILD_MANAGED` and `LVT_BUILD_WINUI3_TEST_FIXTURE` are the options that require the .NET SDK. WPF, WinForms and Avalonia each have a native half that hosts the CLR plus a managed tree-walker assembly; only the latter needs `dotnet`. With `-DLVT_BUILD_MANAGED=OFF` the whole native build still works, including those TAP DLLs — you just lose managed enrichment for those three frameworks. XAML and WinUI 3 provider code is pure C++ either way.
+
+Test builds publish `WinUI3Sample` for the active vcpkg triplet (`win-x64`,
+`win-x86`, or `win-arm64`). Its compile, intermediate, and publish directories
+live under the matching CMake build tree and architecture, so simultaneous x64
+and x86 builds never share XAML compiler state. ARM64 CI compiles the fixture
+and validates its PE machine, RID manifest, and XBF resources without trying to
+execute it on an x64 runner.
+
+The built-in WPF/WinForms managed TAP supports .NET Framework 4.8 targets and
+CoreCLR WindowsDesktop 6.0 or newer. Active CoreCLR 3.1/5 runtimes are rejected
+rather than loading an incompatible component.
 
 #### C++/WinRT projection
 
@@ -425,11 +441,12 @@ cmake --build build
 .\build\viewer\LvtViewer.exe
 ```
 
-It's a separate WPF (.NET) app that drives `lvt.exe` as a subprocess (`watch`
-for live updates, `toggle`/`set-value` for editing) rather than linking
-`lvt_core`. See **[src/viewer/README.md](src/viewer/README.md)** for the
-architecture, why `watch` was chosen over MCP for live updates, and how to
-build/run it.
+It's a separate WPF (.NET) app that launches `lvt mcp --allow-input` and uses
+subscribed MCP tree resources for live snapshot/diff updates. UIA actions and
+typed XAML/WinUI property edits use tools on that same persistent session; the
+viewer never links `lvt_core`. See
+**[src/viewer/README.md](src/viewer/README.md)** for the architecture and
+build/run details.
 
 ## Output format
 
@@ -441,6 +458,17 @@ ticks emit `added`, `removed`, and `changed` events with old/new field values.
 Element matching uses stable framework/type/class/path-derived keys instead of
 the positional `e0`, `e1`, ... ids, so unique moved elements are reported as
 `changed` events with a `path` field change.
+
+With `--element`, the first snapshot resolves the supplied reference normally.
+Later ticks still reconcile complete authoritative trees before selecting the
+reported subtree. If the scoped root's durable identity changes or becomes
+ambiguous, watch emits removal of the old scoped tree and addition of the
+replacement with its fresh key, then follows that replacement. A plain
+structural removal emits removal and keeps the watch alive; only the same
+anchored identity may reappear later, so an unrelated sibling moving into the
+old slot is not silently adopted. Positional/ambiguous scopes have no
+continuity token: once a sibling-set structural change makes their slot
+uncertain, they remain absent and the caller must rescope.
 
 `--fast` applies to `watch` too: every tick collects the cheaper property set
 instead of the full XAML/WinUI3 property chain, so `changed` events on an
@@ -496,7 +524,8 @@ Framework providers:
 - **ComCtlProvider** — enriches ComCtl32 controls (ListView items, TreeView nodes, etc.)
 - **XamlProvider** — injects TAP DLL to walk Windows XAML visual trees
 - **WinUI3Provider** — injects TAP DLL to walk WinUI 3 visual trees
-- **WpfProvider** — walks WPF visual trees via managed DLL injection
+- **WpfProvider** — persistent managed connection; walks WPF visual/logical trees and exposes writable scalar dependency properties on the Application dispatcher
+- **WinFormsProvider** — persistent managed connection; enriches HWND/handle-less controls and exposes a conservative TypeDescriptor property allowlist
 - **Plugins** — extensible framework support (e.g. [Avalonia](avalonia-plugin.md)) via C ABI plugin interface
 
 See [docs/architecture.md](docs/architecture.md) for details.

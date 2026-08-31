@@ -13,11 +13,18 @@
 #include "providers/uia_actions.h"
 #endif
 #include "providers/connection_registry.h"
+#include "providers/native_property_connection.h"
 #if LVT_ENABLE_XAML
 #include "providers/xaml_provider.h"
 #endif
 #if LVT_ENABLE_WINUI3
 #include "providers/winui3_provider.h"
+#endif
+#if LVT_ENABLE_WPF
+#include "providers/wpf_provider.h"
+#endif
+#if LVT_ENABLE_WINFORMS
+#include "providers/winforms_provider.h"
 #endif
 
 #include "element_key.h"
@@ -28,6 +35,7 @@
 #include <fstream>
 #include <sstream>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -528,6 +536,21 @@ static bool write_output(const std::string& outputFile, const std::string& conte
 // UIA support is compile-time optional (LVT_ENABLE_UIA). Keep the two entry
 // points behind a single seam so the rest of main.cpp does not need guards.
 #ifdef LVT_ENABLE_UIA
+static std::optional<lvt::UiaTargetIdentity> uia_identity_for_target(
+    const lvt::TargetInfo& target) {
+    lvt::UiaTargetIdentity identity;
+    identity.hwnd = target.hwnd;
+    identity.pid = target.pid;
+    identity.processCreationIdentity =
+        target.processCreationIdentity;
+    identity.rootRuntimeId = target.uiaRootRuntimeId;
+    identity.windowLifetime =
+        target.uiaWindowLifetime;
+    if (!identity.valid())
+        return std::nullopt;
+    return identity;
+}
+
 static bool build_uia_tree(const lvt::TargetInfo& target, const Args& args,
                            lvt::Element& tree) {
     lvt::UiaOptions options;
@@ -539,9 +562,19 @@ static bool build_uia_tree(const lvt::TargetInfo& target, const Args& args,
     options.timeoutMs = args.uiaTimeoutMs;
 
     lvt::UiaProvider provider;
-    auto result = provider.build(target.hwnd, options);
+    const auto identity = uia_identity_for_target(target);
+    if (!identity) {
+        fprintf(stderr, "lvt: ownershipLost: target identity is unavailable\n");
+        return false;
+    }
+    bool ownershipLost = false;
+    auto result = provider.build(
+        *identity, options, nullptr, &ownershipLost);
     if (!result) {
-        fprintf(stderr, "lvt: could not read the UI Automation tree for this window");
+        fprintf(
+            stderr, ownershipLost
+                ? "lvt: ownershipLost: target window identity changed"
+                : "lvt: could not read the UI Automation tree for this window");
         if (options.timeoutMs > 0) {
             fprintf(stderr, " (a slow or busy target may need a larger "
                             "--uia-timeout than %d ms)", options.timeoutMs);
@@ -615,14 +648,17 @@ static std::string uia_framework_label(const Args&) { return "uia"; }
 // sessions; every other caller (dump/query/screenshot) sees no behavior change.
 static bool build_root_tree(const lvt::TargetInfo& target, const Args& args,
                             lvt::Element& tree,
-                            const lvt::ConnectionLookup& connectionLookup = {}) {
+                            const lvt::ConnectionLookup& connectionLookup = {},
+                            const std::vector<lvt::FrameworkInfo>* detectedFrameworks = nullptr) {
     if (args.uia) {
         if (!build_uia_tree_with_connection(target, args, connectionLookup, tree))
             return false;
         return true;
     }
 
-    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+    auto frameworks = detectedFrameworks
+                          ? *detectedFrameworks
+                          : lvt::detect_frameworks(target.hwnd, target.pid);
     tree = lvt::build_tree(target.hwnd, target.pid, frameworks, -1, args.pluginOption,
                           args.fastProperties, connectionLookup);
     return true;
@@ -630,10 +666,25 @@ static bool build_root_tree(const lvt::TargetInfo& target, const Args& args,
 
 static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
                               lvt::Element& outputTree,
-                              const lvt::ConnectionLookup& connectionLookup = {}) {
+                              const lvt::ConnectionLookup& connectionLookup = {},
+                              const std::vector<lvt::FrameworkInfo>* detectedFrameworks = nullptr) {
     lvt::Element tree;
-    if (!build_root_tree(target, args, tree, connectionLookup))
+    if (!build_root_tree(
+            target, args, tree, connectionLookup, detectedFrameworks))
         return false;
+
+    // The native WinEvent source filters destroyed HWND notifications against
+    // the last authoritative snapshot. Publish the untrimmed tree before
+    // --element/--depth scoping so callback delivery never needs to inspect an
+    // HWND and the fixed-interval tree walk remains the source of truth.
+    if (!args.uia && connectionLookup) {
+        for (const char* label : {"win32", "comctl"}) {
+            auto* native = dynamic_cast<lvt::NativePropertyConnection*>(
+                connectionLookup(label));
+            if (native)
+                native->publish_targets(tree);
+        }
+    }
 
     lvt::Element* outputRoot = &tree;
     if (!args.elementId.empty()) {
@@ -648,6 +699,7 @@ static bool build_output_tree(const lvt::TargetInfo& target, const Args& args,
         lvt::trim_to_depth(*outputRoot, args.depth);
 
     outputTree = *outputRoot;
+    lvt::copy_incomplete_framework_refresh_markers(tree, outputTree);
     return true;
 }
 
@@ -658,9 +710,7 @@ static void collect_frameworks_present(const lvt::Element& el, std::set<std::str
         collect_frameworks_present(child, out);
 }
 
-// True if `previous` had real content in an *injected* framework (xaml or
-// winui3 — the ones that require InitializeXamlDiagnosticsEx and can fail;
-// win32/comctl never inject and are not what this guards against) that
+// True if `previous` had real content in an injected framework that
 // `current` has none of at all. The target window itself being confirmed
 // still open (see run_watch_loop's IsWindow check, which always runs
 // before this) makes "the whole XAML tree just vanished" a symptom, not
@@ -672,19 +722,23 @@ static void collect_frameworks_present(const lvt::Element& el, std::set<std::str
 // kept as a secondary safety net for whatever is left over that: a
 // genuinely hung target, or a walk slower even than the new timeout.
 static bool lost_injected_framework_content(const lvt::Element& previous, const lvt::Element& current) {
+    if (lvt::has_incomplete_framework_refresh(current))
+        return true;
     std::set<std::string> prevFrameworks, currFrameworks;
     collect_frameworks_present(previous, prevFrameworks);
     collect_frameworks_present(current, currFrameworks);
     for (const auto& fw : prevFrameworks) {
-        if ((fw == "xaml" || fw == "winui3") && !currFrameworks.count(fw))
+        if ((fw == "xaml" || fw == "winui3" || fw == "wpf" || fw == "winforms") &&
+            !currFrameworks.count(fw))
             return true;
     }
     return false;
 }
 
 // Acquires the persistent connections a watch session can reuse across ticks.
-// For visual-tree sessions that means one connection per injectable framework
-// (xaml/winui3); for --uia it means one reusable UI Automation client. Held
+// For visual-tree sessions that means one native subscription/property adapter
+// plus one connection per injectable framework; for --uia it means one reusable
+// UI Automation client. Held
 // for the whole watch session; released automatically when run_watch_loop
 // returns.
 //
@@ -695,29 +749,86 @@ static bool lost_injected_framework_content(const lvt::Element& previous, const 
 // process to inject into. UIA needs no such probe because it does not resolve
 // a framework island before connecting.
 static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_connections(
-    const lvt::TargetInfo& target, const Args& args) {
+    const lvt::TargetInfo& target, const Args& args,
+    const std::vector<lvt::FrameworkInfo>& frameworks) {
     std::vector<std::pair<std::string, lvt::ConnectionHandle>> connections;
 
 #ifdef LVT_ENABLE_UIA
     if (args.uia) {
+        char key[64]{};
+        snprintf(
+            key, sizeof(key), "uia@watch@0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(target.hwnd)));
         auto handle = lvt::ConnectionRegistry::instance().acquire(
-            target.pid, target.hwnd, "uia",
-            [](HWND hwnd, DWORD) -> std::shared_ptr<lvt::IFrameworkConnection> {
-                return lvt::UiaConnection::connect(hwnd);
+            target.pid, target.hwnd, key,
+            [identity = uia_identity_for_target(target)](
+                HWND, DWORD)
+                -> std::shared_ptr<lvt::IFrameworkConnection> {
+                return identity
+                    ? lvt::UiaConnection::connect(*identity)
+                    : nullptr;
             });
-        if (handle)
-            connections.emplace_back("uia", std::move(handle));
+        // Retain a slot after a transient registration failure so the normal
+        // watch reconciliation path retries instead of permanently falling
+        // back to one-shot UIA walks.
+        connections.emplace_back("uia", std::move(handle));
         return connections;
     }
 #endif
 
-    auto frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
-    bool hasXaml = false, hasWinUI3 = false;
+    bool hasComCtl = false;
+    std::string comCtlVersion;
+    bool hasXaml = false, hasWinUI3 = false, hasWpf = false, hasWinForms = false;
+    std::vector<lvt::PluginFrameworkInfo> persistentPlugins;
     for (auto& fi : frameworks) {
         if (fi.type == lvt::Framework::Xaml) hasXaml = true;
         if (fi.type == lvt::Framework::WinUI3) hasWinUI3 = true;
+        if (fi.type == lvt::Framework::Wpf) hasWpf = true;
+        if (fi.type == lvt::Framework::WinForms) hasWinForms = true;
+        if (fi.type == lvt::Framework::ComCtl) {
+            hasComCtl = true;
+            comCtlVersion = fi.version;
+        }
+        if (fi.type == lvt::Framework::Plugin) {
+            auto plugin = lvt::find_plugin_framework(
+                fi.name, fi.version, fi.pluginToken);
+            if (plugin.plugin &&
+                lvt::plugin_supports_persistent_connections(*plugin.plugin)) {
+                persistentPlugins.push_back(std::move(plugin));
+            }
+        }
     }
-    if (!hasXaml && !hasWinUI3)
+
+    const auto native_key = [&target](const char* provider) {
+        char key[96]{};
+        snprintf(
+            key, sizeof(key), "%s@watch@0x%llX", provider,
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(target.hwnd)));
+        return std::string(key);
+    };
+    auto win32 = lvt::ConnectionRegistry::instance().acquire(
+        target.pid, target.hwnd, native_key("win32"),
+        [](HWND hwnd, DWORD pid)
+            -> std::shared_ptr<lvt::IFrameworkConnection> {
+            return lvt::NativePropertyConnection::connect(
+                hwnd, pid, "win32", {}, true);
+        });
+    connections.emplace_back("win32", std::move(win32));
+    if (hasComCtl) {
+        auto comctl = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, native_key("comctl"),
+            [comCtlVersion](HWND hwnd, DWORD pid)
+                -> std::shared_ptr<lvt::IFrameworkConnection> {
+                return lvt::NativePropertyConnection::connect(
+                    hwnd, pid, "comctl", comCtlVersion, true);
+            });
+        connections.emplace_back("comctl", std::move(comctl));
+    }
+
+    if (!hasXaml && !hasWinUI3 && !hasWpf && !hasWinForms &&
+        persistentPlugins.empty())
         return connections;
 
     // XamlProvider::open_connection only needs the CoreWindow HWND from the
@@ -730,7 +841,9 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
     // against Microsoft Store. An empty framework list still builds the
     // untrimmed Win32 base tree (build_tree always starts with Win32), which
     // contains the CoreWindow and is all this probe actually needs.
-    lvt::Element probeTree = lvt::build_tree(target.hwnd, target.pid, {});
+    lvt::Element probeTree;
+    if (hasXaml)
+        probeTree = lvt::build_tree(target.hwnd, target.pid, {});
 
 #if LVT_ENABLE_XAML
     if (hasXaml) {
@@ -745,7 +858,7 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
         // falsy) - InitializeXamlDiagnosticsEx is known to fail transiently
         // on a first try against a slow/busy target (observed live against
         // Microsoft Store) even though a retry moments later succeeds.
-        // Without an entry here at all, refresh_dead_watch_connections has
+        // Without an entry here at all, reconcile_watch_connections has
         // nothing to notice and retry: it can only detect and fix an
         // existing (label, handle) pair going dead, not a framework whose
         // very first acquisition never even produced one - which silently
@@ -769,6 +882,41 @@ static std::vector<std::pair<std::string, lvt::ConnectionHandle>> acquire_watch_
         connections.emplace_back("winui3", std::move(handle));
     }
 #endif
+#if LVT_ENABLE_WPF
+    if (hasWpf) {
+        auto handle = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, "wpf",
+            [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                lvt::WpfProvider wpf;
+                return wpf.open_connection(hwnd, pid);
+            });
+        connections.emplace_back("wpf", std::move(handle));
+    }
+#endif
+#if LVT_ENABLE_WINFORMS
+    if (hasWinForms) {
+        auto handle = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, "winforms",
+            [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
+                lvt::WinFormsProvider winforms;
+                return winforms.open_connection(hwnd, pid);
+            });
+        connections.emplace_back("winforms", std::move(handle));
+    }
+#endif
+    for (const auto& plugin : persistentPlugins) {
+        const auto label =
+            lvt::plugin_connection_label(plugin, target.hwnd);
+        auto handle = lvt::ConnectionRegistry::instance().acquire(
+            target.pid, target.hwnd, label,
+            [plugin](HWND hwnd, DWORD pid)
+                -> std::shared_ptr<lvt::IFrameworkConnection> {
+                return lvt::open_plugin_connection(plugin, hwnd, pid);
+            });
+        // As with the built-in injectable providers, retain an empty slot
+        // after a transient open failure so the watch loop keeps retrying.
+        connections.emplace_back(label, std::move(handle));
+    }
     return connections;
 }
 
@@ -786,40 +934,135 @@ static lvt::ConnectionLookup make_lookup(
     };
 }
 
-// Called once per tick, before building the tree: if a held connection has
-// died (a transient timeout against an unusually large/busy tree - observed
-// live against Microsoft Store's home page, whose own collection can take
-// several seconds even in --fast mode - or the target recycling something
-// XAML-diagnostics-related), is_alive() goes false; and, separately, a
-// framework can have been detected but never successfully acquired a
-// connection in the first place (its very first InitializeXamlDiagnosticsEx
-// attempt failed - also observed live against Microsoft Store, transient
-// but common against a slow/busy target). Since tree_builder.cpp no longer
-// silently falls back to one-shot reinjection when a supplied
-// ConnectionLookup returns nothing for a framework (see the commit that
-// tightened that), *both* cases need this function to actively retry them -
-// otherwise either one would silently and permanently skip that
-// framework's enrichment for the rest of the watch session, with nothing
-// left to notice or recover. Observed live: once Microsoft Store's XAML
-// connection timed out once, every following tick logged
-// "InitializeXamlDiagnosticsEx failed" - the connection endpoints were still
-// consumed/settling from the connection that had just died, so immediately
-// retrying via the one-shot path on every single tick kept losing that race
-// too, compounding rather than recovering.
-//
-// Releasing a dead ConnectionHandle before calling acquire() again for the
-// same key is required, not just tidy: ConnectionRegistry::release() only
-// looks up its map by (pid, label), not by matching the specific connection
-// instance a caller's handle refers to. Reacquiring first (while still
-// holding the old, dead handle) would create a new entry in the map under
-// that same key; the old handle's *later* release would then decrement the
-// brand new entry's refcount instead of the dead one's, since release() has
-// no way to tell them apart - risking the fresh connection being torn down
-// prematurely. Resetting first ensures the dead entry is fully erased
-// before any new one for the same key can exist.
-static void refresh_dead_watch_connections(
+enum class WatchConnectionEventDrainPhase {
+    nativeBeforeBuild,
+    nonNativeAfterSuccess,
+};
+
+static void drain_watch_connection_events(
+    std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections,
+    WatchConnectionEventDrainPhase phase) {
+    size_t count = 0;
+    bool snapshotRequired = false;
+    for (auto& [label, handle] : connections) {
+        if (!handle)
+            continue;
+        const bool native =
+            label == "win32" || label == "comctl" ||
+            dynamic_cast<lvt::NativePropertyConnection*>(
+                handle.get()) != nullptr;
+        if ((phase == WatchConnectionEventDrainPhase::nativeBeforeBuild) !=
+            native) {
+            continue;
+        }
+        if (!native && !handle->refresh_events())
+            continue;
+        auto events = handle->poll_events();
+        count += events.size();
+        snapshotRequired =
+            snapshotRequired ||
+            std::any_of(
+                events.begin(), events.end(),
+                [](const lvt::ConnectionEvent& event) {
+                    return event.mutation ==
+                           lvt::ConnectionEvent::Mutation::snapshotRequired;
+                });
+    }
+    if (lvt::g_debug && count != 0) {
+        fprintf(
+            stderr,
+            "lvt: drained %zu %s connection event(s)%s; "
+            "this tick's authoritative snapshot will consume the signal\n",
+            count,
+            phase == WatchConnectionEventDrainPhase::nativeBeforeBuild
+                ? "pre-build native"
+                : "post-success",
+            snapshotRequired ? " including snapshotRequired" : "");
+    }
+}
+
+// Reconciles the held set with the frameworks detected for this exact tick.
+// Plugin frameworks can appear or disappear while the target stays alive
+// (late assembly/module load, teardown, navigation). Add newly detected v2
+// slots before building, erase obsolete plugin slots immediately, and retry
+// every missing/dead built-in or plugin connection through the registry.
+static void reconcile_watch_connections(
     const lvt::TargetInfo& target, const Args& args,
+    const std::vector<lvt::FrameworkInfo>& frameworks,
     std::vector<std::pair<std::string, lvt::ConnectionHandle>>& connections) {
+    if (args.uia) {
+        auto found = std::find_if(
+            connections.begin(), connections.end(),
+            [](const auto& entry) { return entry.first == "uia"; });
+        if (found == connections.end()) {
+            connections.emplace_back("uia", lvt::ConnectionHandle{});
+            found = std::prev(connections.end());
+        }
+        if (found->second && found->second->is_alive())
+            return;
+
+        found->second.reset();
+        auto fresh =
+            acquire_watch_connections(target, args, frameworks);
+        for (auto& [label, handle] : fresh) {
+            if (label == "uia" && handle) {
+                found->second = std::move(handle);
+                break;
+            }
+        }
+        return;
+    }
+
+    std::set<std::string> desiredPluginLabels;
+    const bool wantsComCtl = std::any_of(
+        frameworks.begin(), frameworks.end(),
+        [](const lvt::FrameworkInfo& framework) {
+            return framework.type == lvt::Framework::ComCtl;
+        });
+    for (const auto& framework : frameworks) {
+        if (framework.type != lvt::Framework::Plugin)
+            continue;
+        auto plugin = lvt::find_plugin_framework(
+            framework.name, framework.version, framework.pluginToken);
+        if (!plugin.plugin ||
+            !lvt::plugin_supports_persistent_connections(*plugin.plugin)) {
+            continue;
+        }
+        desiredPluginLabels.insert(
+            lvt::plugin_connection_label(plugin, target.hwnd));
+    }
+
+    for (auto it = connections.begin(); it != connections.end();) {
+        if (it->first == "comctl" && !wantsComCtl) {
+            it = connections.erase(it);
+            continue;
+        }
+        if (it->first.rfind("plugin:", 0) != 0) {
+            ++it;
+            continue;
+        }
+        const auto desired = desiredPluginLabels.find(it->first);
+        if (desired == desiredPluginLabels.end()) {
+            it = connections.erase(it);
+            continue;
+        }
+        desiredPluginLabels.erase(desired);
+        ++it;
+    }
+    const auto has_slot = [&connections](const std::string& label) {
+        return std::any_of(
+            connections.begin(), connections.end(),
+            [&label](const auto& entry) {
+                return entry.first == label;
+            });
+    };
+    if (!has_slot("win32"))
+        connections.emplace_back("win32", lvt::ConnectionHandle{});
+    if (wantsComCtl && !has_slot("comctl"))
+        connections.emplace_back("comctl", lvt::ConnectionHandle{});
+    for (const auto& label : desiredPluginLabels)
+        connections.emplace_back(label, lvt::ConnectionHandle{});
+
     bool anyDead = false;
     for (auto& [label, handle] : connections) {
         // A missing/never-acquired handle (acquire_watch_connections still
@@ -846,7 +1089,7 @@ static void refresh_dead_watch_connections(
     // for the same live key, even transiently, is safe: it is just a
     // temporary extra refcount that `fresh` going out of scope drops again,
     // never releasing anything this function did not itself acquire).
-    auto fresh = acquire_watch_connections(target, args);
+    auto fresh = acquire_watch_connections(target, args, frameworks);
     for (auto& [label, handle] : connections) {
         if (handle)
             continue;
@@ -859,16 +1102,385 @@ static void refresh_dead_watch_connections(
     }
 }
 
+struct WatchElementLocation {
+    lvt::Element* element = nullptr;
+    lvt::Element* parent = nullptr;
+    std::string path;
+};
+
+static bool find_watch_element_location(
+    lvt::Element& element, const std::string& ref,
+    const std::string& path, lvt::Element* parent,
+    WatchElementLocation& out) {
+    if (element.id == ref || element.key == ref) {
+        out = {&element, parent, path};
+        return true;
+    }
+    for (size_t i = 0; i < element.children.size(); ++i) {
+        if (find_watch_element_location(
+                element.children[i], ref,
+                path + "." + std::to_string(i),
+                &element, out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool find_watch_element_location(
+    lvt::Element& root, const std::string& ref,
+    WatchElementLocation& out) {
+    return find_watch_element_location(
+        root, ref, "0", nullptr, out);
+}
+
+static bool find_watch_element_location(
+    lvt::Element& element, const lvt::Element* target,
+    const std::string& path, lvt::Element* parent,
+    WatchElementLocation& out) {
+    if (&element == target) {
+        out = {&element, parent, path};
+        return true;
+    }
+    for (size_t i = 0; i < element.children.size(); ++i) {
+        if (find_watch_element_location(
+                element.children[i], target,
+                path + "." + std::to_string(i),
+                &element, out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool find_watch_element_location(
+    lvt::Element& root, const lvt::Element* target,
+    WatchElementLocation& out) {
+    return target &&
+           find_watch_element_location(
+               root, target, "0", nullptr, out);
+}
+
+struct WatchScopeAnchor {
+    std::string key;
+    std::string baseIdentity;
+    std::string durableIdentity;
+    std::string uiaRuntimeId;
+    std::string parentKey;
+    std::string parentCardinality;
+    std::string path;
+    std::string framework;
+    uintptr_t nativeHandle = 0;
+    uint64_t nativeLifetimeHandle = 0;
+    uint64_t providerHandle = 0;
+    bool nativeIdentity = false;
+    bool durableProviderIdentity = false;
+    bool processWideProviderIdentity = false;
+    bool providerReplacementMapping = false;
+    bool authoritativeContinuity = false;
+};
+
+static const char* watch_scope_cardinality_property(
+    const lvt::Element& element) {
+    if (element.framework != "comctl")
+        return nullptr;
+    if (element.type == "ListViewItem")
+        return "itemCount";
+    if (element.type == "ToolbarButton" ||
+        element.type == "ToolbarSeparator")
+        return "buttonCount";
+    if (element.type == "StatusBarPart")
+        return "partCount";
+    if (element.type == "Tab")
+        return "tabCount";
+    return nullptr;
+}
+
+static std::string watch_scope_parent_cardinality(
+    const lvt::Element& element,
+    const lvt::Element* parent) {
+    const auto* property =
+        watch_scope_cardinality_property(element);
+    if (!property || !parent)
+        return {};
+    const auto found = parent->properties.find(property);
+    return found == parent->properties.end()
+        ? std::string()
+        : found->second;
+}
+
+static void update_watch_scope_anchor(
+    WatchScopeAnchor& anchor,
+    const WatchElementLocation& location) {
+    anchor.key = location.element->key;
+    anchor.baseIdentity =
+        lvt::base_identity_key(*location.element);
+    anchor.durableIdentity =
+        location.element->durableIdentity;
+    const auto runtimeId =
+        location.element->properties.find("RuntimeId");
+    anchor.uiaRuntimeId =
+        runtimeId == location.element->properties.end()
+            ? std::string()
+            : runtimeId->second;
+    anchor.parentKey =
+        location.parent ? location.parent->key : std::string();
+    anchor.parentCardinality =
+        watch_scope_parent_cardinality(
+            *location.element, location.parent);
+    anchor.path = location.path;
+    anchor.framework = location.element->framework;
+    anchor.nativeHandle =
+        location.element->nativeHandle;
+    anchor.nativeLifetimeHandle =
+        location.element->nativeLifetimeHandle;
+    anchor.providerHandle =
+        location.element->providerHandle;
+    anchor.durableProviderIdentity =
+        lvt::has_durable_provider_identity(
+            *location.element);
+    anchor.nativeIdentity =
+        anchor.nativeHandle != 0 &&
+        (anchor.framework == "win32" ||
+         anchor.framework == "comctl");
+    anchor.processWideProviderIdentity =
+        lvt::has_process_wide_provider_identity(
+            *location.element);
+    anchor.providerReplacementMapping =
+        location.element->providerHandle != 0 &&
+        !anchor.parentCardinality.empty() &&
+        watch_scope_cardinality_property(
+            *location.element) != nullptr;
+    anchor.authoritativeContinuity =
+        !anchor.durableIdentity.empty() ||
+        !anchor.uiaRuntimeId.empty() ||
+        anchor.nativeIdentity ||
+        anchor.durableProviderIdentity ||
+        anchor.processWideProviderIdentity;
+}
+
+static bool watch_scope_parent_matches(
+    const WatchScopeAnchor& anchor,
+    const WatchElementLocation& location) {
+    if (anchor.processWideProviderIdentity)
+        return true;
+    const auto parentKey =
+        location.parent ? location.parent->key : std::string();
+    return parentKey == anchor.parentKey;
+}
+
+static bool watch_scope_direct_identity_matches(
+    const WatchScopeAnchor& anchor,
+    const WatchElementLocation& location) {
+    if (!anchor.durableIdentity.empty() &&
+        location.element->durableIdentity ==
+            anchor.durableIdentity) {
+        return true;
+    }
+    if (!anchor.uiaRuntimeId.empty()) {
+        const auto runtimeId =
+            location.element->properties.find("RuntimeId");
+        if (runtimeId !=
+                location.element->properties.end() &&
+            runtimeId->second == anchor.uiaRuntimeId) {
+            return true;
+        }
+    }
+    if (anchor.nativeIdentity &&
+        (anchor.nativeLifetimeHandle != 0
+             ? location.element->nativeLifetimeHandle ==
+                   anchor.nativeLifetimeHandle
+             : location.element->nativeLifetimeHandle == 0 &&
+                   location.element->nativeHandle ==
+                       anchor.nativeHandle)) {
+        return true;
+    }
+    if ((anchor.durableProviderIdentity ||
+         anchor.processWideProviderIdentity) &&
+        location.element->providerHandle ==
+            anchor.providerHandle) {
+        return true;
+    }
+    return false;
+}
+
+static bool watch_scope_provider_replacement_matches(
+    const WatchScopeAnchor& anchor,
+    const WatchElementLocation& location) {
+    return anchor.authoritativeContinuity &&
+           anchor.providerReplacementMapping &&
+           location.element->providerHandle ==
+               anchor.providerHandle &&
+           watch_scope_parent_cardinality(
+               *location.element, location.parent) ==
+               anchor.parentCardinality;
+}
+
+static std::string watch_parent_path(
+    const std::string& path) {
+    const auto separator = path.rfind('.');
+    return separator == std::string::npos
+        ? std::string()
+        : path.substr(0, separator);
+}
+
+static bool watch_scope_has_ambiguous_sibling_change(
+    const WatchScopeAnchor& anchor,
+    const std::vector<lvt::ChangeEvent>& fullEvents) {
+    const auto parentPath = watch_parent_path(anchor.path);
+    for (const auto& event : fullEvents) {
+        if (lvt::base_identity_key(event.element) !=
+            anchor.baseIdentity) {
+            continue;
+        }
+        if ((event.type ==
+                 lvt::ChangeEvent::Type::Added ||
+             event.type ==
+                 lvt::ChangeEvent::Type::Removed) &&
+            watch_parent_path(event.path) == parentPath) {
+            return true;
+        }
+        if (event.type !=
+            lvt::ChangeEvent::Type::Changed) {
+            continue;
+        }
+        const auto changedPath =
+            event.fields.find("path");
+        if (changedPath != event.fields.end() &&
+            (watch_parent_path(
+                 changedPath->second.oldValue) ==
+                 parentPath ||
+             watch_parent_path(
+                 changedPath->second.newValue) ==
+                 parentPath)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum class WatchScopeTransition {
+    absent,
+    same,
+    replacement,
+    reappeared,
+};
+
+static WatchScopeTransition resolve_watch_scope(
+    lvt::Element& current,
+    const std::vector<lvt::ChangeEvent>& fullEvents,
+    const WatchScopeAnchor& anchor, bool wasPresent,
+    WatchElementLocation& location) {
+    WatchElementLocation exact;
+    if (find_watch_element_location(
+            current, anchor.key, exact) &&
+        lvt::base_identity_key(*exact.element) ==
+            anchor.baseIdentity &&
+        watch_scope_parent_matches(anchor, exact)) {
+        if (anchor.authoritativeContinuity) {
+            if (watch_scope_direct_identity_matches(
+                    anchor, exact) &&
+                (wasPresent ||
+                 anchor.processWideProviderIdentity ||
+                 exact.path == anchor.path)) {
+                location = exact;
+                return wasPresent
+                    ? WatchScopeTransition::same
+                    : WatchScopeTransition::reappeared;
+            }
+        } else if (wasPresent &&
+                   exact.path == anchor.path &&
+                   !watch_scope_has_ambiguous_sibling_change(
+                       anchor, fullEvents)) {
+            location = exact;
+            return WatchScopeTransition::same;
+        }
+    }
+
+    if (!wasPresent)
+        return WatchScopeTransition::absent;
+
+    const bool removedAnchor = std::any_of(
+        fullEvents.begin(), fullEvents.end(),
+        [&](const lvt::ChangeEvent& event) {
+            return event.type ==
+                       lvt::ChangeEvent::Type::Removed &&
+                   event.key == anchor.key &&
+                   event.path == anchor.path;
+        });
+    if (!removedAnchor)
+        return WatchScopeTransition::absent;
+
+    // A different key can become the tracked root only as an explicit
+    // same-tick replacement at the exact old path, under the same surviving
+    // parent, with the same provider/type identity. A moved sibling merely
+    // occupying the old slot produces a Changed/path event, not this
+    // Removed+Added pair, and is therefore never silently adopted.
+    for (const auto& event : fullEvents) {
+        if (event.type != lvt::ChangeEvent::Type::Added ||
+            event.path != anchor.path ||
+            lvt::base_identity_key(event.element) !=
+                anchor.baseIdentity) {
+            continue;
+        }
+        WatchElementLocation candidate;
+        if (!find_watch_element_location(
+                current, event.key, candidate) ||
+            !watch_scope_parent_matches(anchor, candidate)) {
+            continue;
+        }
+        if (!watch_scope_direct_identity_matches(
+                anchor, candidate) &&
+            !watch_scope_provider_replacement_matches(
+                anchor, candidate)) {
+            continue;
+        }
+        location = candidate;
+        return WatchScopeTransition::replacement;
+    }
+    return WatchScopeTransition::absent;
+}
+
+static lvt::Element make_watch_scope_snapshot(
+    const lvt::Element& fullTree,
+    const WatchElementLocation& location, int depth) {
+    lvt::Element snapshot = *location.element;
+    if (depth >= 0)
+        lvt::trim_to_depth(snapshot, depth);
+    lvt::copy_incomplete_framework_refresh_markers(
+        fullTree, snapshot);
+    return snapshot;
+}
+
+static std::vector<lvt::ChangeEvent> removed_snapshot_events(
+    lvt::Element& snapshot) {
+    auto events = lvt::snapshot_added_events(snapshot);
+    for (auto& event : events)
+        event.type = lvt::ChangeEvent::Type::Removed;
+    return events;
+}
+
 static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
-    // Acquired at the start of the session and refreshed whenever a held
-    // connection dies (see refresh_dead_watch_connections) - not
-    // re-acquired from scratch every tick, which is the entire point of
-    // this mechanism.
+    // Acquired at the start of the session, reconciled against fresh
+    // framework detection each tick, and reused while alive.
     std::vector<std::pair<std::string, lvt::ConnectionHandle>> connections;
-    connections = acquire_watch_connections(target, args);
+    std::vector<lvt::FrameworkInfo> frameworks;
+    if (!args.uia)
+        frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+    connections = acquire_watch_connections(target, args, frameworks);
     lvt::ConnectionLookup lookup = make_lookup(connections);
+    const bool scoped = !args.elementId.empty();
+    Args buildArgs = args;
+    if (scoped) {
+        // Resolve the user-supplied reference once. Later ticks must reconcile
+        // the authoritative full tree before deciding what that scoped root
+        // became; resolving the original key before diffing would skip every
+        // identity replacement forever.
+        buildArgs.elementId.clear();
+        buildArgs.depth = -1;
+    }
 
     // The very first tree build did not get the same tolerance the tick loop
     // below already has for a transient failure — it would fail outright
@@ -891,14 +1503,55 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             if (lvt::g_debug)
                 fprintf(stderr, "lvt: retrying initial watch connection (attempt %d)\n", attempt + 1);
             Sleep(static_cast<DWORD>(300 * attempt));
+            if (!args.uia)
+                frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+            reconcile_watch_connections(
+                target, args, frameworks, connections);
         }
-        built = build_output_tree(target, args, previous, lookup);
+        drain_watch_connection_events(
+            connections,
+            WatchConnectionEventDrainPhase::nativeBeforeBuild);
+        built = build_output_tree(
+                    target, buildArgs, previous, lookup,
+                    args.uia ? nullptr : &frameworks) &&
+                !lvt::has_incomplete_framework_refresh(previous);
     }
     if (!built)
         return 1;
+    drain_watch_connection_events(
+        connections,
+        WatchConnectionEventDrainPhase::nonNativeAfterSuccess);
 
-    for (const auto& event : lvt::snapshot_added_events(previous))
-        printf("%s\n", lvt::serialize_change_event(event).c_str());
+    WatchScopeAnchor scopeAnchor;
+    std::optional<lvt::Element> previousScope;
+    if (scoped) {
+        auto* resolved =
+            lvt::find_element_by_ref(previous, args.elementId);
+        WatchElementLocation initialScope;
+        if (!find_watch_element_location(
+                previous, resolved, initialScope)) {
+            fprintf(
+                stderr, "lvt: element '%s' not found\n",
+                args.elementId.c_str());
+            return 1;
+        }
+        update_watch_scope_anchor(scopeAnchor, initialScope);
+        previousScope = make_watch_scope_snapshot(
+            previous, initialScope, args.depth);
+        for (const auto& event :
+             lvt::snapshot_added_events(*previousScope)) {
+            printf(
+                "%s\n",
+                lvt::serialize_change_event(event).c_str());
+        }
+    } else {
+        for (const auto& event :
+             lvt::snapshot_added_events(previous)) {
+            printf(
+                "%s\n",
+                lvt::serialize_change_event(event).c_str());
+        }
+    }
     fflush(stdout);
 
     while (!g_watchStop) {
@@ -915,10 +1568,17 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             break;
         }
 
-        refresh_dead_watch_connections(target, args, connections);
+        if (!args.uia)
+            frameworks = lvt::detect_frameworks(target.hwnd, target.pid);
+        reconcile_watch_connections(target, args, frameworks, connections);
+        drain_watch_connection_events(
+            connections,
+            WatchConnectionEventDrainPhase::nativeBeforeBuild);
 
         lvt::Element current;
-        if (!build_output_tree(target, args, current, lookup)) {
+        if (!build_output_tree(
+                target, buildArgs, current, lookup,
+                args.uia ? nullptr : &frameworks)) {
             // A tick can fail transiently — most easily in UIA mode, where a
             // momentarily busy target trips the transaction timeout. That is
             // precisely the condition --watch exists to observe, so skip the
@@ -926,29 +1586,6 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
             if (lvt::g_debug)
                 fprintf(stderr, "lvt: skipping watch tick; tree unavailable\n");
             continue;
-        }
-
-        // Drain whatever incremental Add/Remove notifications a connection
-        // pushed since the last tick (see PushChangeEvent in lvt_tap.cpp
-        // and IFrameworkConnection::poll_events). watch's own change events
-        // (emitted below via diff_trees) already come from comparing two
-        // full GET_TREE snapshots, so these are not fed into that today -
-        // this just bounds each connection's internal event queue (see
-        // XamlDiagConnection::queue_change_event's cap) and surfaces them
-        // for debugging. A future phase could drive watch's ticks from
-        // these directly instead of polling on a fixed interval.
-        if (lvt::g_debug) {
-            for (auto& [label, handle] : connections) {
-                if (!handle) continue;
-                auto events = handle->poll_events();
-                if (!events.empty())
-                    fprintf(stderr, "lvt: %s connection reported %zu pushed change event(s) this tick\n",
-                            label.c_str(), events.size());
-            }
-        } else {
-            for (auto& [label, handle] : connections) {
-                if (handle) (void)handle->poll_events();
-            }
         }
 
         // See lost_injected_framework_content's doc comment: this is now a
@@ -964,16 +1601,102 @@ static int run_watch_loop(const lvt::TargetInfo& target, const Args& args) {
         if (lost_injected_framework_content(previous, current)) {
             for (int extra = 0; extra < 2 && lost_injected_framework_content(previous, current); extra++) {
                 if (lvt::g_debug)
-                    fprintf(stderr, "lvt: XAML/WinUI3 content vanished this tick; retrying (attempt %d)\n", extra + 1);
+                    fprintf(stderr, "lvt: injected framework content vanished this tick; retrying (attempt %d)\n", extra + 1);
                 Sleep(1000);
+                if (!args.uia)
+                    frameworks =
+                        lvt::detect_frameworks(target.hwnd, target.pid);
+                reconcile_watch_connections(
+                    target, args, frameworks, connections);
                 lvt::Element retryTree;
-                if (build_output_tree(target, args, retryTree, lookup))
+                if (build_output_tree(
+                        target, buildArgs, retryTree, lookup,
+                        args.uia ? nullptr : &frameworks))
                     current = std::move(retryTree);
+            }
+            if (lost_injected_framework_content(previous, current)) {
+                if (lvt::g_debug) {
+                    fprintf(stderr,
+                            "lvt: preserving the previous watch snapshot after an "
+                            "incomplete framework refresh\n");
+                }
+                continue;
             }
         }
 
-        for (const auto& event : lvt::diff_trees(previous, current))
-            printf("%s\n", lvt::serialize_change_event(event).c_str());
+        drain_watch_connection_events(
+            connections,
+            WatchConnectionEventDrainPhase::nonNativeAfterSuccess);
+        if (scoped) {
+            // Reconcile full trees first so process-wide XAML moves and
+            // provider-authoritative identity replacement have their normal
+            // semantics before selecting the reporting scope.
+            auto fullEvents =
+                lvt::diff_trees(previous, current);
+            WatchElementLocation currentScope;
+            const auto transition = resolve_watch_scope(
+                current, fullEvents, scopeAnchor,
+                previousScope.has_value(), currentScope);
+
+            std::optional<lvt::Element> nextScope;
+            if (transition != WatchScopeTransition::absent) {
+                nextScope = make_watch_scope_snapshot(
+                    current, currentScope, args.depth);
+            }
+
+            if (previousScope && nextScope) {
+                if (transition ==
+                    WatchScopeTransition::replacement) {
+                    for (const auto& event :
+                         removed_snapshot_events(*previousScope)) {
+                        printf(
+                            "%s\n",
+                            lvt::serialize_change_event(event).c_str());
+                    }
+                    for (const auto& event :
+                         lvt::snapshot_added_events(*nextScope)) {
+                        printf(
+                            "%s\n",
+                            lvt::serialize_change_event(event).c_str());
+                    }
+                } else {
+                    for (const auto& event :
+                         lvt::diff_trees(
+                             *previousScope, *nextScope)) {
+                        printf(
+                            "%s\n",
+                            lvt::serialize_change_event(event).c_str());
+                    }
+                }
+            } else if (previousScope) {
+                for (const auto& event :
+                     removed_snapshot_events(*previousScope)) {
+                    printf(
+                        "%s\n",
+                        lvt::serialize_change_event(event).c_str());
+                }
+            } else if (nextScope) {
+                for (const auto& event :
+                     lvt::snapshot_added_events(*nextScope)) {
+                    printf(
+                        "%s\n",
+                        lvt::serialize_change_event(event).c_str());
+                }
+            }
+
+            if (nextScope) {
+                update_watch_scope_anchor(
+                    scopeAnchor, currentScope);
+            }
+            previousScope = std::move(nextScope);
+        } else {
+            for (const auto& event :
+                 lvt::diff_trees(previous, current)) {
+                printf(
+                    "%s\n",
+                    lvt::serialize_change_event(event).c_str());
+            }
+        }
         fflush(stdout);
         previous = std::move(current);
     }
@@ -1115,7 +1838,13 @@ static int run_action(const lvt::TargetInfo& target, const Args& args) {
     if (!build_action_request(args, request))
         return 1;
 
-    const auto result = lvt::perform_action(target.hwnd, options, request);
+    const auto identity = uia_identity_for_target(target);
+    if (!identity) {
+        fprintf(stderr, "lvt: ownershipLost: target identity is unavailable\n");
+        return 1;
+    }
+    const auto result = lvt::perform_action(
+        *identity, options, request);
 
     nlohmann::json out;
     out["action"] = lvt::action_kind_name(request.kind);
@@ -1126,6 +1855,8 @@ static int run_action(const lvt::TargetInfo& target, const Args& args) {
         out["method"] = result.method;
     if (!result.message.empty())
         out["error"] = result.message;
+    if (!result.errorCode.empty())
+        out["code"] = result.errorCode;
     if (result.hasElement)
         out["result"] = query_element_to_json(result.element);
 
@@ -1199,7 +1930,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         args.hwnd = matches[0].hwnd;
-    } else if (!args.windowTitle.empty()) {
+    } else if (!args.windowTitle.empty() && !args.hwnd && !args.pid) {
         auto matches = lvt::find_by_title(args.windowTitle);
         if (matches.empty()) {
             fprintf(stderr, "lvt: no visible windows found with title containing '%s'\n",
@@ -1243,6 +1974,23 @@ int main(int argc, char* argv[]) {
                 static_cast<void*>(target.hwnd));
         return 1;
     }
+
+#ifdef LVT_ENABLE_UIA
+    if (args.uia || verb_drives_app(args.verb)) {
+        const auto identity = lvt::capture_uia_target_identity(
+            target.hwnd, target.pid,
+            target.processCreationIdentity);
+        if (!identity) {
+            fprintf(
+                stderr,
+                "lvt: ownershipLost: target identity changed before UI Automation acquisition\n");
+            return 1;
+        }
+        target.uiaRootRuntimeId = identity->rootRuntimeId;
+        target.uiaWindowLifetime =
+            identity->windowLifetime;
+    }
+#endif
 
     // Check architecture match. --uia is exempt: UI Automation is a cross-process,
     // cross-architecture client API, so an x64 lvt can read an ARM64 or x86

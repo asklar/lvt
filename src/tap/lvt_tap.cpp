@@ -4,15 +4,21 @@
 // via IVisualTreeService::AdviseVisualTreeChange → sends JSON over named pipe.
 
 #include <Windows.h>
+#include <atomic>
 #include <objbase.h>
 #include <ocidl.h>
 #include <xamlOM.h>
 #include <wil/com.h>
 #include <wil/resource.h>
 #include <string>
+#include <string_view>
 #include <map>
+#include <set>
+#include <sstream>
 #include <vector>
 #include <algorithm>
+#include <charconv>
+#include <cstdint>
 #include <cstdio>
 #include <cmath>
 #include <mutex>
@@ -20,6 +26,9 @@
 #include <unknwn.h>
 
 #include "xaml_property_filter.h"
+#include "bounded_event_queue.h"
+#include "xaml_enum_catalog.h"
+#include "../xaml_enum_util.h"
 
 // C++/WinRT projected types for XAML element inspection.
 // System XAML (Windows.UI.Xaml) headers are always available from the Windows SDK.
@@ -38,6 +47,10 @@
 #else
 #define LVT_HAS_WINUI3_PROJECTION 0
 #endif
+
+constexpr HRESULT
+    LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION =
+        static_cast<HRESULT>(0xA0040201u);
 
 // Stub for C++/WinRT error origination (avoid linking windowsapp.lib)
 extern "C" int32_t __stdcall WINRT_IMPL_RoOriginateLanguageException(
@@ -64,7 +77,9 @@ static void LogMsg(const char* fmt, ...) {
         logFile = _wfopen(tmp, L"a");
         if (!logFile) return;
     }
-    fprintf(logFile, "[%llu][%lu] ", GetTickCount64(), GetCurrentThreadId());
+    fprintf(
+        logFile, "[%llu][%lu][%lu] ", GetTickCount64(),
+        GetCurrentProcessId(), GetCurrentThreadId());
     va_list ap;
     va_start(ap, fmt);
     vfprintf(logFile, fmt, ap);
@@ -140,6 +155,52 @@ struct BatchRequest {
     size_t count;
 };
 
+struct TapProperty {
+    std::wstring name;
+    std::wstring value;
+    std::wstring propertyType;
+    std::wstring valueType;
+    std::wstring declaringType;
+    unsigned int propertyIndex = 0;
+    uint64_t metadataBits = 0;
+    bool overridden = false;
+    std::wstring source;
+};
+
+enum class TapPropertyCommandKind {
+    getProperties,
+    setProperty,
+    clearProperty,
+};
+
+// Passed synchronously from the pipe worker to the SetSite/XAML UI thread via
+// SendMessage. The request and result both remain on the worker's stack until
+// the UI-thread call returns.
+struct TapPropertyCommand {
+    TapPropertyCommandKind kind = TapPropertyCommandKind::getProperties;
+    uint64_t commandId = 0;
+    InstanceHandle object = 0;
+    std::vector<InstanceHandle> allowedRoots;
+    bool simulateReparent = false;
+    unsigned int propertyIndex = 0;
+    std::wstring value;
+
+    HRESULT hresult = E_FAIL;
+    std::wstring error;
+    std::vector<TapProperty> properties;
+    bool hasReadback = false;
+    TapProperty readback;
+};
+
+struct TapChangeEvent {
+    bool added = false;
+    InstanceHandle handle = 0;
+    InstanceHandle parent = 0;
+    unsigned int childIndex = 0;
+    std::wstring type;
+    std::wstring name;
+};
+
 // Forward declaration for WndProc
 static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -181,11 +242,17 @@ class LvtTap : public IObjectWithSite, public IVisualTreeServiceCallback2 {
     // redesign: one connect, many requests, instead of the old one-shot
     // "collect once, write once, close" pipe.
     wil::unique_hfile m_pipe;
-    // Guards every write to m_pipe. A GET_TREE response (written from the
-    // worker/command-loop thread) and a pushed CHANGE event (written from
-    // whichever thread XAML's OnVisualTreeChange happens to call back on)
-    // must never interleave their bytes on the wire.
+    // All pipe writes are performed by the command-loop thread. The mutex is
+    // retained because property/tree helpers also funnel through WriteLine,
+    // and keeping one serialization point prevents future concurrent callers
+    // from interleaving records.
     std::mutex m_pipeWriteMutex;
+    std::atomic_bool m_acceptChangeEvents = false;
+    static constexpr size_t kMaxChangeEvents = 4096;
+    lvt::BoundedEventQueue<TapChangeEvent, kMaxChangeEvents> m_changeEvents;
+    std::vector<lvt::tap::EnumTypeInfo> m_enumCatalog;
+    lvt::XamlEnumFlagsCache m_enumFlagsCache;
+    bool m_enumCatalogServed = false;
 
 public:
     wil::com_ptr<IVisualTreeService> m_vts;
@@ -195,6 +262,7 @@ public:
     // allowed to destroy a window it owns) to destroy m_msgWnd during final
     // cleanup - see CleanupUIResources.
     static constexpr UINT WM_TAP_DESTROY = WM_USER + 102;
+    static constexpr UINT WM_PROPERTY_COMMAND = WM_USER + 103;
 
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
@@ -285,6 +353,7 @@ public:
         }
 
         m_diag = std::move(diag);
+        LoadEnumCatalog();
 
         // Create a message-only window on the UI thread for dispatching
         // GetPropertyValuesChain calls (which have thread affinity).
@@ -339,9 +408,7 @@ public:
         return true;
     }
 
-    // Writes one line (message + '\n') to the pipe. Safe to call from any
-    // thread - guarded (see m_pipeWriteMutex) so a pushed CHANGE event can
-    // never interleave its bytes with a GET_TREE response.
+    // Writes one line (message + '\n') to the pipe.
     bool WriteLine(const std::string& utf8Line) {
         std::lock_guard<std::mutex> lock(m_pipeWriteMutex);
         if (!m_pipe) return false;
@@ -354,26 +421,16 @@ public:
         return ok != FALSE;
     }
 
-    // Writes one unsolicited {"type":"CHANGE",...} line - see
-    // OnVisualTreeChange, which calls this after releasing m_nodesMutex
-    // (never while holding it, to keep lock ordering simple: WriteLine only
-    // ever needs m_pipeWriteMutex). Safe to call before ServeConnection has
-    // run (no pipe yet - SetSiteImpl's synchronous initial replay happens
-    // first) or after the connection has ended: WriteLine just fails
-    // quietly in both cases, same as for any other caller, and a
-    // subsequent GET_TREE response always reflects current reality
-    // regardless of whether this push made it out.
-    void PushChangeEvent(bool added, InstanceHandle handle, InstanceHandle parent,
-                         unsigned int childIndex, const std::wstring& type, const std::wstring& name) {
+    std::string SerializeChangeEvent(const TapChangeEvent& event) {
         std::wstring json = L"{\"type\":\"CHANGE\",\"mutation\":\"";
-        json += added ? L"add" : L"remove";
-        json += L"\",\"handle\":" + std::to_wstring(handle);
-        json += L",\"parent\":" + std::to_wstring(parent);
-        if (added) {
-            json += L",\"childIndex\":" + std::to_wstring(childIndex);
-            json += L",\"elementType\":\"" + Escape(type) + L"\"";
-            if (!name.empty())
-                json += L",\"name\":\"" + Escape(name) + L"\"";
+        json += event.added ? L"add" : L"remove";
+        json += L"\",\"handle\":" + std::to_wstring(event.handle);
+        json += L",\"parent\":" + std::to_wstring(event.parent);
+        if (event.added) {
+            json += L",\"childIndex\":" + std::to_wstring(event.childIndex);
+            json += L",\"elementType\":\"" + Escape(event.type) + L"\"";
+            if (!event.name.empty())
+                json += L",\"name\":\"" + Escape(event.name) + L"\"";
         }
         json += L"}";
 
@@ -382,9 +439,742 @@ public:
         std::string utf8(len, '\0');
         WideCharToMultiByte(CP_UTF8, 0, json.c_str(), (int)json.size(),
                             utf8.data(), len, nullptr, nullptr);
-        bool sent = WriteLine(utf8);
-        LogMsg("PushChangeEvent: %s handle=%llu parent=%llu sent=%d",
-               added ? "add" : "remove", (unsigned long long)handle, (unsigned long long)parent, sent);
+        return utf8;
+    }
+
+    // Called from XAML's target UI callback. It must never perform pipe I/O,
+    // flush a pipe, or wait for the reader. A bounded queue makes the callback
+    // memory-only; overflow discards partial history and asks the consumer for
+    // a fresh snapshot on the next command-thread drain.
+    void QueueChangeEvent(bool added, InstanceHandle handle, InstanceHandle parent,
+                          unsigned int childIndex, const std::wstring& type,
+                          const std::wstring& name) {
+        if (!m_acceptChangeEvents.load(std::memory_order_relaxed))
+            return;
+
+        m_changeEvents.push(
+            TapChangeEvent{added, handle, parent, childIndex, type, name});
+    }
+
+    // Runs only on the command-loop thread. CHANGE records remain compatible
+    // with the existing connection reader. EVENTS_OVERFLOW is an explicit
+    // reset marker: consumers must treat queued deltas as incomplete and use
+    // the next full GET_TREE snapshot as authoritative.
+    void DrainChangeEvents() {
+        auto drained = m_changeEvents.drain();
+
+        if (drained.snapshotRequired)
+            WriteLine("{\"type\":\"EVENTS_OVERFLOW\"}");
+        for (const auto& event : drained.events)
+            WriteLine(SerializeChangeEvent(event));
+    }
+
+    static bool ParseUint64(const std::string& text, uint64_t& value) {
+        if (text.empty())
+            return false;
+        auto parsed = std::from_chars(text.data(), text.data() + text.size(), value, 10);
+        return parsed.ec == std::errc() && parsed.ptr == text.data() + text.size();
+    }
+
+    static bool ParseAllowedRoots(
+        const std::string& text,
+        std::vector<InstanceHandle>& roots,
+        bool& simulateReparent) {
+        roots.clear();
+        simulateReparent = false;
+        std::string_view encoded = text;
+        if (!encoded.empty() && encoded.front() == '!') {
+            simulateReparent = true;
+            encoded.remove_prefix(1);
+        }
+        if (encoded == "-")
+            return true;
+        size_t start = 0;
+        while (start < encoded.size()) {
+            const size_t separator = encoded.find(',', start);
+            const size_t end = separator == std::string::npos
+         ? encoded.size()
+         : separator;
+            uint64_t root = 0;
+            if (end == start ||
+         !ParseUint64(
+             std::string(
+                 encoded.substr(
+                     start, end - start)),
+             root) ||
+         root == 0) {
+         return false;
+            }
+            roots.push_back(
+         static_cast<InstanceHandle>(root));
+            if (separator == std::string::npos)
+         break;
+            start = separator + 1;
+        }
+        return !roots.empty();
+    }
+
+    static bool DecodeHexUtf8(const std::string& encoded, std::wstring& value) {
+        if (encoded == "-") {
+            value.clear();
+            return true;
+        }
+        if (encoded.empty() || (encoded.size() % 2) != 0)
+            return false;
+
+        std::string utf8(encoded.size() / 2, '\0');
+        auto nibble = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+            return -1;
+        };
+        for (size_t i = 0; i < utf8.size(); ++i) {
+            int high = nibble(encoded[i * 2]);
+            int low = nibble(encoded[i * 2 + 1]);
+            if (high < 0 || low < 0)
+                return false;
+            utf8[i] = static_cast<char>((high << 4) | low);
+        }
+
+        int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                         utf8.data(), static_cast<int>(utf8.size()),
+                                         nullptr, 0);
+        if (length <= 0)
+            return false;
+        value.resize(length);
+        return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                   utf8.data(), static_cast<int>(utf8.size()),
+                                   value.data(), length) == length;
+    }
+
+    void LoadEnumCatalog() {
+        unsigned int count = 0;
+        EnumType* rawEnums = nullptr;
+        const HRESULT getHr = m_vts->GetEnums(&count, &rawEnums);
+        lvt::tap::OwnedEnumTypes owned(rawEnums, count);
+        LogMsg("GetEnums called once: hr=0x%08X count=%u", getHr, count);
+        if (FAILED(getHr))
+            return;
+
+        std::vector<lvt::tap::EnumTypeInfo> copied;
+        const HRESULT copyHr =
+            lvt::tap::copy_enum_types(owned.get(), owned.count(), copied);
+        if (FAILED(copyHr)) {
+            LogMsg("GetEnums deep copy failed: 0x%08X", copyHr);
+            return;
+        }
+        for (auto& type : copied)
+            type.flagsKind = m_enumFlagsCache.classify(type.name);
+        m_enumCatalog = std::move(copied);
+    }
+
+    const lvt::tap::EnumTypeInfo* FindEnumType(
+        const std::wstring& typeName) const {
+        auto found = std::find_if(
+            m_enumCatalog.begin(), m_enumCatalog.end(),
+            [&](const lvt::tap::EnumTypeInfo& type) {
+                return type.name == typeName;
+            });
+        return found == m_enumCatalog.end() ? nullptr : &*found;
+    }
+
+    static const wchar_t* FlagsKindNameWide(
+        lvt::XamlEnumFlagsKind kind) {
+        switch (kind) {
+        case lvt::XamlEnumFlagsKind::nonFlags: return L"no";
+        case lvt::XamlEnumFlagsKind::flags: return L"yes";
+        case lvt::XamlEnumFlagsKind::unknown: return L"unknown";
+        }
+        return L"unknown";
+    }
+
+    static std::wstring TakeBstr(BSTR& value) {
+        wil::unique_bstr owned(value);
+        value = nullptr;
+        return owned ? std::wstring(owned.get(), SysStringLen(owned.get())) : std::wstring();
+    }
+
+    static void SanitizeTypeName(std::wstring& value) {
+        value.erase(std::remove_if(
+            value.begin(), value.end(),
+            [](wchar_t ch) { return ch < 0x20; }), value.end());
+    }
+
+    static const wchar_t* BaseValueSourceName(BaseValueSource source) {
+        switch (source) {
+        case BaseValueSourceDefault: return L"Default";
+        case BaseValueSourceBuiltInStyle: return L"BuiltInStyle";
+        case BaseValueSourceStyle: return L"Style";
+        case BaseValueSourceLocal: return L"Local";
+        case Inherited: return L"Inherited";
+        case DefaultStyleTrigger: return L"DefaultStyleTrigger";
+        case TemplateTrigger: return L"TemplateTrigger";
+        case StyleTrigger: return L"StyleTrigger";
+        case ImplicitStyleReference: return L"ImplicitStyleReference";
+        case ParentTemplate: return L"ParentTemplate";
+        case ParentTemplateTrigger: return L"ParentTemplateTrigger";
+        case Animation: return L"Animation";
+        case Coercion: return L"Coercion";
+        case BaseValueSourceVisualState: return L"VisualState";
+        default: return L"Unknown";
+        }
+    }
+
+    HRESULT CollectPropertyChain(InstanceHandle object,
+                                 std::vector<TapProperty>& output,
+                                 std::wstring& error) {
+        unsigned int sourceCount = 0;
+        unsigned int propertyCount = 0;
+        PropertyChainSource* rawSources = nullptr;
+        PropertyChainValue* rawProperties = nullptr;
+        HRESULT hr = m_vts->GetPropertyValuesChain(
+            object, &sourceCount, &rawSources, &propertyCount, &rawProperties);
+        wil::unique_cotaskmem sourcesMemory(rawSources);
+        wil::unique_cotaskmem propertiesMemory(rawProperties);
+        if (FAILED(hr)) {
+            error = L"GetPropertyValuesChain failed";
+            return hr;
+        }
+
+        std::vector<std::wstring> sources;
+        sources.reserve(sourceCount);
+        for (unsigned int i = 0; i < sourceCount; ++i) {
+            auto targetType = TakeBstr(rawSources[i].TargetType);
+            auto name = TakeBstr(rawSources[i].Name);
+            auto fileName = TakeBstr(rawSources[i].SrcInfo.FileName);
+            auto hash = TakeBstr(rawSources[i].SrcInfo.Hash);
+            (void)targetType;
+            (void)fileName;
+            (void)hash;
+
+            std::wstring label = BaseValueSourceName(rawSources[i].Source);
+            if (!name.empty())
+                label += L": " + name;
+            sources.push_back(std::move(label));
+        }
+
+        std::set<std::wstring> seenNames;
+        output.reserve(propertyCount);
+        for (unsigned int i = 0; i < propertyCount; ++i) {
+            auto type = TakeBstr(rawProperties[i].Type);
+            auto declaringType = TakeBstr(rawProperties[i].DeclaringType);
+            auto valueType = TakeBstr(rawProperties[i].ValueType);
+            auto itemType = TakeBstr(rawProperties[i].ItemType);
+            auto value = TakeBstr(rawProperties[i].Value);
+            auto name = TakeBstr(rawProperties[i].PropertyName);
+            (void)itemType;
+            SanitizeTypeName(type);
+            SanitizeTypeName(declaringType);
+            SanitizeTypeName(valueType);
+
+            // xamlOM orders the chain most-specific first. Preserve that
+            // occurrence and discard later inherited/style duplicates.
+            if (name.empty() || !seenNames.insert(name).second)
+                continue;
+
+            TapProperty property;
+            property.name = std::move(name);
+            property.value = std::move(value);
+            property.propertyType = std::move(type);
+            property.valueType = std::move(valueType);
+            property.declaringType = std::move(declaringType);
+            property.propertyIndex = rawProperties[i].Index;
+            property.metadataBits = static_cast<uint64_t>(rawProperties[i].MetadataBits);
+            property.overridden = rawProperties[i].Overridden != FALSE;
+            if (rawProperties[i].PropertyChainIndex < sources.size())
+                property.source = sources[rawProperties[i].PropertyChainIndex];
+            output.push_back(std::move(property));
+        }
+        return S_OK;
+    }
+
+    bool ReadBackProperty(
+        TapPropertyCommand& command, const wchar_t* operation) {
+        std::vector<TapProperty> refreshedProperties;
+        std::wstring readbackError;
+        const HRESULT readbackHr = CollectPropertyChain(
+            command.object, refreshedProperties, readbackError);
+        if (FAILED(readbackHr)) {
+            command.hresult = readbackHr;
+            command.error =
+                std::wstring(operation) +
+                L" succeeded, but effective-value readback failed";
+            if (!readbackError.empty())
+                command.error += L": " + readbackError;
+            return false;
+        }
+
+        const auto refreshed = std::find_if(
+            refreshedProperties.begin(), refreshedProperties.end(),
+            [&](const TapProperty& candidate) {
+                return candidate.propertyIndex == command.propertyIndex;
+            });
+        if (refreshed == refreshedProperties.end()) {
+            command.hresult = E_FAIL;
+            command.error =
+                std::wstring(operation) +
+                L" succeeded, but the property was absent from effective-value readback";
+            return false;
+        }
+
+        command.readback = *refreshed;
+        command.hasReadback = true;
+        command.hresult = S_OK;
+        return true;
+    }
+
+    bool ValidatePropertyRoot(
+        TapPropertyCommand& command,
+        const wchar_t* operation) {
+        if (command.allowedRoots.empty()) {
+            command.hresult =
+                LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+            command.error =
+                std::wstring(operation) +
+                L" has no authorized XAML root";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(m_nodesMutex);
+        auto current = m_nodes.find(command.object);
+        if (current == m_nodes.end()) {
+            command.hresult =
+                LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+            command.error =
+                std::wstring(operation) +
+                L" target is detached or no longer tracked";
+            return false;
+        }
+
+        std::set<InstanceHandle> visited;
+        InstanceHandle root = current->first;
+        while (current->second.parent != 0) {
+            if (!visited.insert(root).second) {
+                command.hresult =
+                    LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+                command.error =
+                    std::wstring(operation) +
+                    L" target has an invalid parent cycle";
+                return false;
+            }
+            root = current->second.parent;
+            current = m_nodes.find(root);
+            if (current == m_nodes.end()) {
+                command.hresult =
+                    LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+                command.error =
+                    std::wstring(operation) +
+                    L" target has a detached parent chain";
+                return false;
+            }
+        }
+
+        if (std::find(
+                command.allowedRoots.begin(),
+                command.allowedRoots.end(),
+                root) == command.allowedRoots.end()) {
+            command.hresult =
+                LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+            command.error =
+                std::wstring(operation) +
+                L" target no longer belongs to an authorized XAML root";
+            return false;
+        }
+        return true;
+    }
+
+    void ApplyPropertyReparentForTesting(
+        const TapPropertyCommand& command) {
+        if (!command.simulateReparent)
+            return;
+
+        std::lock_guard<std::mutex> lock(m_nodesMutex);
+        auto target = m_nodes.find(command.object);
+        if (target == m_nodes.end() ||
+            target->second.parent ==
+                static_cast<InstanceHandle>(~0ull)) {
+            return;
+        }
+        const InstanceHandle oldParent =
+            target->second.parent;
+        if (oldParent != 0) {
+            auto parent = m_nodes.find(oldParent);
+            if (parent != m_nodes.end()) {
+                auto& children =
+                    parent->second.childHandles;
+                children.erase(
+                    std::remove(
+                        children.begin(), children.end(),
+                        command.object),
+                    children.end());
+            }
+        } else {
+            m_roots.erase(
+                std::remove(
+                    m_roots.begin(), m_roots.end(),
+                    command.object),
+                m_roots.end());
+        }
+
+        const InstanceHandle syntheticRoot =
+            static_cast<InstanceHandle>(~0ull);
+        TreeNode root;
+        root.handle = syntheticRoot;
+        root.type =
+            L"Microsoft.UI.Xaml.Hosting.DesktopWindowXamlSource";
+        root.parent = 0;
+        root.numChildren = 1;
+        root.childHandles.push_back(command.object);
+        m_nodes[syntheticRoot] = std::move(root);
+        target = m_nodes.find(command.object);
+        target->second.parent = syntheticRoot;
+        m_roots.push_back(syntheticRoot);
+    }
+
+    void ExecutePropertyCommand(TapPropertyCommand& command) {
+        if (!m_vts) {
+            command.hresult = E_NOINTERFACE;
+            command.error = L"IVisualTreeService is unavailable";
+            return;
+        }
+        ApplyPropertyReparentForTesting(command);
+        if (!ValidatePropertyRoot(
+                command, L"Property operation")) {
+            return;
+        }
+
+        if (command.kind == TapPropertyCommandKind::getProperties) {
+            command.hresult = CollectPropertyChain(
+                command.object, command.properties, command.error);
+            if (SUCCEEDED(command.hresult)) {
+                ValidatePropertyRoot(
+                    command, L"Property readback");
+            }
+            return;
+        }
+
+        if (command.kind == TapPropertyCommandKind::setProperty ||
+            command.kind == TapPropertyCommandKind::clearProperty) {
+            std::vector<TapProperty> currentProperties;
+            std::wstring metadataError;
+            command.hresult = CollectPropertyChain(
+                command.object, currentProperties, metadataError);
+            if (FAILED(command.hresult)) {
+                command.error = metadataError;
+                return;
+            }
+            auto property = std::find_if(
+                currentProperties.begin(), currentProperties.end(),
+                [&](const TapProperty& candidate) {
+                    return candidate.propertyIndex == command.propertyIndex;
+                });
+            if (property == currentProperties.end()) {
+                command.hresult = E_INVALIDARG;
+                command.error = L"The property descriptor is stale or does not apply to this object";
+                return;
+            }
+            if ((property->metadataBits & IsPropertyReadOnly) != 0) {
+                command.hresult = E_ACCESSDENIED;
+                command.error = L"Property mutation refused a read-only property";
+                return;
+            }
+
+            if (command.kind == TapPropertyCommandKind::clearProperty) {
+                command.hresult = m_vts->ClearProperty(
+                    command.object, command.propertyIndex);
+                if (FAILED(command.hresult)) {
+                    command.error = L"ClearProperty failed";
+                    return;
+                }
+                if (!ValidatePropertyRoot(
+                        command, L"ClearProperty readback")) {
+                    return;
+                }
+                ReadBackProperty(command, L"ClearProperty");
+                if (SUCCEEDED(command.hresult)) {
+                    ValidatePropertyRoot(
+                        command,
+                        L"ClearProperty completed readback");
+                }
+                return;
+            }
+
+            if (property->propertyType.empty()) {
+                command.hresult = E_INVALIDARG;
+                command.error = L"The dependency property's declared type is unavailable";
+                return;
+            }
+
+            if (const auto* enumType = FindEnumType(property->propertyType)) {
+                const auto canonical =
+                    lvt::detail::canonicalize_enum_member_list(
+                        command.value, enumType->members,
+                        enumType->flagsKind !=
+                            lvt::XamlEnumFlagsKind::nonFlags);
+                if (!canonical) {
+                    command.hresult = E_INVALIDARG;
+                    command.error =
+                        L"The value contains a member not present in enum type '" +
+                        property->propertyType + L"'";
+                    return;
+                }
+                command.value = *canonical;
+            }
+
+            wil::unique_bstr type(SysAllocStringLen(
+                property->propertyType.data(),
+                static_cast<UINT>(property->propertyType.size())));
+            wil::unique_bstr value(SysAllocStringLen(
+                command.value.data(), static_cast<UINT>(command.value.size())));
+            if (!type || !value) {
+                command.hresult = E_OUTOFMEMORY;
+                command.error = L"CreateInstance input allocation failed";
+                return;
+            }
+
+            InstanceHandle valueHandle = 0;
+            command.hresult = m_vts->CreateInstance(type.get(), value.get(), &valueHandle);
+            if (FAILED(command.hresult)) {
+                command.error = L"CreateInstance failed for value type '" +
+                                property->propertyType + L"' and value '" +
+                                command.value + L"'";
+                return;
+            }
+
+            command.hresult = m_vts->SetProperty(
+                command.object, valueHandle, command.propertyIndex);
+            if (FAILED(command.hresult)) {
+                command.error = L"SetProperty failed after CreateInstance succeeded";
+                return;
+            }
+            if (!ValidatePropertyRoot(
+                    command, L"SetProperty readback")) {
+                return;
+            }
+            ReadBackProperty(command, L"SetProperty");
+            if (SUCCEEDED(command.hresult)) {
+                ValidatePropertyRoot(
+                    command,
+                    L"SetProperty completed readback");
+            }
+            return;
+        }
+    }
+
+    std::wstring SerializePropertyResult(const TapPropertyCommand& command) {
+        wchar_t hrText[16];
+        swprintf_s(hrText, L"0x%08X", static_cast<unsigned int>(command.hresult));
+        const bool ok = SUCCEEDED(command.hresult);
+        std::wstring json = L"{\"type\":\"PROPERTY_RESULT\",\"commandId\":" +
+                            std::to_wstring(command.commandId) +
+                            L",\"ok\":" + (ok ? L"true" : L"false") +
+                            L",\"hresult\":\"" + hrText + L"\"";
+        if (!ok) {
+            json += L",\"error\":\"" + Escape(
+                command.error.empty() ? L"Property command failed" : command.error) + L"\"";
+        } else if (command.kind == TapPropertyCommandKind::getProperties) {
+            json += L",\"properties\":[";
+            for (size_t i = 0; i < command.properties.size(); ++i) {
+                if (i) json += L",";
+                const auto& property = command.properties[i];
+                json += L"{\"name\":\"" + Escape(property.name) +
+                        L"\",\"value\":\"" + Escape(property.value) +
+                        L"\",\"propertyType\":\"" + Escape(property.propertyType) +
+                        L"\",\"valueType\":\"" + Escape(property.valueType) +
+                        L"\",\"declaringType\":\"" + Escape(property.declaringType) +
+                        L"\",\"propertyIndex\":" + std::to_wstring(property.propertyIndex) +
+                        L",\"metadataBits\":" + std::to_wstring(property.metadataBits) +
+                        L",\"overridden\":" + (property.overridden ? L"true" : L"false") +
+                        L",\"source\":\"" + Escape(property.source) + L"\"}";
+            }
+            json += L"]";
+        } else if (command.hasReadback) {
+            json += L",\"readback\":{\"value\":\"" +
+                    Escape(command.readback.value) +
+                    L"\",\"propertyType\":\"" +
+                    Escape(command.readback.propertyType) +
+                    L"\",\"valueType\":\"" +
+                    Escape(command.readback.valueType) +
+                    L"\",\"overridden\":" +
+                    (command.readback.overridden ? L"true" : L"false") +
+                    L",\"source\":\"" +
+                    Escape(command.readback.source) + L"\"}";
+        }
+        json += L"}";
+        return json;
+    }
+
+    void WritePropertyResult(const TapPropertyCommand& command) {
+        std::wstring response = SerializePropertyResult(command);
+        int length = WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, response.data(),
+            static_cast<int>(response.size()), nullptr, 0, nullptr, nullptr);
+        if (length <= 0) {
+            LogMsg("WritePropertyResult: response was not valid UTF-16");
+            return;
+        }
+        std::string utf8(length, '\0');
+        WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, response.data(),
+            static_cast<int>(response.size()), utf8.data(), length, nullptr, nullptr);
+        WriteLine(utf8);
+    }
+
+    void HandlePropertyCommand(const std::string& line) {
+        TapPropertyCommand command;
+        std::istringstream tokens(line);
+        std::string verb;
+        std::string commandIdText;
+        std::string objectText;
+        tokens >> verb >> commandIdText >> objectText;
+
+        uint64_t object = 0;
+        if (!ParseUint64(commandIdText, command.commandId) ||
+            !ParseUint64(objectText, object) || object == 0) {
+            command.hresult = E_INVALIDARG;
+            command.error = L"Malformed property command id or object handle";
+            WritePropertyResult(command);
+            return;
+        }
+        command.object = static_cast<InstanceHandle>(object);
+
+        std::string rootsText;
+        tokens >> rootsText;
+        if (!ParseAllowedRoots(
+                rootsText, command.allowedRoots,
+                command.simulateReparent)) {
+            command.hresult = E_INVALIDARG;
+            command.error =
+                L"Malformed authorized XAML root list";
+            WritePropertyResult(command);
+            return;
+        }
+
+        if (verb == "GET_PROPERTIES") {
+            command.kind = TapPropertyCommandKind::getProperties;
+        } else {
+            std::string indexText;
+            uint64_t index = 0;
+            tokens >> indexText;
+            if (!ParseUint64(indexText, index) || index > UINT_MAX) {
+                command.hresult = E_INVALIDARG;
+                command.error = L"Malformed property index";
+                WritePropertyResult(command);
+                return;
+            }
+            command.propertyIndex = static_cast<unsigned int>(index);
+            if (verb == "SET_PROPERTY") {
+                command.kind = TapPropertyCommandKind::setProperty;
+                std::string encodedValue;
+                tokens >> encodedValue;
+                if (!DecodeHexUtf8(encodedValue, command.value)) {
+                    command.hresult = E_INVALIDARG;
+                    command.error = L"SET_PROPERTY contains an invalid UTF-8 value";
+                    WritePropertyResult(command);
+                    return;
+                }
+            } else {
+                command.kind = TapPropertyCommandKind::clearProperty;
+            }
+        }
+
+        std::string extra;
+        if (tokens >> extra) {
+            command.hresult = E_INVALIDARG;
+            command.error = L"Property command has unexpected trailing fields";
+            WritePropertyResult(command);
+            return;
+        }
+
+        if (!m_msgWnd) {
+            command.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
+            command.error = L"XAML UI-thread dispatcher is unavailable";
+        } else {
+            SendMessageW(m_msgWnd.get(), WM_PROPERTY_COMMAND, 0,
+                         reinterpret_cast<LPARAM>(&command));
+        }
+        WritePropertyResult(command);
+    }
+
+    void HandlePollEvents(const std::string& line) {
+        std::istringstream tokens(line);
+        std::string verb;
+        std::string commandIdText;
+        std::string extra;
+        uint64_t commandId = 0;
+        tokens >> verb >> commandIdText;
+        if (verb != "POLL_EVENTS" || !ParseUint64(commandIdText, commandId) ||
+            (tokens >> extra)) {
+            LogMsg("HandlePollEvents: malformed command");
+            return;
+        }
+        DrainChangeEvents();
+        WriteLine("{\"type\":\"EVENTS_RESULT\",\"commandId\":" +
+                  std::to_string(commandId) + "}");
+    }
+
+    void HandleGetEnums(const std::string& line) {
+        std::istringstream tokens(line);
+        std::string verb;
+        std::string commandIdText;
+        std::string extra;
+        uint64_t commandId = 0;
+        tokens >> verb >> commandIdText;
+        if (verb != "GET_ENUMS" || !ParseUint64(commandIdText, commandId) ||
+            (tokens >> extra)) {
+            LogMsg("HandleGetEnums: malformed command");
+            return;
+        }
+
+        if (m_enumCatalogServed) {
+            WriteLine(
+                "{\"type\":\"ENUM_RESULT\",\"commandId\":" +
+                std::to_string(commandId) +
+                ",\"ok\":false,\"error\":\"Enum catalog was already served\"}");
+            return;
+        }
+        m_enumCatalogServed = true;
+
+        std::wstring response =
+            L"{\"type\":\"ENUM_RESULT\",\"commandId\":" +
+            std::to_wstring(commandId) +
+            L",\"ok\":true,\"catalog\":[";
+        for (size_t i = 0; i < m_enumCatalog.size(); ++i) {
+            if (i)
+                response += L",";
+            const auto& type = m_enumCatalog[i];
+            response += L"{\"name\":\"" + Escape(type.name) +
+                        L"\",\"flags\":\"" +
+                        FlagsKindNameWide(type.flagsKind) +
+                        L"\"" +
+                        L",\"members\":[";
+            for (size_t j = 0; j < type.members.size(); ++j) {
+                if (j)
+                    response += L",";
+                const auto& member = type.members[j];
+                response +=
+                    L"{\"machineValue\":" +
+                    std::to_wstring(member.machineValue) +
+                    L",\"name\":\"" + Escape(member.name) + L"\"}";
+            }
+            response += L"]}";
+        }
+        response += L"]}";
+
+        int length = WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, response.data(),
+            static_cast<int>(response.size()), nullptr, 0, nullptr, nullptr);
+        if (length <= 0) {
+            LogMsg("HandleGetEnums: response was not valid UTF-16");
+            return;
+        }
+        std::string utf8(length, '\0');
+        WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, response.data(),
+            static_cast<int>(response.size()), utf8.data(), length,
+            nullptr, nullptr);
+        WriteLine(utf8);
     }
 
     DWORD AdviseThreadProcImpl() {
@@ -439,8 +1229,10 @@ public:
     void ServeConnection() {
         if (ConnectPipeOnce()) {
             WriteLine("READY");
+            m_acceptChangeEvents.store(true, std::memory_order_release);
             LogMsg("Sent READY, entering command loop");
             RunCommandLoop();
+            m_acceptChangeEvents.store(false, std::memory_order_release);
         } else {
             LogMsg("Failed to connect pipe; cannot serve requests this connection");
         }
@@ -465,6 +1257,14 @@ public:
             } else if (line->rfind("GET_TREE", 0) == 0) {
                 bool fast = line->find("FAST") != std::string::npos;
                 HandleGetTree(fast);
+            } else if (line->rfind("GET_PROPERTIES ", 0) == 0 ||
+                       line->rfind("SET_PROPERTY ", 0) == 0 ||
+                       line->rfind("CLEAR_PROPERTY ", 0) == 0) {
+                HandlePropertyCommand(*line);
+            } else if (line->rfind("POLL_EVENTS ", 0) == 0) {
+                HandlePollEvents(*line);
+            } else if (line->rfind("GET_ENUMS ", 0) == 0) {
+                HandleGetEnums(*line);
             } else {
                 LogMsg("RunCommandLoop: unknown command, ignoring");
             }
@@ -477,6 +1277,7 @@ public:
     // response, even an empty "[]", since lvt.exe blocks waiting for one.
     void HandleGetTree(bool fast) {
         m_fastMode = fast;
+        DrainChangeEvents();
 
         {
             std::lock_guard<std::mutex> lock(m_nodesMutex);
@@ -616,10 +1417,21 @@ public:
                 if (relation.Parent != 0) {
                     auto it = m_nodes.find(relation.Parent);
                     if (it != m_nodes.end()) {
-                        it->second.childHandles.push_back(element.Handle);
+                        auto& children = it->second.childHandles;
+                        children.erase(
+                            std::remove(children.begin(), children.end(), element.Handle),
+                            children.end());
+                        const auto index = std::min<size_t>(
+                            relation.ChildIndex, children.size());
+                        children.insert(children.begin() + index, element.Handle);
                     }
                 } else {
-                    m_roots.push_back(element.Handle);
+                    m_roots.erase(
+                        std::remove(m_roots.begin(), m_roots.end(), element.Handle),
+                        m_roots.end());
+                    const auto index = std::min<size_t>(
+                        relation.ChildIndex, m_roots.size());
+                    m_roots.insert(m_roots.begin() + index, element.Handle);
                 }
             } else if (isRemove) {
                 // Essential for a persistent connection, not optional: the
@@ -646,12 +1458,13 @@ public:
             }
         }
 
-        // Pushed outside m_nodesMutex (see PushChangeEvent's comment on
-        // lock ordering). Lets a connected lvt.exe eventually react to real
-        // events instead of only ever polling via GET_TREE - see
-        // IFrameworkConnection::poll_events.
+        // Queue outside m_nodesMutex. The target callback remains memory-only;
+        // the command-loop thread serializes and drains events for GET_TREE or
+        // POLL_EVENTS.
         if (isAdd || isRemove)
-            PushChangeEvent(isAdd, element.Handle, relation.Parent, relation.ChildIndex, type, name);
+            QueueChangeEvent(
+                isAdd, element.Handle, relation.Parent, relation.ChildIndex,
+                type, name);
         return S_OK;
     }
 
@@ -698,11 +1511,13 @@ private:
             wil::unique_bstr type(props[i].Type);
             wil::unique_bstr declaringType(props[i].DeclaringType);
             wil::unique_bstr valueTypeBstr(props[i].ValueType);
+            wil::unique_bstr itemType(props[i].ItemType);
             wil::unique_bstr propertyName(props[i].PropertyName);
             wil::unique_bstr propertyValue(props[i].Value);
             props[i].Type = nullptr;
             props[i].DeclaringType = nullptr;
             props[i].ValueType = nullptr;
+            props[i].ItemType = nullptr;
             props[i].PropertyName = nullptr;
             props[i].Value = nullptr;
 
@@ -749,8 +1564,12 @@ private:
         for (unsigned int i = 0; i < srcCount; i++) {
             wil::unique_bstr targetType(sources[i].TargetType);
             wil::unique_bstr sourceName(sources[i].Name);
+            wil::unique_bstr sourceFile(sources[i].SrcInfo.FileName);
+            wil::unique_bstr sourceHash(sources[i].SrcInfo.Hash);
             sources[i].TargetType = nullptr;
             sources[i].Name = nullptr;
+            sources[i].SrcInfo.FileName = nullptr;
+            sources[i].SrcInfo.Hash = nullptr;
         }
         node.hasBounds = hasWidth && hasHeight;
     }
@@ -1169,6 +1988,23 @@ static LRESULT CALLBACK LvtTapMsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         DestroyWindow(hwnd);
         return 0;
     }
+    if (msg == LvtTap::WM_PROPERTY_COMMAND) {
+        auto* command = reinterpret_cast<TapPropertyCommand*>(lParam);
+        if (command) {
+            command->hresult = E_FAIL;
+            command->error = L"Property command did not complete";
+            command->properties.clear();
+            command->hasReadback = false;
+            command->readback = {};
+            // ExecutePropertyCommand is called only here, on the message
+            // window's owning XAML UI thread.
+            auto* self = reinterpret_cast<LvtTap*>(
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            if (self)
+                self->ExecutePropertyCommand(*command);
+        }
+        return 0;
+    }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
@@ -1213,6 +2049,24 @@ HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID riid, LPVOID* p
     return factory->QueryInterface(riid, ppv);
 }
 
+// Always returns S_FALSE: this module cannot be safely unloaded mid-session.
+//
+// InitializeXamlDiagnosticsEx calls LoadLibraryEx on this DLL (refcount=1),
+// then creates an LvtTap object via DllGetClassObject and calls SetSite on it.
+// The runtime retains the resulting IObjectWithSite* COM pointer — whose vtable
+// points into this module — for the entire lifetime of the diagnostics session.
+// No public API (IXamlDiagnostics, IVisualTreeService, or the free functions in
+// xamlOM.h) provides a way to force the runtime to release that reference.
+//
+// After DISCONNECT teardown (CleanupUIResources), the runtime still holds the
+// IObjectWithSite* and will call SetSite(newSite) on it if the same endpoint is
+// reused for a subsequent lvt connection. Calling FreeLibrary here would unmap
+// this code segment, leaving the runtime's pointer dangling and crashing the
+// target on the next vtable call.
+//
+// See docs/tap-dll-design.md § "Module lifetime and why DllCanUnloadNow returns
+// S_FALSE" for the full evidence chain and the specific runtime API change that
+// would be needed to make safe unload possible.
 HRESULT STDAPICALLTYPE DllCanUnloadNow() { return S_FALSE; }
 
 BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID) {

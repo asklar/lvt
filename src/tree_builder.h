@@ -10,13 +10,15 @@
 
 namespace lvt {
 
-// Looks up an already-established, reusable connection for a given
-// framework label ("xaml"/"winui3"), instead of build_tree re-injecting a
-// fresh one-shot connection every call. Returns nullptr (or is left unset
-// entirely) to keep today's one-shot-per-call behavior - this is how a
-// one-shot CLI command (dump/query/screenshot) still works unchanged; only
-// a caller that holds a connection across many build_tree calls (watch's
-// loop, an MCP session - see connection_registry.h) supplies one.
+// Looks up an already-established, reusable connection for a provider label
+// ("win32", "comctl", "xaml", "winui3", "wpf", "winforms", or a plugin
+// name). Diagnostics providers avoid reinjection; native providers use the
+// connection for typed-property identities and schema caches. Leaving the
+// callback unset keeps one-shot dump/query/screenshot behavior. Supplying a
+// callback explicitly selects persistent behavior for capable providers: a
+// nullptr result is an incomplete refresh to reacquire, not permission to
+// silently one-shot reinject. Plugins without the complete v2 contract remain
+// one-shot for compatibility.
 //
 // Returns a raw pointer, not a shared_ptr: the callback is only ever used
 // synchronously within one build_tree call, and the caller supplying it
@@ -38,6 +40,13 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
                    int maxDepth = -1, const std::string& pluginOption = {},
                    bool fastProperties = false,
                    const ConnectionLookup& connectionLookup = {});
+
+void mark_framework_refresh_incomplete(Element& root, const std::string& framework);
+bool framework_refresh_incomplete(
+    const Element& root, const std::string& framework);
+bool has_incomplete_framework_refresh(const Element& root);
+void copy_incomplete_framework_refresh_markers(
+    const Element& source, Element& destination);
 
 // Assign deterministic element IDs (e0, e1, ...) in depth-first order.
 void assign_element_ids(Element& root);

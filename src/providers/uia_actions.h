@@ -7,6 +7,8 @@
 #include <vector>
 #include <Windows.h>
 
+struct IUIAutomation;
+
 namespace lvt {
 
 enum class ActionKind {
@@ -58,6 +60,7 @@ struct ActionRequest {
 
 struct ActionResult {
     bool ok = false;
+    std::string errorCode;
     // How the action was actually carried out — "InvokePattern",
     // "ValuePattern", "SendInput", ... Callers surface this because a pattern
     // and a synthetic click are meaningfully different outcomes.
@@ -69,6 +72,17 @@ struct ActionResult {
     bool hasElement = false;
 };
 
+enum class UiaPropertyAction {
+    setValue,
+    setRangeValue,
+    setToggleState,
+    setExpandCollapseState,
+    replaceSelection,
+    addToSelection,
+    removeFromSelection,
+    scroll,
+};
+
 // Resolve the reference against a UIA walk of the target and perform the
 // action. When `connection` is supplied, the resolve/readback/wait walks reuse
 // that persistent client; the live-element action itself still runs on the
@@ -78,9 +92,35 @@ struct ActionResult {
 // move the cursor, and work when the window is not on top. SendInput is the
 // fallback for elements that expose no suitable pattern, and it requires
 // bringing the window forward.
-ActionResult perform_action(HWND hwnd, const UiaOptions& options,
-                            const ActionRequest& request,
-                            UiaConnection* connection = nullptr);
+ActionResult perform_action(
+    const UiaTargetIdentity& identity,
+    const UiaOptions& options,
+    const ActionRequest& request,
+    UiaConnection* connection = nullptr);
+
+// Provider-owned typed property mutation on a live UIA element. The caller
+// supplies the persistent session IUIAutomation object and invokes this on its
+// MTA, so descriptor actions neither create another client nor re-walk the
+// tree. `action` is selected from an opaque descriptor, never from client input.
+PropertyMutationResult perform_uia_property_action(
+    IUIAutomation* automation,
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess,
+    const std::vector<int>& runtimeId,
+    UiaPropertyAction action, const std::string& value);
+
+// Converts the mandatory RangeValue post-set readback into the generic
+// mutation contract. A failed/non-finite readback is an explicit failure with
+// no success-shaped value because the provider's actual value is unknown.
+PropertyMutationResult uia_range_readback_result(
+    HRESULT readbackResult, double currentValue);
+
+namespace uia_property_detail {
+PropertyMutationResult pattern_operation_failure(HRESULT hresult);
+PropertyMutationResult target_validation_failure(HRESULT hresult);
+PropertyMutationResult element_resolution_failure(
+    HRESULT hresult, bool confirmedMissing);
+}
 
 // Parse an action name as accepted on the command line.
 bool parse_action_kind(const std::string& name, ActionKind& out);

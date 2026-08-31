@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cmath>
 #include "element.h"
 #include "tree_builder.h"
 #include "element_key.h"
@@ -13,16 +14,28 @@
 #include "providers/wpf_inject.h"
 #include "providers/uia_provider.h"
 #include "providers/connection_registry.h"
+#include "providers/framework_connection.h"
+#include "providers/managed_connection.h"
+#include "providers/native_message.h"
+#include "providers/native_property_connection.h"
+#include "providers/native_win_event.h"
+#include "providers/overlapped_io.h"
+#include "providers/xaml_diag_common.h"
+#include "providers/xaml_enum_catalog.h"
 #include "providers/uia_props.h"
+#include "providers/uia_property_adapter.h"
 #include "input.h"
 #include "providers/uia_actions.h"
 #include "tap/xaml_property_filter.h"
+#include "tap/bounded_event_queue.h"
+#include "tap/xaml_enum_catalog.h"
 #include <oleacc.h>
 #include <UIAutomation.h>
 #include "wil_diagnostics.h"
 #include "debug.h"
 #include <wil/result.h>
 #include <nlohmann/json.hpp>
+#include <limits>
 #include <string>
 
 using json = nlohmann::json;
@@ -171,6 +184,15 @@ TEST(JsonSerializer, ChildElements) {
     EXPECT_EQ(child["id"], "e1");
     EXPECT_EQ(child["type"], "Button");
     EXPECT_EQ(child["text"], "OK");
+}
+
+TEST(JsonSerializer, NativeHandleIsPreservedAsHex) {
+    auto root = make_test_tree();
+    root.nativeHandle = 0x1234ABCD;
+    auto result = serialize_to_json(root, (HWND)0x1234, 42, "test.exe", {"win32"});
+    auto j = json::parse(result);
+
+    EXPECT_EQ(j["root"]["nativeHandle"], "0x1234ABCD");
 }
 
 TEST(JsonSerializer, ControlCharsSanitized) {
@@ -369,6 +391,7 @@ TEST(Element, DefaultValues) {
     EXPECT_TRUE(el.properties.empty());
     EXPECT_TRUE(el.children.empty());
     EXPECT_EQ(el.nativeHandle, 0u);
+    EXPECT_TRUE(el.durableIdentity.empty());
 }
 
 namespace {
@@ -385,6 +408,17 @@ public:
 
 private:
     std::shared_ptr<int> destroyed_;
+};
+
+class ReplaceableConnection final : public IFrameworkConnection {
+public:
+    bool get_tree(Element&, bool, const std::string& = {}) override {
+        return true;
+    }
+    std::vector<ConnectionEvent> poll_events() override { return {}; }
+    bool is_alive() const override { return alive; }
+
+    bool alive = true;
 };
 
 } // namespace
@@ -404,6 +438,49 @@ TEST(ConnectionHandle, SharedSnapshotOutlivesRegistryHandle) {
 
     snapshot.reset();
     EXPECT_EQ(*destroyed, 1);
+}
+
+TEST(ConnectionHandle, StaleGenerationCannotReleaseReplacement) {
+    const DWORD pid = GetCurrentProcessId();
+    const std::string label = "unit-registry-generation";
+    auto oldConnection = std::make_shared<ReplaceableConnection>();
+    auto oldFirst = ConnectionRegistry::instance().acquire(
+        pid, nullptr, label,
+        [oldConnection](HWND, DWORD) { return oldConnection; });
+    auto oldSecond = ConnectionRegistry::instance().acquire(
+        pid, nullptr, label,
+        [](HWND, DWORD) -> std::shared_ptr<IFrameworkConnection> {
+            ADD_FAILURE() << "the second old holder should reuse the entry";
+            return nullptr;
+        });
+    ASSERT_TRUE(oldFirst);
+    ASSERT_TRUE(oldSecond);
+
+    oldConnection->alive = false;
+    auto replacement = std::make_shared<ReplaceableConnection>();
+    auto fresh = ConnectionRegistry::instance().acquire(
+        pid, nullptr, label,
+        [replacement](HWND, DWORD) { return replacement; });
+    ASSERT_TRUE(fresh);
+    ASSERT_EQ(fresh.get(), replacement.get());
+
+    oldFirst.reset();
+    oldSecond.reset();
+
+    int replacementFactories = 0;
+    auto freshSecond = ConnectionRegistry::instance().acquire(
+        pid, nullptr, label,
+        [&replacementFactories](HWND, DWORD)
+            -> std::shared_ptr<IFrameworkConnection> {
+            ++replacementFactories;
+            return std::make_shared<ReplaceableConnection>();
+        });
+    ASSERT_TRUE(freshSecond);
+    EXPECT_EQ(replacementFactories, 0);
+    EXPECT_EQ(freshSecond.get(), replacement.get());
+
+    fresh.reset();
+    freshSecond.reset();
 }
 
 // ---- Durable element keys and lookup ----
@@ -486,13 +563,13 @@ TEST(ElementKeys, XamlInstanceHandlesUseCompactProcessWideKeys) {
     panel.type = "Grid";
     panel.className = "Microsoft.UI.Xaml.Controls.Grid";
     panel.framework = "winui3";
-    panel.nativeHandle = 0x123456789ABC;
+    panel.providerHandle = UINT64_C(0x123456789ABC);
 
     Element button;
     button.type = "Button";
     button.className = "Microsoft.UI.Xaml.Controls.Button";
     button.framework = "winui3";
-    button.nativeHandle = 0xFEDCBA987654;
+    button.providerHandle = UINT64_C(0xFEDCBA987654);
     panel.children.push_back(std::move(button));
     root.children.push_back(std::move(panel));
 
@@ -502,6 +579,196 @@ TEST(ElementKeys, XamlInstanceHandlesUseCompactProcessWideKeys) {
     EXPECT_EQ(root.children[0].children[0].key, "winui3:0xFEDCBA987654");
     EXPECT_EQ(root.children[0].children[0].key.find(root.children[0].key),
               std::string::npos);
+}
+
+TEST(ElementKeys, ProcessWideProviderIdentityIsExplicitOptIn) {
+    Element xaml;
+    xaml.framework = "xaml";
+    xaml.providerHandle = 0x101;
+    EXPECT_TRUE(has_process_wide_provider_identity(xaml));
+
+    Element winui = xaml;
+    winui.framework = "winui3";
+    EXPECT_TRUE(has_process_wide_provider_identity(winui));
+
+    Element wpf = xaml;
+    wpf.framework = "wpf";
+    EXPECT_FALSE(has_process_wide_provider_identity(wpf));
+
+    xaml.providerHandle = 0;
+    EXPECT_FALSE(has_process_wide_provider_identity(xaml));
+}
+
+TEST(ElementKeys, NativeMutationHandlesAreNotDurableIdentity) {
+    Element win32;
+    win32.framework = "win32";
+    win32.providerHandle = 0x101;
+    EXPECT_FALSE(has_durable_provider_identity(win32));
+
+    Element comctl = win32;
+    comctl.framework = "comctl";
+    EXPECT_FALSE(has_durable_provider_identity(comctl));
+
+    Element wpf = win32;
+    wpf.framework = "wpf";
+    EXPECT_TRUE(has_durable_provider_identity(wpf));
+
+    Element plugin = win32;
+    plugin.framework = "fake-plugin";
+    EXPECT_TRUE(has_durable_provider_identity(plugin));
+}
+
+TEST(ElementKeys, ManagedFrameworkHandlesUseCompactSessionKeys) {
+    Element root = key_el("Window");
+
+    Element wpfButton;
+    wpfButton.type = "Button";
+    wpfButton.className = "System.Windows.Controls.Button";
+    wpfButton.framework = "wpf";
+    wpfButton.providerHandle = 0x1234;
+
+    Element winFormsButton;
+    winFormsButton.type = "Button";
+    winFormsButton.className = "System.Windows.Forms.Button";
+    winFormsButton.framework = "winforms";
+    winFormsButton.providerHandle = 0x5678;
+
+    root.children.push_back(std::move(wpfButton));
+    root.children.push_back(std::move(winFormsButton));
+    assign_element_keys(root);
+
+    EXPECT_EQ(root.children[0].key, "wpf:0x1234");
+    EXPECT_EQ(root.children[1].key, "winforms:0x5678");
+}
+
+TEST(ElementKeys, WinFormsManagedIdentitySurvivesHwndRecreation) {
+    Element original;
+    original.type = "Button";
+    original.className = "System.Windows.Forms.Button";
+    original.framework = "winforms";
+    original.providerHandle = 0x1234;
+    original.nativeHandle = 0x100;
+    assign_element_keys(original);
+
+    Element recreated = original;
+    recreated.nativeHandle = 0x200;
+    assign_element_keys(recreated);
+    EXPECT_EQ(recreated.key, original.key);
+
+    Element reusedHwnd = original;
+    reusedHwnd.providerHandle = 0x5678;
+    reusedHwnd.nativeHandle = 0x100;
+    assign_element_keys(reusedHwnd);
+    EXPECT_NE(reusedHwnd.key, original.key);
+}
+
+TEST(ElementKeys, NativeHwndKeysUsePublishedLifetimeIdentity) {
+    Element oneShot;
+    oneShot.type = "Window";
+    oneShot.className = "FixtureWindow";
+    oneShot.framework = "win32";
+    oneShot.nativeHandle = 0x1234;
+
+    Element list;
+    list.type = "ListView";
+    list.className = "SysListView32";
+    list.framework = "comctl";
+    list.nativeHandle = 0x5678;
+
+    Element item;
+    item.type = "ListViewItem";
+    item.framework = "comctl";
+    item.text = "Alpha row";
+    item.durableIdentity = "item-text:Alpha row";
+    list.children.push_back(std::move(item));
+    oneShot.children.push_back(std::move(list));
+
+    Element persistent = oneShot;
+    persistent.nativeLifetimeHandle = UINT64_C(0x123456);
+    persistent.children[0].nativeLifetimeHandle = UINT64_C(0x56789A);
+    persistent.children[0].children[0].providerHandle =
+        UINT64_C(0x8000000000000042);
+
+    assign_element_keys(oneShot);
+    assign_element_keys(persistent);
+
+    EXPECT_EQ(oneShot.key, "win32:0x1234");
+    EXPECT_EQ(oneShot.children[0].key, "comctl:0x5678");
+    EXPECT_EQ(persistent.key, "win32:0x123456");
+    EXPECT_EQ(
+        persistent.children[0].key,
+        "comctl:0x56789A");
+    EXPECT_NE(persistent.key, oneShot.key);
+    EXPECT_NE(
+        persistent.children[0].key,
+        oneShot.children[0].key);
+    EXPECT_NE(
+        persistent.children[0].children[0].key.find(
+            "identity:item-text\\:Alpha row"),
+        std::string::npos);
+    EXPECT_EQ(
+        oneShot.children[0].children[0].key.find("8000000000000042"),
+        std::string::npos);
+}
+
+TEST(ElementKeys, LogicalNativeIdentitySurvivesReorderButNotReplacement) {
+    Element list;
+    list.type = "ListView";
+    list.className = "SysListView32";
+    list.framework = "comctl";
+    list.nativeHandle = 0x5678;
+
+    Element alpha;
+    alpha.type = "ListViewItem";
+    alpha.framework = "comctl";
+    alpha.durableIdentity = "item-text:Alpha";
+    alpha.providerHandle = UINT64_C(0x8000000000000001);
+    Element beta = alpha;
+    beta.durableIdentity = "item-text:Beta";
+    beta.providerHandle = UINT64_C(0x8000000000000002);
+    list.children.push_back(alpha);
+    list.children.push_back(beta);
+    assign_element_keys(list);
+    const auto alphaKey = list.children[0].key;
+    const auto betaKey = list.children[1].key;
+
+    std::swap(list.children[0], list.children[1]);
+    list.children[0].providerHandle = UINT64_C(0x8000000000000001);
+    list.children[1].providerHandle = UINT64_C(0x8000000000000002);
+    assign_element_keys(list);
+    EXPECT_EQ(list.children[0].key, betaKey);
+    EXPECT_EQ(list.children[1].key, alphaKey);
+
+    list.children[1].durableIdentity = "item-text:Replacement";
+    assign_element_keys(list);
+    EXPECT_NE(list.children[1].key, alphaKey);
+}
+
+TEST(ElementKeys, ParsesOnlyCompactXamlInstanceKeys) {
+    CompactXamlKey key;
+    std::string error;
+    ASSERT_TRUE(parse_compact_xaml_key("xaml:0x123ABC", key, error));
+    EXPECT_EQ(key.framework, "xaml");
+    EXPECT_EQ(key.handle, 0x123ABCu);
+
+    ASSERT_TRUE(parse_compact_xaml_key("winui3:0xFEDCBA987654", key, error));
+    EXPECT_EQ(key.framework, "winui3");
+    EXPECT_EQ(key.handle, UINT64_C(0xFEDCBA987654));
+
+    ASSERT_TRUE(parse_compact_xaml_key(
+        "winui3:0xFEDCBA9876543210", key, error));
+    EXPECT_EQ(key.handle, UINT64_C(0xFEDCBA9876543210));
+
+    EXPECT_FALSE(parse_compact_xaml_key("win32|Window/winui3|Button", key, error));
+    EXPECT_NE(error.find("compact XAML/WinUI3"), std::string::npos);
+    EXPECT_FALSE(parse_compact_xaml_key("winui3:0xZZ", key, error));
+    EXPECT_FALSE(parse_compact_xaml_key("xaml:0x0", key, error));
+}
+
+TEST(ElementKeys, ProviderHandlesRemain64BitOnEveryArchitecture) {
+    static_assert(sizeof(decltype(Element::providerHandle)) == sizeof(uint64_t));
+    static_assert(sizeof(decltype(CompactXamlKey::handle)) == sizeof(uint64_t));
+    static_assert(sizeof(decltype(ConnectionEvent::handle)) == sizeof(uint64_t));
 }
 
 TEST(ElementLookup, ResolvesByIdAndDurableKey) {
@@ -596,6 +863,91 @@ TEST(WinFormsEnrichment, InvalidJsonDoesNotModifyTree) {
     EXPECT_EQ(root.type, "Window");
 }
 
+TEST(WinFormsEnrichment, PreservesManagedIdentityForControlsWithoutHwnd) {
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+    root.nativeHandle = 0x100;
+
+    ASSERT_TRUE(apply_winforms_control_json(
+        root,
+        R"([{"hwnd":"100","managedHandle":1,"type":"System.Windows.Forms.Form","children":[)"
+        R"({"managedHandle":2,"type":"System.Windows.Forms.Control","name":"windowless"})"
+        R"(]}])"));
+
+    ASSERT_EQ(root.children.size(), 1u);
+    const auto& child = root.children[0];
+    EXPECT_EQ(child.framework, "winforms");
+    EXPECT_EQ(child.nativeHandle, 0u);
+    EXPECT_EQ(child.providerHandle, 2u);
+    EXPECT_EQ(child.properties.at("managedHandle"), "0x2");
+    EXPECT_EQ(child.properties.at("handleKind"), "managed");
+}
+
+TEST(WinFormsEnrichment, HwndIndexSurvivesHandlelessChildInsertion) {
+    Element root;
+    root.type = "Window";
+    root.framework = "win32";
+    root.nativeHandle = 0x100;
+
+    Element first;
+    first.type = "Window";
+    first.framework = "win32";
+    first.nativeHandle = 0x200;
+    Element later;
+    later.type = "Window";
+    later.framework = "win32";
+    later.nativeHandle = 0x300;
+    root.children = {first, later};
+    root.children.shrink_to_fit();
+
+    ASSERT_TRUE(apply_winforms_control_json(
+        root,
+        R"([{"hwnd":"100","managedHandle":1,"type":"System.Windows.Forms.Form","children":[)"
+        R"({"hwnd":"200","managedHandle":2,"type":"System.Windows.Forms.Button","name":"first"},)"
+        R"({"managedHandle":3,"type":"System.Windows.Forms.Control","name":"handleless"},)"
+        R"({"hwnd":"300","managedHandle":4,"type":"System.Windows.Forms.Button","name":"later"})"
+        R"(]}])"));
+
+    ASSERT_EQ(root.children.size(), 3u);
+    EXPECT_EQ(root.children[0].properties.at("name"), "first");
+    EXPECT_EQ(root.children[0].providerHandle, 2u);
+    EXPECT_EQ(root.children[1].properties.at("name"), "later");
+    EXPECT_EQ(root.children[1].providerHandle, 4u);
+    EXPECT_EQ(root.children[2].properties.at("name"), "handleless");
+    EXPECT_EQ(root.children[2].providerHandle, 3u);
+}
+
+namespace {
+
+class FailingManagedTreeConnection final : public IFrameworkConnection {
+public:
+    bool get_tree(Element&, bool, const std::string& = {}) override {
+        return false;
+    }
+    std::vector<ConnectionEvent> poll_events() override { return {}; }
+    bool is_alive() const override { return true; }
+};
+
+} // namespace
+
+TEST(ManagedFrameworkCompleteness, FailedRefreshIsExplicit) {
+    FailingManagedTreeConnection connection;
+    std::vector<FrameworkInfo> frameworks{
+        {Framework::Wpf, "", "wpf"},
+        {Framework::WinForms, "", "winforms"},
+    };
+    auto tree = build_tree(
+        nullptr, GetCurrentProcessId(), frameworks, -1, {}, false,
+        [&connection](const std::string&) -> IFrameworkConnection* {
+            return &connection;
+        });
+
+    EXPECT_TRUE(framework_refresh_incomplete(tree, "wpf"));
+    EXPECT_TRUE(framework_refresh_incomplete(tree, "winforms"));
+    EXPECT_TRUE(has_incomplete_framework_refresh(tree));
+}
+
 TEST(WpfTreeJson, ZeroSizeIsMarkedRatherThanSilentlyOmitted) {
     // Before the fix, w<=0 || h<=0 meant no width/height/offset/zeroSize at
     // all: indistinguishable from PresentationSource throwing or the element
@@ -608,6 +960,17 @@ TEST(WpfTreeJson, ZeroSizeIsMarkedRatherThanSilentlyOmitted) {
     EXPECT_EQ((*roots)[0].properties["zeroSize"], "true");
     EXPECT_EQ((*roots)[0].bounds.width, 0);
     EXPECT_EQ((*roots)[0].bounds.height, 0);
+}
+
+TEST(WpfTreeJson, PreservesManagedIdentity) {
+    auto roots = lvt::wpf_parse_tree_json(
+        R"([{"managedHandle":42,"type":"System.Windows.Controls.Button"}])", "wpf");
+    ASSERT_TRUE(roots.has_value());
+    ASSERT_EQ(roots->size(), 1u);
+    EXPECT_EQ((*roots)[0].nativeHandle, 0u);
+    EXPECT_EQ((*roots)[0].providerHandle, 42u);
+    EXPECT_EQ((*roots)[0].properties.at("managedHandle"), "0x2A");
+    EXPECT_EQ((*roots)[0].properties.at("handleKind"), "managed");
 }
 
 TEST(WpfTreeJson, NonZeroBoundsAreGraftedNormally) {
@@ -696,6 +1059,20 @@ static Element diff_el(const std::string& type, const std::string& className,
     return el;
 }
 
+static Element diff_provider_el(const std::string& framework,
+                                const std::string& type,
+                                const std::string& className,
+                                uint64_t providerHandle,
+                                const std::string& text = "") {
+    Element el;
+    el.type = type;
+    el.framework = framework;
+    el.className = className;
+    el.providerHandle = providerHandle;
+    el.text = text;
+    return el;
+}
+
 TEST(WatchDiff, AddedElement) {
     auto before = diff_el("Window", "Root");
     auto after = before;
@@ -707,6 +1084,200 @@ TEST(WatchDiff, AddedElement) {
     EXPECT_EQ(events[0].type, ChangeEvent::Type::Added);
     EXPECT_EQ(events[0].path, "0.0");
     EXPECT_EQ(events[0].element.text, "OK");
+}
+
+TEST(WatchDiff, SnapshotPreservesAncestorQualifiedScopedRootKey) {
+    Element scoped = diff_el("Item", "Item", "Scoped");
+    scoped.key =
+        "win32:0x1234/fake-provider|Item|identity:scoped";
+
+    const auto events = snapshot_added_events(scoped);
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].key, scoped.key);
+    EXPECT_EQ(events[0].element.key, scoped.key);
+}
+
+TEST(WatchDiff, DurableIdentityChangeReplacesSubtreeWithFreshKeys) {
+    Element before = diff_el("Window", "Root");
+    Element alpha = diff_el("ListViewItem", "ListViewItem", "Alpha");
+    alpha.framework = "comctl";
+    alpha.durableIdentity = "item-text:alpha";
+    alpha.children.push_back(
+        diff_el("Text", "Text", "alpha child"));
+    before.children.push_back(alpha);
+    assign_element_keys(before);
+    const auto oldItemKey = before.children[0].key;
+    const auto oldChildKey = before.children[0].children[0].key;
+
+    Element after = diff_el("Window", "Root");
+    Element replacement =
+        diff_el("ListViewItem", "ListViewItem", "External replacement");
+    replacement.framework = "comctl";
+    replacement.durableIdentity = "item-text:replacement";
+    replacement.children.push_back(
+        diff_el("Text", "Text", "replacement child"));
+    after.children.push_back(replacement);
+
+    const auto events = diff_trees(before, after);
+    const auto freshItemKey = after.children[0].key;
+    const auto freshChildKey = after.children[0].children[0].key;
+    EXPECT_NE(freshItemKey, oldItemKey);
+    EXPECT_NE(freshChildKey, oldChildKey);
+
+    const auto hasEvent =
+        [&events](ChangeEvent::Type type, const std::string& key) {
+        return std::any_of(
+            events.begin(), events.end(),
+            [&](const ChangeEvent& event) {
+                return event.type == type && event.key == key;
+            });
+    };
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Removed, oldItemKey));
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Removed, oldChildKey));
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Added, freshItemKey));
+    EXPECT_TRUE(hasEvent(ChangeEvent::Type::Added, freshChildKey));
+    EXPECT_FALSE(hasEvent(ChangeEvent::Type::Changed, oldItemKey));
+}
+
+TEST(WatchDiff, ScopedRootDurableIdentityChangeReplacesWholeTree) {
+    Element before =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    before.framework = "comctl";
+    before.durableIdentity = "item-text:alpha";
+    before.children.push_back(
+        diff_el("Text", "Text", "old child"));
+    assign_element_keys(before);
+    const auto oldRootKey = before.key;
+    const auto oldChildKey = before.children[0].key;
+
+    Element after =
+        diff_el("ListViewItem", "ListViewItem", "Replacement");
+    after.framework = "comctl";
+    after.durableIdentity = "item-text:replacement";
+    after.children.push_back(
+        diff_el("Text", "Text", "new child"));
+
+    const auto events = diff_trees(before, after);
+    ASSERT_EQ(events.size(), 4u);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Removed);
+    EXPECT_EQ(events[0].key, oldRootKey);
+    EXPECT_EQ(events[1].type, ChangeEvent::Type::Removed);
+    EXPECT_EQ(events[1].key, oldChildKey);
+    EXPECT_EQ(events[2].type, ChangeEvent::Type::Added);
+    EXPECT_EQ(events[2].key, after.key);
+    EXPECT_EQ(events[3].type, ChangeEvent::Type::Added);
+    EXPECT_EQ(events[3].key, after.children[0].key);
+}
+
+TEST(WatchDiff, DurableIdentityAmbiguityDoesNotFallBackToSlots) {
+    Element before = diff_el("Window", "Root");
+    Element original =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    original.framework = "comctl";
+    original.durableIdentity = "item-text:alpha";
+    before.children.push_back(original);
+    assign_element_keys(before);
+    const auto oldKey = before.children[0].key;
+
+    Element after = diff_el("Window", "Root");
+    Element first = original;
+    first.key.clear();
+    Element second = first;
+    after.children = {first, second};
+
+    const auto events = diff_trees(before, after);
+    ASSERT_EQ(after.children.size(), 2u);
+    EXPECT_NE(after.children[0].key, oldKey);
+    EXPECT_NE(after.children[1].key, oldKey);
+    EXPECT_NE(after.children[0].key, after.children[1].key);
+
+    const auto removedOld = std::count_if(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Removed &&
+                   event.key == oldKey;
+        });
+    const auto addedFresh = std::count_if(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Added &&
+                   (event.key == after.children[0].key ||
+                    event.key == after.children[1].key);
+        });
+    EXPECT_EQ(removedOld, 1);
+    EXPECT_EQ(addedFresh, 2);
+}
+
+TEST(WatchDiff, DuplicateTransitionWithholdsOldDurableKey) {
+    Element before = diff_el("Window", "Root");
+    Element original =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    original.framework = "comctl";
+    original.durableIdentity = "item-text:alpha";
+    before.children.push_back(original);
+    assign_element_keys(before);
+    const auto oldKey = before.children[0].key;
+
+    Element after = diff_el("Window", "Root");
+    Element first =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    first.framework = "comctl";
+    Element second = first;
+    after.children = {first, second};
+
+    const auto events = diff_trees(before, after);
+    EXPECT_TRUE(std::any_of(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Removed &&
+                   event.key == oldKey;
+        }));
+    EXPECT_EQ(
+        std::count_if(
+            events.begin(), events.end(),
+            [&](const ChangeEvent& event) {
+                return event.type == ChangeEvent::Type::Added &&
+                       event.key != oldKey;
+            }),
+        2);
+    EXPECT_TRUE(std::none_of(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type != ChangeEvent::Type::Removed &&
+                   event.key == oldKey;
+        }));
+}
+
+TEST(WatchDiff, MissingDurableIdentityDoesNotInheritOldKey) {
+    Element before = diff_el("Window", "Root");
+    Element original =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    original.framework = "comctl";
+    original.durableIdentity = "item-text:alpha";
+    before.children.push_back(original);
+    assign_element_keys(before);
+    const auto oldKey = before.children[0].key;
+
+    Element after = diff_el("Window", "Root");
+    Element unverified =
+        diff_el("ListViewItem", "ListViewItem", "Alpha");
+    unverified.framework = "comctl";
+    after.children.push_back(unverified);
+
+    const auto events = diff_trees(before, after);
+    EXPECT_NE(after.children[0].key, oldKey);
+    EXPECT_TRUE(std::any_of(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Removed &&
+                   event.key == oldKey;
+        }));
+    EXPECT_TRUE(std::any_of(
+        events.begin(), events.end(),
+        [&](const ChangeEvent& event) {
+            return event.type == ChangeEvent::Type::Added &&
+                   event.key == after.children[0].key;
+        }));
 }
 
 TEST(WatchDiff, RemovedElement) {
@@ -756,20 +1327,16 @@ TEST(WatchDiff, MovedElement) {
 
     auto events = diff_trees(before, after);
 
-    // Reparenting shows up as Removed (old key) + Added (new key), not a
-    // single Changed/path event, and that is a deliberate trade-off, not a
-    // gap: assign_element_keys (the one, single key algorithm this and
-    // dump/query/UIA output all share — see its doc comment in
-    // element_key.h) always threads the full parent chain into every
-    // element's key, precisely because that per-parent locality is what
-    // keeps an unrelated change elsewhere in the tree from ever touching
-    // this element's key at all (see the
+    // A structural Win32 element without a process-wide provider identity
+    // still shows reparenting as Removed (old key) + Added (new key):
+    // assign_element_keys (the one, single key algorithm this and dump/query/
+    // UIA output all share — see its doc comment in element_key.h) threads
+    // the full parent chain into this element's key, precisely because that
+    // per-parent locality is what keeps an unrelated change elsewhere in the
+    // tree from ever touching this element's key at all (see the
     // DuplicateIdentityElsewhereDoesNotDestabilizeUnrelatedSubtree test
-    // right below). Reparenting inherently changes that chain, so the key
-    // changes with it — for any element, named or not. The information
-    // itself is still fully accurate (Button really did stop existing at
-    // its old position and start existing at its new one); it is just
-    // conveyed as two events instead of a single, more elegant one.
+    // right below). Reparenting changes that chain, so without a stronger
+    // provider contract the information is correctly conveyed as two events.
     //
     // Checked by type+path rather than by vector index/order: diff_trees
     // emits all Added events before all Removed events (see its own
@@ -785,6 +1352,230 @@ TEST(WatchDiff, MovedElement) {
     };
     EXPECT_TRUE(hasEvent(ChangeEvent::Type::Removed, "0.1"));
     EXPECT_TRUE(hasEvent(ChangeEvent::Type::Added, "0.0.0"));
+}
+
+TEST(WatchDiff, ProcessWideProviderHandleReparentsFromEarlierToLaterParent) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(diff_provider_el(
+        "xaml", "Button", "Windows.UI.Xaml.Controls.Button", 0xA01, "Move"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(diff_provider_el(
+        "xaml", "Button", "Windows.UI.Xaml.Controls.Button", 0xA01, "Move"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Changed);
+    EXPECT_EQ(events[0].key, "xaml:0xA01");
+    EXPECT_EQ(events[0].path, "0.1.0");
+    ASSERT_TRUE(events[0].fields.count("path"));
+    EXPECT_EQ(events[0].fields["path"].oldValue, "0.0.0");
+    EXPECT_EQ(events[0].fields["path"].newValue, "0.1.0");
+    EXPECT_EQ(after.children[1].children[0].key,
+              before.children[0].children[0].key);
+}
+
+TEST(WatchDiff, ProcessWideProviderHandleReparentsFromLaterToEarlierParent) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[1].children.push_back(diff_provider_el(
+        "winui3", "Button", "Microsoft.UI.Xaml.Controls.Button", 0xB01, "Move"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[0].children.push_back(diff_provider_el(
+        "winui3", "Button", "Microsoft.UI.Xaml.Controls.Button", 0xB01, "Move"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Changed);
+    EXPECT_EQ(events[0].key, "winui3:0xB01");
+    EXPECT_EQ(events[0].path, "0.0.0");
+    ASSERT_TRUE(events[0].fields.count("path"));
+    EXPECT_EQ(events[0].fields["path"].oldValue, "0.1.0");
+    EXPECT_EQ(events[0].fields["path"].newValue, "0.0.0");
+}
+
+TEST(WatchDiff, SamePathDifferentParentEmitsExplicitRelocation) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "OldPanel"));
+    before.children[0].children.push_back(diff_provider_el(
+        "winui3", "Button", "Microsoft.UI.Xaml.Controls.Button", 0xB02, "Move"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "NewPanel"));
+    after.children[0].children.push_back(diff_provider_el(
+        "winui3", "Button", "Microsoft.UI.Xaml.Controls.Button", 0xB02, "Move"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 3u);
+    EXPECT_EQ(events[0].type, ChangeEvent::Type::Added);
+    EXPECT_EQ(events[0].path, "0.0");
+    EXPECT_EQ(events[1].type, ChangeEvent::Type::Changed);
+    EXPECT_EQ(events[1].key, "winui3:0xB02");
+    EXPECT_EQ(events[1].path, "0.0.0");
+    EXPECT_FALSE(events[1].fields.count("path"));
+    ASSERT_TRUE(events[1].fields.count("parentKey"));
+    EXPECT_EQ(events[1].fields.at("parentKey").oldValue,
+              "win32|Root/win32|OldPanel");
+    EXPECT_EQ(events[1].fields.at("parentKey").newValue,
+              "win32|Root/win32|NewPanel");
+    EXPECT_EQ(events[2].type, ChangeEvent::Type::Removed);
+    EXPECT_EQ(events[2].path, "0.0");
+
+    auto serialized = json::parse(serialize_change_event(events[1]));
+    EXPECT_EQ(serialized["path"], "0.0.0");
+    EXPECT_EQ(serialized["fields"]["parentKey"]["old"],
+              "win32|Root/win32|OldPanel");
+    EXPECT_EQ(serialized["fields"]["parentKey"]["new"],
+              "win32|Root/win32|NewPanel");
+}
+
+TEST(WatchDiff, ReparentedProviderSubtreeIsReconciledExactlyOnce) {
+    auto makeSubtree = [] {
+        auto root = diff_provider_el(
+            "winui3", "Grid", "Microsoft.UI.Xaml.Controls.Grid", 0xC01);
+        auto child = diff_provider_el(
+            "winui3", "Border", "Microsoft.UI.Xaml.Controls.Border", 0xC02);
+        child.children.push_back(diff_provider_el(
+            "winui3", "TextBlock", "Microsoft.UI.Xaml.Controls.TextBlock",
+            0xC03, "Stable"));
+        root.children.push_back(std::move(child));
+        return root;
+    };
+
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(makeSubtree());
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(makeSubtree());
+    after.children[1].children[0].children[0].children[0].text = "Updated";
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 3u);
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Added ||
+               event.type == ChangeEvent::Type::Removed;
+    }));
+
+    const std::map<std::string, std::pair<std::string, std::string>> expectedPaths{
+        {"winui3:0xC01", {"0.0.0", "0.1.0"}},
+        {"winui3:0xC02", {"0.0.0.0", "0.1.0.0"}},
+        {"winui3:0xC03", {"0.0.0.0.0", "0.1.0.0.0"}},
+    };
+    for (const auto& [key, paths] : expectedPaths) {
+        auto matches = std::count_if(events.begin(), events.end(), [&](const auto& event) {
+            return event.key == key;
+        });
+        EXPECT_EQ(matches, 1) << key << " was reconciled more than once";
+        auto event = std::find_if(events.begin(), events.end(), [&](const auto& candidate) {
+            return candidate.key == key;
+        });
+        ASSERT_NE(event, events.end());
+        ASSERT_TRUE(event->fields.count("path"));
+        EXPECT_EQ(event->fields.at("path").oldValue, paths.first);
+        EXPECT_EQ(event->fields.at("path").newValue, paths.second);
+    }
+    auto leaf = std::find_if(events.begin(), events.end(), [](const auto& event) {
+        return event.key == "winui3:0xC03";
+    });
+    ASSERT_NE(leaf, events.end());
+    ASSERT_TRUE(leaf->fields.count("text"));
+    EXPECT_EQ(leaf->fields.at("text").oldValue, "Stable");
+    EXPECT_EQ(leaf->fields.at("text").newValue, "Updated");
+}
+
+TEST(WatchDiff, RecycledIncompatibleProviderHandleIsNotGloballyMatched) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(diff_provider_el(
+        "xaml", "Button", "Windows.UI.Xaml.Controls.Button", 0xD01, "Old"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(diff_provider_el(
+        "xaml", "TextBlock", "Windows.UI.Xaml.Controls.TextBlock", 0xD01, "New"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Changed;
+    }));
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Added;
+    }), 1);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Removed;
+    }), 1);
+}
+
+TEST(WatchDiff, DuplicateProviderHandlesAreNotGloballyMatched) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(diff_provider_el(
+        "winui3", "Item", "Microsoft.UI.Xaml.Controls.Item", 0xE01, "One"));
+    before.children[0].children.push_back(diff_provider_el(
+        "winui3", "Item", "Microsoft.UI.Xaml.Controls.Item", 0xE01, "Two"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(diff_provider_el(
+        "winui3", "Item", "Microsoft.UI.Xaml.Controls.Item", 0xE01, "One"));
+    after.children[1].children.push_back(diff_provider_el(
+        "winui3", "Item", "Microsoft.UI.Xaml.Controls.Item", 0xE01, "Two"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 4u);
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Changed;
+    }));
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Added;
+    }), 2);
+    EXPECT_EQ(std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Removed;
+    }), 2);
+}
+
+TEST(WatchDiff, ProviderHandleWithoutProcessWideContractIsNotGloballyMatched) {
+    auto before = diff_el("Window", "Root");
+    before.children.push_back(diff_el("Pane", "Earlier"));
+    before.children.push_back(diff_el("Pane", "Later"));
+    before.children[0].children.push_back(diff_provider_el(
+        "wpf", "Button", "System.Windows.Controls.Button", 0xF01, "Move"));
+
+    auto after = diff_el("Window", "Root");
+    after.children.push_back(diff_el("Pane", "Earlier"));
+    after.children.push_back(diff_el("Pane", "Later"));
+    after.children[1].children.push_back(diff_provider_el(
+        "wpf", "Button", "System.Windows.Controls.Button", 0xF01, "Move"));
+
+    auto events = diff_trees(before, after);
+
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Changed;
+    }));
 }
 
 TEST(WatchDiff, DuplicateIdentityElsewhereDoesNotDestabilizeUnrelatedSubtree) {
@@ -881,6 +1672,7 @@ TEST(WatchDiff, AncestorSiblingChurnDoesNotDestabilizeStableDescendants) {
         EXPECT_NE(event.type, ChangeEvent::Type::Removed)
             << "an ancestor's own index shift destabilized a stable descendant (reported as Removed)";
     }
+
     bool sawTrackedCardMove = std::any_of(events.begin(), events.end(), [](const ChangeEvent& e) {
         return e.type == ChangeEvent::Type::Changed &&
                e.fields.count("path") &&
@@ -889,17 +1681,289 @@ TEST(WatchDiff, AncestorSiblingChurnDoesNotDestabilizeStableDescendants) {
     EXPECT_TRUE(sawTrackedCardMove) << "expected the tracked card to be recognized as moved, not replaced";
 }
 
+TEST(WatchDiff, ProviderHandlesAbove32BitsSurviveSiblingReordering) {
+    Element before = diff_el("Window", "Root");
+    Element first = diff_provider_el(
+        "fake-provider", "Item", "Item",
+        UINT64_C(0x100000001), "First");
+    Element second = diff_provider_el(
+        "fake-provider", "Item", "Item",
+        UINT64_C(0x200000001), "Second");
+    before.children = {first, second};
+
+    Element after = diff_el("Window", "Root");
+    after.children = {second, first};
+
+    auto events = diff_trees(before, after);
+
+    EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const auto& event) {
+        return event.type == ChangeEvent::Type::Added ||
+               event.type == ChangeEvent::Type::Removed;
+    }));
+    EXPECT_NE(after.children[0].key.find("200000001"), std::string::npos);
+    EXPECT_NE(after.children[1].key.find("100000001"), std::string::npos);
+}
+
+TEST(BoundedEventQueue, OverflowRequiresSnapshotAndRecoversAfterDrain) {
+    BoundedEventQueue<int, 2> queue;
+    queue.push(1);
+    queue.push(2);
+    queue.push(3);
+
+    auto overflow = queue.drain();
+    EXPECT_TRUE(overflow.snapshotRequired);
+    EXPECT_TRUE(overflow.events.empty());
+
+    queue.push(4);
+    auto recovered = queue.drain();
+    EXPECT_FALSE(recovered.snapshotRequired);
+    ASSERT_EQ(recovered.events.size(), 1u);
+    EXPECT_EQ(recovered.events[0], 4);
+}
+
+TEST(UiaEventSnapshotHint, BurstCoalescesAndStopRejectsLaterCallbacks) {
+    lvt::uia_eventing_detail::SnapshotHint hint;
+    for (int i = 0; i < 10000; ++i)
+        hint.signal();
+
+    EXPECT_TRUE(hint.consume());
+    EXPECT_FALSE(hint.consume());
+
+    hint.stop();
+    hint.signal();
+    EXPECT_FALSE(hint.consume());
+}
+
+TEST(UiaEventSubscriptions, CoverTreeSchemaAndTypedPropertyState) {
+    const auto& properties =
+        lvt::uia_eventing_detail::subscribed_property_ids();
+    const auto has_property = [&](long id) {
+        return std::find(properties.begin(), properties.end(), id) !=
+               properties.end();
+    };
+
+    EXPECT_TRUE(has_property(UIA_NamePropertyId));
+    EXPECT_TRUE(has_property(UIA_BoundingRectanglePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsOffscreenPropertyId));
+    EXPECT_TRUE(has_property(UIA_IsEnabledPropertyId));
+    EXPECT_TRUE(has_property(UIA_IsValuePatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_ValueValuePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsRangeValuePatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_RangeValueValuePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsTogglePatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_ToggleToggleStatePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsExpandCollapsePatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_ExpandCollapseExpandCollapseStatePropertyId));
+    EXPECT_TRUE(has_property(UIA_IsSelectionPatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_SelectionItemIsSelectedPropertyId));
+    EXPECT_TRUE(has_property(UIA_IsScrollPatternAvailablePropertyId));
+    EXPECT_TRUE(has_property(UIA_ScrollVerticalScrollPercentPropertyId));
+
+    const auto& events =
+        lvt::uia_eventing_detail::subscribed_automation_event_ids();
+    EXPECT_NE(
+        std::find(
+            events.begin(), events.end(),
+            UIA_SelectionItem_ElementSelectedEventId),
+        events.end());
+    EXPECT_NE(
+        std::find(events.begin(), events.end(), UIA_Text_TextChangedEventId),
+        events.end());
+}
+
+TEST(NativeWinEventQueue, BurstOverflowIsBoundedAndRecoversAfterDrain) {
+    using namespace lvt::native_eventing_detail;
+    NativeWinEventQueue<4> queue;
+    const NativeWinEventRecord event{
+        EVENT_OBJECT_REORDER,
+        reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1234)),
+        OBJID_CLIENT,
+        CHILDID_SELF};
+
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_FALSE(queue.push(event));
+
+    size_t drainedCount = 0;
+    EXPECT_TRUE(queue.drain(
+        [&](const NativeWinEventRecord&) noexcept {
+            ++drainedCount;
+        }));
+    EXPECT_EQ(drainedCount, 4u);
+
+    drainedCount = 0;
+    EXPECT_TRUE(queue.push(event));
+    EXPECT_FALSE(queue.drain(
+        [&](const NativeWinEventRecord&) noexcept {
+            ++drainedCount;
+        }));
+    EXPECT_EQ(drainedCount, 1u);
+}
+
+TEST(NativeWinEventRootLifecycle, OnlyTheRootWindowObjectMarksTheRootDestroyed) {
+    using namespace lvt::native_eventing_detail;
+    const HWND root =
+        reinterpret_cast<HWND>(static_cast<uintptr_t>(0x1234));
+    const HWND other =
+        reinterpret_cast<HWND>(static_cast<uintptr_t>(0x5678));
+
+    EXPECT_FALSE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_CLIENT, 1},
+        true));
+    EXPECT_FALSE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_WINDOW, 1},
+        false));
+    EXPECT_FALSE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_CLIENT, CHILDID_SELF},
+        true));
+    EXPECT_TRUE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_WINDOW, CHILDID_SELF},
+        true));
+    EXPECT_TRUE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, root, OBJID_CLIENT, CHILDID_SELF},
+        false));
+    EXPECT_FALSE(event_destroys_root_window(
+        root,
+        {EVENT_OBJECT_DESTROY, other, OBJID_WINDOW, CHILDID_SELF},
+        false));
+}
+
+TEST(OverlappedIo, CancellationCompletesBeforeStackStorageIsReleased) {
+    const auto pipeName =
+        std::wstring(L"\\\\.\\pipe\\lvt_overlapped_test_") +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64());
+    wil::unique_hfile server(CreateNamedPipeW(
+        pipeName.c_str(),
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 64, 64, 0, nullptr));
+    ASSERT_TRUE(server);
+
+    wil::unique_event connectEvent(
+        CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ASSERT_TRUE(connectEvent);
+    OVERLAPPED connectOv{};
+    connectOv.hEvent = connectEvent.get();
+    ASSERT_FALSE(ConnectNamedPipe(server.get(), &connectOv));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    wil::unique_hfile client(CreateFileW(
+        pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        OPEN_EXISTING, 0, nullptr));
+    ASSERT_TRUE(client);
+    ASSERT_EQ(WaitForSingleObject(connectEvent.get(), 5000), WAIT_OBJECT_0);
+    DWORD connectedBytes = 0;
+    ASSERT_TRUE(GetOverlappedResult(
+        server.get(), &connectOv, &connectedBytes, FALSE));
+
+    char buffer[8]{};
+    wil::unique_event readEvent(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    ASSERT_TRUE(readEvent);
+    OVERLAPPED readOv{};
+    readOv.hEvent = readEvent.get();
+    DWORD bytesRead = 0;
+    ASSERT_FALSE(ReadFile(
+        server.get(), buffer, sizeof(buffer), &bytesRead, &readOv));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    detail::cancel_and_complete_overlapped(server.get(), readOv);
+
+    SetLastError(ERROR_SUCCESS);
+    EXPECT_FALSE(GetOverlappedResult(
+        server.get(), &readOv, &bytesRead, FALSE));
+    EXPECT_EQ(GetLastError(), ERROR_OPERATION_ABORTED);
+}
+
+TEST(OverlappedIo, PendingConnectCancellationIsDrained) {
+    const auto pipeName =
+        std::wstring(L"\\\\.\\pipe\\lvt_connect_cancel_") +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64());
+    wil::unique_hfile pipe(CreateNamedPipeW(
+        pipeName.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 64, 64, 0, nullptr));
+    ASSERT_TRUE(pipe);
+    wil::unique_event event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    OVERLAPPED overlapped{};
+    overlapped.hEvent = event.get();
+    ASSERT_FALSE(ConnectNamedPipe(pipe.get(), &overlapped));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    detail::cancel_and_complete_overlapped(pipe.get(), overlapped);
+
+    DWORD transferred = 0;
+    EXPECT_FALSE(GetOverlappedResult(
+        pipe.get(), &overlapped, &transferred, FALSE));
+    EXPECT_EQ(GetLastError(), ERROR_OPERATION_ABORTED);
+}
+
+TEST(OverlappedIo, PendingWriteCancellationIsDrained) {
+    const auto pipeName =
+        std::wstring(L"\\\\.\\pipe\\lvt_write_cancel_") +
+        std::to_wstring(GetCurrentProcessId()) + L"_" +
+        std::to_wstring(GetTickCount64());
+    wil::unique_hfile server(CreateNamedPipeW(
+        pipeName.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 1, 1, 0, nullptr));
+    ASSERT_TRUE(server);
+    wil::unique_event connectEvent(
+        CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    OVERLAPPED connectOv{};
+    connectOv.hEvent = connectEvent.get();
+    ASSERT_FALSE(ConnectNamedPipe(server.get(), &connectOv));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+    wil::unique_hfile client(CreateFileW(
+        pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        OPEN_EXISTING, 0, nullptr));
+    ASSERT_TRUE(client);
+    ASSERT_EQ(WaitForSingleObject(connectEvent.get(), 5000), WAIT_OBJECT_0);
+    DWORD connected = 0;
+    ASSERT_TRUE(GetOverlappedResult(
+        server.get(), &connectOv, &connected, FALSE));
+
+    std::vector<char> payload(1024 * 1024, 'x');
+    wil::unique_event writeEvent(
+        CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    OVERLAPPED writeOv{};
+    writeOv.hEvent = writeEvent.get();
+    DWORD written = 0;
+    ASSERT_FALSE(WriteFile(
+        server.get(), payload.data(), static_cast<DWORD>(payload.size()),
+        &written, &writeOv));
+    ASSERT_EQ(GetLastError(), ERROR_IO_PENDING);
+
+    detail::cancel_and_complete_overlapped(server.get(), writeOv);
+
+    EXPECT_FALSE(GetOverlappedResult(
+        server.get(), &writeOv, &written, FALSE));
+    EXPECT_EQ(GetLastError(), ERROR_OPERATION_ABORTED);
+}
+
 TEST(WatchDiff, SerializeChangedEvent) {
     ChangeEvent event;
     event.type = ChangeEvent::Type::Changed;
     event.key = "win32|Button|Button";
-    event.path = "0.0";
+    event.path = "0.1.0";
     event.fields["text"] = {"OK", "Cancel"};
+    event.fields["path"] = {"0.0", "0.1.0"};
 
     auto j = json::parse(serialize_change_event(event));
     EXPECT_EQ(j["event"], "changed");
+    EXPECT_EQ(j["path"], "0.1.0");
     EXPECT_EQ(j["fields"]["text"]["old"], "OK");
     EXPECT_EQ(j["fields"]["text"]["new"], "Cancel");
+    EXPECT_EQ(j["fields"]["path"]["old"], "0.0");
+    EXPECT_EQ(j["fields"]["path"]["new"], "0.1.0");
 }
 
 // ---- Large tree serialization ----
@@ -1010,6 +2074,308 @@ static LoadedPlugin make_mock_plugin() {
 
 static PluginFrameworkInfo make_mock_fw(const LoadedPlugin* p) {
     return {"mock", "", p};
+}
+
+namespace {
+
+struct PersistentPluginMockState {
+    enum class EventMode {
+        normal,
+        oversized,
+        nullPointer,
+        shortStruct,
+        unknownMutation,
+    };
+
+    int opens = 0;
+    int gets = 0;
+    int polls = 0;
+    int frees = 0;
+    int eventFrees = 0;
+    int closes = 0;
+    int failGetAt = 0;
+    std::string treeJson = "[]";
+    std::string filter;
+    EventMode eventMode = EventMode::normal;
+};
+
+PersistentPluginMockState s_persistentPlugin;
+
+void* persistent_mock_open(HWND, DWORD) {
+    ++s_persistentPlugin.opens;
+    return &s_persistentPlugin;
+}
+
+int persistent_mock_get_tree(void*, const char* filter, char** jsonOut) {
+    const int call = ++s_persistentPlugin.gets;
+    s_persistentPlugin.filter = filter ? filter : "";
+    if (call == s_persistentPlugin.failGetAt)
+        return 0;
+    *jsonOut = _strdup(s_persistentPlugin.treeJson.c_str());
+    return *jsonOut != nullptr;
+}
+
+int persistent_mock_poll(
+    void*, LvtConnectionEvent** eventsOut, uint32_t* countOut) {
+    ++s_persistentPlugin.polls;
+    if (s_persistentPlugin.eventMode ==
+        PersistentPluginMockState::EventMode::nullPointer) {
+        *eventsOut = nullptr;
+        *countOut = 1;
+        return 1;
+    }
+    auto* events = static_cast<LvtConnectionEvent*>(
+        malloc(sizeof(LvtConnectionEvent)));
+    if (!events)
+        return 0;
+    *events = {
+        s_persistentPlugin.eventMode ==
+                PersistentPluginMockState::EventMode::shortStruct
+            ? sizeof(uint32_t)
+            : sizeof(LvtConnectionEvent),
+        s_persistentPlugin.eventMode ==
+                PersistentPluginMockState::EventMode::unknownMutation
+            ? "replace"
+            : "remove",
+        42, 7, 3, nullptr, nullptr};
+    *eventsOut = events;
+    *countOut =
+        s_persistentPlugin.eventMode ==
+                PersistentPluginMockState::EventMode::oversized
+            ? 10001
+            : 1;
+    return 1;
+}
+
+void persistent_mock_free(void* pointer) {
+    ++s_persistentPlugin.frees;
+    free(pointer);
+}
+
+void persistent_mock_events_free(
+    LvtConnectionEvent* events, uint32_t) {
+    ++s_persistentPlugin.eventFrees;
+    free(events);
+}
+
+void persistent_mock_close(void*) {
+    ++s_persistentPlugin.closes;
+}
+
+LoadedPlugin make_persistent_mock_plugin() {
+    LoadedPlugin plugin{};
+    plugin.info = &s_mockInfo;
+    plugin.enrich = mock_enrich;
+    plugin.free_fn = persistent_mock_free;
+    plugin.connection_open = persistent_mock_open;
+    plugin.connection_get_tree = persistent_mock_get_tree;
+    plugin.connection_poll_events = persistent_mock_poll;
+    plugin.connection_events_free = persistent_mock_events_free;
+    plugin.connection_close = persistent_mock_close;
+    return plugin;
+}
+
+} // namespace
+
+TEST(PluginConnectionContract, RequiresCompleteLifetimeAndPollingGroups) {
+    auto plugin = make_persistent_mock_plugin();
+    EXPECT_TRUE(plugin_supports_persistent_connections(plugin));
+    EXPECT_TRUE(plugin_supports_event_polling(plugin));
+
+    plugin.connection_close = nullptr;
+    EXPECT_FALSE(plugin_supports_persistent_connections(plugin));
+    plugin.connection_close = persistent_mock_close;
+    plugin.free_fn = nullptr;
+    EXPECT_FALSE(plugin_supports_persistent_connections(plugin));
+
+    plugin = make_persistent_mock_plugin();
+    plugin.connection_events_free = nullptr;
+    EXPECT_FALSE(plugin_supports_event_polling(plugin));
+    EXPECT_TRUE(plugin_supports_persistent_connections(plugin));
+}
+
+TEST(PluginConnectionContract, AdapterReusesTreeOptionPollsAndClosesOnce) {
+    s_persistentPlugin = {};
+    auto plugin = make_persistent_mock_plugin();
+    auto connection =
+        open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+    ASSERT_NE(connection, nullptr);
+    EXPECT_EQ(s_persistentPlugin.opens, 1);
+
+    Element root;
+    EXPECT_TRUE(connection->get_tree(root, false, "title:Dashboard"));
+    EXPECT_TRUE(connection->get_tree(root, true, "url:*example*"));
+    EXPECT_EQ(s_persistentPlugin.gets, 2);
+    EXPECT_EQ(s_persistentPlugin.frees, 2);
+    EXPECT_EQ(s_persistentPlugin.filter, "url:*example*");
+
+    const auto events = connection->poll_events();
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].mutation, ConnectionEvent::Mutation::removed);
+    EXPECT_EQ(events[0].handle, 42u);
+    EXPECT_EQ(events[0].parentHandle, 7u);
+    EXPECT_EQ(events[0].childIndex, 3);
+    EXPECT_EQ(s_persistentPlugin.polls, 1);
+    EXPECT_EQ(s_persistentPlugin.eventFrees, 1);
+
+    connection.reset();
+    EXPECT_EQ(s_persistentPlugin.closes, 1);
+}
+
+TEST(PluginConnectionContract, FailedRefreshMarksConnectionDead) {
+    s_persistentPlugin = {};
+    s_persistentPlugin.failGetAt = 1;
+    auto plugin = make_persistent_mock_plugin();
+    auto connection =
+        open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+    ASSERT_NE(connection, nullptr);
+
+    Element root;
+    EXPECT_FALSE(connection->get_tree(root, false));
+    EXPECT_FALSE(connection->is_alive());
+    connection.reset();
+    EXPECT_EQ(s_persistentPlugin.closes, 1);
+}
+
+TEST(PluginConnectionContract, MalformedTreesAreFreedAndMarkConnectionDead) {
+    for (const char* malformed : {
+             "42",
+             R"([{"children":{}}])",
+             R"([{"offsetX":"left"}])",
+             "{not-json",
+         }) {
+        SCOPED_TRACE(malformed);
+        s_persistentPlugin = {};
+        s_persistentPlugin.treeJson = malformed;
+        auto plugin = make_persistent_mock_plugin();
+        auto connection =
+            open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+        ASSERT_NE(connection, nullptr);
+
+        Element root;
+        EXPECT_FALSE(connection->get_tree(root, false));
+        EXPECT_FALSE(connection->is_alive());
+        EXPECT_TRUE(root.children.empty());
+        EXPECT_EQ(s_persistentPlugin.frees, 1);
+        connection.reset();
+        EXPECT_EQ(s_persistentPlugin.closes, 1);
+    }
+}
+
+TEST(PluginConnectionContract, OversizedTreeIsRejectedBeforeGrafting) {
+    s_persistentPlugin = {};
+    s_persistentPlugin.treeJson.reserve(300005);
+    s_persistentPlugin.treeJson = "[";
+    for (int i = 0; i < 100001; ++i) {
+        if (i > 0)
+            s_persistentPlugin.treeJson += ",";
+        s_persistentPlugin.treeJson += "{}";
+    }
+    s_persistentPlugin.treeJson += "]";
+
+    auto plugin = make_persistent_mock_plugin();
+    auto connection =
+        open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+    ASSERT_NE(connection, nullptr);
+    Element root;
+    EXPECT_FALSE(connection->get_tree(root, false));
+    EXPECT_FALSE(connection->is_alive());
+    EXPECT_TRUE(root.children.empty());
+    EXPECT_EQ(s_persistentPlugin.frees, 1);
+    connection.reset();
+    EXPECT_EQ(s_persistentPlugin.closes, 1);
+}
+
+TEST(PluginConnectionContract, MalformedEventsAreBoundedFreedAndMarkDead) {
+    for (const auto mode : {
+             PersistentPluginMockState::EventMode::oversized,
+             PersistentPluginMockState::EventMode::nullPointer,
+             PersistentPluginMockState::EventMode::shortStruct,
+             PersistentPluginMockState::EventMode::unknownMutation,
+         }) {
+        s_persistentPlugin = {};
+        s_persistentPlugin.eventMode = mode;
+        auto plugin = make_persistent_mock_plugin();
+        auto connection =
+            open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+        ASSERT_NE(connection, nullptr);
+
+        EXPECT_TRUE(connection->poll_events().empty());
+        EXPECT_FALSE(connection->is_alive());
+        EXPECT_EQ(
+            s_persistentPlugin.eventFrees,
+            mode == PersistentPluginMockState::EventMode::nullPointer ? 0 : 1);
+        connection.reset();
+        EXPECT_EQ(s_persistentPlugin.closes, 1);
+    }
+}
+
+TEST(PluginConnectionContract, PersistentPluginWithoutPollStillRefreshes) {
+    s_persistentPlugin = {};
+    auto plugin = make_persistent_mock_plugin();
+    plugin.connection_poll_events = nullptr;
+    plugin.connection_events_free = nullptr;
+    ASSERT_TRUE(plugin_supports_persistent_connections(plugin));
+    ASSERT_FALSE(plugin_supports_event_polling(plugin));
+
+    auto connection =
+        open_plugin_connection(make_mock_fw(&plugin), nullptr, 123);
+    ASSERT_NE(connection, nullptr);
+    Element root;
+    EXPECT_TRUE(connection->get_tree(root, false));
+    EXPECT_TRUE(connection->get_tree(root, false));
+    EXPECT_TRUE(connection->poll_events().empty());
+    EXPECT_EQ(s_persistentPlugin.gets, 2);
+    EXPECT_EQ(s_persistentPlugin.polls, 0);
+    EXPECT_EQ(s_persistentPlugin.frees, 2);
+    connection.reset();
+    EXPECT_EQ(s_persistentPlugin.closes, 1);
+}
+
+TEST(PluginConnectionContract, V1AndPartialV2StayOneShot) {
+    auto v1 = make_mock_plugin();
+    EXPECT_FALSE(plugin_supports_persistent_connections(v1));
+    EXPECT_EQ(open_plugin_connection(make_mock_fw(&v1), nullptr, 123), nullptr);
+
+    auto partial = make_persistent_mock_plugin();
+    partial.connection_close = nullptr;
+    EXPECT_FALSE(plugin_supports_persistent_connections(partial));
+    EXPECT_EQ(
+        open_plugin_connection(make_mock_fw(&partial), nullptr, 123), nullptr);
+}
+
+TEST(PluginConnectionContract, RegistryLabelsIsolatePluginAndWindowInstances) {
+    auto first = make_persistent_mock_plugin();
+    auto second = make_persistent_mock_plugin();
+    first.sourcePath = L"C:\\plugins\\first.dll";
+    second.sourcePath = L"C:\\plugins\\second.dll";
+    const PluginFrameworkInfo firstFramework{"mock", "", &first};
+    const PluginFrameworkInfo secondFramework{"mock", "", &second};
+    const auto firstLabel = plugin_connection_label(
+        firstFramework, reinterpret_cast<HWND>(0x101));
+    const auto otherPluginLabel = plugin_connection_label(
+        secondFramework, reinterpret_cast<HWND>(0x101));
+    const auto otherWindowLabel = plugin_connection_label(
+        firstFramework, reinterpret_cast<HWND>(0x202));
+
+    EXPECT_EQ(firstLabel.rfind("plugin:", 0), 0u);
+    EXPECT_NE(firstLabel, "xaml");
+    EXPECT_NE(firstLabel, otherPluginLabel);
+    EXPECT_NE(firstLabel, otherWindowLabel);
+}
+
+TEST(FrameworkRefreshCompleteness, CopiesEveryProviderMarkerToScopedTree) {
+    Element full;
+    full.properties["lvt.incomplete.wpf"] = "true";
+    full.properties["lvt.incomplete.fake-plugin"] = "true";
+    full.properties["unrelated"] = "value";
+    Element scoped;
+
+    copy_incomplete_framework_refresh_markers(full, scoped);
+
+    EXPECT_TRUE(framework_refresh_incomplete(scoped, "wpf"));
+    EXPECT_TRUE(framework_refresh_incomplete(scoped, "fake-plugin"));
+    EXPECT_FALSE(scoped.properties.contains("unrelated"));
 }
 
 TEST(PluginGraft, GraftByTargetHwnd) {
@@ -1499,6 +2865,458 @@ TEST(UiaRuntimeId, RejectsMalformedInput) {
     EXPECT_FALSE(lvt::parse_runtime_id("1..2", parsed));
 }
 
+TEST(UiaProperties, DoubleFormattingRoundTripsAdjacentValues) {
+    const double first = 1.2345678901234567;
+    const double second =
+        std::nextafter(first, std::numeric_limits<double>::infinity());
+    const auto firstText = format_uia_double(first);
+    const auto secondText = format_uia_double(second);
+    EXPECT_EQ(std::stod(firstText), first);
+    EXPECT_EQ(std::stod(secondText), second);
+    EXPECT_NE(firstText, secondText);
+}
+
+TEST(UiaProperties, RangeReadbackFailureHasNoSuccessShapedValue) {
+    const auto failed = uia_range_readback_result(E_FAIL, 0);
+    EXPECT_FALSE(failed.ok);
+    EXPECT_FALSE(failed.hasValue);
+    EXPECT_TRUE(failed.value.empty());
+    EXPECT_EQ(failed.hresult, E_FAIL);
+    EXPECT_EQ(failed.errorCode, "typed_property_readback_failed");
+    EXPECT_EQ(
+        failed.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(failed.retryable);
+    EXPECT_NE(failed.error.find("actual value is unknown"), std::string::npos);
+
+    const auto nonFinite = uia_range_readback_result(
+        S_OK, std::numeric_limits<double>::infinity());
+    EXPECT_FALSE(nonFinite.ok);
+    EXPECT_FALSE(nonFinite.hasValue);
+
+    const auto succeeded =
+        uia_range_readback_result(S_OK, 12.345678901234567);
+    EXPECT_TRUE(succeeded.ok);
+    EXPECT_TRUE(succeeded.hasValue);
+    EXPECT_EQ(std::stod(succeeded.value), 12.345678901234567);
+}
+
+TEST(UiaProperties, ValidationFailuresPreserveRetrySemantics) {
+    const auto transient =
+        uia_property_detail::target_validation_failure(
+            RPC_E_CALL_REJECTED);
+    EXPECT_FALSE(transient.ok);
+    EXPECT_EQ(transient.hresult, RPC_E_CALL_REJECTED);
+    EXPECT_EQ(
+        transient.errorCode,
+        "typed_property_identity_validation_failed");
+    EXPECT_EQ(
+        transient.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(transient.retryable);
+
+    const auto ownership =
+        uia_property_detail::target_validation_failure(
+            HRESULT_FROM_WIN32(ERROR_INVALID_OWNER));
+    EXPECT_EQ(
+        ownership.errorDisposition,
+        PropertyErrorDisposition::ownershipLost);
+    EXPECT_FALSE(ownership.retryable);
+
+    const auto stale =
+        uia_property_detail::element_resolution_failure(
+            static_cast<HRESULT>(
+                UIA_E_ELEMENTNOTAVAILABLE),
+            true);
+    EXPECT_EQ(stale.errorCode, "typed_property_stale_element");
+    EXPECT_EQ(
+        stale.errorDisposition,
+        PropertyErrorDisposition::terminal);
+    EXPECT_FALSE(stale.retryable);
+
+    const auto busy =
+        uia_property_detail::element_resolution_failure(
+            static_cast<HRESULT>(
+                UIA_E_ELEMENTNOTAVAILABLE),
+            false);
+    EXPECT_EQ(busy.errorCode, "typed_property_provider_busy");
+    EXPECT_EQ(
+        busy.hresult,
+        static_cast<HRESULT>(
+            UIA_E_ELEMENTNOTAVAILABLE));
+    EXPECT_EQ(
+        busy.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(busy.retryable);
+
+    const auto rejected =
+        uia_property_detail::element_resolution_failure(
+            RPC_E_SERVERCALL_RETRYLATER, false);
+    EXPECT_EQ(
+        rejected.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(rejected.retryable);
+}
+
+TEST(UiaProperties, OneShotFallbackTreeReceivesConnectionOwnedIdentities) {
+    UiaPropertyIdentityCache identities;
+    Element root;
+    root.type = "Window";
+    root.framework = "uia";
+    root.properties["RuntimeId"] = "42.100";
+    Element child;
+    child.type = "Edit";
+    child.framework = "uia";
+    child.properties["AutomationId"] = "RawOnlyInput";
+    child.properties["RuntimeId"] = "42.100.7";
+    root.children.push_back(child);
+
+    identities.attach(root);
+    ASSERT_NE(root.children[0].providerHandle, 0u);
+    const auto originalHandle = root.children[0].providerHandle;
+    assign_element_keys(root);
+    identities.remember(root);
+
+    std::string error;
+    const auto byKey =
+        identities.resolve(root.children[0].key, error);
+    ASSERT_TRUE(byKey.has_value()) << error;
+    EXPECT_EQ(*byKey, originalHandle);
+    const auto byRuntime =
+        identities.resolve("uia:42.100.7", error);
+    ASSERT_TRUE(byRuntime.has_value()) << error;
+    EXPECT_EQ(*byRuntime, originalHandle);
+
+    Element fallbackChild = child;
+    fallbackChild.providerHandle = 0;
+    identities.attach(fallbackChild);
+    EXPECT_EQ(fallbackChild.providerHandle, originalHandle);
+
+    Element conflicting = child;
+    conflicting.key = root.children[0].key;
+    conflicting.properties["RuntimeId"] = "42.100.8";
+    identities.attach(conflicting);
+    identities.remember(conflicting);
+    error.clear();
+    const auto ambiguous =
+        identities.resolve(conflicting.key, error);
+    EXPECT_FALSE(ambiguous.has_value());
+    EXPECT_EQ(
+        ambiguous.failure,
+        UiaPropertyReferenceFailure::ambiguous);
+    EXPECT_EQ(
+        ambiguous.hresult,
+        HRESULT_FROM_WIN32(ERROR_DUP_NAME));
+    EXPECT_NE(error.find("ambiguous"), std::string::npos);
+
+    error.clear();
+    const auto malformed =
+        identities.resolve("uia:not-a-runtime-id", error);
+    EXPECT_FALSE(malformed.has_value());
+    EXPECT_EQ(
+        malformed.failure,
+        UiaPropertyReferenceFailure::malformed);
+    EXPECT_EQ(malformed.hresult, E_INVALIDARG);
+}
+
+TEST(UiaProperties, IdentityCachePrunesVirtualizationChurnAndRejectsStaleAliases) {
+    UiaPropertyIdentityCache identities;
+    std::string firstKey;
+    uint64_t firstHandle = 0;
+    std::string previousKey;
+
+    for (int generation = 0; generation < 1000; ++generation) {
+        Element root;
+        root.type = "Window";
+        root.framework = "uia";
+        root.properties["RuntimeId"] = "42.500";
+        Element item;
+        item.type = "ListItem";
+        item.framework = "uia";
+        item.properties["AutomationId"] =
+            "item-" + std::to_string(generation);
+        item.properties["RuntimeId"] =
+            "42.500." + std::to_string(generation);
+        root.children.push_back(item);
+        identities.attach(root);
+        assign_element_keys(root);
+        identities.remember(root);
+        if (generation == 0) {
+            firstKey = root.children[0].key;
+            firstHandle = root.children[0].providerHandle;
+        }
+        if (generation == 998)
+            previousKey = root.children[0].key;
+        EXPECT_LE(identities.runtime_id_count(), 3u);
+        EXPECT_LE(identities.key_alias_count(), 3u);
+    }
+
+    std::string error;
+    EXPECT_TRUE(identities.resolve(previousKey, error).has_value())
+        << "the immediately previous snapshot alias should survive one patch: "
+        << error;
+    EXPECT_FALSE(identities.runtime_id(firstHandle).has_value());
+    error.clear();
+    EXPECT_FALSE(identities.resolve(firstKey, error).has_value());
+    EXPECT_NE(error.find("stale"), std::string::npos);
+}
+
+TEST(UiaProperties, TruncatedSnapshotsDoNotPruneKnownIdentities) {
+    UiaPropertyIdentityCache identities;
+    Element complete;
+    complete.type = "Edit";
+    complete.framework = "uia";
+    complete.properties["RuntimeId"] = "42.700.1";
+    identities.attach(complete);
+    const auto handle = complete.providerHandle;
+
+    for (int i = 0; i < 10; ++i) {
+        Element partial;
+        partial.type = "Edit";
+        partial.framework = "uia";
+        partial.properties["RuntimeId"] =
+            "42.700." + std::to_string(i + 2);
+        identities.attach(partial, "default", false);
+    }
+    EXPECT_EQ(identities.runtime_id(handle), "42.700.1");
+}
+
+TEST(UiaProperties, RawIdentitySurvivesControlAndContentWalks) {
+    UiaPropertyIdentityCache identities;
+    Element rawOnly;
+    rawOnly.type = "Edit";
+    rawOnly.framework = "uia";
+    rawOnly.properties["AutomationId"] = "RawOnly";
+    rawOnly.properties["RuntimeId"] = "42.800.1";
+    ASSERT_TRUE(identities.attach(rawOnly, "raw"));
+    assign_element_keys(rawOnly);
+    ASSERT_TRUE(identities.remember(rawOnly, "raw"));
+    const auto rawKey = rawOnly.key;
+    const auto rawHandle = rawOnly.providerHandle;
+
+    for (int i = 0; i < 20; ++i) {
+        Element control;
+        control.type = "Button";
+        control.framework = "uia";
+        control.properties["RuntimeId"] =
+            "42.801." + std::to_string(i);
+        ASSERT_TRUE(identities.attach(control, "control"));
+        assign_element_keys(control);
+        ASSERT_TRUE(identities.remember(control, "control"));
+
+        Element content;
+        content.type = "Text";
+        content.framework = "uia";
+        content.properties["RuntimeId"] =
+            "42.802." + std::to_string(i);
+        ASSERT_TRUE(identities.attach(content, "content"));
+        assign_element_keys(content);
+        ASSERT_TRUE(identities.remember(content, "content"));
+    }
+
+    std::string error;
+    const auto resolved = identities.resolve(rawKey, error);
+    ASSERT_TRUE(resolved.has_value()) << error;
+    EXPECT_EQ(*resolved, rawHandle);
+}
+
+TEST(UiaProperties, IdentityScopeUsesOnlyTheUiaView) {
+    UiaPropertyIdentityCache identities;
+    Element raw;
+    raw.type = "Edit";
+    raw.framework = "uia";
+    raw.properties["AutomationId"] = "RawOnly";
+    raw.properties["RuntimeId"] = "42.850.1";
+
+    UiaOptions options;
+    options.view = UiaView::raw;
+    std::string rawKey;
+    uint64_t rawHandle = 0;
+    for (int i = 0; i < 32; ++i) {
+        options.timeoutMs = 1000 + i;
+        options.extraProperties = {
+            i % 2 == 0 ? "Name" : "AutomationId",
+            "RuntimeId",
+        };
+        EXPECT_EQ(uia_identity_scope(options), "raw");
+        ASSERT_TRUE(identities.attach(
+            raw, uia_identity_scope(options)));
+        assign_element_keys(raw);
+        ASSERT_TRUE(identities.remember(
+            raw, uia_identity_scope(options)));
+        rawKey = raw.key;
+        rawHandle = raw.providerHandle;
+    }
+    EXPECT_EQ(identities.scope_count(), 1u);
+
+    for (const auto view :
+         {UiaView::control, UiaView::content}) {
+        Element other;
+        other.type = "Text";
+        other.framework = "uia";
+        other.properties["AutomationId"] =
+            std::string(uia_view_name(view)) + "-element";
+        other.properties["RuntimeId"] =
+            view == UiaView::control
+                ? "42.851.1"
+                : "42.852.1";
+        options.view = view;
+        options.timeoutMs += 100;
+        options.extraProperties = {"HelpText"};
+        ASSERT_TRUE(identities.attach(
+            other, uia_identity_scope(options)));
+        assign_element_keys(other);
+        ASSERT_TRUE(identities.remember(
+            other, uia_identity_scope(options)));
+    }
+    EXPECT_EQ(identities.scope_count(), 3u);
+
+    std::string error;
+    const auto resolved = identities.resolve(rawKey, error);
+    ASSERT_TRUE(resolved.has_value()) << error;
+    EXPECT_EQ(*resolved, rawHandle);
+}
+
+TEST(UiaProperties, OversizedAliasSnapshotPreservesCurrentKeys) {
+    UiaPropertyIdentityCache identities;
+    Element root;
+    root.type = "Window";
+    root.framework = "uia";
+    root.children.reserve(
+        UiaPropertyIdentityCache::kMaximumKeyAliases + 1);
+    for (size_t i = 0;
+         i <= UiaPropertyIdentityCache::kMaximumKeyAliases;
+         ++i) {
+        Element child;
+        child.type = "Text";
+        child.framework = "uia";
+        child.properties["AutomationId"] =
+            "alias-" + std::to_string(i);
+        child.properties["RuntimeId"] = "42.875.1";
+        root.children.push_back(std::move(child));
+    }
+
+    ASSERT_TRUE(identities.attach(root, "raw"));
+    assign_element_keys(root);
+    EXPECT_FALSE(identities.remember(root, "raw"));
+    EXPECT_EQ(identities.key_alias_count(), 0u);
+
+    root.children.pop_back();
+    ASSERT_TRUE(identities.remember(root, "raw"));
+    EXPECT_EQ(
+        identities.key_alias_count(),
+        UiaPropertyIdentityCache::kMaximumKeyAliases);
+    const auto currentKey = root.children.back().key;
+    const auto currentHandle = root.children.back().providerHandle;
+
+    Element additional;
+    additional.type = "Text";
+    additional.framework = "uia";
+    additional.properties["AutomationId"] = "additional-alias";
+    additional.properties["RuntimeId"] = "42.875.2";
+    ASSERT_TRUE(identities.attach(additional, "control"));
+    assign_element_keys(additional);
+    EXPECT_FALSE(identities.remember(additional, "control"));
+
+    std::string error;
+    const auto current = identities.resolve(currentKey, error);
+    ASSERT_TRUE(current.has_value()) << error;
+    EXPECT_EQ(*current, currentHandle);
+    EXPECT_EQ(
+        identities.key_alias_count(),
+        UiaPropertyIdentityCache::kMaximumKeyAliases);
+}
+
+TEST(UiaProperties, OversizedSnapshotIsRefusedBeforeReturningInvalidKeys) {
+    UiaPropertyIdentityCache identities;
+    Element root;
+    root.type = "Window";
+    root.framework = "uia";
+    root.children.reserve(
+        UiaPropertyIdentityCache::kMaximumRuntimeIds + 1);
+    for (size_t i = 0;
+         i <= UiaPropertyIdentityCache::kMaximumRuntimeIds;
+         ++i) {
+        Element child;
+        child.type = "Text";
+        child.framework = "uia";
+        child.properties["RuntimeId"] =
+            "42.900." + std::to_string(i);
+        root.children.push_back(std::move(child));
+    }
+    EXPECT_FALSE(identities.attach(root, "raw"));
+    EXPECT_EQ(identities.runtime_id_count(), 0u);
+    EXPECT_EQ(identities.key_alias_count(), 0u);
+
+    root.children.pop_back();
+    ASSERT_TRUE(identities.attach(root, "raw"));
+    const auto protectedHandle = root.children.front().providerHandle;
+    std::string capacityError;
+    const auto capacity = identities.resolve(
+        "uia:42.999.1", capacityError);
+    EXPECT_FALSE(capacity.has_value());
+    EXPECT_EQ(
+        capacity.failure,
+        UiaPropertyReferenceFailure::capacity);
+    EXPECT_EQ(
+        capacity.hresult,
+        HRESULT_FROM_WIN32(
+            ERROR_NOT_ENOUGH_QUOTA));
+    EXPECT_NE(
+        capacityError.find("bounded identity cache"),
+        std::string::npos);
+
+    Element additional;
+    additional.type = "Text";
+    additional.framework = "uia";
+    additional.properties["RuntimeId"] = "42.999.1";
+    EXPECT_FALSE(identities.attach(additional, "control"));
+    EXPECT_TRUE(identities.runtime_id(protectedHandle).has_value())
+        << "capacity handling evicted an identity from the current raw snapshot";
+
+    UiaPropertyIdentityCache scoped;
+    std::string firstKey;
+    std::string newestKey;
+    uint64_t newestHandle = 0;
+    for (size_t i = 0;
+         i <= UiaPropertyIdentityCache::kMaximumScopes;
+         ++i) {
+        Element tree;
+        tree.type = "Window";
+        tree.framework = "uia";
+        tree.properties["RuntimeId"] =
+            "42.901." + std::to_string(i);
+        Element child;
+        child.type = "Text";
+        child.framework = "uia";
+        child.properties["AutomationId"] =
+            "scope-" + std::to_string(i);
+        child.properties["RuntimeId"] =
+            "42.901." + std::to_string(i) + ".1";
+        tree.children.push_back(std::move(child));
+        EXPECT_TRUE(scoped.attach(
+            tree, "scope-" + std::to_string(i)));
+        assign_element_keys(tree);
+        EXPECT_TRUE(scoped.remember(
+            tree, "scope-" + std::to_string(i)));
+        if (i == 0)
+            firstKey = tree.children[0].key;
+        newestKey = tree.children[0].key;
+        newestHandle = tree.children[0].providerHandle;
+    }
+    EXPECT_EQ(
+        scoped.scope_count(),
+        UiaPropertyIdentityCache::kMaximumScopes);
+
+    std::string error;
+    EXPECT_FALSE(scoped.resolve(firstKey, error).has_value());
+    EXPECT_NE(error.find("stale"), std::string::npos);
+    error.clear();
+    const auto newest = scoped.resolve(newestKey, error);
+    ASSERT_TRUE(newest.has_value()) << error;
+    EXPECT_EQ(*newest, newestHandle);
+}
+
 TEST(FindElementByRef, ResolvesUiaRuntimeIdReference) {
     lvt::Element root;
     root.type = "Window";
@@ -1719,6 +3537,631 @@ TEST(XamlPropertyFilter, ArbitraryPropertiesAreCapturedWithRecognizedValueTypes)
     EXPECT_TRUE(lvt::xaml_should_capture_property(L"FontSize", L"14", L"Double"));
     EXPECT_TRUE(lvt::xaml_should_capture_property(L"Opacity", L"0.5", L"Double"));
     EXPECT_TRUE(lvt::xaml_should_capture_property(L"SomeRandomProperty", L"42", L"Int32"));
+}
+
+TEST(TypedPropertyContract, EditorKindUsesDeclaredPropertyType) {
+    EXPECT_EQ(
+        classify_property_editor("String", true),
+        PropertyEditorKind::string);
+    EXPECT_EQ(
+        classify_property_editor("System.Boolean", true),
+        PropertyEditorKind::boolean);
+    EXPECT_EQ(
+        classify_property_editor("Windows.Foundation.Int32", true),
+        PropertyEditorKind::integer);
+    EXPECT_EQ(
+        classify_property_editor("Double", true),
+        PropertyEditorKind::number);
+    EXPECT_EQ(
+        classify_property_editor("Enum", true),
+        PropertyEditorKind::enumeration);
+    EXPECT_EQ(
+        classify_property_editor("String", false),
+        PropertyEditorKind::readonly);
+}
+
+TEST(TypedPropertyContract, EditorKindWireNamesAreProviderNeutral) {
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::readonly), "readonly");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::string), "string");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::boolean), "boolean");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::integer), "integer");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::number), "number");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::enumeration), "enum");
+    EXPECT_STREQ(
+        property_editor_kind_name(PropertyEditorKind::command), "command");
+}
+
+TEST(TypedPropertyContract, MutationFailuresHaveStableDispositions) {
+    EXPECT_NE(
+        LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION,
+        static_cast<HRESULT>(
+            UIA_E_ELEMENTNOTAVAILABLE));
+    EXPECT_EQ(
+        static_cast<uint32_t>(
+            LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION),
+        0xA0040201u);
+
+    const auto invalid = property_mutation_failure(
+        E_INVALIDARG, "invalid value");
+    EXPECT_EQ(invalid.errorCode, "typed_property_invalid_value");
+    EXPECT_EQ(
+        invalid.errorDisposition,
+        PropertyErrorDisposition::terminal);
+    EXPECT_FALSE(invalid.retryable);
+
+    const auto timeout = property_mutation_failure(
+        HRESULT_FROM_WIN32(ERROR_TIMEOUT), "provider timeout");
+    EXPECT_EQ(timeout.errorCode, "typed_property_timeout");
+    EXPECT_EQ(
+        timeout.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(timeout.retryable);
+
+    const auto ownership = property_mutation_failure(
+        HRESULT_FROM_WIN32(ERROR_INVALID_OWNER), "target replaced");
+    EXPECT_EQ(
+        ownership.errorDisposition,
+        PropertyErrorDisposition::ownershipLost);
+    EXPECT_FALSE(ownership.retryable);
+    EXPECT_STREQ(
+        property_error_disposition_name(
+            PropertyErrorDisposition::ownershipLost),
+        "ownershipLost");
+}
+
+TEST(TypedPropertyContract, ProvidersRefineMutationFailureSemantics) {
+    const std::string xamlMessage =
+        "SetProperty succeeded, but effective-value readback failed: "
+        "provider disconnected";
+    const auto genericReadback = property_mutation_failure(
+        E_FAIL, xamlMessage, "typed_property_mutation_failed",
+        PropertyErrorDisposition::transient);
+    EXPECT_EQ(
+        genericReadback.errorCode,
+        "typed_property_readback_failed");
+
+    const auto xaml = detail::xaml_mutation_command_failure(
+        E_FAIL, xamlMessage);
+    EXPECT_EQ(xaml.errorCode, "typed_property_readback_failed");
+    EXPECT_EQ(
+        xaml.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(xaml.retryable);
+    EXPECT_EQ(xaml.error, xamlMessage);
+
+    const std::string managedMessage =
+        "WPF mutation timed out after execution began; its outcome is "
+        "indeterminate";
+    const auto genericTimeout = property_mutation_failure(
+        E_PENDING, managedMessage, "typed_property_mutation_failed",
+        PropertyErrorDisposition::transient);
+    EXPECT_EQ(genericTimeout.errorCode, "typed_property_timeout");
+
+    const auto managed = detail::managed_mutation_command_failure(
+        E_PENDING, managedMessage);
+    EXPECT_EQ(managed.errorCode, "typed_property_timeout");
+    EXPECT_EQ(
+        managed.errorDisposition,
+        PropertyErrorDisposition::transient);
+    EXPECT_TRUE(managed.retryable);
+    EXPECT_EQ(managed.hresult, E_PENDING);
+    EXPECT_EQ(managed.error, managedMessage);
+
+    const auto stale =
+        uia_property_detail::pattern_operation_failure(
+            static_cast<HRESULT>(UIA_E_ELEMENTNOTAVAILABLE));
+    EXPECT_EQ(stale.errorCode, "typed_property_stale_element");
+    EXPECT_EQ(
+        stale.errorDisposition,
+        PropertyErrorDisposition::terminal);
+    EXPECT_FALSE(stale.retryable);
+}
+
+namespace {
+
+Element editable_uia_element(
+    const std::string& type, const std::string& patterns,
+    std::initializer_list<std::pair<const std::string, std::string>> properties) {
+    Element element;
+    element.type = type;
+    element.framework = "uia";
+    element.properties["SupportedPatterns"] = patterns;
+    element.properties["IsEnabled"] = "true";
+    for (const auto& [name, value] : properties)
+        element.properties[name] = value;
+    return element;
+}
+
+const PropertyDescriptor* descriptor_named(
+    const PropertySchema& schema, const std::string& name) {
+    for (const auto& descriptor : schema.descriptors) {
+        if (descriptor.name == name)
+            return &descriptor;
+    }
+    return nullptr;
+}
+
+const PropertyValue* value_for(
+    const PropertySnapshotResult& snapshot, const PropertyDescriptor& descriptor) {
+    for (const auto& value : snapshot.values) {
+        if (value.descriptorId == descriptor.descriptorId)
+            return &value;
+    }
+    return nullptr;
+}
+
+std::vector<std::string> choice_values(const PropertyDescriptor& descriptor) {
+    std::vector<std::string> result;
+    for (const auto& choice : descriptor.choices)
+        result.push_back(choice.value);
+    return result;
+}
+
+} // namespace
+
+TEST(UiaTypedProperties, ValueHonorsReadOnlyAndSchemaCacheDoesNotStoreValues) {
+    UiaPropertySchemaCache cache;
+    auto writable = editable_uia_element(
+        "Edit", "Value",
+        {{"Value.Value", "first"}, {"Value.IsReadOnly", "false"}});
+    auto first = make_uia_property_snapshot(
+        writable, UiaSelectionCapabilities{}, cache);
+    ASSERT_TRUE(first.ok);
+    const auto* descriptor = descriptor_named(*first.schema, "Value.Value");
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_EQ(descriptor->kind, PropertyEditorKind::string);
+    EXPECT_TRUE(descriptor->writable);
+    EXPECT_FALSE(descriptor->supportsClear);
+    const auto* firstValue = value_for(first, *descriptor);
+    ASSERT_NE(firstValue, nullptr);
+    EXPECT_EQ(firstValue->value, "first");
+
+    writable.properties["Value.Value"] = "second";
+    auto second = make_uia_property_snapshot(
+        writable, UiaSelectionCapabilities{}, cache);
+    EXPECT_EQ(first.schema.get(), second.schema.get());
+    EXPECT_EQ(first.schema->schemaId, second.schema->schemaId);
+    const auto* secondValue = value_for(second, *descriptor);
+    ASSERT_NE(secondValue, nullptr);
+    EXPECT_EQ(secondValue->value, "second");
+    EXPECT_EQ(cache.size(), 1u);
+
+    writable.properties["Value.IsReadOnly"] = "true";
+    auto readOnly = make_uia_property_snapshot(
+        writable, UiaSelectionCapabilities{}, cache);
+    const auto* readOnlyDescriptor =
+        descriptor_named(*readOnly.schema, "Value.Value");
+    ASSERT_NE(readOnlyDescriptor, nullptr);
+    EXPECT_EQ(readOnlyDescriptor->kind, PropertyEditorKind::readonly);
+    EXPECT_FALSE(readOnlyDescriptor->writable);
+    EXPECT_NE(readOnly.schema->schemaId, first.schema->schemaId);
+    EXPECT_EQ(cache.size(), 2u);
+}
+
+TEST(UiaTypedProperties, RangeValueSuppliesBoundsWithoutInventingStep) {
+    UiaPropertySchemaCache cache;
+    auto slider = editable_uia_element(
+        "Slider", "RangeValue",
+        {{"RangeValue.Value", "25"},
+         {"RangeValue.Minimum", "0"},
+         {"RangeValue.Maximum", "100"},
+         {"RangeValue.IsReadOnly", "false"}});
+    auto snapshot = make_uia_property_snapshot(
+        slider, UiaSelectionCapabilities{}, cache);
+    const auto* descriptor =
+        descriptor_named(*snapshot.schema, "RangeValue.Value");
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_EQ(descriptor->kind, PropertyEditorKind::number);
+    ASSERT_TRUE(descriptor->minimum.has_value());
+    ASSERT_TRUE(descriptor->maximum.has_value());
+    EXPECT_DOUBLE_EQ(*descriptor->minimum, 0);
+    EXPECT_DOUBLE_EQ(*descriptor->maximum, 100);
+    EXPECT_FALSE(descriptor->step.has_value());
+
+    slider.properties["RangeValue.IsReadOnly"] = "true";
+    auto readOnly = make_uia_property_snapshot(
+        slider, UiaSelectionCapabilities{}, cache);
+    const auto* readOnlyDescriptor =
+        descriptor_named(*readOnly.schema, "RangeValue.Value");
+    ASSERT_NE(readOnlyDescriptor, nullptr);
+    EXPECT_EQ(readOnlyDescriptor->kind, PropertyEditorKind::readonly);
+    EXPECT_FALSE(readOnlyDescriptor->writable);
+    EXPECT_EQ(readOnlyDescriptor->minimum, descriptor->minimum);
+    EXPECT_EQ(readOnlyDescriptor->maximum, descriptor->maximum);
+
+    slider.properties["RangeValue.Minimum"] = "0.12345678901234566";
+    slider.properties["RangeValue.Maximum"] = "0.12345678901239999";
+    slider.properties["RangeValue.IsReadOnly"] = "false";
+    auto precise = make_uia_property_snapshot(
+        slider, UiaSelectionCapabilities{}, cache);
+    const auto* preciseDescriptor =
+        descriptor_named(*precise.schema, "RangeValue.Value");
+    ASSERT_NE(preciseDescriptor, nullptr);
+    ASSERT_TRUE(preciseDescriptor->minimum.has_value());
+    ASSERT_TRUE(preciseDescriptor->maximum.has_value());
+    EXPECT_EQ(*preciseDescriptor->minimum,
+              std::stod("0.12345678901234566"));
+    EXPECT_EQ(*preciseDescriptor->maximum,
+              std::stod("0.12345678901239999"));
+    EXPECT_NE(precise.schema->schemaId, snapshot.schema->schemaId);
+}
+
+TEST(UiaTypedProperties, ToggleAndExpandExposeOnlyDeterministicStates) {
+    UiaPropertySchemaCache cache;
+    auto element = editable_uia_element(
+        "CheckBox", "Toggle,ExpandCollapse",
+        {{"Toggle.ToggleState", "Indeterminate"},
+         {"ExpandCollapse.State", "PartiallyExpanded"}});
+    auto snapshot = make_uia_property_snapshot(
+        element, UiaSelectionCapabilities{}, cache);
+
+    const auto* toggle =
+        descriptor_named(*snapshot.schema, "Toggle.ToggleState");
+    ASSERT_NE(toggle, nullptr);
+    EXPECT_EQ(toggle->kind, PropertyEditorKind::enumeration);
+    EXPECT_EQ(choice_values(*toggle),
+              (std::vector<std::string>{"Off", "On"}));
+
+    const auto* expand =
+        descriptor_named(*snapshot.schema, "ExpandCollapse.State");
+    ASSERT_NE(expand, nullptr);
+    EXPECT_EQ(expand->kind, PropertyEditorKind::enumeration);
+    EXPECT_EQ(choice_values(*expand),
+              (std::vector<std::string>{"Expanded", "Collapsed"}));
+
+    element.properties["ExpandCollapse.State"] = "LeafNode";
+    auto leaf = make_uia_property_snapshot(
+        element, UiaSelectionCapabilities{}, cache);
+    const auto* leafExpand =
+        descriptor_named(*leaf.schema, "ExpandCollapse.State");
+    ASSERT_NE(leafExpand, nullptr);
+    EXPECT_EQ(leafExpand->kind, PropertyEditorKind::readonly);
+    EXPECT_FALSE(leafExpand->writable);
+}
+
+TEST(UiaTypedProperties, SelectionAndScrollCommandsFollowProviderCapabilities) {
+    UiaPropertySchemaCache cache;
+    UiaSelectionCapabilities selection{
+        .known = true,
+        .canSelectMultiple = true,
+        .isSelectionRequired = false,
+    };
+    auto item = editable_uia_element(
+        "ListItem", "SelectionItem,Scroll",
+        {{"SelectionItem.IsSelected", "false"},
+         {"Scroll.HorizontallyScrollable", "false"},
+         {"Scroll.VerticallyScrollable", "true"},
+         {"Scroll.VerticalPercent", "10"}});
+    auto snapshot = make_uia_property_snapshot(item, selection, cache);
+
+    const auto* selectionDescriptor =
+        descriptor_named(*snapshot.schema, "SelectionItem.Action");
+    ASSERT_NE(selectionDescriptor, nullptr);
+    EXPECT_EQ(selectionDescriptor->kind, PropertyEditorKind::command);
+    EXPECT_EQ(
+        choice_values(*selectionDescriptor),
+        (std::vector<std::string>{"select", "add", "remove"}));
+
+    const auto* scroll =
+        descriptor_named(*snapshot.schema, "Scroll.Action");
+    ASSERT_NE(scroll, nullptr);
+    EXPECT_EQ(scroll->kind, PropertyEditorKind::command);
+    EXPECT_EQ(
+        choice_values(*scroll),
+        (std::vector<std::string>{"up", "down"}));
+}
+
+TEST(XamlEnumParser, DeepCopiesAliasesAndSanitizesTypeNames) {
+    std::vector<tap::EnumTypeInfo> copied;
+    {
+        auto* raw = static_cast<EnumType*>(
+            CoTaskMemAlloc(sizeof(EnumType)));
+        ASSERT_NE(raw, nullptr);
+        ZeroMemory(raw, sizeof(EnumType));
+        tap::OwnedEnumTypes owned(raw, 1);
+
+        raw[0].Name =
+            SysAllocString(L"Microsoft.UI.Xaml.Text\nAlignment");
+        raw[0].ValueInts = SafeArrayCreateVector(VT_INT, 0, 3);
+        raw[0].ValueStrings = SafeArrayCreateVector(VT_BSTR, 0, 3);
+        ASSERT_NE(raw[0].Name, nullptr);
+        ASSERT_NE(raw[0].ValueInts, nullptr);
+        ASSERT_NE(raw[0].ValueStrings, nullptr);
+
+        const int machineValues[] = {0, 0, 1};
+        const wchar_t* names[] = {L"Left", L"Start", L"Center"};
+        for (LONG index = 0; index < 3; ++index) {
+            int machineValue = machineValues[index];
+            ASSERT_EQ(
+                SafeArrayPutElement(
+                    raw[0].ValueInts, &index, &machineValue),
+                S_OK);
+            wil::unique_bstr name(SysAllocString(names[index]));
+            ASSERT_TRUE(name);
+            ASSERT_EQ(
+                SafeArrayPutElement(
+                    raw[0].ValueStrings, &index, name.get()),
+                S_OK);
+        }
+
+        ASSERT_EQ(tap::copy_enum_types(
+                      owned.get(), owned.count(), copied),
+                  S_OK);
+    }
+
+    ASSERT_EQ(copied.size(), 1u);
+    EXPECT_EQ(
+        copied[0].name, L"Microsoft.UI.Xaml.TextAlignment");
+    EXPECT_EQ(
+        copied[0].flagsKind, XamlEnumFlagsKind::unknown);
+    ASSERT_EQ(copied[0].members.size(), 3u);
+    EXPECT_EQ(copied[0].members[0].machineValue, 0);
+    EXPECT_EQ(copied[0].members[0].name, L"Left");
+    EXPECT_EQ(copied[0].members[1].machineValue, 0);
+    EXPECT_EQ(copied[0].members[1].name, L"Start");
+    EXPECT_EQ(copied[0].members[2].machineValue, 1);
+    EXPECT_EQ(copied[0].members[2].name, L"Center");
+}
+
+TEST(XamlEnumParser, MalformedCatalogStillReleasesOwnedMemory) {
+    auto* raw = static_cast<EnumType*>(
+        CoTaskMemAlloc(sizeof(EnumType)));
+    ASSERT_NE(raw, nullptr);
+    ZeroMemory(raw, sizeof(EnumType));
+    tap::OwnedEnumTypes owned(raw, 1);
+    raw[0].Name = SysAllocString(L"Broken.Enum");
+    raw[0].ValueInts = SafeArrayCreateVector(VT_INT, 0, 1);
+    ASSERT_NE(raw[0].Name, nullptr);
+    ASSERT_NE(raw[0].ValueInts, nullptr);
+
+    std::vector<tap::EnumTypeInfo> copied;
+    EXPECT_EQ(
+        tap::copy_enum_types(owned.get(), owned.count(), copied),
+        E_INVALIDARG);
+    EXPECT_TRUE(copied.empty());
+}
+
+TEST(XamlEnumCatalog, AssociatesChoicesCanonicalValuesAndAliases) {
+    XamlEnumCatalog catalog;
+    catalog.add(
+        "Microsoft.UI.Xaml.TextAlignment",
+        {
+            {-1, "Unset"},
+            {0, "Left"},
+            {0, "Start"},
+            {1, "Center"},
+            {2, "Right"},
+        },
+        XamlEnumFlagsKind::nonFlags);
+
+    const auto choices =
+        catalog.choices_for("Microsoft.UI.Xaml.TextAlignment");
+    ASSERT_EQ(choices.size(), 5u);
+    EXPECT_EQ(choices[0].value, "Unset");
+    EXPECT_EQ(choices[1].value, "Left");
+    EXPECT_EQ(choices[2].value, "Start");
+    EXPECT_EQ(choices[3].label, "Center");
+    EXPECT_TRUE(catalog.accepts(
+        "Microsoft.UI.Xaml.TextAlignment", "Center"));
+    EXPECT_FALSE(catalog.accepts(
+        "Microsoft.UI.Xaml.TextAlignment", "1"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.TextAlignment", "0"),
+        std::optional<std::string>("Left"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.TextAlignment", "-1"),
+        std::optional<std::string>("Unset"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.TextAlignment", "3"),
+        std::optional<std::string>("3"));
+    EXPECT_EQ(
+        catalog.canonical_input(
+            "Microsoft.UI.Xaml.TextAlignment", "Center,Right"),
+        std::nullopt);
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.TextAlignment", "Center"),
+        std::optional<std::string>("Center"));
+}
+
+TEST(XamlEnumCatalog, ConnectionCatalogsRemainIsolated) {
+    XamlEnumCatalog systemXaml;
+    XamlEnumCatalog winui;
+    systemXaml.add(
+        "Shared.Enum", {{0, "SystemValue"}},
+        XamlEnumFlagsKind::nonFlags);
+    winui.add(
+        "Shared.Enum", {{0, "WinUIValue"}},
+        XamlEnumFlagsKind::nonFlags);
+
+    EXPECT_TRUE(systemXaml.accepts("Shared.Enum", "SystemValue"));
+    EXPECT_FALSE(systemXaml.accepts("Shared.Enum", "WinUIValue"));
+    EXPECT_TRUE(winui.accepts("Shared.Enum", "WinUIValue"));
+    EXPECT_FALSE(winui.accepts("Shared.Enum", "SystemValue"));
+}
+
+TEST(XamlEnumCatalog, FlagsAcceptCompositeNamesAndPreserveResidualBits) {
+    XamlEnumCatalog catalog;
+    catalog.add(
+        "Microsoft.UI.Xaml.Input.ManipulationModes",
+        {
+            {0, "None"},
+            {1, "TranslateX"},
+            {1, "TranslateHorizontal"},
+            {2, "TranslateY"},
+            {4, "Scale"},
+        },
+        XamlEnumFlagsKind::flags);
+
+    EXPECT_EQ(
+        catalog.canonical_input(
+            "Microsoft.UI.Xaml.Input.ManipulationModes",
+            " TranslateX , Scale "),
+        std::optional<std::string>("TranslateX,Scale"));
+    EXPECT_TRUE(catalog.accepts(
+        "Microsoft.UI.Xaml.Input.ManipulationModes",
+        "TranslateHorizontal,Scale"));
+    EXPECT_EQ(
+        catalog.canonical_input(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", " None "),
+        std::optional<std::string>("None"));
+    EXPECT_FALSE(catalog.accepts(
+        "Microsoft.UI.Xaml.Input.ManipulationModes",
+        "TranslateX,NotAFlag"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", "5"),
+        std::optional<std::string>("TranslateX,Scale"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", "1"),
+        std::optional<std::string>("TranslateX"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", "0"),
+        std::optional<std::string>("None"));
+    EXPECT_EQ(
+        catalog.canonical_value(
+            "Microsoft.UI.Xaml.Input.ManipulationModes", "9"),
+        std::optional<std::string>("TranslateX,0x00000008"));
+}
+
+TEST(XamlEnumCatalog, FlagsDetectionIsConservativeAndProviderOwned) {
+    EXPECT_EQ(
+        resolve_xaml_enum_flags_metadata(
+            L"Windows.UI.Text.TextDecorations"),
+        XamlEnumFlagsKind::flags);
+    EXPECT_EQ(
+        resolve_xaml_enum_flags_metadata(
+            L"Windows.UI.Xaml.Input.ManipulationModes"),
+        XamlEnumFlagsKind::flags);
+    EXPECT_EQ(
+        resolve_xaml_enum_flags_metadata(
+            L"Windows.UI.Xaml.TextAlignment"),
+        XamlEnumFlagsKind::nonFlags);
+    EXPECT_EQ(
+        resolve_xaml_enum_flags_metadata(
+            L"Contoso.Unresolvable.CustomEnum"),
+        XamlEnumFlagsKind::unknown);
+}
+
+TEST(XamlEnumCatalog, MetadataClassificationIsCachedPerType) {
+    int probes = 0;
+    XamlEnumFlagsCache cache(
+        [&](std::wstring_view) {
+            ++probes;
+            return XamlEnumFlagsKind::flags;
+        });
+
+    EXPECT_EQ(
+        cache.classify(L"Contoso.Flags"),
+        XamlEnumFlagsKind::flags);
+    EXPECT_EQ(
+        cache.classify(L"Contoso.Flags"),
+        XamlEnumFlagsKind::flags);
+    EXPECT_EQ(probes, 1);
+    EXPECT_EQ(cache.size(), 1u);
+}
+
+TEST(XamlEnumCatalog, UnresolvedTypesDeferCompositeInputWithoutDecomposition) {
+    XamlEnumCatalog catalog;
+    catalog.add(
+        "Contoso.CustomEnum",
+        {{1, "First"}, {2, "Second"}},
+        XamlEnumFlagsKind::unknown);
+
+    EXPECT_EQ(
+        catalog.canonical_input(
+            "Contoso.CustomEnum", " First , Second "),
+        std::optional<std::string>("First,Second"));
+    EXPECT_EQ(
+        catalog.canonical_value("Contoso.CustomEnum", "3"),
+        std::optional<std::string>("3"));
+}
+
+TEST(NativeTypedPropertyContract, ParsesOnlyCanonicalScalarShapes) {
+    EXPECT_EQ(
+        normalize_native_class_name("SysListView32"),
+        "syslistview32");
+
+    bool boolean = false;
+    EXPECT_TRUE(native_property_detail::parse_boolean("true", boolean));
+    EXPECT_TRUE(boolean);
+    EXPECT_TRUE(native_property_detail::parse_boolean("FALSE", boolean));
+    EXPECT_FALSE(boolean);
+    EXPECT_FALSE(native_property_detail::parse_boolean("1", boolean));
+    EXPECT_FALSE(native_property_detail::parse_boolean(" true", boolean));
+
+    int integer = 0;
+    EXPECT_TRUE(native_property_detail::parse_integer("-1", integer));
+    EXPECT_EQ(integer, -1);
+    EXPECT_TRUE(native_property_detail::parse_integer("2147483647", integer));
+    EXPECT_EQ(integer, 2147483647);
+    EXPECT_FALSE(native_property_detail::parse_integer("", integer));
+    EXPECT_FALSE(native_property_detail::parse_integer("1.0", integer));
+    EXPECT_FALSE(native_property_detail::parse_integer(" 1", integer));
+    EXPECT_FALSE(native_property_detail::parse_integer("2147483648", integer));
+}
+
+TEST(NativeTypedPropertyContract, ComputesEffectiveScrollRange) {
+    EXPECT_EQ(native_property_detail::effective_scroll_max(10, 110, 0), 110);
+    EXPECT_EQ(native_property_detail::effective_scroll_max(10, 110, 1), 110);
+    EXPECT_EQ(native_property_detail::effective_scroll_max(10, 110, 10), 101);
+    EXPECT_EQ(native_property_detail::effective_scroll_max(10, 15, 20), 10);
+    EXPECT_EQ(native_property_detail::effective_scroll_max(20, 10, 0), 20);
+}
+
+TEST(NativeTypedPropertyContract, PointerOperationsRequireMatchingArchitecture) {
+    EXPECT_TRUE(native_pointer_operations_allowed(
+        Architecture::x64, Architecture::x64));
+    EXPECT_TRUE(native_pointer_operations_allowed(
+        Architecture::x86, Architecture::x86));
+    EXPECT_FALSE(native_pointer_operations_allowed(
+        Architecture::x64, Architecture::x86));
+    EXPECT_FALSE(native_pointer_operations_allowed(
+        Architecture::x86, Architecture::x64));
+    EXPECT_FALSE(native_pointer_operations_allowed(
+        Architecture::unknown, Architecture::x64));
+}
+
+TEST(UiaTypedProperties, SchemaCacheIsBoundedUnderDynamicRangeChurn) {
+    UiaPropertySchemaCache cache;
+    std::string firstSchemaId;
+    for (size_t i = 0;
+         i < UiaPropertySchemaCache::kMaximumSchemas * 3;
+         ++i) {
+        auto slider = editable_uia_element(
+            "Slider", "RangeValue",
+            {{"RangeValue.Value", "1"},
+             {"RangeValue.Minimum", std::to_string(i) + ".125"},
+             {"RangeValue.Maximum", std::to_string(i + 1000) + ".875"},
+             {"RangeValue.IsReadOnly", "false"}});
+        auto snapshot = make_uia_property_snapshot(
+            slider, UiaSelectionCapabilities{}, cache);
+        if (i == 0)
+            firstSchemaId = snapshot.schema->schemaId;
+        EXPECT_LE(cache.size(), UiaPropertySchemaCache::kMaximumSchemas);
+    }
+
+    auto firstAgain = editable_uia_element(
+        "Slider", "RangeValue",
+        {{"RangeValue.Value", "1"},
+         {"RangeValue.Minimum", "0.125"},
+         {"RangeValue.Maximum", "1000.875"},
+         {"RangeValue.IsReadOnly", "false"}});
+    auto recreated = make_uia_property_snapshot(
+        firstAgain, UiaSelectionCapabilities{}, cache);
+    EXPECT_EQ(recreated.schema->schemaId, firstSchemaId);
+    EXPECT_LE(cache.size(), UiaPropertySchemaCache::kMaximumSchemas);
 }
 
 TEST(XamlPropertyFilter, ArbitraryPropertiesWithUnrecognizedComplexTypesAreExcluded) {

@@ -1,30 +1,56 @@
 #pragma once
 #include "element.h"
+#include <cstdint>
 #include <string>
 
 namespace lvt {
 
+struct CompactXamlKey {
+    std::string framework;
+    uint64_t handle = 0;
+};
+
 std::string escape_key_part(const std::string& value);
 std::string base_identity_key(const Element& el);
 
-// A stable, human-meaningful identifier for `el` drawn from the first of
-// AutomationId / x:Name / Name (and their lowercase property-bag spellings)
-// that is actually present, or empty if none are. Exposed (not file-local)
-// so watch_diff.cpp's cross-tick reconciliation can use the exact same
-// notion of "this child is identifiable independent of its position" that
-// assign_element_keys' own per-sibling disambiguation already uses —
+// True only for providers whose providerHandle contract explicitly makes the
+// value a process/session-wide object identity. Consumers must use this gate
+// rather than assuming every providerHandle can survive reparenting.
+bool has_process_wide_provider_identity(const Element& el);
+
+// Whether providerHandle is itself part of the element's durable identity.
+// Native Win32/common-control property handles are explicitly excluded:
+// HWND-backed elements use nativeHandle, while logical common-control items
+// use durableIdentity, so one-shot and persistent trees produce equal keys.
+bool has_durable_provider_identity(const Element& el);
+
+// Parse a process-wide XAML diagnostics identity produced by
+// assign_element_keys. Structural and non-XAML keys cannot address an object
+// for IVisualTreeService property operations and are rejected explicitly.
+bool parse_compact_xaml_key(const std::string& text, CompactXamlKey& out,
+                            std::string& error);
+
+// A stable public identifier for `el`, preferring a provider-supplied
+// durableIdentity and then AutomationId / x:Name / Name (including lowercase
+// property-bag spellings), or empty if none are present. Exposed (not
+// file-local) so watch_diff.cpp's cross-tick reconciliation can use the exact
+// same notion of "this child is identifiable independent of its position"
+// that assign_element_keys' own per-sibling disambiguation already uses —
 // having two different answers to "is this child otherwise identifiable"
-// living in two different files is exactly the kind of divergence that
-// caused this area's bugs before.
+// living in two different files is exactly the kind of divergence that caused
+// this area's bugs before.
 std::string stable_name_key(const Element& el);
 
 // Assigns every element in `root` a durable, self-describing key. XAML and
 // WinUI3 elements with an IXamlDiagnostics InstanceHandle use the compact,
-// process-wide form "xaml:0x..." / "winui3:0x...". Other providers (and the
-// rare XAML node without a handle) use "framework|className" path segments,
-// "/"-joined from the nearest structural ancestor and disambiguated among
-// siblings by native handle first, then a stable name property, then a local
-// sibling index as a last resort. Used by dump/query/UIA output, and by
+// process-wide form "xaml:0x..." / "winui3:0x...". HWND-backed Win32 and
+// common-control elements likewise use their framework-qualified HWND in
+// every mode, regardless of whether a persistent property connection exists.
+// Other providers (and logical common-control items) use
+// "framework|className" path segments, "/"-joined from the nearest structural
+// ancestor and disambiguated among siblings by a public-safe durableIdentity,
+// a durable provider handle, native handle, stable name, then a local sibling
+// index as a last resort. Used by dump/query/UIA output, and by
 // watch_diff.cpp to give a *freshly discovered* element (the first tick, or
 // a genuinely new node appearing later) its initial key.
 //
@@ -48,6 +74,9 @@ std::string stable_name_key(const Element& el);
 // never recomputing it. A key assigned by this function only "sticks" for
 // as long as reconciliation keeps recognizing that same conceptual slot —
 // which is indefinitely, unless the element is actually removed.
-void assign_element_keys(Element& root);
+// `preserveExistingRoot` is for a subtree that was scoped only after keys were
+// assigned on the complete tree (watch/MCP diff snapshots). Its existing root
+// key remains authoritative while descendants are refreshed beneath it.
+void assign_element_keys(Element& root, bool preserveExistingRoot = false);
 
 } // namespace lvt

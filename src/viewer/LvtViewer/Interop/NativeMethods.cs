@@ -105,7 +105,7 @@ public static class NativeMethods
     /// verified live on a 150%-scaled system: lvt.exe reported a window's
     /// rect scaled down by exactly 1/1.5 from its true physical rect. Every
     /// bounds value the viewer gets *from lvt* (ElementNodeViewModel's
-    /// Bounds* fields, ultimately from a `lvt watch`/`dump` JSON payload) is
+    /// Bounds* fields, ultimately from an MCP tree-resource payload) is
     /// in that same virtualized space, and must be scaled by this factor
     /// before it can be compared against or used to position anything this
     /// (Per-Monitor-V2 DPI aware, the .NET default) process gets directly

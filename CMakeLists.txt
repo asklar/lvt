@@ -31,10 +31,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # can drop the pieces they can't build. Win32 and ComCtl are always present:
 # they are the base layer every other provider enriches.
 #
-# XAML and WinUI 3 are pure C++ and need no .NET SDK. WPF, WinForms and
-# Avalonia have a native half that always builds, plus a managed helper
-# assembly gated behind LVT_BUILD_MANAGED, which is the only thing here that
-# shells out to `dotnet`.
+# XAML and WinUI 3 providers are pure C++ and need no .NET SDK. WPF, WinForms
+# and Avalonia have a native half that always builds, plus a managed helper
+# assembly gated behind LVT_BUILD_MANAGED. The optional WinUI test fixture also
+# shells out to `dotnet`, independently of the provider itself.
 option(LVT_ENABLE_XAML     "System XAML (UWP / DesktopWindowXamlSource) support" ON)
 option(LVT_ENABLE_WINUI3   "WinUI 3 (Windows App SDK) support"                   ON)
 option(LVT_ENABLE_WPF      "WPF support"                                         ON)
@@ -45,9 +45,16 @@ option(LVT_ENABLE_UIA      "UI Automation tree output (--uia)"                  
 # The MCP server needs a Rust toolchain, which not every contributor has, so it
 # is opt-in locally. CI and the release build turn it on explicitly.
 option(LVT_ENABLE_MCP      "MCP server mode (lvt mcp); requires a Rust toolchain" OFF)
+if(LVT_ENABLE_MCP AND NOT LVT_ENABLE_UIA)
+    message(FATAL_ERROR
+        "LVT_ENABLE_MCP requires LVT_ENABLE_UIA so every session has an exact, non-recyclable window identity")
+endif()
 
 option(LVT_BUILD_TOOL    "Build the lvt command-line tool"                     ON)
 option(LVT_BUILD_MANAGED "Build managed .NET assemblies (requires .NET SDK)"   ON)
+option(LVT_BUILD_WINUI3_TEST_FIXTURE
+    "Publish the architecture-matched WinUI 3 integration-test fixture"
+    ${LVT_BUILD_TESTS})
 # Off by default: it's a separate WPF app built by its own `dotnet build`, not
 # something most contributors touching lvt_core need. See src/viewer/README.md
 # for the architecture (it drives lvt.exe as a subprocess; it never links
@@ -58,6 +65,12 @@ option(LVT_BUILD_VIEWER  "Build the lvt Viewer WPF app (requires .NET SDK)"    O
 if(LVT_BUILD_MANAGED AND NOT (LVT_ENABLE_WPF OR LVT_ENABLE_WINFORMS OR LVT_ENABLE_AVALONIA))
     message(STATUS "lvt: no managed-backed framework enabled; forcing LVT_BUILD_MANAGED=OFF")
     set(LVT_BUILD_MANAGED OFF)
+endif()
+
+if(LVT_BUILD_TESTS AND NOT LVT_BUILD_WINUI3_TEST_FIXTURE)
+    message(FATAL_ERROR
+        "LVT_BUILD_TESTS requires LVT_BUILD_WINUI3_TEST_FIXTURE so WinUI tests "
+        "cannot silently run against a missing or foreign-architecture app.")
 endif()
 
 set(LVT_WITH_MANAGED ${LVT_BUILD_MANAGED})
@@ -127,6 +140,7 @@ set(LVT_CORE_SOURCES
     src/element_key.cpp
     src/json_serializer.cpp
     src/watch_diff.cpp
+    src/xaml_flags_metadata.cpp
     src/screenshot.cpp
     src/module_util.cpp
     src/input.cpp
@@ -135,7 +149,11 @@ set(LVT_CORE_SOURCES
     src/wil_diagnostics.cpp
     src/providers/win32_provider.cpp
     src/providers/comctl_provider.cpp
+    src/providers/native_message.cpp
+    src/providers/native_property_connection.cpp
+    src/providers/native_win_event.cpp
     src/providers/connection_registry.cpp
+    src/providers/property_contract.cpp
 )
 
 # xaml_diag_common backs both the XAML and WinUI 3 providers.
@@ -148,6 +166,9 @@ endif()
 if(LVT_ENABLE_WINUI3)
     list(APPEND LVT_CORE_SOURCES src/providers/winui3_provider.cpp)
 endif()
+if(LVT_ENABLE_WPF OR LVT_ENABLE_WINFORMS)
+    list(APPEND LVT_CORE_SOURCES src/providers/managed_connection.cpp)
+endif()
 if(LVT_ENABLE_WPF)
     list(APPEND LVT_CORE_SOURCES src/providers/wpf_provider.cpp src/providers/wpf_inject.cpp)
 endif()
@@ -159,6 +180,7 @@ if(LVT_ENABLE_UIA)
         src/providers/uia_provider.cpp
         src/providers/uia_props.cpp
         src/providers/uia_actions.cpp
+        src/providers/uia_property_adapter.cpp
     )
 endif()
 
@@ -250,6 +272,16 @@ if(LVT_BUILD_VIEWER)
         )
         add_dependencies(lvt_viewer lvt)
     endif()
+
+    set(LVT_VIEWER_TEST_PROJECT
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer.Tests/LvtViewer.Tests.csproj")
+    add_custom_target(lvt_viewer_tests ALL
+        COMMAND "${LVT_DOTNET_EXE}" build "${LVT_VIEWER_TEST_PROJECT}"
+            -c Release -p:Platform=x64
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Building lvt Viewer regression tests"
+    )
+    add_dependencies(lvt_viewer_tests lvt_viewer)
 endif()
 
 # --- MCP server (Rust) -----------------------------------------------------
@@ -563,11 +595,12 @@ endif()
 if(LVT_ENABLE_XAML OR LVT_ENABLE_WINUI3)
 add_library(lvt_tap SHARED
     src/tap/lvt_tap.cpp
+    src/xaml_flags_metadata.cpp
     src/tap/lvt_tap.def
 )
 target_compile_definitions(lvt_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN)
 target_include_directories(lvt_tap PRIVATE src src/tap/winui3)
-target_link_libraries(lvt_tap PRIVATE WIL::WIL ole32)
+target_link_libraries(lvt_tap PRIVATE WIL::WIL ole32 windowsapp)
 set_property(TARGET lvt_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # Place lvt_tap_{arch}.dll next to lvt.exe
@@ -587,10 +620,11 @@ if(LVT_ENABLE_WPF)
 add_library(lvt_wpf_tap SHARED
     src/tap_wpf/wpf_tap_native.cpp
     src/tap_wpf/wpf_tap_native.def
+    src/tap_managed/managed_tap_host.cpp
 )
 target_compile_definitions(lvt_wpf_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(lvt_wpf_tap PRIVATE src)
-target_link_libraries(lvt_wpf_tap PRIVATE WIL::WIL ole32)
+target_include_directories(lvt_wpf_tap PRIVATE src src/tap_managed)
+target_link_libraries(lvt_wpf_tap PRIVATE WIL::WIL ole32 version)
 set_property(TARGET lvt_wpf_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set_target_properties(lvt_wpf_tap PROPERTIES
@@ -601,19 +635,42 @@ lvt_add_version_resource(lvt_wpf_tap
     "lvt WPF TAP DLL (injected diagnostics helper)"
     "lvt_wpf_tap" "lvt_wpf_tap_${TAP_ARCH_SUFFIX}.dll" VFT_DLL)
 
-# Build managed WPF tree walker assembly and copy to output
-# Pre-build with: dotnet build src/tap_wpf/LvtWpfTap.csproj -c Release
 # The managed DLL is AnyCPU so the same binary works for all architectures.
 if(LVT_BUILD_MANAGED)
-add_custom_command(TARGET lvt_wpf_tap POST_BUILD
+set(LVT_WPF_MANAGED_DLL "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/Release/LvtWpfTap.dll")
+add_custom_command(
+    OUTPUT "${LVT_WPF_MANAGED_DLL}"
+    COMMAND dotnet build "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.csproj" -c Release --nologo
+    DEPENDS
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.csproj"
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/WpfTreeWalker.cs"
+        "${CMAKE_SOURCE_DIR}/src/tap_managed/ManagedProtocol.cs"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building managed WPF tree walker assembly"
+    VERBATIM
+)
+add_custom_target(lvt_wpf_managed ALL
+    DEPENDS "${LVT_WPF_MANAGED_DLL}"
+)
+set(LVT_WPF_RUNTIME_DLL "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.dll")
+set(LVT_WPF_RUNTIME_CONFIG "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.runtimeconfig.json")
+add_custom_command(
+    OUTPUT "${LVT_WPF_RUNTIME_DLL}" "${LVT_WPF_RUNTIME_CONFIG}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/src/tap_wpf/bin/Release/LvtWpfTap.dll"
-        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.dll"
+        "${LVT_WPF_MANAGED_DLL}"
+        "${LVT_WPF_RUNTIME_DLL}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.runtimeconfig.json"
-        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWpfTap.runtimeconfig.json"
+        "${LVT_WPF_RUNTIME_CONFIG}"
+    DEPENDS
+        "${LVT_WPF_MANAGED_DLL}"
+        "${CMAKE_SOURCE_DIR}/src/tap_wpf/LvtWpfTap.runtimeconfig.json"
     COMMENT "Copying managed WPF tree walker assembly"
 )
+add_custom_target(lvt_wpf_managed_payload ALL
+    DEPENDS "${LVT_WPF_RUNTIME_DLL}" "${LVT_WPF_RUNTIME_CONFIG}"
+)
+add_dependencies(lvt_wpf_tap lvt_wpf_managed_payload)
 endif()
 endif()
 
@@ -622,10 +679,11 @@ if(LVT_ENABLE_WINFORMS)
 add_library(lvt_winforms_tap SHARED
     src/tap_winforms/winforms_tap_native.cpp
     src/tap_winforms/winforms_tap_native.def
+    src/tap_managed/managed_tap_host.cpp
 )
 target_compile_definitions(lvt_winforms_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_include_directories(lvt_winforms_tap PRIVATE src)
-target_link_libraries(lvt_winforms_tap PRIVATE WIL::WIL ole32)
+target_include_directories(lvt_winforms_tap PRIVATE src src/tap_managed)
+target_link_libraries(lvt_winforms_tap PRIVATE WIL::WIL ole32 version)
 set_property(TARGET lvt_winforms_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 set_target_properties(lvt_winforms_tap PROPERTIES
@@ -644,6 +702,7 @@ add_custom_command(
     DEPENDS
         "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.csproj"
         "${CMAKE_SOURCE_DIR}/src/tap_winforms/WinFormsTreeWalker.cs"
+        "${CMAKE_SOURCE_DIR}/src/tap_managed/ManagedProtocol.cs"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building managed WinForms tree walker assembly"
     VERBATIM
@@ -651,16 +710,25 @@ add_custom_command(
 add_custom_target(lvt_winforms_managed ALL
     DEPENDS "${LVT_WINFORMS_MANAGED_DLL}"
 )
-add_dependencies(lvt_winforms_tap lvt_winforms_managed)
-add_custom_command(TARGET lvt_winforms_tap POST_BUILD
+set(LVT_WINFORMS_RUNTIME_DLL "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.dll")
+set(LVT_WINFORMS_RUNTIME_CONFIG "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.runtimeconfig.json")
+add_custom_command(
+    OUTPUT "${LVT_WINFORMS_RUNTIME_DLL}" "${LVT_WINFORMS_RUNTIME_CONFIG}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${LVT_WINFORMS_MANAGED_DLL}"
-        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.dll"
+        "${LVT_WINFORMS_RUNTIME_DLL}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.runtimeconfig.json"
-        "${LVT_RUNTIME_OUTPUT_DIR}/LvtWinFormsTap.runtimeconfig.json"
+        "${LVT_WINFORMS_RUNTIME_CONFIG}"
+    DEPENDS
+        "${LVT_WINFORMS_MANAGED_DLL}"
+        "${CMAKE_SOURCE_DIR}/src/tap_winforms/LvtWinFormsTap.runtimeconfig.json"
     COMMENT "Copying managed WinForms tree walker assembly"
 )
+add_custom_target(lvt_winforms_managed_payload ALL
+    DEPENDS "${LVT_WINFORMS_RUNTIME_DLL}" "${LVT_WINFORMS_RUNTIME_CONFIG}"
+)
+add_dependencies(lvt_winforms_tap lvt_winforms_managed_payload)
 endif()
 endif()
 
@@ -687,7 +755,8 @@ add_library(lvt_avalonia_tap SHARED
     src/plugin_avalonia/avalonia_tap_native.def
 )
 target_compile_definitions(lvt_avalonia_tap PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(lvt_avalonia_tap PRIVATE WIL::WIL)
+target_include_directories(lvt_avalonia_tap PRIVATE src src/tap_managed)
+target_link_libraries(lvt_avalonia_tap PRIVATE WIL::WIL version)
 set_property(TARGET lvt_avalonia_tap PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set_target_properties(lvt_avalonia_tap PROPERTIES
     OUTPUT_NAME "lvt_avalonia_tap_${TAP_ARCH_SUFFIX}"
@@ -702,25 +771,32 @@ lvt_add_version_resource(lvt_avalonia_tap
 # The csproj sets AppendTargetFrameworkToOutputPath=false so output is bin/Release/,
 # but as a fallback we also build via a custom command that publishes to a known location.
 if(LVT_BUILD_MANAGED)
-add_custom_command(TARGET lvt_avalonia_tap POST_BUILD
-    COMMAND dotnet publish "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj"
-        -c Release -o "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia" --no-restore
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
-        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
-    COMMENT "Publishing managed Avalonia tree walker assembly"
-)
-
+set(LVT_AVALONIA_RID "win-${TAP_ARCH_SUFFIX}")
+set(LVT_AVALONIA_PUBLISH_DIR "${CMAKE_CURRENT_BINARY_DIR}/avalonia-publish-${TAP_ARCH_SUFFIX}")
+set(LVT_AVALONIA_STAGE_STAMP "${CMAKE_CURRENT_BINARY_DIR}/avalonia-stage-${TAP_ARCH_SUFFIX}.stamp")
 add_custom_target(lvt_avalonia_tree_walker
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
+    BYPRODUCTS "${LVT_AVALONIA_STAGE_STAMP}"
+    COMMAND ${CMAKE_COMMAND} -E remove_directory "${LVT_AVALONIA_PUBLISH_DIR}"
     COMMAND dotnet publish "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csproj"
-        -c Release -o "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
+        -c Release -r "${LVT_AVALONIA_RID}" --self-contained false
+        -p:DebugSymbols=false -p:DebugType=None
+        -o "${LVT_AVALONIA_PUBLISH_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E remove_directory
+        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${LVT_AVALONIA_PUBLISH_DIR}"
+        "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.runtimeconfig.json"
         "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
+    COMMAND ${CMAKE_COMMAND} -E touch "${LVT_AVALONIA_STAGE_STAMP}"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Publishing managed Avalonia tree walker assembly"
+    COMMENT "Publishing managed Avalonia tree walker for ${LVT_AVALONIA_RID}"
 )
+add_dependencies(lvt_avalonia_tap lvt_avalonia_tree_walker)
+# Staging removes the prior native TAP, so force an incremental relink after
+# the matching RID publish has replaced the directory.
+set_property(TARGET lvt_avalonia_tap APPEND PROPERTY LINK_DEPENDS "${LVT_AVALONIA_STAGE_STAMP}")
 endif()
 endif()
 
@@ -817,23 +893,14 @@ if(LVT_BUILD_VIEWER AND LVT_BUILD_TOOL)
 
     if(TARGET lvt_avalonia_tap)
         add_custom_command(TARGET lvt_viewer POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "$<TARGET_FILE:lvt_avalonia_tap>" "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/"
-            COMMENT "Copying the Avalonia TAP DLL next to the viewer"
+            COMMAND ${CMAKE_COMMAND} -E remove_directory
+                "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia"
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia"
+                "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia"
+            COMMENT "Copying the matching Avalonia published runtime next to the viewer"
         )
         add_dependencies(lvt_viewer lvt_avalonia_tap)
-        if(LVT_BUILD_MANAGED)
-            add_custom_command(TARGET lvt_viewer POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
-                    "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.dll"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${LVT_RUNTIME_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
-                    "${LVT_VIEWER_OUTPUT_DIR}/plugins/avalonia/LvtAvaloniaTreeWalker.runtimeconfig.json"
-                COMMENT "Copying the managed Avalonia tree walker assembly next to the viewer"
-            )
-        endif()
     endif()
 
     if(TARGET lvt_chromium_plugin)
@@ -842,13 +909,140 @@ if(LVT_BUILD_VIEWER AND LVT_BUILD_TOOL)
                 "${LVT_RUNTIME_OUTPUT_DIR}/plugins/chromium" "${LVT_VIEWER_OUTPUT_DIR}/plugins/chromium"
             COMMENT "Copying the Chromium native host + extension next to the viewer"
         )
+        if(TARGET lvt_chromium_host)
+            add_dependencies(lvt_viewer lvt_chromium_host)
+        endif()
     endif()
+endif()
+
+# The WinUI fixture is also buildable without the test executables. Release and
+# cross-compilation CI use that path to retain x86/ARM64 compile and packaging
+# coverage even when those binaries cannot be executed on the current runner.
+if(LVT_BUILD_WINUI3_TEST_FIXTURE)
+    if(VCPKG_TARGET_TRIPLET MATCHES "arm64")
+        set(LVT_WINUI3_SAMPLE_ARCH "arm64")
+        set(LVT_WINUI3_SAMPLE_PLATFORM "ARM64")
+        set(LVT_WINUI3_SAMPLE_RID "win-arm64")
+    elseif(VCPKG_TARGET_TRIPLET MATCHES "x86")
+        set(LVT_WINUI3_SAMPLE_ARCH "x86")
+        set(LVT_WINUI3_SAMPLE_PLATFORM "x86")
+        set(LVT_WINUI3_SAMPLE_RID "win-x86")
+    elseif(VCPKG_TARGET_TRIPLET MATCHES "x64" OR NOT VCPKG_TARGET_TRIPLET)
+        set(LVT_WINUI3_SAMPLE_ARCH "x64")
+        set(LVT_WINUI3_SAMPLE_PLATFORM "x64")
+        set(LVT_WINUI3_SAMPLE_RID "win-x64")
+    else()
+        message(FATAL_ERROR
+            "The WinUI 3 test fixture does not support target triplet "
+            "'${VCPKG_TARGET_TRIPLET}'. Supported architectures are x64, x86, and arm64.")
+    endif()
+
+    find_program(LVT_POWERSHELL_EXE NAMES pwsh powershell)
+    if(NOT LVT_POWERSHELL_EXE)
+        message(FATAL_ERROR
+            "The WinUI 3 test fixture requires PowerShell for its static "
+            "architecture and resource validation.")
+    endif()
+
+    set(WINUI3_SAMPLE_PROJECT
+        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/WinUI3Sample.csproj")
+    set(WINUI3_SAMPLE_ROOT
+        "${CMAKE_BINARY_DIR}/tests/apps/WinUI3Sample/${LVT_WINUI3_SAMPLE_ARCH}")
+    set(WINUI3_SAMPLE_OUTPUT_DIR "${WINUI3_SAMPLE_ROOT}/bin")
+    set(WINUI3_SAMPLE_BUILD_DIR "${WINUI3_SAMPLE_ROOT}/build")
+    set(WINUI3_SAMPLE_INTERMEDIATE_DIR "${WINUI3_SAMPLE_ROOT}/obj")
+    set(WINUI3_SAMPLE_MSBUILD_ARGS "")
+    if(DEFINED ENV{VSINSTALLDIR} AND EXISTS "$ENV{VSINSTALLDIR}/MSBuild/Microsoft/VisualStudio/v18.0/AppxPackage/Microsoft.Build.Packaging.Pri.Tasks.dll")
+        list(APPEND WINUI3_SAMPLE_MSBUILD_ARGS
+            "-p:MSBuildExtensionsPath=$ENV{VSINSTALLDIR}/MSBuild")
+    endif()
+    add_custom_target(winui3_sample_app ALL
+        COMMAND dotnet publish "${WINUI3_SAMPLE_PROJECT}"
+            -c Release
+            "-p:Platform=${LVT_WINUI3_SAMPLE_PLATFORM}"
+            "-p:PlatformTarget=${LVT_WINUI3_SAMPLE_PLATFORM}"
+            -r "${LVT_WINUI3_SAMPLE_RID}"
+            --self-contained true
+            -o "${WINUI3_SAMPLE_OUTPUT_DIR}"
+            "-p:BaseOutputPath=${WINUI3_SAMPLE_BUILD_DIR}/"
+            "-p:OutputPath=${WINUI3_SAMPLE_BUILD_DIR}/"
+            "-p:BaseIntermediateOutputPath=${WINUI3_SAMPLE_INTERMEDIATE_DIR}/"
+            "-p:IntermediateOutputPath=${WINUI3_SAMPLE_INTERMEDIATE_DIR}/"
+            "-p:MSBuildProjectExtensionsPath=${WINUI3_SAMPLE_INTERMEDIATE_DIR}/"
+            ${WINUI3_SAMPLE_MSBUILD_ARGS}
+            --nologo
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${WINUI3_SAMPLE_INTERMEDIATE_DIR}/App.xbf"
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/App.xbf"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${WINUI3_SAMPLE_INTERMEDIATE_DIR}/MainWindow.xbf"
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/MainWindow.xbf"
+        COMMAND "${LVT_POWERSHELL_EXE}" -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_SOURCE_DIR}/scripts/validate-winui3-test-fixture.ps1"
+            -Root "${WINUI3_SAMPLE_OUTPUT_DIR}"
+            -IntermediateRoot "${WINUI3_SAMPLE_INTERMEDIATE_DIR}"
+            -Architecture "${LVT_WINUI3_SAMPLE_ARCH}"
+        BYPRODUCTS
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe"
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/App.xbf"
+            "${WINUI3_SAMPLE_OUTPUT_DIR}/MainWindow.xbf"
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        COMMENT "Publishing ${LVT_WINUI3_SAMPLE_ARCH} WinUI3 sample app"
+        VERBATIM
+    )
+    file(TO_NATIVE_PATH
+        "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe"
+        WINUI3_SAMPLE_EXE_NATIVE)
+    string(REPLACE "\\" "\\\\"
+        WINUI3_SAMPLE_EXE_ESCAPED "${WINUI3_SAMPLE_EXE_NATIVE}")
 endif()
 
 # --- Tests ---
 if(LVT_BUILD_TESTS)
 enable_testing()
 find_package(GTest CONFIG REQUIRED)
+
+# Deterministic plugin ABI fixtures. Each variant has its own directory but
+# the same file name so LVT_PLUGIN_DIR can select exactly one contract:
+# complete v2, legacy v1, or deliberately incomplete v2.
+function(lvt_add_fake_plugin target output_dir plugin_name api_version)
+    add_library(${target} SHARED tests/plugins/fake_plugin.cpp)
+    target_include_directories(${target} PRIVATE src)
+    target_compile_definitions(${target} PRIVATE
+        WIN32_LEAN_AND_MEAN NOMINMAX
+        "LVT_FAKE_PLUGIN_NAME=\"${plugin_name}\""
+        "LVT_FAKE_PLUGIN_API_VERSION=${api_version}"
+        ${ARGN}
+    )
+    set_target_properties(${target} PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "lvt_fake_plugin"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-plugins/${output_dir}"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-plugins/${output_dir}"
+        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-plugins/${output_dir}"
+    )
+endfunction()
+
+lvt_add_fake_plugin(
+    lvt_fake_plugin_v2 persistent fake-persistent 2
+    LVT_FAKE_PLUGIN_PERSISTENT)
+lvt_add_fake_plugin(
+    lvt_fake_plugin_v1 legacy fake-v1 1)
+lvt_add_fake_plugin(
+    lvt_fake_plugin_partial partial fake-partial 2
+    LVT_FAKE_PLUGIN_PARTIAL)
+lvt_add_fake_plugin(
+    lvt_fake_plugin_identity_a identity fake-plugin-a 2
+    LVT_FAKE_PLUGIN_PERSISTENT
+    "LVT_FAKE_FRAMEWORK_NAME=\"shared-alias\"")
+set_target_properties(
+    lvt_fake_plugin_identity_a PROPERTIES OUTPUT_NAME "lvt_fake_plugin_a")
+lvt_add_fake_plugin(
+    lvt_fake_plugin_identity_b identity fake-plugin-b 2
+    LVT_FAKE_PLUGIN_PERSISTENT
+    "LVT_FAKE_FRAMEWORK_NAME=\"shared-alias\"")
+set_target_properties(
+    lvt_fake_plugin_identity_b PROPERTIES OUTPUT_NAME "lvt_fake_plugin_b")
 
 # Unit tests — pure logic, no live HWND needed
 add_executable(lvt_unit_tests
@@ -864,6 +1058,14 @@ target_link_libraries(lvt_unit_tests PRIVATE
 )
 add_test(NAME unit_tests COMMAND lvt_unit_tests)
 
+if(LVT_BUILD_VIEWER)
+    add_test(
+        NAME viewer_tests
+        COMMAND "${LVT_DOTNET_EXE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer.Tests/bin/x64/Release/net10.0-windows/LvtViewer.Tests.dll"
+    )
+endif()
+
 # Compile-only guard: links lvt_core with no include dirs of its own, so it sees
 # only what lvt_core propagates. Catches a public header depending on something
 # lvt_core links PRIVATE before a downstream consumer does.
@@ -872,10 +1074,24 @@ target_compile_definitions(lvt_public_headers_test PRIVATE WIN32_LEAN_AND_MEAN N
 target_link_libraries(lvt_public_headers_test PRIVATE lvt_core)
 
 # WPF sample app used by integration tests
+if(VCPKG_TARGET_TRIPLET MATCHES "arm64")
+    set(LVT_MANAGED_TEST_RID "win-arm64")
+    set(LVT_MANAGED_TEST_PLATFORM "arm64")
+elseif(VCPKG_TARGET_TRIPLET MATCHES "x86")
+    set(LVT_MANAGED_TEST_RID "win-x86")
+    set(LVT_MANAGED_TEST_PLATFORM "x86")
+else()
+    set(LVT_MANAGED_TEST_RID "win-x64")
+    set(LVT_MANAGED_TEST_PLATFORM "x64")
+endif()
 set(WPF_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WpfSample/WpfSample.csproj")
 set(WPF_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WpfSample")
 add_custom_target(wpf_sample_app ALL
-    COMMAND dotnet build "${WPF_SAMPLE_PROJECT}" -c Release -o "${WPF_SAMPLE_OUTPUT_DIR}"
+    COMMAND dotnet publish "${WPF_SAMPLE_PROJECT}" -c Release
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WPF_SAMPLE_OUTPUT_DIR}"
     BYPRODUCTS "${WPF_SAMPLE_OUTPUT_DIR}/WpfSample.exe"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building WPF sample app"
@@ -883,40 +1099,49 @@ add_custom_target(wpf_sample_app ALL
 file(TO_NATIVE_PATH "${WPF_SAMPLE_OUTPUT_DIR}/WpfSample.exe" WPF_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" WPF_SAMPLE_EXE_ESCAPED "${WPF_SAMPLE_EXE_NATIVE}")
 
-# WinUI3 sample app used by integration tests
-set(WINUI3_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/WinUI3Sample.csproj")
-set(WINUI3_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinUI3Sample")
-set(WINUI3_SAMPLE_MSBUILD_ARGS "")
-if(DEFINED ENV{VSINSTALLDIR} AND EXISTS "$ENV{VSINSTALLDIR}/MSBuild/Microsoft/VisualStudio/v18.0/AppxPackage/Microsoft.Build.Packaging.Pri.Tasks.dll")
-    list(APPEND WINUI3_SAMPLE_MSBUILD_ARGS
-        "-p:MSBuildExtensionsPath=$ENV{VSINSTALLDIR}/MSBuild")
-endif()
-add_custom_target(winui3_sample_app ALL
-    COMMAND dotnet publish "${WINUI3_SAMPLE_PROJECT}"
-        -c Release -p:Platform=x64 -r win-x64 --self-contained true
-        -o "${WINUI3_SAMPLE_OUTPUT_DIR}"
-        ${WINUI3_SAMPLE_MSBUILD_ARGS}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net10.0-windows10.0.19041.0/win-x64/App.xbf"
-        "${WINUI3_SAMPLE_OUTPUT_DIR}/App.xbf"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/tests/apps/WinUI3Sample/obj/x64/Release/net10.0-windows10.0.19041.0/win-x64/MainWindow.xbf"
-        "${WINUI3_SAMPLE_OUTPUT_DIR}/MainWindow.xbf"
-    BYPRODUCTS "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe"
+set(WPF_NET6_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WpfSampleNet6/WpfSampleNet6.csproj")
+set(WPF_NET6_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WpfSampleNet6")
+add_custom_target(wpf_net6_sample_app ALL
+    COMMAND dotnet publish "${WPF_NET6_SAMPLE_PROJECT}" -c Release
+        -p:CheckEolTargetFramework=false
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WPF_NET6_SAMPLE_OUTPUT_DIR}"
+    BYPRODUCTS "${WPF_NET6_SAMPLE_OUTPUT_DIR}/WpfSample.exe"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Publishing WinUI3 sample app"
+    COMMENT "Building .NET 6 WPF sample app"
 )
-file(TO_NATIVE_PATH "${WINUI3_SAMPLE_OUTPUT_DIR}/WinUI3Sample.exe" WINUI3_SAMPLE_EXE_NATIVE)
-string(REPLACE "\\" "\\\\" WINUI3_SAMPLE_EXE_ESCAPED "${WINUI3_SAMPLE_EXE_NATIVE}")
+file(TO_NATIVE_PATH "${WPF_NET6_SAMPLE_OUTPUT_DIR}/WpfSample.exe" WPF_NET6_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WPF_NET6_SAMPLE_EXE_ESCAPED "${WPF_NET6_SAMPLE_EXE_NATIVE}")
+
+set(WPF_NET48_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WpfSampleNet48/WpfSampleNet48.csproj")
+set(WPF_NET48_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WpfSampleNet48")
+add_custom_target(wpf_net48_sample_app ALL
+    COMMAND dotnet build "${WPF_NET48_SAMPLE_PROJECT}" -c Release
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WPF_NET48_SAMPLE_OUTPUT_DIR}"
+    BYPRODUCTS "${WPF_NET48_SAMPLE_OUTPUT_DIR}/WpfSample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building .NET Framework 4.8 WPF sample app"
+)
+file(TO_NATIVE_PATH "${WPF_NET48_SAMPLE_OUTPUT_DIR}/WpfSample.exe" WPF_NET48_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WPF_NET48_SAMPLE_EXE_ESCAPED "${WPF_NET48_SAMPLE_EXE_NATIVE}")
 
 # Avalonia sample app used by integration tests
 set(AVALONIA_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/avalonia_test_app/AvaloniaTestApp.csproj")
 set(AVALONIA_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/avalonia_test_app")
 add_custom_target(avalonia_test_app ALL
-    COMMAND dotnet build "${AVALONIA_SAMPLE_PROJECT}" -c Release -o "${AVALONIA_SAMPLE_OUTPUT_DIR}"
+    COMMAND dotnet publish "${AVALONIA_SAMPLE_PROJECT}" -c Release
+        -p:CheckEolTargetFramework=false
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained true
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${AVALONIA_SAMPLE_OUTPUT_DIR}" --nologo
     BYPRODUCTS "${AVALONIA_SAMPLE_OUTPUT_DIR}/AvaloniaTestApp.exe"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Building Avalonia integration test app"
+    COMMENT "Publishing architecture-matched Avalonia integration test app"
 )
 file(TO_NATIVE_PATH "${AVALONIA_SAMPLE_OUTPUT_DIR}/AvaloniaTestApp.exe" AVALONIA_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" AVALONIA_SAMPLE_EXE_ESCAPED "${AVALONIA_SAMPLE_EXE_NATIVE}")
@@ -925,13 +1150,75 @@ string(REPLACE "\\" "\\\\" AVALONIA_SAMPLE_EXE_ESCAPED "${AVALONIA_SAMPLE_EXE_NA
 set(WINFORMS_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinFormsSample/WinFormsSample.csproj")
 set(WINFORMS_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinFormsSample")
 add_custom_target(winforms_sample_app ALL
-    COMMAND dotnet build "${WINFORMS_SAMPLE_PROJECT}" -c Release -o "${WINFORMS_SAMPLE_OUTPUT_DIR}" --nologo
+    COMMAND dotnet publish "${WINFORMS_SAMPLE_PROJECT}" -c Release
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WINFORMS_SAMPLE_OUTPUT_DIR}" --nologo
     BYPRODUCTS "${WINFORMS_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Building WinForms sample app"
 )
 file(TO_NATIVE_PATH "${WINFORMS_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe" WINFORMS_SAMPLE_EXE_NATIVE)
 string(REPLACE "\\" "\\\\" WINFORMS_SAMPLE_EXE_ESCAPED "${WINFORMS_SAMPLE_EXE_NATIVE}")
+
+set(WINFORMS_NET6_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinFormsSampleNet6/WinFormsSampleNet6.csproj")
+set(WINFORMS_NET6_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinFormsSampleNet6")
+add_custom_target(winforms_net6_sample_app ALL
+    COMMAND dotnet publish "${WINFORMS_NET6_SAMPLE_PROJECT}" -c Release
+        -p:CheckEolTargetFramework=false
+        -r "${LVT_MANAGED_TEST_RID}" --self-contained false
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WINFORMS_NET6_SAMPLE_OUTPUT_DIR}" --nologo
+    BYPRODUCTS "${WINFORMS_NET6_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building .NET 6 WinForms sample app"
+)
+file(TO_NATIVE_PATH "${WINFORMS_NET6_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe" WINFORMS_NET6_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WINFORMS_NET6_SAMPLE_EXE_ESCAPED "${WINFORMS_NET6_SAMPLE_EXE_NATIVE}")
+
+set(WINFORMS_NET48_SAMPLE_PROJECT "${CMAKE_SOURCE_DIR}/tests/apps/WinFormsSampleNet48/WinFormsSampleNet48.csproj")
+set(WINFORMS_NET48_SAMPLE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/tests/apps/WinFormsSampleNet48")
+add_custom_target(winforms_net48_sample_app ALL
+    COMMAND dotnet build "${WINFORMS_NET48_SAMPLE_PROJECT}" -c Release
+        -p:PlatformTarget="${LVT_MANAGED_TEST_PLATFORM}"
+        -p:Platform="${LVT_MANAGED_TEST_PLATFORM}"
+        -o "${WINFORMS_NET48_SAMPLE_OUTPUT_DIR}" --nologo
+    BYPRODUCTS "${WINFORMS_NET48_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Building .NET Framework 4.8 WinForms sample app"
+)
+file(TO_NATIVE_PATH "${WINFORMS_NET48_SAMPLE_OUTPUT_DIR}/WinFormsSample.exe" WINFORMS_NET48_SAMPLE_EXE_NATIVE)
+string(REPLACE "\\" "\\\\" WINFORMS_NET48_SAMPLE_EXE_ESCAPED "${WINFORMS_NET48_SAMPLE_EXE_NATIVE}")
+
+# Native Win32/Common Controls sample app used by integration tests and future
+# property-editing coverage. It deliberately builds for the active CMake
+# architecture, so the same fixture source is usable in x64 and x86 test builds.
+add_executable(lvt_native_controls_fixture WIN32
+    tests/apps/NativeControlsFixture/main.cpp
+    tests/apps/NativeControlsFixture/NativeControlsFixture.rc
+)
+target_compile_definitions(lvt_native_controls_fixture PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
+)
+target_link_libraries(lvt_native_controls_fixture PRIVATE comctl32)
+target_link_options(lvt_native_controls_fixture PRIVATE "/MANIFEST:NO")
+
+add_executable(lvt_managed_pipe_spoof
+    tests/apps/ManagedPipeSpoof/main.cpp
+)
+
+add_library(lvt_loader_lock_blocker SHARED
+    tests/apps/LoaderLockBlocker/dllmain.cpp
+)
+target_compile_definitions(lvt_loader_lock_blocker PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE
+)
+set_property(
+    TARGET lvt_loader_lock_blocker
+    PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
 
 # Integration tests — require a running Notepad instance
 add_executable(lvt_integration_tests
@@ -942,60 +1229,122 @@ target_include_directories(lvt_integration_tests PRIVATE src)
 target_compile_definitions(lvt_integration_tests PRIVATE
     WIN32_LEAN_AND_MEAN NOMINMAX WINRT_LEAN_AND_MEAN UNICODE _UNICODE
     WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
+    WPF_NET6_SAMPLE_EXE_PATH="${WPF_NET6_SAMPLE_EXE_ESCAPED}"
+    WPF_NET48_SAMPLE_EXE_PATH="${WPF_NET48_SAMPLE_EXE_ESCAPED}"
     WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
     AVALONIA_SAMPLE_EXE_PATH="${AVALONIA_SAMPLE_EXE_ESCAPED}"
     WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
+    WINFORMS_NET6_SAMPLE_EXE_PATH="${WINFORMS_NET6_SAMPLE_EXE_ESCAPED}"
+    WINFORMS_NET48_SAMPLE_EXE_PATH="${WINFORMS_NET48_SAMPLE_EXE_ESCAPED}"
+    "NATIVE_CONTROLS_FIXTURE_EXE_PATH=\"$<TARGET_FILE:lvt_native_controls_fixture>\""
+    "MANAGED_PIPE_SPOOF_EXE_PATH=\"$<TARGET_FILE:lvt_managed_pipe_spoof>\""
+    "LOADER_LOCK_BLOCKER_DLL_PATH=\"$<TARGET_FILE:lvt_loader_lock_blocker>\""
+    "LVT_FAKE_PLUGIN_V2_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v2>\""
+    "LVT_FAKE_PLUGIN_V1_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v1>\""
+    "LVT_FAKE_PLUGIN_PARTIAL_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_partial>\""
+    "LVT_FAKE_PLUGIN_IDENTITY_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_identity_a>\""
     # Lets tests assert on repository files, e.g. that the packaged skill has
     # not drifted from the one this repo's own agent reads.
     "LVT_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\""
 )
 target_link_libraries(lvt_integration_tests PRIVATE
+    lvt_core
     GTest::gtest GTest::gtest_main
     WIL::WIL nlohmann_json::nlohmann_json
-    comctl32
+    comctl32 version
 )
 target_link_options(lvt_integration_tests PRIVATE "/MANIFEST:NO")
-set(LVT_INTEGRATION_DEPS wpf_sample_app winui3_sample_app)
+set(LVT_INTEGRATION_DEPS
+    wpf_sample_app
+    wpf_net6_sample_app
+    wpf_net48_sample_app
+    winui3_sample_app
+    lvt_native_controls_fixture
+    lvt_managed_pipe_spoof
+    lvt_loader_lock_blocker
+    winforms_net6_sample_app
+    winforms_net48_sample_app
+    lvt_fake_plugin_v2
+    lvt_fake_plugin_v1
+    lvt_fake_plugin_partial
+    lvt_fake_plugin_identity_a
+    lvt_fake_plugin_identity_b
+)
 if(LVT_BUILD_TOOL)
     list(APPEND LVT_INTEGRATION_DEPS lvt)
+endif()
+if(LVT_ENABLE_WPF)
+    list(APPEND LVT_INTEGRATION_DEPS lvt_wpf_tap)
 endif()
 if(LVT_ENABLE_WINFORMS)
     list(APPEND LVT_INTEGRATION_DEPS lvt_winforms_tap winforms_sample_app)
 endif()
 if(LVT_ENABLE_AVALONIA)
     list(APPEND LVT_INTEGRATION_DEPS lvt_avalonia_plugin lvt_avalonia_tap avalonia_test_app)
-    if(LVT_BUILD_MANAGED)
-        list(APPEND LVT_INTEGRATION_DEPS lvt_avalonia_tree_walker)
-    endif()
 endif()
 add_dependencies(lvt_integration_tests ${LVT_INTEGRATION_DEPS})
 add_test(NAME integration_tests COMMAND lvt_integration_tests)
+add_test(
+    NAME winui3_fixture_static
+    COMMAND "${LVT_POWERSHELL_EXE}" -NoProfile -ExecutionPolicy Bypass
+        -File "${CMAKE_SOURCE_DIR}/scripts/validate-winui3-test-fixture.ps1"
+        -Root "${WINUI3_SAMPLE_OUTPUT_DIR}"
+        -IntermediateRoot "${WINUI3_SAMPLE_INTERMEDIATE_DIR}"
+        -Architecture "${LVT_WINUI3_SAMPLE_ARCH}")
+add_test(
+    NAME winui3_fixture_legacy_obj_regression
+    COMMAND "${LVT_POWERSHELL_EXE}" -NoProfile -ExecutionPolicy Bypass
+        -File "${CMAKE_SOURCE_DIR}/scripts/test-winui3-isolated-build.ps1"
+        -SourceRoot "${CMAKE_SOURCE_DIR}"
+        -ScratchRoot "${CMAKE_BINARY_DIR}/tests/winui3-legacy-obj-regression")
+set_tests_properties(
+    winui3_fixture_legacy_obj_regression
+    PROPERTIES TIMEOUT 300)
 
-# Chromium plugin tests — DOM JSON format and native messaging protocol
-if(LVT_ENABLE_CHROMIUM)
 # --- MCP server tests ------------------------------------------------------
 # A separate binary because it needs a live JSON-RPC conversation over pipes
 # rather than the one-shot commands the other integration tests run, and
 # because it only exists when the MCP server was built.
 if(LVT_ENABLE_MCP AND LVT_BUILD_TOOL)
     add_executable(lvt_mcp_tests tests/mcp_tests.cpp)
-    target_include_directories(lvt_mcp_tests PRIVATE src)
+    target_include_directories(lvt_mcp_tests PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/include/lvt")
     target_compile_definitions(lvt_mcp_tests PRIVATE
         WIN32_LEAN_AND_MEAN NOMINMAX
         WINUI3_SAMPLE_EXE_PATH="${WINUI3_SAMPLE_EXE_ESCAPED}"
+        WPF_SAMPLE_EXE_PATH="${WPF_SAMPLE_EXE_ESCAPED}"
+        WINFORMS_SAMPLE_EXE_PATH="${WINFORMS_SAMPLE_EXE_ESCAPED}"
+        "NATIVE_CONTROLS_FIXTURE_EXE_PATH=\"$<TARGET_FILE:lvt_native_controls_fixture>\""
+        "LVT_FAKE_PLUGIN_V2_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v2>\""
+        "LVT_FAKE_PLUGIN_V1_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_v1>\""
+        "LVT_FAKE_PLUGIN_PARTIAL_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_partial>\""
+        "LVT_FAKE_PLUGIN_IDENTITY_DIR=\"$<TARGET_FILE_DIR:lvt_fake_plugin_identity_a>\""
     )
     target_link_libraries(lvt_mcp_tests PRIVATE
         GTest::gtest GTest::gtest_main
         WIL::WIL
         nlohmann_json::nlohmann_json
     )
-    add_dependencies(lvt_mcp_tests lvt)
+    add_dependencies(
+        lvt_mcp_tests lvt lvt_native_controls_fixture
+        lvt_fake_plugin_v2 lvt_fake_plugin_v1 lvt_fake_plugin_partial
+        lvt_fake_plugin_identity_a lvt_fake_plugin_identity_b)
+    if(TARGET lvt_tap)
+        add_dependencies(lvt_mcp_tests lvt_tap)
+    endif()
     if(TARGET winui3_sample_app)
         add_dependencies(lvt_mcp_tests winui3_sample_app)
+    endif()
+    if(TARGET lvt_wpf_tap)
+        add_dependencies(lvt_mcp_tests lvt_wpf_tap wpf_sample_app)
+    endif()
+    if(TARGET lvt_winforms_tap)
+        add_dependencies(lvt_mcp_tests lvt_winforms_tap winforms_sample_app)
     endif()
     add_test(NAME mcp_tests COMMAND lvt_mcp_tests)
 endif()
 
+# Chromium plugin tests — DOM JSON format and native messaging protocol
+if(LVT_ENABLE_CHROMIUM)
 add_executable(lvt_chromium_tests    tests/chromium_tests.cpp
     src/element_key.cpp
 )

@@ -10,12 +10,24 @@ namespace LvtViewer.ViewModels;
 /// <summary>
 /// One node of the live element tree shown in the TreeView, and the source
 /// of the property panel when selected. Instances are long-lived: the same
-/// object is reused across watch ticks (keyed by lvt's durable "key"), so
+/// object is reused across MCP resource patches (keyed by lvt's durable "key"), so
 /// updating its bound properties in place is what makes the TreeView/property
 /// panel refresh live without losing selection or expansion state.
 /// </summary>
 public sealed class ElementNodeViewModel : ObservableObject
 {
+    public readonly record struct PropertyMutationToken(
+        long OperationId,
+        string ProviderName,
+        long SubmittedRevision);
+
+    private sealed class PropertyMutationContext(
+        PropertyMutationToken token)
+    {
+        public PropertyMutationToken Token { get; } = token;
+        public bool IsCompleted { get; set; }
+    }
+
     private string _id = "";
     private string _type = "";
     private string _framework = "";
@@ -153,7 +165,17 @@ public sealed class ElementNodeViewModel : ObservableObject
         }
     }
 
-    public ObservableCollection<PropertyRowViewModel> PropertyRows { get; } = new();
+    private ObservableCollection<PropertyRowViewModel> _propertyRows = new();
+    private readonly Dictionary<string, PropertyMutationContext>
+        _propertyMutations = new(StringComparer.Ordinal);
+    private long _nextPropertyMutationId;
+
+    public ObservableCollection<PropertyRowViewModel> PropertyRows
+    {
+        get => _propertyRows;
+        private set => SetField(ref _propertyRows, value);
+    }
+    public long PropertyVersion { get; private set; }
 
     public ObservableCollection<ElementNodeViewModel> Children { get; } = new();
 
@@ -207,9 +229,13 @@ public sealed class ElementNodeViewModel : ObservableObject
         }
         // Drop rows for properties that no longer appear at all (rare on a
         // full snapshot, but keeps a re-added node from carrying stale rows).
-        foreach (var stale in PropertyRows.Where(r => !seen.Contains(r.Name) && !r.IsEditable).ToList())
+        foreach (var stale in PropertyRows.Where(
+                     r => !r.IsTypedProperty &&
+                          !seen.Contains(r.ProviderName) &&
+                          !r.IsEditable).ToList())
         {
             PropertyRows.Remove(stale);
+            PropertyVersion++;
             NotifyIfIdentifyingProperty(stale.Name);
         }
     }
@@ -241,12 +267,35 @@ public sealed class ElementNodeViewModel : ObservableObject
     /// <summary>Upserts a property row, or removes a non-editable row whose value went empty.</summary>
     public void SetProperty(string name, string value)
     {
-        var row = PropertyRows.FirstOrDefault(r => r.Name == name);
+        var row = PropertyRows.FirstOrDefault(
+                      r => r.IsTypedProperty && r.ProviderName == name)
+                  ?? PropertyRows.FirstOrDefault(
+                      r => !r.IsTypedProperty && r.ProviderName == name);
         if (row == null)
         {
             if (value.Length == 0)
                 return; // never was there; nothing to show
             PropertyRows.Add(new PropertyRowViewModel(name, value));
+            PropertyVersion++;
+            NotifyIfIdentifyingProperty(name);
+            return;
+        }
+
+        if (row.IsTypedProperty)
+        {
+            // Tree patches can carry the same property already represented
+            // by a richer provider descriptor. Refresh its value without
+            // replacing/removing the metadata-backed row.
+            if (row.Value != value)
+            {
+                row.UpdateProviderValue(
+                    value,
+                    preservePendingEdit: true,
+                    preserveCurrentAction:
+                        row.HasPendingAction ||
+                        _propertyMutations.ContainsKey(row.ProviderName));
+                PropertyVersion++;
+            }
             NotifyIfIdentifyingProperty(name);
             return;
         }
@@ -254,11 +303,182 @@ public sealed class ElementNodeViewModel : ObservableObject
         if (value.Length == 0 && !row.IsEditable)
         {
             PropertyRows.Remove(row);
+            PropertyVersion++;
             NotifyIfIdentifyingProperty(name);
             return;
         }
-        row.Value = value;
+        if (row.Value != value)
+        {
+            row.Value = value;
+            PropertyVersion++;
+        }
         NotifyIfIdentifyingProperty(name);
+    }
+
+    public void ReplaceTypedPropertyRows(
+        IEnumerable<PropertyRowViewModel> rows,
+        bool preservePendingEdits = false)
+    {
+        var incoming = rows.ToList();
+        var existingTyped = PropertyRows
+            .Where(row => row.IsTypedProperty)
+            .ToDictionary(row => row.ProviderName, StringComparer.Ordinal);
+        var merged = PropertyRows.Where(row => !row.IsTypedProperty).ToList();
+        foreach (var row in incoming)
+        {
+            existingTyped.TryGetValue(row.ProviderName, out var existing);
+            bool isExactAcceptedAction =
+                existing != null &&
+                IsExactCompletedMutation(existing);
+            bool preserveMutationAction =
+                existing != null &&
+                ShouldPreserveMutationAction(existing);
+            if (preservePendingEdits &&
+                existing != null &&
+                !isExactAcceptedAction &&
+                (existing.IsDirty ||
+                 existing.HasPendingAction ||
+                 preserveMutationAction))
+            {
+                row.PreservePendingEditFrom(existing);
+            }
+            var treeRow = merged.FirstOrDefault(
+                existing => existing.ProviderName == row.ProviderName);
+            if (treeRow != null)
+                merged.Remove(treeRow);
+            merged.Add(row);
+        }
+        if (preservePendingEdits)
+        {
+            var incomingNames = incoming
+                .Select(row => row.ProviderName)
+                .ToHashSet(StringComparer.Ordinal);
+            foreach (var existing in existingTyped.Values)
+            {
+                bool isExactAcceptedAction =
+                    IsExactCompletedMutation(existing);
+                bool preserveMutationAction =
+                    ShouldPreserveMutationAction(existing);
+                if ((!existing.IsDirty &&
+                     !existing.HasPendingAction &&
+                     !preserveMutationAction) ||
+                    isExactAcceptedAction ||
+                    incomingNames.Contains(existing.ProviderName))
+                {
+                    continue;
+                }
+                existing.MarkUnavailable(
+                    "The provider no longer exposes this descriptor. "
+                    + "Your pending edit was retained until you reselect or reload.");
+                merged.Add(existing);
+            }
+        }
+        // One collection replacement produces one ItemsControl refresh.
+        // Clearing/adding hundreds of dependency properties individually
+        // made selecting a node look frozen while WPF repeatedly remeasured
+        // the property panel.
+        PropertyRows = new ObservableCollection<PropertyRowViewModel>(merged);
+        PropertyVersion++;
+        OnPropertyChanged(nameof(DisplayName));
+    }
+
+    public PropertyMutationToken BeginPropertyMutation(
+        string providerName,
+        long submittedRevision)
+    {
+        var token = new PropertyMutationToken(
+            ++_nextPropertyMutationId,
+            providerName,
+            submittedRevision);
+        _propertyMutations[providerName] = new PropertyMutationContext(token);
+        PropertyVersion++;
+        return token;
+    }
+
+    public bool TryCompletePropertyMutation(PropertyMutationToken token)
+    {
+        if (!TryGetCurrentPropertyMutation(token, out var context))
+            return false;
+        context.IsCompleted = true;
+        PropertyVersion++;
+        return true;
+    }
+
+    public bool CancelPropertyMutation(PropertyMutationToken token)
+    {
+        if (!TryGetCurrentPropertyMutation(token, out _))
+            return false;
+        _propertyMutations.Remove(token.ProviderName);
+        PropertyVersion++;
+        return true;
+    }
+
+    public void SettleCompletedPropertyMutations()
+    {
+        foreach (var providerName in _propertyMutations
+                     .Where(pair => pair.Value.IsCompleted)
+                     .Select(pair => pair.Key)
+                     .ToList())
+        {
+            _propertyMutations.Remove(providerName);
+        }
+    }
+
+    public void ClearPropertyMutations()
+    {
+        if (_propertyMutations.Count == 0)
+            return;
+        _propertyMutations.Clear();
+        PropertyVersion++;
+    }
+
+    private bool IsExactCompletedMutation(PropertyRowViewModel row)
+    {
+        return _propertyMutations.TryGetValue(
+                   row.ProviderName, out var context) &&
+               context.IsCompleted &&
+               row.EditRevision == context.Token.SubmittedRevision;
+    }
+
+    private bool ShouldPreserveMutationAction(PropertyRowViewModel row)
+    {
+        if (!_propertyMutations.TryGetValue(
+                row.ProviderName, out var context))
+        {
+            return false;
+        }
+        return !context.IsCompleted ||
+               row.EditRevision != context.Token.SubmittedRevision;
+    }
+
+    private bool TryGetCurrentPropertyMutation(
+        PropertyMutationToken token,
+        out PropertyMutationContext context)
+    {
+        return _propertyMutations.TryGetValue(
+                   token.ProviderName, out context!) &&
+               context.Token.OperationId == token.OperationId;
+    }
+
+    public void ReplacePropertyRows(
+        IEnumerable<PropertyRowViewModel> rows,
+        bool preserveTypedRows = false)
+    {
+        var replacement = rows.ToList();
+        if (preserveTypedRows)
+        {
+            foreach (var typedRow in PropertyRows.Where(
+                         row => row.IsTypedProperty))
+            {
+                replacement.RemoveAll(
+                    row => row.ProviderName == typedRow.ProviderName);
+                replacement.Add(typedRow);
+            }
+        }
+        PropertyRows = new ObservableCollection<PropertyRowViewModel>(
+            replacement);
+        PropertyVersion++;
+        OnPropertyChanged(nameof(DisplayName));
     }
 
     /// <summary>
@@ -292,5 +512,5 @@ public sealed class ElementNodeViewModel : ObservableObject
     }
 
     public PropertyRowViewModel? FindProperty(string name) =>
-        PropertyRows.FirstOrDefault(r => r.Name == name);
+        PropertyRows.FirstOrDefault(r => r.ProviderName == name);
 }

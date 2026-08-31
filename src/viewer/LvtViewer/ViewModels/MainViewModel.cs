@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Windows.Data;
 using System.Windows.Threading;
 using LvtViewer.Models;
 using LvtViewer.Services;
@@ -12,34 +14,47 @@ namespace LvtViewer.ViewModels;
 
 /// <summary>
 /// Top-level view model: owns the resolved lvt.exe path, the current
-/// target's watch session, the live tree, and the property-editing actions.
+/// target's MCP session, the live tree, and the property-editing actions.
 /// </summary>
 public sealed class MainViewModel : ObservableObject, IDisposable
 {
     private readonly Dispatcher _dispatcher;
     private readonly LiveTree _liveTree = new();
-    private readonly WatchSession _watch = new();
-    private readonly LvtCli _cli;
+    private readonly McpSession _mcp = new();
+    private readonly PropertyDescriptorSchemaCache _propertySchemas = new();
 
     private string _statusText = "Drag the crosshair onto a window to inspect it.";
     private string _targetText = "No target";
     private bool _useUia = true;
     private ElementNodeViewModel? _selectedElement;
+    private ICollectionView? _selectedPropertyRows;
+    private string _propertySearchQuery = "";
+    private bool _isPropertyPanelLoading;
     private string? _currentHwndHex;
     private IntPtr _currentHwnd;
+    private int _connectionGeneration;
+    private readonly DispatcherTimer _targetLivenessTimer;
+    private readonly DispatcherTimer _typedPropertyRefreshTimer;
+    private readonly TypedPropertyRefreshState _typedPropertyRefreshState = new();
+    private readonly TypedPropertyRefreshRetryBudget
+        _typedPropertyRefreshRetryBudget = new();
+    private int _typedPropertyRefreshDelayMs =
+        TypedPropertyRefreshPolicy.InitialDelayMs;
+    private bool _typedRefreshNeedsFullUiaLoad;
+    private bool _typedRefreshPreservePendingEdits;
+    private bool _awaitingSnapshot;
+    private bool _resourceProbeRunning;
+    private int _resourceProbeFailures;
+    private DateTime _lastPatchUtc = DateTime.UtcNow;
 
     public MainViewModel(Dispatcher dispatcher)
     {
         _dispatcher = dispatcher;
         LvtExePath = LvtLocator.Find();
-        _cli = new LvtCli(LvtExePath);
 
         // 60ms: short enough that a live filter refresh still feels
-        // immediate, long enough to reliably span the few-ms gaps between
-        // the separate OS read completions one `watch` poll's output can
-        // arrive in (see ScheduleFilterRefresh's comment) — chosen well
-        // under `watch`'s own --interval default (500ms) so this never
-        // itself becomes the visible lag.
+        // immediate, while coalescing the thousands of element events an
+        // initial MCP resource snapshot can contain into one filter walk.
         _filterDebounceTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
             Interval = TimeSpan.FromMilliseconds(60),
@@ -49,31 +64,224 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _filterDebounceTimer.Stop();
             ApplyFrameworkFilter();
         };
-
-        _watch.EventReceived += evt => _dispatcher.BeginInvoke(() => OnWatchEvent(evt));
-        _watch.DiagnosticReceived += line => _dispatcher.BeginInvoke(() => StatusText = line);
-        _watch.Exited += code => _dispatcher.BeginInvoke(() =>
+        _typedPropertyRefreshTimer = new DispatcherTimer(
+            DispatcherPriority.Background, _dispatcher)
         {
-            Logger.Log("viewmodel", $"watch Exited(code={code}) -> IsConnected=false, clearing tree/selection");
+            Interval = TimeSpan.FromMilliseconds(100),
+        };
+        _typedPropertyRefreshTimer.Tick += async (_, _) =>
+        {
+            _typedPropertyRefreshTimer.Stop();
+            if (!_typedPropertyRefreshState.TryBegin(out var refreshToken))
+                return;
+            var node = SelectedElement;
+            var generation = _connectionGeneration;
+            var fullUiaLoad = _typedRefreshNeedsFullUiaLoad;
+            var preservePendingEdits = _typedRefreshPreservePendingEdits;
+            _typedRefreshNeedsFullUiaLoad = false;
+            _typedRefreshPreservePendingEdits = false;
+            var attemptNumber =
+                _typedPropertyRefreshRetryBudget.BeginAttempt();
+            var refreshResult = TypedPropertyRefreshAttemptResult.Retry(
+                "No property snapshot was applied.");
+            try
+            {
+                refreshResult =
+                    await TypedPropertyRefreshPolicy.RunAttemptAsync(
+                        async () =>
+                        {
+                            if (node == null)
+                            {
+                                return TypedPropertyRefreshAttemptResult
+                                    .OwnershipLost(
+                                        "No property target is selected.");
+                            }
+                            var result = UseUia && fullUiaLoad
+                                ? await RefreshUiaPropertiesAsync(
+                                    node, preservePendingEdits, refreshToken)
+                                : await RefreshTypedPropertiesAsync(
+                                    node, preservePendingEdits, refreshToken);
+                            if (result.Status ==
+                                    TypedPropertyRefreshAttemptStatus.Applied &&
+                                (generation != _connectionGeneration ||
+                                 SelectedElement != node))
+                            {
+                                return TypedPropertyRefreshAttemptResult
+                                    .OwnershipLost(
+                                        "The property target changed during refresh.");
+                            }
+                            return result;
+                        },
+                        () => generation != _connectionGeneration ||
+                              SelectedElement != node,
+                        ex => Logger.LogException(
+                            "properties", "Property refresh failed", ex));
+            }
+            finally
+            {
+                bool wasLatest =
+                    _typedPropertyRefreshState.IsLatest(refreshToken);
+                bool applied =
+                    refreshResult.Status ==
+                    TypedPropertyRefreshAttemptStatus.Applied;
+                var completionAccepted =
+                    _typedPropertyRefreshState.Complete(
+                        refreshToken, applied);
+                if (completionAccepted)
+                {
+                    if (!wasLatest)
+                    {
+                        _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+                        _typedRefreshPreservePendingEdits |=
+                            preservePendingEdits;
+                        if (!_typedPropertyRefreshRetryBudget.CanRetry)
+                        {
+                            _typedPropertyRefreshRetryBudget.Stop();
+                            _typedPropertyRefreshState.Reset();
+                            IsPropertyPanelLoading = false;
+                            if (SelectedElement == node)
+                            {
+                                StatusText =
+                                    "Could not refresh properties after "
+                                    + $"{attemptNumber} attempts: "
+                                    + refreshResult.Error;
+                            }
+                        }
+                    }
+                    else if (applied)
+                    {
+                        node?.SettleCompletedPropertyMutations();
+                        _typedPropertyRefreshRetryBudget.Reset();
+                        _typedPropertyRefreshDelayMs =
+                            TypedPropertyRefreshPolicy.InitialDelayMs;
+                        IsPropertyPanelLoading = false;
+                    }
+                    else if (refreshResult.Status is
+                             TypedPropertyRefreshAttemptStatus.Terminal or
+                             TypedPropertyRefreshAttemptStatus.OwnershipLost)
+                    {
+                        if (refreshResult.Status ==
+                            TypedPropertyRefreshAttemptStatus.OwnershipLost)
+                        {
+                            node?.ClearPropertyMutations();
+                        }
+                        else
+                        {
+                            _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+                            _typedRefreshPreservePendingEdits |=
+                                preservePendingEdits;
+                        }
+                        _typedPropertyRefreshRetryBudget.Stop();
+                        _typedPropertyRefreshState.Reset();
+                        IsPropertyPanelLoading = false;
+                        if (SelectedElement == node)
+                        {
+                            StatusText =
+                                $"Could not refresh properties: {refreshResult.Error}";
+                        }
+                    }
+                    else if (!_typedPropertyRefreshRetryBudget.CanRetry)
+                    {
+                        _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+                        _typedRefreshPreservePendingEdits |=
+                            preservePendingEdits;
+                        _typedPropertyRefreshRetryBudget.Stop();
+                        _typedPropertyRefreshState.Reset();
+                        IsPropertyPanelLoading = false;
+                        if (SelectedElement == node)
+                        {
+                            StatusText =
+                                "Could not refresh properties after "
+                                + $"{attemptNumber} attempts: {refreshResult.Error}";
+                        }
+                    }
+                    else
+                    {
+                        _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+                        _typedRefreshPreservePendingEdits |=
+                            preservePendingEdits;
+                        _typedPropertyRefreshDelayMs =
+                            _typedPropertyRefreshRetryBudget.RetryDelayMs;
+                    }
+
+                    if (_typedPropertyRefreshState.HasPending &&
+                        SelectedElement != null)
+                    {
+                        _typedPropertyRefreshTimer.Interval =
+                            TimeSpan.FromMilliseconds(
+                                _typedPropertyRefreshDelayMs);
+                        _typedPropertyRefreshTimer.Start();
+                    }
+                }
+            }
+        };
+
+        _mcp.PatchReceived += (generation, patch) =>
+            _dispatcher.BeginInvoke(() => OnTreePatch(generation, patch));
+        _mcp.DiagnosticReceived += line => _dispatcher.BeginInvoke(() => StatusText = line);
+        _mcp.Exited += code => _dispatcher.BeginInvoke(() =>
+        {
+            Logger.Log("viewmodel", $"MCP server exited (code={code})");
             IsConnecting = false;
-            StatusText = $"lvt watch exited (code {code}) — target likely closed. Re-pick a window to reconnect.";
-            // The target's own process may have crashed or been closed: its
-            // tree is no longer meaningful, and clearing SelectedElement is
-            // what tells MainWindow's highlight overlay (item 1) to hide
-            // rather than being left pointing at the last-known bounds of a
-            // now-gone window forever. IsConnected also drops, disabling
-            // the element-pick crosshair (item 2) until a fresh connection
-            // gives it something live to pick from again.
+            StatusText = $"lvt MCP server exited (code {code}). Reconnect or pick a window again.";
             _liveTree.Reset();
             SelectedElement = null;
             IsConnected = false;
         });
 
-        ToggleCommand = new RelayCommand(p => _ = ToggleAsync(p as PropertyRowViewModel));
-        SetValueCommand = new RelayCommand(p => _ = SetValueAsync(p as PropertyRowViewModel));
+        SetPropertyCommand =
+            new RelayCommand(p => _ = SetPropertyAsync(p as PropertyRowViewModel));
+        ClearPropertyCommand =
+            new RelayCommand(p => _ = ClearPropertyAsync(p as PropertyRowViewModel));
         ReconnectCommand = new RelayCommand(_ => Reconnect(), _ => _currentHwndHex != null);
         FindNextCommand = new RelayCommand(_ => FindNext());
         FindPreviousCommand = new RelayCommand(_ => FindPrevious());
+
+        _targetLivenessTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(1),
+        };
+        _targetLivenessTimer.Tick += async (_, _) =>
+        {
+            if (_currentHwnd != IntPtr.Zero &&
+                (IsConnecting || IsConnected) &&
+                !Interop.NativeMethods.IsWindow(_currentHwnd))
+            {
+                await HandleTargetClosedAsync();
+                return;
+            }
+
+            // Resource notifications are the normal path. A low-frequency
+            // read is only a watchdog for a subscription task that failed
+            // while the target window remained alive; it also keeps a quiet
+            // app distinguishable from a frozen session.
+            if (IsConnected && !_resourceProbeRunning &&
+                DateTime.UtcNow - _lastPatchUtc > TimeSpan.FromSeconds(5))
+            {
+                _resourceProbeRunning = true;
+                try
+                {
+                    var result = await _mcp.RefreshResourceAsync();
+                    if (result.Ok)
+                    {
+                        _resourceProbeFailures = 0;
+                        _lastPatchUtc = DateTime.UtcNow;
+                    }
+                    else if (++_resourceProbeFailures >= 2)
+                    {
+                        IsConnected = false;
+                        SelectedElement = null;
+                        _liveTree.Reset();
+                        StatusText = $"The MCP tree subscription stopped: {result.Error}";
+                    }
+                }
+                finally
+                {
+                    _resourceProbeRunning = false;
+                }
+            }
+        };
+        _targetLivenessTimer.Start();
     }
 
     public string LvtExePath { get; }
@@ -124,7 +332,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _isConnecting;
 
     /// <summary>
-    /// True from starting a watch process until its first tree event arrives.
+    /// True from starting an MCP session until its first resource snapshot arrives.
     /// Drives the status bar's indeterminate progress indicator: the native
     /// protocol currently exposes phases/timings in logs but no truthful
     /// percentage during its initial AdviseVisualTreeChange replay.
@@ -146,7 +354,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>
     /// Discovered framework/content types (win32, xaml, winui3, wpf, comctl,
     /// dui, ...) for the current target, each with its own include/exclude
-    /// checkbox. Populated lazily as watch events report elements with a
+    /// checkbox. Populated lazily as MCP patches report elements with a
     /// framework value not seen yet this session.
     /// </summary>
     public ObservableCollection<FrameworkFilterOption> FrameworkFilters { get; } = new();
@@ -163,15 +371,54 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         get => _selectedElement;
         set
         {
-            if (!SetField(ref _selectedElement, value))
+            if (ReferenceEquals(_selectedElement, value))
                 return;
-            // The live tree only carries the fast/cheap property set by
-            // default (see ConnectTo's --fast comment) — a selected node's
-            // *exhaustive* set is worth the cost of one extra one-shot call,
-            // since it only happens when the user actually looks at one
-            // element, not for the whole tree on every tick.
-            _ = RefreshFullPropertiesAsync(value);
+            if (_selectedElement != null)
+            {
+                _selectedElement.PropertyChanged -= OnSelectedElementPropertyChanged;
+                _selectedElement.ClearPropertyMutations();
+            }
+            SetField(ref _selectedElement, value);
+            if (_selectedElement != null)
+                _selectedElement.PropertyChanged += OnSelectedElementPropertyChanged;
+            RebuildPropertyView();
+            _typedPropertyRefreshTimer.Stop();
+            _typedPropertyRefreshState.Reset();
+            _typedRefreshNeedsFullUiaLoad = false;
+            _typedRefreshPreservePendingEdits = false;
+            _typedPropertyRefreshRetryBudget.Reset();
+            _typedPropertyRefreshDelayMs =
+                TypedPropertyRefreshPolicy.InitialDelayMs;
+            IsPropertyPanelLoading = value != null;
+            if (value != null)
+            {
+                RequestTypedPropertySchemaRefresh(
+                    fullUiaLoad: UseUia,
+                    preservePendingEdits: false);
+            }
         }
+    }
+
+    public ICollectionView? SelectedPropertyRows
+    {
+        get => _selectedPropertyRows;
+        private set => SetField(ref _selectedPropertyRows, value);
+    }
+
+    public string PropertySearchQuery
+    {
+        get => _propertySearchQuery;
+        set
+        {
+            if (SetField(ref _propertySearchQuery, value))
+                SelectedPropertyRows?.Refresh();
+        }
+    }
+
+    public bool IsPropertyPanelLoading
+    {
+        get => _isPropertyPanelLoading;
+        private set => SetField(ref _isPropertyPanelLoading, value);
     }
 
     private bool _highlightSelected = true;
@@ -205,36 +452,108 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>Fired when FindNext resolves a match, so MainWindow can select+highlight it in the TreeView.</summary>
     public event Action<ElementNodeViewModel>? SearchMatchFound;
 
-    public RelayCommand ToggleCommand { get; }
-    public RelayCommand SetValueCommand { get; }
+    public RelayCommand SetPropertyCommand { get; }
+    public RelayCommand ClearPropertyCommand { get; }
     public RelayCommand ReconnectCommand { get; }
     public RelayCommand FindNextCommand { get; }
     public RelayCommand FindPreviousCommand { get; }
 
     private readonly DispatcherTimer _filterDebounceTimer;
 
-    private void OnWatchEvent(WatchEventDto evt)
+    private void OnSelectedElementPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        // The first event means lvt finished injection/subscription,
-        // collected and serialized the initial snapshot, and began emitting
-        // it. Stop the indeterminate progress UI at that point.
+        if (e.PropertyName == nameof(ElementNodeViewModel.PropertyRows))
+            RebuildPropertyView();
+    }
+
+    private void RebuildPropertyView()
+    {
+        if (SelectedElement == null)
+        {
+            SelectedPropertyRows = null;
+            return;
+        }
+
+        var view = new ListCollectionView(SelectedElement.PropertyRows);
+        view.Filter = item =>
+        {
+            if (item is not PropertyRowViewModel row)
+                return false;
+            var query = PropertySearchQuery.Trim();
+            return query.Length == 0 ||
+                   row.Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                   row.Value.Contains(query, StringComparison.OrdinalIgnoreCase);
+        };
+        if (view.CanChangeLiveFiltering)
+        {
+            view.LiveFilteringProperties.Add(nameof(PropertyRowViewModel.Value));
+            view.IsLiveFiltering = true;
+        }
+        SelectedPropertyRows = view;
+    }
+
+    private void OnTreePatch(int mcpGeneration, TreePatchDto patch)
+    {
+        if (mcpGeneration != _mcp.CurrentGeneration)
+            return;
+        string expectedTree = UseUia ? "uia" : "visual";
+        if (!string.Equals(patch.Tree, expectedTree, StringComparison.Ordinal))
+        {
+            Logger.Log("mcp", $"Ignoring stale {patch.Tree} patch while showing {expectedTree}");
+            return;
+        }
+
+        if (!patch.Snapshot && _awaitingSnapshot)
+        {
+            IsConnecting = false;
+            IsConnected = false;
+            StatusText = "MCP sent a diff before the initial snapshot. Reconnect to resynchronize.";
+            _ = _mcp.StopAsync();
+            return;
+        }
+        if (patch.Snapshot)
+            _awaitingSnapshot = false;
+
+        if (patch.Snapshot)
+        {
+            _liveTree.Reset();
+            SelectedElement = null;
+            FrameworkFilters.Clear();
+            _propertySchemas.Clear();
+        }
+
+        Logger.Log(
+            "tree",
+            $"Applying {patch.Tree} {(patch.Snapshot ? "snapshot" : "diff")} " +
+            $"with {patch.Events.Count} event(s)");
+        bool refreshTypedSchema = false;
+        foreach (var evt in patch.Events)
+        {
+            if (UseUia && SelectedElement != null &&
+                PatchAffectsTypedSchema(evt, SelectedElement))
+            {
+                refreshTypedSchema = true;
+            }
+            _liveTree.Apply(evt);
+            DiscoverFrameworks(evt);
+        }
+        if (refreshTypedSchema)
+        {
+            RequestTypedPropertySchemaRefresh(
+                resetRetryBudget: false);
+        }
+        ScheduleFilterRefresh();
+        _lastPatchUtc = DateTime.UtcNow;
+        _resourceProbeFailures = 0;
+
         if (IsConnecting)
         {
             IsConnecting = false;
+            IsConnected = true;
             StatusText = UseUia
                 ? "Watching the UI Automation tree live."
                 : "Watching the visual tree live.";
         }
-        // Applied immediately, synchronously, every time — LiveTree.Apply
-        // only ever patches the one node (or one parent/child edge) an
-        // event actually names, so there is no "whole tree" cost here to
-        // batch in the first place; see LiveTree's class comment for why an
-        // earlier version of this needed to defer a full-hierarchy rebuild
-        // and why that approach was replaced rather than merely debounced
-        // further.
-        _liveTree.Apply(evt);
-        DiscoverFrameworks(evt);
-        ScheduleFilterRefresh();
     }
 
     /// <summary>
@@ -244,16 +563,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// event, only eventually. Debouncing this (instead of running it after
     /// every event) is what actually still needs a timer here.
     ///
-    /// A true debounce, not "run once the dispatcher queue drains": an
-    /// earlier version used Dispatcher.BeginInvoke at Background priority,
-    /// reasoning that it would only fire once nothing higher-priority was
-    /// still queued — that helped but was not enough, because `watch`'s one
-    /// poll can still deliver its events to stdout in a few separate OS read
-    /// completions a handful of milliseconds apart, each queuing its own
-    /// OnWatchEvent dispatch — draining *completely* in between, meaning the
-    /// queue-drain trick could still fire several times per poll. Resetting
-    /// an actual timer on every event and only running once it elapses
-    /// without a new one arriving tolerates gaps like that.
+    /// The resource delivers a patch as a batch. Resetting an actual timer
+    /// while applying it guarantees filtering runs once after the batch,
+    /// rather than once per added/changed/removed element.
     /// </summary>
     private void ScheduleFilterRefresh()
     {
@@ -262,7 +574,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>Adds a checkbox (default checked) for any not-yet-seen framework value in this event.</summary>
-    private void DiscoverFrameworks(WatchEventDto evt)
+    private void DiscoverFrameworks(TreeChangeEventDto evt)
     {
         string? framework = evt.Element?.Framework;
         if (evt.Fields != null && evt.Fields.TryGetValue("framework", out var change))
@@ -376,15 +688,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         !string.IsNullOrEmpty(haystack) && haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
 
     /// <summary>Called by the crosshair picker once a target window is resolved.</summary>
-    public void ConnectTo(IntPtr hwnd)
+    public void ConnectTo(IntPtr hwnd) => _ = ConnectAsync(hwnd, reconnect: false);
+
+    private async System.Threading.Tasks.Task ConnectAsync(IntPtr hwnd, bool reconnect)
     {
+        int generation = ++_connectionGeneration;
         NativeMethodsWindowInfo(hwnd, out var pid, out var title);
-        Logger.Log("viewmodel", $"ConnectTo hwnd=0x{hwnd.ToInt64():X} pid={pid} title=\"{title}\" uia={UseUia}");
+        Logger.Log(
+            "viewmodel",
+            $"MCP connect hwnd=0x{hwnd.ToInt64():X} pid={pid} title=\"{title}\" uia={UseUia}");
 
         _currentHwnd = hwnd;
         _currentHwndHex = "0x" + hwnd.ToInt64().ToString("X", CultureInfo.InvariantCulture);
-        IsConnected = true;
+        IsConnected = false;
         IsConnecting = true;
+        _awaitingSnapshot = true;
+        _resourceProbeFailures = 0;
+        _lastPatchUtc = DateTime.UtcNow;
 
         string processName = "?";
         try
@@ -397,29 +717,35 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         TargetText = $"{processName} (pid {pid})  —  hwnd {_currentHwndHex}  —  \"{title}\"";
-        StatusText = "Connecting…";
+        StatusText = reconnect ? "Reconnecting…" : "Connecting…";
         _liveTree.Reset();
-        FrameworkFilters.Clear(); // new target: fresh discovery, previous app's types no longer apply
-        // --fast: the live tree only needs bounds/Text/Content/basic state to
-        // browse, search, and highlight/hit-test by (see MainWindow.xaml.cs) —
-        // it does not need every XAML/WinUI3 element's full property chain
-        // eagerly. A selected node's exhaustive property set is fetched
-        // on demand instead (see MainViewModel's property-panel wiring),
-        // so this trades nothing the viewer actually shows by default for a
-        // dramatically faster live connect on a rich tree.
-        _watch.Start(LvtExePath, _currentHwndHex, UseUia, fastProperties: true);
+        SelectedElement = null;
+        FrameworkFilters.Clear();
+
+        McpStartResult result;
+        try
+        {
+            result = await _mcp.StartAsync(LvtExePath, _currentHwndHex, UseUia);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        if (generation != _connectionGeneration)
+            return;
+        if (!result.Ok)
+        {
+            IsConnecting = false;
+            IsConnected = false;
+            StatusText = $"Could not connect: {result.Error}";
+        }
     }
 
     private void Reconnect()
     {
         if (_currentHwndHex == null)
             return;
-        Logger.Log("viewmodel", $"Reconnect hwnd={_currentHwndHex} uia={UseUia}");
-        _liveTree.Reset();
-        StatusText = "Reconnecting…";
-        IsConnected = true;
-        IsConnecting = true;
-        _watch.Start(LvtExePath, _currentHwndHex, UseUia, fastProperties: true);
+        _ = ConnectAsync(_currentHwnd, reconnect: true);
     }
 
     private static void NativeMethodsWindowInfo(IntPtr hwnd, out uint pid, out string title)
@@ -428,78 +754,456 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         title = Interop.NativeMethods.GetWindowTitle(hwnd);
     }
 
-    /// <summary>
-    /// Fetches <paramref name="node"/>'s full property set with a one-shot
-    /// "lvt query" call (no --fast, so this always gets everything the
-    /// exhaustive GetPropertyValuesChain walk reports, regardless of the
-    /// live tree's own fast/full mode) and merges it into the node's
-    /// PropertyRows. "query" without a property name dumps every property
-    /// as flat top-level JSON fields (main.cpp's query_element_to_json) —
-    /// a different shape from watch's nested {properties: {...}}, so this
-    /// is parsed directly rather than reusing ElementDto.
-    /// </summary>
-    private async System.Threading.Tasks.Task RefreshFullPropertiesAsync(ElementNodeViewModel? node)
+    private async System.Threading.Tasks.Task<TypedPropertyRefreshAttemptResult>
+        RefreshUiaPropertiesAsync(
+        ElementNodeViewModel? node,
+        bool preservePendingEdits = false,
+        TypedPropertyRefreshState.Token? refreshToken = null)
     {
-        if (node == null || _currentHwndHex == null)
-            return;
+        if (node == null)
+        {
+            IsPropertyPanelLoading = false;
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "No property target is selected.");
+        }
 
-        var result = await _cli.RunAsync("query", node.Key, "--hwnd", _currentHwndHex);
-        // The selection (or the connection) may have moved on while this
-        // one-shot call was in flight; a stale result must never overwrite
-        // whatever is selected now.
-        if (!result.Ok || SelectedElement != node)
-            return;
+        long propertyVersion = node.PropertyVersion;
+        var stopwatch = Stopwatch.StartNew();
+        var result = await _mcp.GetElementPropertiesAsync(node.Key);
+        if (SelectedElement != node)
+        {
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "The property target changed during refresh.");
+        }
+        if (node.PropertyVersion != propertyVersion ||
+            (refreshToken.HasValue &&
+             !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
+        {
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "The property snapshot was superseded.");
+        }
+        if (!result.Ok)
+        {
+            StatusText = $"Could not read UI Automation properties: {result.Error}";
+            return TypedPropertyRefreshAttemptResult.Failure(
+                result.Error, result.ErrorDisposition, result.Retryable);
+        }
 
-        System.Text.Json.JsonDocument doc;
+        if (result.Payload.ValueKind !=
+                System.Text.Json.JsonValueKind.Object ||
+            !result.Payload.TryGetProperty("element", out var element) ||
+            element.ValueKind != System.Text.Json.JsonValueKind.Object ||
+            !element.TryGetProperty("properties", out var properties) ||
+            properties.ValueKind != System.Text.Json.JsonValueKind.Object)
+        {
+            Logger.Log(
+                "properties",
+                $"UI Automation property response for {node.Key} had no property snapshot");
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "UI Automation property response had no property snapshot.");
+        }
+
         try
         {
-            doc = System.Text.Json.JsonDocument.Parse(result.StdOut);
-        }
-        catch (System.Text.Json.JsonException)
-        {
-            return; // tolerate a malformed/partial response rather than crashing the panel
-        }
-
-        using (doc)
-        {
-            foreach (var prop in doc.RootElement.EnumerateObject())
+            string propertyJson = properties.GetRawText();
+            var rows = await System.Threading.Tasks.Task.Run(() =>
             {
-                if (prop.Name is "id" or "key" or "type" or "framework" or "className" or "text" or "bounds")
-                    continue; // already shown by dedicated ElementNodeViewModel fields, not a property row
-                var value = prop.Value.ValueKind == System.Text.Json.JsonValueKind.String
-                    ? prop.Value.GetString() ?? ""
-                    : prop.Value.ToString();
-                node.SetProperty(prop.Name, value);
+                using var document = System.Text.Json.JsonDocument.Parse(propertyJson);
+                return document.RootElement.EnumerateObject()
+                    .Select(property => new PropertyRowViewModel(
+                        property.Name,
+                        property.Value.ValueKind == System.Text.Json.JsonValueKind.String
+                            ? property.Value.GetString() ?? ""
+                            : property.Value.ToString()))
+                    .ToList();
+            });
+            if (SelectedElement != node)
+            {
+                return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                    "The property target changed during refresh.");
             }
+            if (node.PropertyVersion != propertyVersion ||
+                (refreshToken.HasValue &&
+                 !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
+            {
+                return TypedPropertyRefreshAttemptResult.Retry(
+                    "The property snapshot was superseded.");
+            }
+            node.ReplacePropertyRows(
+                rows, preserveTypedRows: preservePendingEdits);
         }
+        catch (Exception ex) when (
+            ex is System.Text.Json.JsonException or
+                InvalidOperationException or
+                NotSupportedException)
+        {
+            Logger.LogException(
+                "properties", "Could not parse UI Automation properties", ex);
+            return TypedPropertyRefreshAttemptResult.Retry(ex.Message);
+        }
+        Logger.Log("properties", $"Loaded UIA properties in {stopwatch.ElapsedMilliseconds} ms");
+        return await RefreshTypedPropertiesAsync(
+            node,
+            preservePendingEdits,
+            refreshToken: refreshToken,
+            clearLoadingOnCompletion: false);
     }
 
-    private async System.Threading.Tasks.Task ToggleAsync(PropertyRowViewModel? row)
+    private void RequestTypedPropertySchemaRefresh(
+        bool fullUiaLoad = false,
+        bool preservePendingEdits = true,
+        bool resetRetryBudget = true)
     {
-        if (row == null || SelectedElement == null || _currentHwndHex == null)
+        _typedRefreshNeedsFullUiaLoad |= fullUiaLoad;
+        _typedRefreshPreservePendingEdits |= preservePendingEdits;
+        _typedPropertyRefreshRetryBudget.RegisterRequest(
+            resetRetryBudget);
+        if (resetRetryBudget)
+        {
+            _typedPropertyRefreshDelayMs =
+                TypedPropertyRefreshPolicy.InitialDelayMs;
+        }
+        _typedPropertyRefreshState.Request();
+        if (_typedPropertyRefreshState.IsRunning ||
+            _typedPropertyRefreshRetryBudget.IsStopped)
             return;
-        StatusText = $"Toggling {SelectedElement.DisplayName}…";
-        var result = await _cli.RunAsync("toggle", SelectedElement.Key, "--hwnd", _currentHwndHex);
-        StatusText = result.Ok
-            ? "Toggled. The live tree will confirm the new state shortly."
-            : $"Toggle failed: {result.StdErr.Trim()}";
+        _typedPropertyRefreshTimer.Interval =
+            TimeSpan.FromMilliseconds(_typedPropertyRefreshDelayMs);
+        _typedPropertyRefreshTimer.Stop();
+        _typedPropertyRefreshTimer.Start();
     }
 
-    private async System.Threading.Tasks.Task SetValueAsync(PropertyRowViewModel? row)
+    private async System.Threading.Tasks.Task<TypedPropertyRefreshAttemptResult>
+        RefreshTypedPropertiesAsync(
+        ElementNodeViewModel? node, bool preservePendingEdits = false,
+        TypedPropertyRefreshState.Token? refreshToken = null,
+        bool clearLoadingOnCompletion = true)
     {
-        if (row == null || SelectedElement == null || _currentHwndHex == null)
+        if (node == null)
+        {
+            IsPropertyPanelLoading = false;
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "No property target is selected.");
+        }
+
+        long propertyVersion = node.PropertyVersion;
+        var stopwatch = Stopwatch.StartNew();
+        var result = await _mcp.GetEditablePropertiesAsync(node.Key);
+        if (SelectedElement != node)
+        {
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "The property target changed during refresh.");
+        }
+        if (node.PropertyVersion != propertyVersion ||
+            (refreshToken.HasValue &&
+             !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
+        {
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "The typed property snapshot was superseded.");
+        }
+        if (!result.Ok)
+        {
+            Logger.Log(
+                "properties",
+                $"No typed property provider for {node.Key}: {result.Error}");
+            return TypedPropertyRefreshAttemptResult.Failure(
+                result.Error, result.ErrorDisposition, result.Retryable);
+        }
+
+        if (!TypedPropertyRefreshPolicy.TryValidateSnapshotPayload(
+                result.Payload, out var validationError))
+        {
+            Logger.Log("properties", validationError);
+            return TypedPropertyRefreshAttemptResult.Retry(validationError);
+        }
+
+        PropertySnapshotDto? snapshot;
+        try
+        {
+            string snapshotJson = result.Payload.GetRawText();
+            snapshot = await System.Threading.Tasks.Task.Run(() =>
+                System.Text.Json.JsonSerializer.Deserialize<PropertySnapshotDto>(
+                    snapshotJson, JsonDefaults.Options));
+        }
+        catch (Exception ex) when (
+            ex is System.Text.Json.JsonException or
+                InvalidOperationException or
+                NotSupportedException)
+        {
+            Logger.LogException(
+                "properties", "Could not parse typed property snapshot", ex);
+            return TypedPropertyRefreshAttemptResult.Retry(ex.Message);
+        }
+        if (SelectedElement != node)
+        {
+            return TypedPropertyRefreshAttemptResult.OwnershipLost(
+                "The property target changed during refresh.");
+        }
+        if (node.PropertyVersion != propertyVersion ||
+            (refreshToken.HasValue &&
+             !_typedPropertyRefreshState.IsCurrent(refreshToken.Value)))
+        {
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "The typed property snapshot was superseded.");
+        }
+        if (snapshot == null || string.IsNullOrWhiteSpace(snapshot.SchemaId))
+        {
+            Logger.Log(
+                "properties",
+                $"Typed property response for {node.Key} had no schema");
+            return TypedPropertyRefreshAttemptResult.Retry(
+                "Typed property response had no schema.");
+        }
+
+        try
+        {
+            if (!_propertySchemas.TryGet(snapshot.SchemaId, out var descriptors))
+            {
+                foreach (var descriptor in snapshot.Descriptors)
+                    descriptor.PreparePresentation();
+                descriptors = snapshot.Descriptors;
+                _propertySchemas.Store(
+                    snapshot.SchemaId, descriptors, snapshot.SchemaId);
+            }
+
+            var values = snapshot.Values.ToDictionary(
+                value => value.DescriptorId, StringComparer.Ordinal);
+            var rows = descriptors
+                .Where(descriptor => values.ContainsKey(descriptor.DescriptorId))
+                .Select(descriptor =>
+                {
+                    var value = values[descriptor.DescriptorId];
+                    var row = new PropertyRowViewModel(
+                        descriptor.Name, value.Value);
+                    row.UpdateTypedProperty(descriptor, value);
+                    return row;
+                })
+                .ToList();
+
+            node.ReplaceTypedPropertyRows(rows, preservePendingEdits);
+            Logger.Log(
+                "properties",
+                $"Loaded {rows.Count} typed properties from schema {snapshot.SchemaId} " +
+                $"in {stopwatch.ElapsedMilliseconds} ms");
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException or
+                InvalidOperationException or
+                NullReferenceException)
+        {
+            Logger.LogException(
+                "properties", "Invalid typed property snapshot", ex);
+            return TypedPropertyRefreshAttemptResult.Retry(ex.Message);
+        }
+        if (clearLoadingOnCompletion)
+            IsPropertyPanelLoading = false;
+        return TypedPropertyRefreshAttemptResult.Applied();
+    }
+
+    private async System.Threading.Tasks.Task SetPropertyAsync(PropertyRowViewModel? row)
+    {
+        var node = SelectedElement;
+        if (row == null || node == null || !row.IsTypedProperty || !row.CanApply)
             return;
-        StatusText = $"Setting {row.Name} on {SelectedElement.DisplayName}…";
-        var result = await _cli.RunAsync(
-            "set-value", SelectedElement.Key, row.EditText, "--hwnd", _currentHwndHex);
-        StatusText = result.Ok
-            ? "Value set. The live tree will confirm it shortly."
-            : $"set-value failed: {result.StdErr.Trim()}";
+
+        var submittedProviderName = row.ProviderName;
+        var submittedRevision = row.EditRevision;
+        var submittedValue = row.EditText;
+        var mutation = node.BeginPropertyMutation(
+            submittedProviderName, submittedRevision);
+        RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
+        StatusText = $"Setting {row.Name}…";
+        McpToolResult result;
+        try
+        {
+            result = await _mcp.SetPropertyAsync(
+                node.Key, row.DescriptorId, submittedValue);
+        }
+        catch (Exception ex)
+        {
+            if (node.CancelPropertyMutation(mutation) &&
+                SelectedElement == node)
+            {
+                StatusText = $"Set failed: {ex.Message}";
+            }
+            return;
+        }
+        if (SelectedElement != node)
+        {
+            node.CancelPropertyMutation(mutation);
+            return;
+        }
+        if (!result.Ok)
+        {
+            if (node.CancelPropertyMutation(mutation))
+                StatusText = $"Set failed: {result.Error}";
+            return;
+        }
+        if (!node.TryCompletePropertyMutation(mutation))
+            return;
+        if (!TypedPropertyRefreshPolicy.TryValidateMutationPayload(
+                result.Payload, requireCleared: false,
+                out var validationError))
+        {
+            node.CancelPropertyMutation(mutation);
+            StatusText = $"Set failed: {validationError}";
+            RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
+            return;
+        }
+        var currentRow = node.FindProperty(submittedProviderName);
+        currentRow?.ApplyMutationResult(
+            result.Payload.GetProperty("value").GetString() ?? "",
+            result.Payload.GetProperty("runtimeType").GetString() ?? "",
+            result.Payload.GetProperty("source").GetString() ?? "",
+            result.Payload.GetProperty("canClear").GetBoolean(),
+            result.Payload.GetProperty("overridden").GetBoolean(),
+            submittedRevision);
+        StatusText = $"{row.Name} updated.";
+        RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
+    }
+
+    private async System.Threading.Tasks.Task ClearPropertyAsync(PropertyRowViewModel? row)
+    {
+        var node = SelectedElement;
+        if (row == null || node == null || !row.IsTypedProperty)
+            return;
+
+        var submittedProviderName = row.ProviderName;
+        var submittedRevision = row.EditRevision;
+        var mutation = node.BeginPropertyMutation(
+            submittedProviderName, submittedRevision);
+        RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
+        StatusText = $"Clearing {row.Name}…";
+        McpToolResult result;
+        try
+        {
+            result = await _mcp.ClearPropertyAsync(
+                node.Key, row.DescriptorId);
+        }
+        catch (Exception ex)
+        {
+            if (node.CancelPropertyMutation(mutation) &&
+                SelectedElement == node)
+            {
+                StatusText = $"Clear failed: {ex.Message}";
+            }
+            return;
+        }
+        if (SelectedElement != node)
+        {
+            node.CancelPropertyMutation(mutation);
+            return;
+        }
+        if (!result.Ok)
+        {
+            if (node.CancelPropertyMutation(mutation))
+                StatusText = $"Clear failed: {result.Error}";
+            return;
+        }
+        if (!node.TryCompletePropertyMutation(mutation))
+            return;
+        if (!TypedPropertyRefreshPolicy.TryValidateMutationPayload(
+                result.Payload, requireCleared: true,
+                out var validationError))
+        {
+            node.CancelPropertyMutation(mutation);
+            StatusText = $"Clear failed: {validationError}";
+            RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
+            return;
+        }
+        var currentRow = node.FindProperty(submittedProviderName);
+        currentRow?.ApplyMutationResult(
+            result.Payload.GetProperty("value").GetString() ?? "",
+            result.Payload.GetProperty("runtimeType").GetString() ?? "",
+            result.Payload.GetProperty("source").GetString() ?? "",
+            result.Payload.GetProperty("canClear").GetBoolean(),
+            result.Payload.GetProperty("overridden").GetBoolean(),
+            submittedRevision);
+        StatusText = $"{row.Name} restored.";
+        RequestTypedPropertySchemaRefresh(preservePendingEdits: true);
+    }
+
+    private async System.Threading.Tasks.Task HandleTargetClosedAsync()
+    {
+        if (_currentHwnd == IntPtr.Zero)
+            return;
+        ++_connectionGeneration;
+        _currentHwnd = IntPtr.Zero;
+        _currentHwndHex = null;
+        IsConnecting = false;
+        IsConnected = false;
+        SelectedElement = null;
+        _liveTree.Reset();
+        TargetText = "No target";
+        StatusText = "The target window closed. Drag the crosshair onto another window.";
+        await _mcp.StopAsync();
     }
 
     public void Dispose()
     {
         _filterDebounceTimer.Stop();
-        _watch.Dispose();
+        _typedPropertyRefreshTimer.Stop();
+        _targetLivenessTimer.Stop();
+        _mcp.Dispose();
+    }
+
+    public static bool PatchAffectsTypedSchema(
+        TreeChangeEventDto evt, ElementNodeViewModel selected)
+    {
+        bool isSelected = evt.Key == selected.Key;
+        bool isSelectionAncestor = false;
+        for (var ancestor = selected.Parent;
+             ancestor != null;
+             ancestor = ancestor.Parent)
+        {
+            if (ancestor.Key == evt.Key)
+            {
+                isSelectionAncestor = true;
+                break;
+            }
+        }
+        bool selectedOrAncestor = isSelected || isSelectionAncestor;
+        if (evt.Event == "removed" && selectedOrAncestor)
+            return true;
+        if (evt.Event == "added" &&
+            !string.IsNullOrEmpty(evt.Path) &&
+            selected.Path.StartsWith(evt.Path + ".", StringComparison.Ordinal))
+        {
+            return true;
+        }
+        if (evt.Event != "changed" || evt.Fields == null)
+            return false;
+        if (selectedOrAncestor && evt.Fields.ContainsKey("path"))
+            return true;
+        if (isSelected && evt.Fields.ContainsKey("type"))
+            return true;
+
+        foreach (var field in evt.Fields.Keys)
+        {
+            if (!field.StartsWith("properties.", StringComparison.Ordinal))
+                continue;
+            var property = field["properties.".Length..];
+            if (isSelected && property is (
+                "IsEnabled" or
+                "SupportedPatterns" or
+                "Value.IsReadOnly" or
+                "RangeValue.IsReadOnly" or
+                "RangeValue.Minimum" or
+                "RangeValue.Maximum" or
+                "ExpandCollapse.State" or
+                "Scroll.HorizontallyScrollable" or
+                "Scroll.VerticallyScrollable"))
+            {
+                return true;
+            }
+            if (isSelectionAncestor && property is (
+                "SupportedPatterns" or
+                "Selection.CanSelectMultiple" or
+                "Selection.IsSelectionRequired"))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 }

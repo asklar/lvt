@@ -53,4 +53,9 @@ std::shared_ptr<IFrameworkConnection> make_xaml_diag_connection(
     const std::string& frameworkLabel,
     const std::wstring& connPrefix = L"VisualDiagConnection");
 
+namespace detail {
+PropertyMutationResult xaml_mutation_command_failure(
+    HRESULT hresult, std::string error);
+}
+
 } // namespace lvt

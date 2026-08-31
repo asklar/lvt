@@ -11,7 +11,7 @@ public:
     // Injects lvt_tap.dll into the target process via InitializeXamlDiagnosticsEx
     // and reads the XAML visual tree over a named pipe.
     // `fastProperties` — see xaml_diag_common.h's inject_and_collect_xaml_tree.
-    void enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties = false);
+    bool enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties = false);
 
     // Establishes a persistent connection (see framework_connection.h) for
     // reuse across many refreshes, e.g. by watch's loop or an MCP session —
@@ -27,7 +27,7 @@ public:
     // walk happens every tick, so an Element pointer from a previous tick is
     // never valid) and refreshes it over the already-open `connection`
     // instead of re-injecting. No-op if `root` has no CoreWindow this tick.
-    void enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties = false);
+    bool enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties = false);
 };
 
 } // namespace lvt

@@ -5,8 +5,11 @@
 #include <nlohmann/json.hpp>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <cmath>
 #include <functional>
+#include <mutex>
+#include <sstream>
 #include <set>
 #include <utility>
 #include <userenv.h>
@@ -19,6 +22,61 @@ using json = nlohmann::json;
 namespace lvt {
 
 static std::vector<LoadedPlugin> s_plugins;
+
+bool plugin_supports_persistent_connections(const LoadedPlugin& plugin) {
+    return plugin.connection_open && plugin.connection_get_tree &&
+           plugin.connection_close && plugin.free_fn;
+}
+
+bool plugin_supports_event_polling(const LoadedPlugin& plugin) {
+    return plugin.connection_poll_events && plugin.connection_events_free;
+}
+
+PluginFrameworkInfo find_plugin_framework(
+    const std::string& name, const std::string& version,
+    uintptr_t pluginToken) {
+    if (pluginToken != 0) {
+        for (const auto& plugin : s_plugins) {
+            if (reinterpret_cast<uintptr_t>(&plugin) == pluginToken)
+                return {name, version, &plugin};
+        }
+        return {};
+    }
+    for (const auto& plugin : s_plugins) {
+        if (plugin.info && plugin.info->name && name == plugin.info->name)
+            return {name, version, &plugin};
+    }
+    return {};
+}
+
+std::string plugin_connection_label(
+    const PluginFrameworkInfo& pluginFw, HWND hwnd) {
+    const auto pluginInstance =
+        pluginFw.plugin && pluginFw.plugin->module
+            ? reinterpret_cast<uintptr_t>(pluginFw.plugin->module.get())
+            : reinterpret_cast<uintptr_t>(pluginFw.plugin);
+    std::ostringstream label;
+    label << "plugin:";
+    if (pluginFw.plugin && !pluginFw.plugin->sourcePath.empty()) {
+        const auto& path = pluginFw.plugin->sourcePath;
+        const int size = WideCharToMultiByte(
+            CP_UTF8, 0, path.data(), static_cast<int>(path.size()),
+            nullptr, 0, nullptr, nullptr);
+        std::string utf8Path(size, '\0');
+        if (size > 0) {
+            WideCharToMultiByte(
+                CP_UTF8, 0, path.data(), static_cast<int>(path.size()),
+                utf8Path.data(), size, nullptr, nullptr);
+        }
+        label << utf8Path;
+    } else {
+        label << "<in-memory>";
+    }
+    label << ":module:0x" << std::hex << pluginInstance
+          << ":hwnd:0x" << reinterpret_cast<uintptr_t>(hwnd)
+          << ":" << pluginFw.name;
+    return label.str();
+}
 
 // Directories searched for plugins, in priority order:
 //   1. $LVT_PLUGIN_DIR
@@ -100,6 +158,7 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
 
         LoadedPlugin lp{};
         lp.module = std::move(mod);
+        lp.sourcePath = fullPath;
         lp.info = info;
         lp.detect = reinterpret_cast<LvtDetectFrameworkFn>(
             GetProcAddress(lp.module.get(), LVT_PLUGIN_DETECT_FUNC));
@@ -112,8 +171,7 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
         // export them, GetProcAddress returns nullptr, and every consumer
         // of LoadedPlugin already treats a null function pointer as "this
         // plugin doesn't support that" (open_plugin_connection below
-        // requires connection_open specifically to be non-null before
-        // trying to use any of the rest).
+        // requires the complete lifetime group before using any of it).
         lp.connection_open = reinterpret_cast<LvtConnectionOpenFn>(
             GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_OPEN_FUNC));
         lp.connection_get_tree = reinterpret_cast<LvtConnectionGetTreeFn>(
@@ -126,8 +184,7 @@ static void load_plugins_from(const std::wstring& dir, std::set<std::wstring>& s
             GetProcAddress(lp.module.get(), LVT_PLUGIN_CONNECTION_CLOSE_FUNC));
 
         const bool supportsPersistentConnections =
-            lp.connection_open && lp.connection_get_tree &&
-            lp.connection_close && lp.free_fn;
+            plugin_supports_persistent_connections(lp);
         if (g_debug)
             fprintf(stderr, "lvt: loaded plugin '%s' (%s)%s\n",
                     info->name ? info->name : "?",
@@ -163,10 +220,10 @@ std::vector<PluginFrameworkInfo> detect_plugin_frameworks(HWND hwnd, DWORD pid) 
             pfi.name = det.name ? det.name : p.info->name;
             pfi.version = det.version ? det.version : "";
             pfi.plugin = &p;
-            result.push_back(std::move(pfi));
             if (g_debug)
                 fprintf(stderr, "lvt: plugin '%s' detected framework '%s' %s\n",
                         p.info->name, pfi.name.c_str(), pfi.version.c_str());
+            result.push_back(std::move(pfi));
         }
     }
     return result;
@@ -181,6 +238,116 @@ static std::string sanitize(const std::string& s) {
             r += c;
     }
     return r;
+}
+
+constexpr size_t kMaxPluginTreeNodes = 100000;
+constexpr size_t kMaxPluginTreeDepth = 512;
+constexpr uint32_t kMaxPluginEvents = 10000;
+
+class PluginAllocation {
+public:
+    PluginAllocation(const LoadedPlugin* plugin, void* pointer)
+        : m_plugin(plugin), m_pointer(pointer) {
+    }
+
+    ~PluginAllocation() {
+        if (m_pointer && m_plugin && m_plugin->free_fn)
+            m_plugin->free_fn(m_pointer);
+    }
+
+    PluginAllocation(const PluginAllocation&) = delete;
+    PluginAllocation& operator=(const PluginAllocation&) = delete;
+
+private:
+    const LoadedPlugin* m_plugin;
+    void* m_pointer;
+};
+
+class PluginEventAllocation {
+public:
+    PluginEventAllocation(
+        const LoadedPlugin* plugin, LvtConnectionEvent* events, uint32_t count)
+        : m_plugin(plugin), m_events(events), m_count(count) {
+    }
+
+    ~PluginEventAllocation() {
+        if (m_events && m_plugin && m_plugin->connection_events_free)
+            m_plugin->connection_events_free(m_events, m_count);
+    }
+
+    PluginEventAllocation(const PluginEventAllocation&) = delete;
+    PluginEventAllocation& operator=(const PluginEventAllocation&) = delete;
+
+private:
+    const LoadedPlugin* m_plugin;
+    LvtConnectionEvent* m_events;
+    uint32_t m_count;
+};
+
+static bool validate_plugin_node(
+    const json& node, size_t depth, size_t& nodeCount,
+    std::string& error) {
+    if (!node.is_object()) {
+        error = "tree nodes must be objects";
+        return false;
+    }
+    if (depth > kMaxPluginTreeDepth) {
+        error = "tree exceeds the maximum nesting depth";
+        return false;
+    }
+    if (++nodeCount > kMaxPluginTreeNodes) {
+        error = "tree exceeds the maximum node count";
+        return false;
+    }
+
+    for (const char* field : {"target_hwnd", "type", "text", "name"}) {
+        const auto value = node.find(field);
+        if (value != node.end() && !value->is_string()) {
+            error = std::string("'") + field + "' must be a string";
+            return false;
+        }
+    }
+    for (const char* field : {"offsetX", "offsetY", "width", "height"}) {
+        const auto value = node.find(field);
+        if (value != node.end() && !value->is_number()) {
+            error = std::string("'") + field + "' must be a number";
+            return false;
+        }
+    }
+
+    const auto properties = node.find("properties");
+    if (properties != node.end() && !properties->is_object()) {
+        error = "'properties' must be an object";
+        return false;
+    }
+
+    const auto children = node.find("children");
+    if (children == node.end())
+        return true;
+    if (!children->is_array()) {
+        error = "'children' must be an array";
+        return false;
+    }
+    for (const auto& child : *children) {
+        if (!validate_plugin_node(child, depth + 1, nodeCount, error))
+            return false;
+    }
+    return true;
+}
+
+static bool validate_plugin_tree(const json& tree, std::string& error) {
+    size_t nodeCount = 0;
+    if (tree.is_object())
+        return validate_plugin_node(tree, 0, nodeCount, error);
+    if (!tree.is_array()) {
+        error = "top-level plugin tree must be an object or array";
+        return false;
+    }
+    for (const auto& node : tree) {
+        if (!validate_plugin_node(node, 0, nodeCount, error))
+            return false;
+    }
+    return true;
 }
 
 // Recursively graft JSON nodes into an Element tree.
@@ -285,6 +452,28 @@ static void graft_plugin_tree_json(const json& treeJson, Element& root, const st
     }
 }
 
+static bool parse_and_graft_plugin_tree(
+    const char* jsonText, Element& root, const std::string& frameworkName,
+    const char* source) {
+    try {
+        auto treeJson = json::parse(jsonText);
+        std::string validationError;
+        if (!validate_plugin_tree(treeJson, validationError)) {
+            fprintf(
+                stderr, "lvt: invalid %s plugin tree: %s\n",
+                source, validationError.c_str());
+            return false;
+        }
+        graft_plugin_tree_json(treeJson, root, frameworkName);
+        return true;
+    } catch (const json::exception& e) {
+        fprintf(
+            stderr, "lvt: invalid %s plugin JSON: %s\n",
+            source, e.what());
+        return false;
+    }
+}
+
 bool enrich_with_plugin(Element& root, HWND hwnd, DWORD pid,
                         const PluginFrameworkInfo& pluginFw,
                         const std::string& pluginOption) {
@@ -294,25 +483,16 @@ bool enrich_with_plugin(Element& root, HWND hwnd, DWORD pid,
     int ok = pluginFw.plugin->enrich(hwnd, pid,
                                      pluginOption.empty() ? nullptr : pluginOption.c_str(),
                                      &jsonOut);
-    if (!ok || !jsonOut) return false;
-
-    json treeJson;
-    try {
-        treeJson = json::parse(jsonOut);
-    } catch (const json::parse_error& e) {
-        fprintf(stderr, "lvt: failed to parse plugin JSON: %s\n", e.what());
-        if (pluginFw.plugin->free_fn) pluginFw.plugin->free_fn(jsonOut);
+    PluginAllocation allocation(pluginFw.plugin, jsonOut);
+    if (!ok || !jsonOut)
         return false;
-    }
 
     if (g_debug)
         fprintf(stderr, "lvt: plugin '%s' returned %zu bytes of tree data\n",
                 pluginFw.name.c_str(), strlen(jsonOut));
 
-    if (pluginFw.plugin->free_fn) pluginFw.plugin->free_fn(jsonOut);
-
-    graft_plugin_tree_json(treeJson, root, pluginFw.name);
-    return true;
+    return parse_and_graft_plugin_tree(
+        jsonOut, root, pluginFw.name, "one-shot");
 }
 
 // IFrameworkConnection adapter over a plugin's optional v2 connection
@@ -337,57 +517,85 @@ public:
         // LvtConnectionGetTreeFn. Accepting and ignoring the parameter here
         // (rather than omitting it) keeps this a drop-in IFrameworkConnection,
         // consistent with XamlDiagConnection's signature.
-        if (!m_handle || !m_plugin->connection_get_tree)
+        std::lock_guard<std::mutex> lock(m_operationMutex);
+        if (!m_handle || !m_plugin->connection_get_tree || !m_alive)
             return false;
 
         char* jsonOut = nullptr;
         const char* filter = providerOption.empty() ? nullptr : providerOption.c_str();
         int ok = m_plugin->connection_get_tree(m_handle, filter, &jsonOut);
+        PluginAllocation allocation(m_plugin, jsonOut);
         if (!ok || !jsonOut) {
             m_alive = false;
             return false;
         }
 
-        json treeJson;
-        try {
-            treeJson = json::parse(jsonOut);
-        } catch (const json::parse_error& e) {
-            fprintf(stderr, "lvt: failed to parse plugin connection JSON: %s\n", e.what());
-            if (m_plugin->free_fn) m_plugin->free_fn(jsonOut);
+        if (!parse_and_graft_plugin_tree(
+                jsonOut, root, m_frameworkName, "persistent")) {
+            m_alive = false;
             return false;
         }
-        if (m_plugin->free_fn) m_plugin->free_fn(jsonOut);
-
-        graft_plugin_tree_json(treeJson, root, m_frameworkName);
         return true;
     }
 
     std::vector<ConnectionEvent> poll_events() override {
         std::vector<ConnectionEvent> result;
-        if (!m_handle || !m_plugin->connection_poll_events ||
-            !m_plugin->connection_events_free)
+        std::lock_guard<std::mutex> lock(m_operationMutex);
+        if (!m_handle || !m_alive ||
+            !plugin_supports_event_polling(*m_plugin))
             return result;
 
         LvtConnectionEvent* events = nullptr;
         uint32_t count = 0;
-        if (!m_plugin->connection_poll_events(m_handle, &events, &count) || !events)
+        const int ok =
+            m_plugin->connection_poll_events(m_handle, &events, &count);
+        PluginEventAllocation allocation(m_plugin, events, count);
+        if (!ok) {
+            m_alive = false;
             return result;
-
-        result.reserve(count);
-        for (uint32_t i = 0; i < count; i++) {
-            ConnectionEvent ev;
-            ev.mutation = (events[i].mutation && std::string(events[i].mutation) == "remove")
-                              ? ConnectionEvent::Mutation::removed
-                              : ConnectionEvent::Mutation::added;
-            ev.handle = events[i].handle;
-            ev.parentHandle = events[i].parent_handle;
-            ev.childIndex = events[i].child_index;
-            ev.elementType = events[i].element_type ? events[i].element_type : "";
-            ev.name = events[i].name ? events[i].name : "";
-            result.push_back(std::move(ev));
         }
-        if (m_plugin->connection_events_free)
-            m_plugin->connection_events_free(events, count);
+        if (count == 0) {
+            return result;
+        }
+        if (!events || count > kMaxPluginEvents) {
+            m_alive = false;
+            return result;
+        }
+
+        try {
+            result.reserve(count);
+            for (uint32_t i = 0; i < count; i++) {
+                if (events[i].struct_size < sizeof(LvtConnectionEvent) ||
+                    !events[i].mutation) {
+                    m_alive = false;
+                    return {};
+                }
+                const std::string mutation(events[i].mutation);
+                if (mutation != "add" && mutation != "remove") {
+                    m_alive = false;
+                    return {};
+                }
+
+                ConnectionEvent ev;
+                ev.mutation = mutation == "remove"
+                                  ? ConnectionEvent::Mutation::removed
+                                  : ConnectionEvent::Mutation::added;
+                ev.handle = static_cast<uint64_t>(events[i].handle);
+                ev.parentHandle =
+                    static_cast<uint64_t>(events[i].parent_handle);
+                ev.childIndex = events[i].child_index;
+                ev.elementType =
+                    events[i].element_type ? events[i].element_type : "";
+                ev.name = events[i].name ? events[i].name : "";
+                result.push_back(std::move(ev));
+            }
+        } catch (const std::exception& e) {
+            fprintf(
+                stderr, "lvt: invalid persistent plugin events: %s\n",
+                e.what());
+            m_alive = false;
+            return {};
+        }
         return result;
     }
 
@@ -397,16 +605,14 @@ private:
     const LoadedPlugin* m_plugin;
     void* m_handle;
     std::string m_frameworkName;
-    bool m_alive = true;
+    std::mutex m_operationMutex;
+    std::atomic_bool m_alive = true;
 };
 
 std::shared_ptr<IFrameworkConnection> open_plugin_connection(
     const PluginFrameworkInfo& pluginFw, HWND hwnd, DWORD pid) {
     if (!pluginFw.plugin ||
-        !pluginFw.plugin->connection_open ||
-        !pluginFw.plugin->connection_get_tree ||
-        !pluginFw.plugin->connection_close ||
-        !pluginFw.plugin->free_fn)
+        !plugin_supports_persistent_connections(*pluginFw.plugin))
         return nullptr;
 
     void* handle = pluginFw.plugin->connection_open(hwnd, pid);

@@ -9,6 +9,7 @@
 #include <objbase.h>
 #include <sddl.h>
 #include <wil/resource.h>
+#include <wil/result.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -113,11 +114,22 @@ static std::wstring make_pipe_name() {
 
 // ---------- Injection ----------
 
-static bool write_pipe_name_file(const std::wstring& dir, const std::wstring& pipeName) {
-    std::wstring path = dir + L"\\lvt_avalonia_pipe.txt";
-    int len = WideCharToMultiByte(CP_UTF8, 0, pipeName.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string utf8(len - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, pipeName.c_str(), -1, utf8.data(), len, nullptr, nullptr);
+static std::wstring pipe_name_file(const std::wstring& dir, DWORD pid) {
+    return dir + L"\\lvt_avalonia_pipe_" + std::to_wstring(pid) + L".txt";
+}
+
+static bool write_pipe_name_file(const std::wstring& path, const std::wstring& pipeName) {
+    const int len = WideCharToMultiByte(
+        CP_UTF8, 0, pipeName.data(), static_cast<int>(pipeName.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (len <= 0)
+        return false;
+    std::string utf8(static_cast<size_t>(len), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8, 0, pipeName.data(), static_cast<int>(pipeName.size()),
+            utf8.data(), len, nullptr, nullptr) != len) {
+        return false;
+    }
 
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) return false;
@@ -127,7 +139,8 @@ static bool write_pipe_name_file(const std::wstring& dir, const std::wstring& pi
 
 static bool inject_dll(DWORD pid, const std::wstring& dllPath) {
     wil::unique_handle proc(OpenProcess(
-        PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION,
+        PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE |
+            PROCESS_QUERY_INFORMATION | SYNCHRONIZE,
         FALSE, pid));
     if (!proc) {
         DebugLog("failed to open target process %lu (error %lu)", pid, GetLastError());
@@ -158,11 +171,51 @@ static bool inject_dll(DWORD pid, const std::wstring& dllPath) {
         return false;
     }
 
-    WaitForSingleObject(thread.get(), 5000);
+    DWORD waitResult = WaitForSingleObject(thread.get(), 5000);
+    if (waitResult != WAIT_OBJECT_0) {
+        if (waitResult == WAIT_TIMEOUT) {
+            DebugLog(
+                "LoadLibraryW is still pending in target process; "
+                "holding the injection transaction until it completes");
+        } else {
+            DebugLog(
+                "initial remote LoadLibraryW wait failed (error %lu); "
+                "holding the transaction",
+                GetLastError());
+        }
+        HANDLE waits[] = {thread.get(), proc.get()};
+        for (;;) {
+            waitResult = WaitForMultipleObjects(
+                static_cast<DWORD>(_countof(waits)), waits, FALSE, INFINITE);
+            if (waitResult == WAIT_OBJECT_0)
+                break;
+            if (waitResult == WAIT_OBJECT_0 + 1) {
+                DebugLog("target exited while LoadLibraryW was pending");
+                return false;
+            }
+            DebugLog(
+                "remote LoadLibraryW wait failed (error %lu); "
+                "retaining transaction ownership",
+                GetLastError());
+            Sleep(100);
+        }
+    }
+
+    if (WaitForSingleObject(proc.get(), 0) == WAIT_OBJECT_0) {
+        DebugLog("target exited after remote LoadLibraryW completed");
+        return false;
+    }
 
     DWORD exitCode = 0;
-    GetExitCodeThread(thread.get(), &exitCode);
-    VirtualFreeEx(proc.get(), remoteMem, 0, MEM_RELEASE);
+    const bool gotExitCode = GetExitCodeThread(thread.get(), &exitCode) != FALSE;
+    const bool freed =
+        VirtualFreeEx(proc.get(), remoteMem, 0, MEM_RELEASE) != FALSE;
+    if (!gotExitCode || !freed) {
+        DebugLog(
+            "failed to finalize remote LoadLibraryW (exit=%d, free=%d, error %lu)",
+            gotExitCode, freed, GetLastError());
+        return false;
+    }
 
     if (exitCode == 0) {
         DebugLog("LoadLibraryW failed in target process");
@@ -171,6 +224,30 @@ static bool inject_dll(DWORD pid, const std::wstring& dllPath) {
 
     DebugLog("TAP DLL injected into pid %lu", pid);
     return true;
+}
+
+static bool wait_for_tap_unload(
+    DWORD pid, const std::wstring& tapPath, DWORD timeoutMs) {
+    wil::unique_handle process(OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE,
+        FALSE, pid));
+    if (!process)
+        return false;
+
+    const auto separator = tapPath.find_last_of(L"\\/");
+    const std::wstring tapName =
+        separator == std::wstring::npos
+            ? tapPath
+            : tapPath.substr(separator + 1);
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    do {
+        if (WaitForSingleObject(process.get(), 0) == WAIT_OBJECT_0)
+            return false;
+        if (get_module_path(process.get(), tapName.c_str()).empty())
+            return true;
+        Sleep(25);
+    } while (GetTickCount64() < deadline);
+    return false;
 }
 
 // ---------- Version string storage ----------
@@ -226,8 +303,12 @@ __declspec(dllexport) int lvt_enrich_tree(HWND hwnd, DWORD pid,
 
 #if defined(_M_ARM64)
     std::wstring tapDll = tapDir + L"\\lvt_avalonia_tap_arm64.dll";
-#else
+#elif defined(_M_IX86)
+    std::wstring tapDll = tapDir + L"\\lvt_avalonia_tap_x86.dll";
+#elif defined(_M_X64)
     std::wstring tapDll = tapDir + L"\\lvt_avalonia_tap_x64.dll";
+#else
+#error Unsupported Avalonia plugin architecture
 #endif
 
     if (GetFileAttributesW(tapDll.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -241,13 +322,39 @@ __declspec(dllexport) int lvt_enrich_tree(HWND hwnd, DWORD pid,
         return 0;
     }
 
+    const std::wstring mutexName =
+        L"Local\\LvtAvaloniaConnect_" + std::to_wstring(pid);
+    wil::unique_handle connectMutex(
+        CreateMutexW(nullptr, FALSE, mutexName.c_str()));
+    if (!connectMutex) {
+        DebugLog("failed to create connection mutex (error %lu)", GetLastError());
+        return 0;
+    }
+    const DWORD mutexWait = WaitForSingleObject(connectMutex.get(), 20000);
+    if (mutexWait != WAIT_OBJECT_0 && mutexWait != WAIT_ABANDONED) {
+        DebugLog("timed out acquiring connection mutex");
+        return 0;
+    }
+    auto releaseConnectMutex = wil::scope_exit([&] {
+        ReleaseMutex(connectMutex.get());
+    });
+
+    if (!wait_for_tap_unload(pid, tapDll, 5000)) {
+        DebugLog("previous TAP DLL session is still active");
+        return 0;
+    }
+
     std::wstring pipeName = make_pipe_name();
+    const std::wstring pipeNameFile = pipe_name_file(tapDir, pid);
 
     // Write pipe name to sidecar file in the TAP directory
-    if (!write_pipe_name_file(tapDir, pipeName)) {
+    if (!write_pipe_name_file(pipeNameFile, pipeName)) {
         DebugLog("failed to write pipe name file");
         return 0;
     }
+    auto deletePipeNameFile = wil::scope_exit([&] {
+        DeleteFileW(pipeNameFile.c_str());
+    });
 
     // Create named pipe
     SECURITY_ATTRIBUTES sa = {};
@@ -324,9 +431,6 @@ __declspec(dllexport) int lvt_enrich_tree(HWND hwnd, DWORD pid,
         }
         data.append(buf, bytesRead);
     }
-
-    // Clean up sidecar file
-    DeleteFileW((tapDir + L"\\lvt_avalonia_pipe.txt").c_str());
 
     DebugLog("received %zu bytes of tree data", data.size());
 

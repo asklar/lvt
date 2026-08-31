@@ -52,7 +52,10 @@ work across them.
 | `connect` | Open a session on a window, by `hwnd`, `pid`, `name` or `title` |
 | `disconnect` | Close a session |
 | `get_uia_tree` | The UI Automation tree — AutomationIds, control types, states, patterns. **This is the tree to automate against.** |
+| `get_uia_tree_changes` | Session-scoped UIA patches: a snapshot on first call, then added/removed/changed events |
 | `get_visual_tree` | The framework-native tree — Win32/XAML/WPF/WinForms/Avalonia/Chromium. Shows *how a UI is built*; drive it from a `visual`-mode session |
+| `get_visual_tree_changes` | Session-scoped visual-tree patches: a snapshot on first call, then added/removed/changed events |
+| `get_editable_properties` | Provider-owned typed property schema and live values for one element in the session's UIA or visual tree |
 | `get_frameworks` | UI frameworks detected in the target, with versions |
 | `find_elements` | Match by AutomationId, name, control type or supported pattern |
 | `get_element_properties` | One element's properties, or a named subset |
@@ -68,6 +71,8 @@ work across them.
 | `invoke` | InvokePattern only — never moves the mouse |
 | `toggle` | Flip a checkbox or toggle button |
 | `set_value` | Set a text or numeric value outright |
+| `set_property` | Set a writable typed property by opaque provider descriptor id |
+| `clear_property` | Clear/reset a typed property when its provider supports that operation |
 | `set_expanded` | Expand or collapse a tree item or combo box |
 | `select` | Select a list item or tab (`replace`, `add`, `remove`) |
 | `focus` | Give an element keyboard focus |
@@ -114,9 +119,10 @@ of architecture, and its elements are the ones a `uia` session acts on.
 shows HWNDs, XAML types, WPF elements and Chromium DOM nodes — implementation
 structure the UIA tree deliberately hides. Its elements can be driven too, but
 only from a session connected with `mode: "visual"`, which acts by aiming real
-input at where an element is. Because it works by injecting into the target it
-needs lvt and the target to share an architecture; when they do not, it says so
-and names the right binary.
+input at where an element is. Injected XAML/WPF/WinForms/plugin visual trees
+need lvt and the target to share an architecture. A native-only Win32/ComCtl
+tree can still be read across architectures; ABI-sensitive item detail and
+property operations become read-only while scalar operations remain available.
 
 On a rich XAML/WinUI3 tree, `get_visual_tree` walks every element's entire
 property inheritance chain by default (`IVisualTreeService::
@@ -128,6 +134,277 @@ This is enough to browse or search a tree by, and to hit-test/highlight
 elements, but it will not report arbitrary custom properties the way the
 default (`fast: false`) walk does — use `get_element_properties` for a single
 element's exhaustive property set regardless of which mode built the tree.
+
+### Incremental tree updates
+
+`get_uia_tree_changes` and `get_visual_tree_changes` each retain their own
+previous tree per MCP session. The first call returns the current tree as flat
+`added` events with `"snapshot": true`; subsequent calls return the same
+`added`, `removed`, and `changed` patch events as `watch`, with
+`"snapshot": false`. Disconnecting clears both baselines. Changing the UIA
+view/property options or the visual `fast` setting starts a fresh snapshot,
+because those choices intentionally describe different trees.
+
+Changed events carry per-field `{ "old", "new" }` values. A `path` field moves
+an existing key to a new absolute tree path; `parentKey` is an explicit
+relocation signal for the rarer case where the parent object changed while the
+child's absolute path stayed the same.
+
+Every connected session exposes exactly one standards-compliant subscribable
+MCP resource, matching the session's fixed mode:
+
+- `lvt://session/<session>/uia-tree` for the default UIA mode
+- `lvt://session/<session>/visual-tree` for visual mode
+
+`resources/list` discovers those mode-specific resources, `resources/read`
+returns `{ "tree": "uia"|"visual", "snapshot": bool, "events": [...] }`, and
+`resources/subscribe` opts into `notifications/resources/updated`. The server
+diff-polls the appropriate native tree about every 500 ms, with missed ticks
+skipped. This remains the correctness path for both modes: XAML structural
+callbacks do not report text/property/bounds changes, and UIA providers are not
+required to raise every event consistently.
+
+Visual sessions also maintain a PID- and root-scoped out-of-context WinEvent
+hook for native Win32/Common Controls create, destroy, reorder, parent, state,
+name, value, selection, and location notifications. Those notifications are
+bounded and coalesced to an internal `snapshotRequired` hint. They do not
+replace or short-circuit the resource poll, and the current resource scheduler
+does not yet wait directly on the hook, so notification latency is still
+bounded by the roughly 500 ms cadence. The next full tree refresh consumes the
+hint; only its authoritative diff is cached/notified, avoiding a second stream
+of duplicate native add/remove events.
+
+UIA sessions similarly keep exact-HWND, subtree-scoped structure/property/
+automation handlers on their persistent `IUIAutomation` connection. Callback
+bursts allocate nothing and coalesce to one `snapshotRequired` hint. The MCP
+bridge drains that hint only after a successful UIA snapshot. Visual snapshots
+exclude the `uia` label, including when a visual response later performs a UIA
+correlation walk; that correlation drains UIA separately and never polls
+visual plugins a second time. Consequently a failed or unrelated refresh
+cannot consume the notification and plugin/native event sources are still
+polled exactly once in their existing phases. The resource scheduler
+remains interval-based rather than waiting directly on provider event handles,
+so UIA notification latency is bounded by the same roughly 500 ms cadence.
+
+At `connect`, MCP captures a UIA target identity containing the authoritative
+PID, process creation timestamp, and root `RuntimeId`, even for visual sessions
+that may later request correlation. The identity also retains a per-window
+generation sentinel, so exact numeric HWND reuse inside the same process cannot
+masquerade as the old root. UIA tree reads, correlation, resources, typed
+properties, and actions all reuse that identity. A transient persistent client
+failure can use a one-shot fallback only with the captured identity;
+PID/HWND/root replacement instead returns the structured code
+`ownershipLost`.
+
+Visual tree walks validate that identity before connection acquisition, before
+and after every snapshot attempt, and again before publishing a response or
+diff baseline. Explicit window/process/lifetime mismatches return
+`ownershipLost`; transient UIA/COM validation failures remain retryable and do
+not invalidate the live session. A complete successful root snapshot stages a
+replacement for the session's authorized `(provider, providerHandle)` set and
+commits it only after the caller accepts the response or diff baseline. Compact
+XAML/WinUI/WPF/WinForms property keys must be present in that set, so a
+process-wide diagnostics connection cannot use another application window's
+registry entry. Scoped responses, failed/incomplete refreshes, and unrelated
+sessions never narrow or expand the set; disconnect clears it, and a new
+session must publish its own complete snapshot before compact keys are usable.
+WPF and WinForms operations additionally revalidate the live object's current
+top-level native window inside the managed TAP immediately before each read,
+mutation, and readback, so moving an object to another window revokes the old
+session without waiting for another tree snapshot.
+XAML and WinUI operations carry the accepted snapshot's provider root handles
+to the TAP, which follows its callback-maintained parent graph immediately
+before and after property work; detached objects or objects moved to another
+island are refused the same way. Authorization publication also rechecks the
+session's disconnect tombstone while holding the session lock, so a delayed
+response cannot recreate authorization after disconnect.
+
+UI Automation identity reads preserve the original COM and SAFEARRAY HRESULT.
+Only successful PID, process-lifetime, window-generation, and RuntimeId reads
+that prove a mismatch become `ownershipLost`; rejected calls and malformed or
+failed RuntimeId reads remain transient and retryable.
+
+Visual-mode actions validate that same original identity rather than trusting
+only the current numeric HWND. Both visual and UIA synthetic input paths require
+the target root to remain foreground and repeat identity/foreground checks
+before every mouse, wheel, text, select-all, or individual key-chord batch.
+Typed-property reads and mutations map identity loss—including a race after the
+initial descriptor read—to `typed_property_session_disconnected`,
+`errorDisposition: ownershipLost`, and `retryable: false`.
+Reference-to-provider-handle resolution performs the same original-token check,
+so a close or exact HWND recycle during resolution is never downgraded to an
+ordinary stale-element error.
+
+Visual resources always poll `get_visual_tree_changes` with `fast: true`,
+matching the Viewer's former `watch --fast` path. The live stream still carries
+the bounds, text, content, and basic state needed to render and search the tree;
+full selected-node dependency properties come separately from
+`get_editable_properties`, avoiding multi-second full-property walks every tick.
+UIA resources use their normal default options.
+
+Screenshots use an internal staging file for both inline and path output. The
+original session identity is checked immediately before and after capture (and
+again after inline encoding or before publishing a requested path). A replaced
+target therefore returns structured `ownershipLost`, removes the staging file,
+and never exposes replacement pixels or overwrites the caller's existing file.
+
+The poll result is cached before the notification is sent, so the following
+`resources/read` is fast and drains that cached patch rather than walking the
+application again. The initial subscribe/read is always a full snapshot.
+Several patches arriving before a read are appended in order; a newer snapshot
+replaces older queued patches. Pending diffs are capped at 10,000 events. If
+appending would exceed that cap, the server replaces the queue with a fresh
+snapshot, preserving a recoverable current state instead of dropping arbitrary
+events. Unsubscribe, disconnect, transport errors, and tree-read errors cancel
+the resource task and clear its cache.
+
+With rmcp 3.1 this is implemented using
+`ServerCapabilities::builder().enable_resources().enable_resources_subscribe()`,
+the `ServerHandler::{list_resources,read_resource,subscribe,unsubscribe}`
+methods, and `Peer<RoleServer>::notify_resource_updated` for MCP 2025-06-18.
+The newer 2026-07-28 subscription lifecycle is supported too through
+`ServerHandler::{accepted_subscription_filter,listen}` and
+`SubscriptionContext::sink().notify_resource_updated`; no custom JSON-RPC
+method or notification is introduced.
+
+### Typed property schemas and mutation
+
+`get_editable_properties` takes an `element` reference or durable key from the
+session's own UIA or visual tree. UIA positional references (`uia:eN`) are not
+accepted here because they do not encode whether `eN` came from the raw,
+control, or content view. Use the element's durable key or `uia:<RuntimeId>`;
+the session retains key-to-RuntimeId identity from each tree it returns and
+rejects a key if different views made it ambiguous.
+It returns a provider-owned `schemaId`, immutable `descriptors`, and separate
+per-element live `values`. Descriptors include an opaque `descriptorId`,
+declared property type, provider/framework identity, editor kind
+(`readonly`, `string`, `boolean`, `integer`, `number`, `enum`, or `command`),
+choices, optional numeric limits, writability, and clear capability. A command
+descriptor represents provider-supplied actions such as supported UIA scroll
+directions; clients render its choices without inferring behavior from the
+property name. Live values carry the current value, runtime value type, source,
+override state, and whether that specific value can currently be cleared.
+
+Clients never send a property index or type name. The provider resolves the
+opaque descriptor id and owns conversion:
+
+```json
+{"name":"set_property","arguments":{"session":"s1","element":"winui3:0x123","descriptorId":"winui3-1:p7","value":"100"}}
+{"name":"clear_property","arguments":{"session":"s1","element":"winui3:0x123","descriptorId":"winui3-1:p7"}}
+```
+
+Setting and clearing require `lvt mcp --allow-input`. Clearing has
+provider-defined semantics: XAML removes a local value, while the curated
+ComboBox/ListBox descriptors clear selection to the documented no-selection
+state. UI Automation patterns generally have no reset operation, so their
+descriptors report `supportsClear:false` and `clear_property` returns an
+explicit unsupported error. Unknown, stale, element-mismatched, and read-only
+descriptor ids are rejected. Successful mutations include provider readback of the effective
+`value`, `runtimeType`, `source`, `overridden`, and `canClear` state. The
+returned value is never the caller's input echoed back; a failed readback is
+reported as an explicit mutation failure.
+
+Every `set_property`/`clear_property` failure has the same structured shape:
+`errorCode`, `errorDisposition`, `retryable`, provider error text in `error`,
+and `hresult`. Invalid values/descriptors, read-only or unsupported operations,
+bounds failures, and stale ordinary elements are `terminal`. Broken transports,
+provider-busy responses, and timeouts are `transient` and retryable. A lost
+session, target process, or root-window identity is `ownershipLost` and is not
+retryable.
+
+The provider-neutral contract is implemented by XAML/WinUI3, UI Automation,
+WPF, WinForms, and curated Win32/Common Controls adapters. WPF exposes writable scalar
+dependency properties and preserves local value precedence through
+`SetValue`/`ClearValue`. WinForms uses `TypeDescriptor`, including custom
+descriptors, but admits only a conservative scalar/converter allowlist and
+uses `ResetValue` only when reset is supported. Native support deliberately
+exposes semantic properties rather than styles or messages:
+
+| Native target | Typed properties |
+|---|---|
+| Any supported HWND | Text and enabled state |
+| Button | Check state when the button style is checkable |
+| Edit | Text, selection start/end, and read-only state |
+| ComboBox / single-select ListBox | Selected index; clear removes selection |
+| ScrollBar | Minimum, maximum, position; page size is read-only |
+| SysListView32 | View mode; bounded grow/retry item selected/focused/text when identity is verified and it is not owner-data |
+| SysTreeView32 | Item selected, expanded, and bounded grow/retry text |
+| ToolbarWindow32 | Button checked/enabled/text after index and unique command-id revalidation |
+| Status bar | Text parts only; owner-drawn item-data parts are unavailable/read-only |
+| Tab control | Selected index and bounded tab text when the label/order identity is unique |
+
+When a native operation is not safe for a particular class/style, owner-data
+control, stale item, or architecture combination, the descriptor/value is
+read-only with an explicit reason. Native descriptors never contain styles,
+message ids, `wParam`/`lParam`, or caller-controlled pointers.
+
+Schema caches are connection-scoped and contain metadata only, never live
+values. Native schemas are keyed by normalized class, common-control version,
+capability style bits, item kind, and host/target architecture. XAML schemas
+use the provider's declared property metadata. For xamlOM properties, the
+descriptor's declared `propertyType` comes from `PropertyChainValue.Type` and
+drives editor selection and `CreateInstance`; the evaluated value's
+`ValueType` is reported only as live `runtimeType` and never trusted for
+mutation. Each persistent XAML connection fetches its runtime enum catalog
+once. Flags values accept comma-separated members only when WinRT metadata
+confirms `System.FlagsAttribute`; ordinary and unresolved enum numerics are
+never fabricated into flag combinations. The UIA adapter derives editors and
+choices from cached supported patterns and capability properties:
+Value/RangeValue read-only state, RangeValue bounds, deterministic Toggle and
+ExpandCollapse states, Selection-container capabilities, and supported Scroll
+directions. External plugin ABI support is not part of this contract.
+
+Native messaging is bounded with `SendMessageTimeoutW` using
+`SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT`. Pointer-bearing common-control
+structures and strings use target-process buffers opened with only VM
+read/write/operation rights. Before every write lvt revalidates the HWND,
+owner PID, class, item index/identity or toolbar command, and value range, then
+reads the property back before reporting success. ABI-sensitive pointer
+operations are read-only across process architectures; tested scalar message
+operations remain available. This architecture check is also applied to
+one-shot tree enrichment, even when no property connection exists.
+
+`SendMessageTimeoutW` can return while a target WndProc is still using a
+pointer. Pointer operations therefore carry a bounded lifetime token; after a
+timeout their local or remote buffer is retained until the target exits rather
+than being freed underneath the target. Once the bounded retirement capacity is
+full, lvt refuses another pointer message instead of leaking without limit.
+Toolbar text is length-queried, safety-capped, and retrieved through a
+capacity-bearing `TB_GETBUTTONINFO` buffer with bounded growth rechecks.
+
+Native HWND keys are stable across one-shot commands and persistent sessions:
+`win32:0x…` and `comctl:0x…` combine the HWND with a process-independent
+window-lifetime sentinel, never with a session mutation handle. Destroying and
+reusing the same numeric HWND therefore produces removal/addition with a fresh
+key instead of transferring the old element's identity. If UIPI prevents
+installing the sentinel, read-only native inspection remains available but
+mutation handles are withheld. Logical common-control item keys similarly use
+public-safe text/handle fingerprints or toolbar command ids plus the owning
+window lifetime; toolbar separators and status parts remain structural because
+their indices are mutable positions, not durable identities. Opaque mutation
+handles remain private to the provider.
+List and toolbar uniqueness is checked across the full control rather than the
+50-item output window. Scans above the 256-item safety bound, or scans that
+fail, suppress that logical identity and expose the item read-only. Tab labels
+use the same bounded full-control proof; tree handles are already unique within
+their owning control.
+
+Those compact keys identify but do not authorize. They are valid for native
+properties only after that exact target was registered and published while
+building the session's root tree. A guessed same-process HWND, a sibling
+top-level window, a reparented child that left the root, or a key from a
+reconnected session before its first tree refresh is rejected. Each complete
+published snapshot replaces the native allow-list. Tab identity never requests
+`TCIF_PARAM`, because
+`TCM_SETITEMEXTRA` changes that ABI; it instead requires unique text and
+revalidates the complete ordered label fingerprint. Duplicate toolbar command
+ids similarly make affected buttons read-only.
+
+Tree reads and all three property operations share the session's existing
+persistent connection: there is no second injection or side protocol. UIA
+connections are scoped to the session's target HWND, not merely its process,
+so two windows owned by one process cannot resolve or mutate through each
+other's UIA root.
 
 ## Addressing elements
 

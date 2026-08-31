@@ -1,4 +1,6 @@
 #include "win32_provider.h"
+#include "native_message.h"
+#include "native_property_connection.h"
 #include <vector>
 
 namespace lvt {
@@ -67,13 +69,25 @@ static BOOL CALLBACK enum_direct_children(HWND hwnd, LPARAM lParam) {
     return TRUE;
 }
 
-Element Win32Provider::build(HWND hwnd, int maxDepth) {
-    return build_element(hwnd, 0, maxDepth);
+Element Win32Provider::build(
+    HWND hwnd, int maxDepth, NativePropertyConnection* properties) {
+    return build_element(hwnd, 0, maxDepth, properties);
 }
 
-Element Win32Provider::build_element(HWND hwnd, int depth, int maxDepth) {
+Element Win32Provider::build_element(
+    HWND hwnd, int depth, int maxDepth,
+    NativePropertyConnection* properties) {
     Element el;
     el.nativeHandle = reinterpret_cast<uintptr_t>(hwnd);
+    NativeWindowIdentity identity;
+    if (capture_native_window_identity(
+            hwnd, 0, identity).ok) {
+        el.nativeLifetimeHandle =
+            native_window_provider_handle(identity);
+    }
+    if (properties) {
+        el.providerHandle = properties->register_hwnd(hwnd);
+    }
     el.framework = "win32";
     el.className = get_window_class(hwnd);
     el.type = classify_window(el.className);
@@ -98,7 +112,8 @@ Element Win32Provider::build_element(HWND hwnd, int depth, int maxDepth) {
         EnumChildData data{{}, hwnd};
         EnumChildWindows(hwnd, enum_direct_children, reinterpret_cast<LPARAM>(&data));
         for (auto child : data.children) {
-            el.children.push_back(build_element(child, depth + 1, maxDepth));
+            el.children.push_back(
+                build_element(child, depth + 1, maxDepth, properties));
         }
     }
 

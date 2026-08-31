@@ -22,6 +22,7 @@ class ConnectionHandle {
 public:
     ConnectionHandle() = default;
     ConnectionHandle(DWORD pid, std::string frameworkLabel,
+                      uint64_t generation,
                       std::shared_ptr<IFrameworkConnection> connection);
     ~ConnectionHandle();
 
@@ -49,16 +50,19 @@ private:
 
     DWORD m_pid = 0;
     std::string m_frameworkLabel;
+    uint64_t m_generation = 0;
     std::shared_ptr<IFrameworkConnection> m_connection;
 };
 
 // Per-process (i.e. per lvt_core instance - a one-shot CLI command links
 // this fresh each run, while lvt_core stays loaded for the whole life of an
 // `lvt watch` process or an `lvt mcp` server process) registry of live
-// IFrameworkConnections, keyed by (pid, framework label, e.g. "xaml" /
-// "winui3"). Refcounted: multiple acquirers within the SAME process share
-// one underlying connection; it is only torn down once the last holder
-// releases (or lets its ConnectionHandle go out of scope).
+// IFrameworkConnections, keyed by (pid, connection key). Diagnostics
+// providers use framework labels such as "xaml"; native property adapters
+// include their root HWND and session id so neither windows nor sessions share
+// published item-identity maps. Refcounted: multiple acquirers with the same
+// key share one underlying connection; it is only torn down once the last
+// holder releases (or lets its ConnectionHandle go out of scope).
 //
 // Deliberately per-process only - a connection acquired by one lvt.exe
 // invocation is not visible to another separately-running lvt.exe process
@@ -69,8 +73,9 @@ public:
     static ConnectionRegistry& instance();
 
     // Attempts to establish a NEW connection for (hwnd, pid). Returning
-    // nullptr means "could not connect"; the caller falls back to whatever
-    // one-shot path it used before this registry existed.
+    // nullptr means "could not connect". Long-running owners retain/retry a
+    // missing slot; providers that never support persistence keep using their
+    // one-shot path without entering the registry.
     using Factory = std::function<std::shared_ptr<IFrameworkConnection>(HWND hwnd, DWORD pid)>;
 
     // Returns the existing live connection for (pid, frameworkLabel) if one
@@ -82,15 +87,19 @@ public:
 
 private:
     friend class ConnectionHandle;
-    void release(DWORD pid, const std::string& frameworkLabel);
+    void release(
+        DWORD pid, const std::string& frameworkLabel, uint64_t generation,
+        const IFrameworkConnection* connection);
 
     struct Entry {
         std::shared_ptr<IFrameworkConnection> connection;
         int refCount = 0;
+        uint64_t generation = 0;
     };
 
     std::mutex m_mutex;
     std::map<std::pair<DWORD, std::string>, Entry> m_entries;
+    uint64_t m_nextGeneration = 1;
 };
 
 } // namespace lvt

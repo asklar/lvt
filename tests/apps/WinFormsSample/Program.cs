@@ -1,5 +1,11 @@
 using System;
+using System.Collections.Generic;
+using System.ComponentModel;
 using System.Drawing;
+using System.Linq;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace WinFormsSample
@@ -11,31 +17,77 @@ namespace WinFormsSample
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new SampleForm());
+            TypeDescriptor.AddProvider(
+                new SampleFormTypeDescriptionProvider(
+                    TypeDescriptor.GetProvider(typeof(SampleForm))),
+                typeof(SampleForm));
+            var mainForm = new SampleForm(false);
+            SampleForm secondaryForm = null;
+            if (Environment.GetEnvironmentVariable(
+                    "LVT_TEST_SECONDARY_WINFORMS_WINDOW") == "1")
+            {
+                mainForm.Shown += (sender, args) =>
+                {
+                    secondaryForm = new SampleForm(true);
+                    secondaryForm.Show();
+                };
+            }
+            Application.Run(mainForm);
+            secondaryForm?.Dispose();
         }
+    }
+
+    internal enum SampleMode
+    {
+        Basic,
+        Advanced,
+        Expert,
     }
 
     internal sealed class SampleForm : Form
     {
-        public SampleForm()
+        internal const int ReparentElementMessage = 0x84D1;
+        private static SampleForm primaryForm = null!;
+        private static SampleForm secondaryForm = null!;
+        private readonly EventWaitHandle blockTrigger;
+        private readonly EventWaitHandle blockEntered;
+        private readonly EventWaitHandle blockRelease;
+        private readonly TextBox inputTextBox;
+        private string editableText = "Default text";
+        private int retryCount = 5;
+        private SampleMode mode = SampleMode.Basic;
+
+        public SampleForm(bool secondary)
         {
-            Name = "MainForm";
-            Text = "LVT WinForms Sample";
+            if (secondary)
+                secondaryForm = this;
+            else
+                primaryForm = this;
+            Name = secondary ? "SecondaryForm" : "MainForm";
+            Text = secondary
+                ? "LVT WinForms Secondary"
+                : "LVT WinForms Sample";
             StartPosition = FormStartPosition.Manual;
-            Location = new Point(120, 120);
+            Location = secondary
+                ? new Point(620, 140)
+                : new Point(120, 120);
             Size = new Size(420, 260);
 
             var label = new Label
             {
-                Name = "messageLabel",
+                Name = secondary
+                    ? "secondaryMessageLabel"
+                    : "messageLabel",
                 Text = "Sample label",
                 AutoSize = true,
                 Location = new Point(20, 20)
             };
 
-            var textBox = new TextBox
+            inputTextBox = new TextBox
             {
-                Name = "inputTextBox",
+                Name = secondary
+                    ? "secondaryInputTextBox"
+                    : "inputTextBox",
                 Text = "Sample text",
                 Location = new Point(20, 55),
                 Width = 220
@@ -43,7 +95,9 @@ namespace WinFormsSample
 
             var button = new Button
             {
-                Name = "okButton",
+                Name = secondary
+                    ? "secondaryOkButton"
+                    : "okButton",
                 Text = "OK",
                 Location = new Point(20, 95),
                 Size = new Size(90, 30)
@@ -51,17 +105,201 @@ namespace WinFormsSample
 
             var checkBox = new CheckBox
             {
-                Name = "enabledCheckBox",
+                Name = secondary
+                    ? "secondaryEnabledCheckBox"
+                    : "enabledCheckBox",
                 Text = "Enabled",
                 Checked = true,
                 Location = new Point(20, 135),
                 AutoSize = true
             };
 
+            var childScopePanel = new Panel
+            {
+                Name = secondary
+                    ? "secondaryChildScopePanel"
+                    : "childScopePanel",
+                Location = new Point(260, 55),
+                Size = new Size(130, 80)
+            };
+            var childScopeTextBox = new TextBox
+            {
+                Name = secondary
+                    ? "secondaryChildScopeTextBox"
+                    : "childScopeTextBox",
+                Text = "Child scoped text",
+                Location = new Point(5, 5),
+                Width = 115
+            };
+            childScopePanel.Controls.Add(childScopeTextBox);
+
             Controls.Add(label);
-            Controls.Add(textBox);
+            Controls.Add(inputTextBox);
             Controls.Add(button);
             Controls.Add(checkBox);
+            Controls.Add(childScopePanel);
+
+            var prefix = $@"Local\LvtWinFormsSampleUiBlock_{Process.GetCurrentProcess().Id}";
+            blockTrigger = new EventWaitHandle(
+                false, EventResetMode.AutoReset, prefix + "_trigger");
+            blockEntered = new EventWaitHandle(
+                false, EventResetMode.ManualReset, prefix + "_entered");
+            blockRelease = new EventWaitHandle(
+                false, EventResetMode.AutoReset, prefix + "_release");
+            _ = Task.Run(() =>
+            {
+                while (blockTrigger.WaitOne())
+                {
+                    BeginInvoke(new MethodInvoker(() =>
+                    {
+                        blockEntered.Set();
+                        blockRelease.WaitOne();
+                        blockEntered.Reset();
+                    }));
+                }
+            });
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == ReparentElementMessage &&
+                ReferenceEquals(this, primaryForm) &&
+                secondaryForm != null)
+            {
+                Controls.Remove(inputTextBox);
+                secondaryForm.Controls.Add(inputTextBox);
+                inputTextBox.Location = new Point(20, 55);
+                message.Result = new IntPtr(1);
+                return;
+            }
+            base.WndProc(ref message);
+        }
+
+        [Browsable(true)]
+        [DefaultValue("Default text")]
+        public string EditableText
+        {
+            get => editableText;
+            set => editableText = value;
+        }
+
+        [Browsable(true)]
+        [DefaultValue(5)]
+        public int RetryCount
+        {
+            get => retryCount;
+            set => retryCount = value;
+        }
+
+        [Browsable(true)]
+        [DefaultValue(SampleMode.Basic)]
+        public SampleMode Mode
+        {
+            get => mode;
+            set => mode = value;
+        }
+
+        [Browsable(true)]
+        public string ReadOnlyValue => "read only";
+
+        [Browsable(true)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public Font UnsafeFontProperty { get; set; } = SystemFonts.DefaultFont;
+
+        [Browsable(true)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public string ThrowingValue
+        {
+            get => "unchanged";
+            set => throw new InvalidOperationException("Sample setter rejected the value");
+        }
+
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        internal string ProviderTextValue { get; set; } = "Provider default";
+    }
+
+    internal sealed class SampleFormTypeDescriptionProvider : TypeDescriptionProvider
+    {
+        private readonly TypeDescriptionProvider baseProvider;
+
+        public SampleFormTypeDescriptionProvider(TypeDescriptionProvider baseProvider)
+        {
+            this.baseProvider = baseProvider;
+        }
+
+        public override ICustomTypeDescriptor GetTypeDescriptor(
+            Type objectType, object instance)
+        {
+            return new SampleFormTypeDescriptor(
+                baseProvider.GetTypeDescriptor(objectType, instance));
+        }
+    }
+
+    internal sealed class SampleFormTypeDescriptor : CustomTypeDescriptor
+    {
+        public SampleFormTypeDescriptor(ICustomTypeDescriptor parent)
+            : base(parent)
+        {
+        }
+
+        public override PropertyDescriptorCollection GetProperties()
+        {
+            return GetProperties(Array.Empty<Attribute>());
+        }
+
+        public override PropertyDescriptorCollection GetProperties(Attribute[] attributes)
+        {
+            var properties = base.GetProperties(attributes)
+                .Cast<PropertyDescriptor>()
+                .ToList();
+            properties.Add(new ProviderTextPropertyDescriptor());
+            return new PropertyDescriptorCollection(properties.ToArray(), true);
+        }
+    }
+
+    internal sealed class ProviderTextPropertyDescriptor : PropertyDescriptor
+    {
+        public ProviderTextPropertyDescriptor()
+            : base(
+                "ProviderText",
+                new Attribute[]
+                {
+                    BrowsableAttribute.Yes,
+                    new DefaultValueAttribute("Provider default"),
+                })
+        {
+        }
+
+        public override Type ComponentType => typeof(SampleForm);
+        public override bool IsReadOnly => false;
+        public override Type PropertyType => typeof(string);
+
+        public override bool CanResetValue(object component)
+        {
+            return ((SampleForm)component).ProviderTextValue != "Provider default";
+        }
+
+        public override object GetValue(object component)
+        {
+            return ((SampleForm)component).ProviderTextValue;
+        }
+
+        public override void ResetValue(object component)
+        {
+            ((SampleForm)component).ProviderTextValue = "Provider default";
+            OnValueChanged(component, EventArgs.Empty);
+        }
+
+        public override void SetValue(object component, object value)
+        {
+            ((SampleForm)component).ProviderTextValue = (string)value;
+            OnValueChanged(component, EventArgs.Empty);
+        }
+
+        public override bool ShouldSerializeValue(object component)
+        {
+            return CanResetValue(component);
         }
     }
 }

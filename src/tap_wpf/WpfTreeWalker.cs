@@ -1,29 +1,245 @@
-// WpfTreeWalker.cs — Managed assembly injected into WPF target process.
-// Walks the WPF visual tree via VisualTreeHelper and serializes to JSON
-// over a named pipe, matching the schema used by the XAML TAP DLL.
-
 using System;
-using System.IO;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
 using System.IO.Pipes;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Windows;
+using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Threading;
+using LvtManagedTap;
 
 namespace LvtWpfTap
 {
     public static class WpfTreeWalker
     {
-        // Delegate type for .NET Core hosting interop
-        public delegate int CollectTreeDelegate(IntPtr pipeNamePtr, int pipeNameLength);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        public delegate int RunServerDelegate(IntPtr pipeNamePtr, int pipeNameLength);
 
-        // Entry point for .NET Core hosting (load_assembly_and_get_function_pointer).
-        // Takes IntPtr + length matching the component entry point convention.
-        public static int CollectTree(IntPtr pipeNamePtr, int pipeNameLength)
+        private const int UiTimeoutMilliseconds = 10000;
+        private static readonly Guid AssemblyInstanceGuid = Guid.NewGuid();
+        private static readonly string AssemblyInstanceId =
+            AssemblyInstanceGuid.ToString("N");
+        private static readonly long AssemblyIdentityPrefix =
+            Math.Max(
+                1,
+                BitConverter.ToUInt32(AssemblyInstanceGuid.ToByteArray(), 0) &
+                0x7FFFFFFF);
+        private static readonly ConditionalWeakTable<DependencyObject, Identity> Identities =
+            new ConditionalWeakTable<DependencyObject, Identity>();
+        private static long nextIdentity;
+        private static int serverStartCount;
+
+        private sealed class Identity
+        {
+            public Identity(long value)
+            {
+                Value = value;
+            }
+
+            public long Value { get; private set; }
+        }
+
+        private sealed class ObjectRegistry
+        {
+            private Dictionary<long, WeakReference> objects =
+                new Dictionary<long, WeakReference>();
+
+            public Dictionary<long, WeakReference> CreateSnapshot()
+            {
+                return new Dictionary<long, WeakReference>();
+            }
+
+            public long Track(
+                DependencyObject value, Dictionary<long, WeakReference> snapshot)
+            {
+                Identity identity = Identities.GetValue(
+                    value, ignored => new Identity(NextIdentity()));
+                snapshot[identity.Value] = new WeakReference(value);
+                return identity.Value;
+            }
+
+            private static long NextIdentity()
+            {
+                uint local = unchecked((uint)Interlocked.Increment(ref nextIdentity));
+                return (AssemblyIdentityPrefix << 32) | local;
+            }
+
+            public void Commit(Dictionary<long, WeakReference> snapshot)
+            {
+                objects = snapshot;
+            }
+
+            public bool TryGet(ulong handle, out DependencyObject value)
+            {
+                WeakReference reference;
+                value = null;
+                if (handle > long.MaxValue ||
+                    !objects.TryGetValue((long)handle, out reference))
+                    return false;
+                value = reference.Target as DependencyObject;
+                return value != null;
+            }
+
+            public void Clear()
+            {
+                objects.Clear();
+            }
+        }
+
+        private sealed class WpfPropertyMetadata
+        {
+            public string DescriptorId;
+            public string Name;
+            public string DisplayName;
+            public string Description;
+            public string DeclaringType;
+            public string PropertyType;
+            public DependencyProperty Property;
+            public ManagedScalarDescriptor Scalar;
+        }
+
+        private sealed class WpfPropertySchema
+        {
+            public string SchemaId;
+            public List<WpfPropertyMetadata> Properties;
+            public Dictionary<string, WpfPropertyMetadata> ByDescriptorId;
+        }
+
+        private sealed class WpfPropertyCatalog
+        {
+            private readonly string connectionId;
+            private readonly Dictionary<Type, WpfPropertySchema> schemas =
+                new Dictionary<Type, WpfPropertySchema>();
+            private int nextSchemaId = 1;
+            private int nextDescriptorId = 1;
+
+            public WpfPropertyCatalog(string connectionId)
+            {
+                this.connectionId = connectionId;
+            }
+
+            public WpfPropertySchema GetOrCreate(Type runtimeType)
+            {
+                WpfPropertySchema existing;
+                if (schemas.TryGetValue(runtimeType, out existing))
+                    return existing;
+
+                var discovered = new List<WpfPropertyMetadata>();
+                var seen = new HashSet<DependencyProperty>();
+                foreach (PropertyDescriptor descriptor in TypeDescriptor.GetProperties(runtimeType))
+                {
+                    DependencyPropertyDescriptor dependencyDescriptor;
+                    try
+                    {
+                        dependencyDescriptor =
+                            DependencyPropertyDescriptor.FromProperty(descriptor);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                    if (dependencyDescriptor == null ||
+                        dependencyDescriptor.DependencyProperty == null)
+                        continue;
+
+                    DependencyProperty property =
+                        dependencyDescriptor.DependencyProperty;
+                    if (property.ReadOnly || descriptor.IsReadOnly || !seen.Add(property))
+                        continue;
+
+                    ManagedScalarDescriptor scalar;
+                    if (!ManagedProtocol.TryDescribeScalar(
+                            property.PropertyType, out scalar))
+                        continue;
+
+                    discovered.Add(new WpfPropertyMetadata
+                    {
+                        Name = property.Name,
+                        DisplayName = string.IsNullOrEmpty(descriptor.DisplayName)
+                            ? property.Name
+                            : descriptor.DisplayName,
+                        Description = descriptor.Description ?? "",
+                        DeclaringType =
+                            property.OwnerType.FullName ?? property.OwnerType.Name,
+                        PropertyType =
+                            property.PropertyType.FullName ?? property.PropertyType.Name,
+                        Property = property,
+                        Scalar = scalar,
+                    });
+                }
+
+                discovered.Sort((left, right) =>
+                {
+                    int owner = string.Compare(
+                        left.DeclaringType, right.DeclaringType,
+                        StringComparison.Ordinal);
+                    return owner != 0
+                        ? owner
+                        : string.Compare(left.Name, right.Name, StringComparison.Ordinal);
+                });
+
+                string schemaId =
+                    connectionId + ":wpf:s" +
+                    nextSchemaId++.ToString(CultureInfo.InvariantCulture);
+                var byId =
+                    new Dictionary<string, WpfPropertyMetadata>(StringComparer.Ordinal);
+                foreach (WpfPropertyMetadata property in discovered)
+                {
+                    property.DescriptorId =
+                        connectionId + ":wpf:p" +
+                        nextDescriptorId++.ToString(CultureInfo.InvariantCulture);
+                    byId[property.DescriptorId] = property;
+                }
+
+                var schema = new WpfPropertySchema
+                {
+                    SchemaId = schemaId,
+                    Properties = discovered,
+                    ByDescriptorId = byId,
+                };
+                schemas[runtimeType] = schema;
+                return schema;
+            }
+        }
+
+        private sealed class ReferenceComparer : IEqualityComparer<DependencyObject>
+        {
+            public static readonly ReferenceComparer Instance = new ReferenceComparer();
+
+            public bool Equals(DependencyObject left, DependencyObject right)
+            {
+                return ReferenceEquals(left, right);
+            }
+
+            public int GetHashCode(DependencyObject value)
+            {
+                return RuntimeHelpers.GetHashCode(value);
+            }
+        }
+
+        private sealed class CommandException : Exception
+        {
+            public CommandException(string message, uint hresult)
+                : base(message)
+            {
+                HResultCode = hresult;
+            }
+
+            public uint HResultCode { get; private set; }
+        }
+
+        public static int RunServerCore(IntPtr pipeNamePtr, int pipeNameLength)
         {
             try
             {
-                string pipeName = System.Runtime.InteropServices.Marshal.PtrToStringUni(pipeNamePtr);
-                return CollectTreeImpl(pipeName);
+                return RunServerImpl(Marshal.PtrToStringUni(pipeNamePtr));
             }
             catch
             {
@@ -31,257 +247,734 @@ namespace LvtWpfTap
             }
         }
 
-        // Entry point for .NET Framework hosting (ExecuteInDefaultAppDomain).
-        // Takes a string parameter directly.
-        public static int CollectTree(string pipeName)
+        public static int RunServer(string pipeName)
         {
-            return CollectTreeImpl(pipeName);
+            return RunServerImpl(pipeName);
         }
 
-        private static int CollectTreeImpl(string pipeName)
+        private static int RunServerImpl(string pipeName)
         {
+            if (string.IsNullOrEmpty(pipeName))
+                return 1;
+
+            string shortName = pipeName;
+            const string pipePrefix = @"\\.\pipe\";
+            if (shortName.StartsWith(pipePrefix, StringComparison.OrdinalIgnoreCase))
+                shortName = shortName.Substring(pipePrefix.Length);
+
+            var registry = new ObjectRegistry();
             try
             {
-                // Must run on the WPF Dispatcher thread
-                var app = Application.Current;
-                if (app == null) return 1;
-
-                string json = null;
-                app.Dispatcher.Invoke(() =>
-                {
-                    json = WalkAllWindows();
-                });
-
-                if (json == null) return 2;
-
-                // Extract just the pipe name portion for NamedPipeClientStream
-                // Input: "\\.\pipe\lvt_XXXX" -> "lvt_XXXX"
-                string shortName = pipeName;
-                const string pipePrefix = @"\\.\pipe\";
-                if (shortName.StartsWith(pipePrefix))
-                    shortName = shortName.Substring(pipePrefix.Length);
-
-                using (var client = new NamedPipeClientStream(".", shortName,
-                    PipeDirection.Out))
+                using (var client = new NamedPipeClientStream(
+                    ".", shortName, PipeDirection.InOut, PipeOptions.None))
                 {
                     client.Connect(5000);
-                    byte[] data = Encoding.UTF8.GetBytes(json);
-                    client.Write(data, 0, data.Length);
-                    client.Flush();
-                }
+                    using (var reader = new System.IO.StreamReader(
+                        client, new UTF8Encoding(false), false, 4096, true))
+                    using (var writer = new System.IO.StreamWriter(
+                        client, new UTF8Encoding(false), 4096, true))
+                    {
+                        writer.AutoFlush = true;
+                        int startCount = Interlocked.Increment(ref serverStartCount);
+                        string connectionId = Guid.NewGuid().ToString("N");
+                        var catalog = new WpfPropertyCatalog(connectionId);
+                        ManagedProtocol.WriteReady(
+                            writer, connectionId, AssemblyInstanceId, startCount,
+                            "GET_TREE", "GET_PROPERTIES", "SET_PROPERTY",
+                            "CLEAR_PROPERTY", "DISCONNECT");
 
+                        for (;;)
+                        {
+                            string line = reader.ReadLine();
+                            if (line == null)
+                                break;
+
+                            ManagedRequest request;
+                            if (!ManagedProtocol.TryParseRequest(line, out request))
+                                continue;
+                            if (request.Command == "DISCONNECT")
+                            {
+                                ManagedProtocol.WriteSuccess(writer, request.Id, "{}");
+                                break;
+                            }
+
+                            try
+                            {
+                                string response;
+                                switch (request.Command)
+                                {
+                                    case "GET_TREE":
+                                        response = CollectTreeOnDispatcher(registry);
+                                        break;
+                                    case "GET_PROPERTIES":
+                                        response = GetPropertySnapshot(
+                                            registry, catalog, request.Arguments);
+                                        break;
+                                    case "SET_PROPERTY":
+                                        response = SetProperty(
+                                            registry, catalog, request.Arguments);
+                                        break;
+                                    case "CLEAR_PROPERTY":
+                                        response = ClearProperty(
+                                            registry, catalog, request.Arguments);
+                                        break;
+                                    default:
+                                        throw new CommandException(
+                                            "Unsupported managed command",
+                                            ManagedProtocol.EInvalidArg);
+                                }
+                                ManagedProtocol.WriteSuccess(writer, request.Id, response);
+                            }
+                            catch (Exception error)
+                            {
+                                WriteCommandError(writer, request.Id, error);
+                            }
+                        }
+                    }
+                }
                 return 0;
             }
             catch
             {
                 return -1;
             }
+            finally
+            {
+                registry.Clear();
+            }
         }
 
-        private static string WalkAllWindows()
+        private static void WriteCommandError(
+            System.IO.StreamWriter writer, string commandId, Exception error)
         {
-            var sb = new StringBuilder();
-            sb.Append('[');
+            error = ManagedProtocol.Unwrap(error);
+            var commandError = error as CommandException;
+            uint hresult = commandError != null
+                ? commandError.HResultCode
+                : error is FormatException || error is OverflowException ||
+                  error is ArgumentException
+                    ? ManagedProtocol.EInvalidArg
+                    : error is InvalidOperationException
+                        ? ManagedProtocol.InvalidState
+                        : ManagedProtocol.EFail;
+            ManagedProtocol.WriteError(writer, commandId, error.Message, hresult);
+        }
 
-            var windows = Application.Current.Windows;
-            bool first = true;
-            for (int i = 0; i < windows.Count; i++)
+        private static string GetPropertySnapshot(
+            ObjectRegistry registry, WpfPropertyCatalog catalog, string arguments)
+        {
+            string[] parts =
+                ManagedProtocol.SplitArguments(arguments, 2);
+            ulong handle = ParseHandle(parts[0]);
+            ulong expectedRoot = ParseExpectedRoot(parts[1]);
+            DependencyObject target = ResolveTarget(registry, handle);
+            return InvokeOnDispatcher(() =>
             {
-                var window = windows[i];
-                if (!first) sb.Append(',');
+                ValidateTargetRoot(target, expectedRoot);
+                return BuildPropertySnapshot(target, catalog);
+            });
+        }
+
+        private static string SetProperty(
+            ObjectRegistry registry, WpfPropertyCatalog catalog, string arguments)
+        {
+            string[] parts = ManagedProtocol.SplitArguments(arguments, 4);
+            ulong handle = ParseHandle(parts[0]);
+            ulong expectedRoot = ParseExpectedRoot(parts[1]);
+            string descriptorId = ManagedProtocol.DecodeHex(parts[2]);
+            string value = ManagedProtocol.DecodeHex(parts[3]);
+            DependencyObject target = ResolveTarget(registry, handle);
+            return InvokeMutationOnDispatcher(() =>
+            {
+                ValidateTargetRoot(target, expectedRoot);
+                WpfPropertyMetadata property =
+                    ResolveProperty(target, catalog, descriptorId);
+                object converted =
+                    ManagedProtocol.ConvertScalar(value, property.Scalar);
+                target.SetValue(property.Property, converted);
+                ValidateTargetRoot(target, expectedRoot);
+                return BuildMutationResult(target, property, false);
+            });
+        }
+
+        private static string ClearProperty(
+            ObjectRegistry registry, WpfPropertyCatalog catalog, string arguments)
+        {
+            string[] parts = ManagedProtocol.SplitArguments(arguments, 3);
+            ulong handle = ParseHandle(parts[0]);
+            ulong expectedRoot = ParseExpectedRoot(parts[1]);
+            string descriptorId = ManagedProtocol.DecodeHex(parts[2]);
+            DependencyObject target = ResolveTarget(registry, handle);
+            return InvokeMutationOnDispatcher(() =>
+            {
+                ValidateTargetRoot(target, expectedRoot);
+                WpfPropertyMetadata property =
+                    ResolveProperty(target, catalog, descriptorId);
+                if (target.ReadLocalValue(property.Property) ==
+                    DependencyProperty.UnsetValue)
+                {
+                    throw new CommandException(
+                        "The dependency property has no local value to clear",
+                        ManagedProtocol.EInvalidArg);
+                }
+                target.ClearValue(property.Property);
+                ValidateTargetRoot(target, expectedRoot);
+                return BuildMutationResult(target, property, true);
+            });
+        }
+
+        private static ulong ParseHandle(string text)
+        {
+            ulong handle;
+            if (!ulong.TryParse(
+                    text, NumberStyles.None, CultureInfo.InvariantCulture, out handle) ||
+                handle == 0)
+            {
+                throw new CommandException(
+                    "The managed element handle is invalid",
+                    ManagedProtocol.EInvalidArg);
+            }
+            return handle;
+        }
+
+        private static ulong ParseExpectedRoot(string text)
+        {
+            ulong handle;
+            if (!ulong.TryParse(
+                    text, NumberStyles.None,
+                    CultureInfo.InvariantCulture, out handle))
+            {
+                throw new CommandException(
+                    "The expected WPF session root is invalid",
+                    ManagedProtocol.EInvalidArg);
+            }
+            return handle;
+        }
+
+        private static void ValidateTargetRoot(
+            DependencyObject target, ulong expectedRoot)
+        {
+            if (expectedRoot == 0)
+                return;
+            Window window = target as Window ?? Window.GetWindow(target);
+            HwndSource source = window == null
+                ? null
+                : PresentationSource.FromVisual(window) as HwndSource;
+            ulong actualRoot =
+                source == null || source.Handle == IntPtr.Zero
+                    ? 0
+                    : unchecked((ulong)source.Handle.ToInt64());
+            if (actualRoot != expectedRoot)
+            {
+                throw new CommandException(
+                    "The WPF element no longer belongs to the authorized session window",
+                    ManagedProtocol.TargetOutsideSession);
+            }
+        }
+
+        private static DependencyObject ResolveTarget(
+            ObjectRegistry registry, ulong handle)
+        {
+            DependencyObject target;
+            if (!registry.TryGet(handle, out target))
+            {
+                throw new CommandException(
+                    "The WPF element identity is dead, stale, or unknown",
+                    ManagedProtocol.NotFound);
+            }
+            return target;
+        }
+
+        private static WpfPropertyMetadata ResolveProperty(
+            DependencyObject target, WpfPropertyCatalog catalog,
+            string descriptorId)
+        {
+            WpfPropertySchema schema = catalog.GetOrCreate(target.GetType());
+            WpfPropertyMetadata property;
+            if (string.IsNullOrEmpty(descriptorId) ||
+                !schema.ByDescriptorId.TryGetValue(descriptorId, out property))
+            {
+                throw new CommandException(
+                    "The WPF property descriptor is unknown, stale, or does not apply to this element",
+                    ManagedProtocol.EInvalidArg);
+            }
+            return property;
+        }
+
+        private static string BuildPropertySnapshot(
+            DependencyObject target, WpfPropertyCatalog catalog)
+        {
+            WpfPropertySchema schema = catalog.GetOrCreate(target.GetType());
+            var builder = new StringBuilder();
+            builder.Append("{\"schemaId\":");
+            ManagedProtocol.AppendJsonString(builder, schema.SchemaId);
+            builder.Append(",\"descriptors\":[");
+            for (int index = 0; index < schema.Properties.Count; index++)
+            {
+                if (index > 0)
+                    builder.Append(',');
+                AppendDescriptor(builder, schema.Properties[index]);
+            }
+            builder.Append("],\"values\":[");
+            for (int index = 0; index < schema.Properties.Count; index++)
+            {
+                if (index > 0)
+                    builder.Append(',');
+                AppendPropertyValue(builder, target, schema.Properties[index]);
+            }
+            builder.Append("]}");
+            return builder.ToString();
+        }
+
+        private static void AppendDescriptor(
+            StringBuilder builder, WpfPropertyMetadata property)
+        {
+            builder.Append("{\"descriptorId\":");
+            ManagedProtocol.AppendJsonString(builder, property.DescriptorId);
+            builder.Append(",\"name\":");
+            ManagedProtocol.AppendJsonString(builder, property.Name);
+            builder.Append(",\"displayName\":");
+            ManagedProtocol.AppendJsonString(builder, property.DisplayName);
+            builder.Append(",\"provider\":\"wpf\",\"framework\":\"wpf\",\"declaringType\":");
+            ManagedProtocol.AppendJsonString(builder, property.DeclaringType);
+            builder.Append(",\"propertyType\":");
+            ManagedProtocol.AppendJsonString(builder, property.PropertyType);
+            builder.Append(",\"kind\":");
+            ManagedProtocol.AppendJsonString(builder, property.Scalar.KindName);
+            builder.Append(",\"choices\":[");
+            AppendChoices(builder, property.Scalar);
+            builder.Append("],\"writable\":true,\"supportsClear\":true,\"description\":");
+            ManagedProtocol.AppendJsonString(
+                builder,
+                string.IsNullOrEmpty(property.Description)
+                    ? "WPF dependency property"
+                    : property.Description);
+            if (property.Scalar.Kind == ManagedScalarKind.Integer)
+                builder.Append(",\"step\":1");
+            builder.Append('}');
+        }
+
+        private static void AppendChoices(
+            StringBuilder builder, ManagedScalarDescriptor scalar)
+        {
+            bool first = true;
+            if (scalar.IsNullable)
+            {
+                AppendChoice(builder, "", "(null)");
                 first = false;
-                SerializeElement(sb, window);
+            }
+            if (scalar.Kind == ManagedScalarKind.Boolean)
+            {
+                if (!first) builder.Append(',');
+                AppendChoice(builder, "false", "False");
+                builder.Append(',');
+                AppendChoice(builder, "true", "True");
+            }
+            else if (scalar.Kind == ManagedScalarKind.Enumeration)
+            {
+                foreach (string name in ManagedProtocol.EnumNames(scalar.ValueType))
+                {
+                    if (!first) builder.Append(',');
+                    first = false;
+                    AppendChoice(builder, name, name);
+                }
+            }
+        }
+
+        private static void AppendChoice(
+            StringBuilder builder, string value, string label)
+        {
+            builder.Append("{\"value\":");
+            ManagedProtocol.AppendJsonString(builder, value);
+            builder.Append(",\"label\":");
+            ManagedProtocol.AppendJsonString(builder, label);
+            builder.Append('}');
+        }
+
+        private static void AppendPropertyValue(
+            StringBuilder builder, DependencyObject target,
+            WpfPropertyMetadata property)
+        {
+            builder.Append("{\"descriptorId\":");
+            ManagedProtocol.AppendJsonString(builder, property.DescriptorId);
+            try
+            {
+                object value = target.GetValue(property.Property);
+                bool local =
+                    target.ReadLocalValue(property.Property) !=
+                    DependencyProperty.UnsetValue;
+                builder.Append(",\"value\":");
+                ManagedProtocol.AppendJsonString(
+                    builder, ManagedProtocol.FormatScalar(value));
+                builder.Append(",\"runtimeType\":");
+                ManagedProtocol.AppendJsonString(
+                    builder, ManagedProtocol.RuntimeTypeName(value));
+                builder.Append(",\"canClear\":")
+                    .Append(local ? "true" : "false");
+                builder.Append(",\"overridden\":")
+                    .Append(local ? "true" : "false");
+                builder.Append(",\"source\":");
+                ManagedProtocol.AppendJsonString(
+                    builder, WpfValueSource(target, property.Property, local));
+                builder.Append(",\"unavailableReason\":\"\",\"readOnlyReason\":\"\"");
+            }
+            catch (Exception error)
+            {
+                error = ManagedProtocol.Unwrap(error);
+                builder.Append(",\"value\":\"\",\"runtimeType\":\"\",\"canClear\":false,")
+                    .Append("\"overridden\":false,\"source\":\"\",\"unavailableReason\":");
+                ManagedProtocol.AppendJsonString(builder, error.Message);
+                builder.Append(",\"readOnlyReason\":\"\"");
+            }
+            builder.Append('}');
+        }
+
+        private static string WpfValueSource(
+            DependencyObject target, DependencyProperty property, bool local)
+        {
+            if (local)
+                return "Local";
+            try
+            {
+                ValueSource source =
+                    DependencyPropertyHelper.GetValueSource(target, property);
+                var builder = new StringBuilder(source.BaseValueSource.ToString());
+                if (source.IsExpression) builder.Append(" expression");
+                if (source.IsAnimated) builder.Append(" animated");
+                if (source.IsCoerced) builder.Append(" coerced");
+                return builder.ToString();
+            }
+            catch
+            {
+                return "Effective";
+            }
+        }
+
+        private static string BuildMutationResult(
+            DependencyObject target, WpfPropertyMetadata property, bool cleared)
+        {
+            object value = target.GetValue(property.Property);
+            bool local =
+                target.ReadLocalValue(property.Property) !=
+                DependencyProperty.UnsetValue;
+            var builder = new StringBuilder();
+            builder.Append("{\"value\":");
+            ManagedProtocol.AppendJsonString(
+                builder, ManagedProtocol.FormatScalar(value));
+            builder.Append(",\"runtimeType\":");
+            ManagedProtocol.AppendJsonString(
+                builder, ManagedProtocol.RuntimeTypeName(value));
+            builder.Append(",\"canClear\":")
+                .Append(local ? "true" : "false");
+            builder.Append(",\"overridden\":")
+                .Append(local ? "true" : "false");
+            builder.Append(",\"source\":");
+            ManagedProtocol.AppendJsonString(
+                builder, WpfValueSource(target, property.Property, local));
+            if (cleared)
+                builder.Append(",\"cleared\":true");
+            builder.Append('}');
+            return builder.ToString();
+        }
+
+        private static T InvokeOnDispatcher<T>(Func<T> action)
+        {
+            Application application = Application.Current;
+            if (application == null || application.Dispatcher == null)
+            {
+                throw new CommandException(
+                    "WPF Application dispatcher is unavailable",
+                    ManagedProtocol.InvalidState);
+            }
+            Dispatcher dispatcher = application.Dispatcher;
+            if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+            {
+                throw new CommandException(
+                    "WPF Application dispatcher is shutting down",
+                    ManagedProtocol.InvalidState);
             }
 
-            sb.Append(']');
-            return sb.ToString();
+            DispatcherOperation<T> operation =
+                dispatcher.InvokeAsync(action, DispatcherPriority.Send);
+            if (!operation.Task.Wait(UiTimeoutMilliseconds))
+            {
+                operation.Abort();
+                throw new CommandException(
+                    "WPF UI thread did not complete the managed operation",
+                    ManagedProtocol.InvalidState);
+            }
+            return operation.Task.GetAwaiter().GetResult();
         }
 
-        private static void SerializeElement(StringBuilder sb, DependencyObject element)
+        private static T InvokeMutationOnDispatcher<T>(Func<T> action)
         {
-            sb.Append('{');
+            Application application = Application.Current;
+            if (application == null || application.Dispatcher == null)
+            {
+                throw new CommandException(
+                    "WPF Application dispatcher is unavailable",
+                    ManagedProtocol.InvalidState);
+            }
+            Dispatcher dispatcher = application.Dispatcher;
+            if (dispatcher.HasShutdownStarted || dispatcher.HasShutdownFinished)
+            {
+                throw new CommandException(
+                    "WPF Application dispatcher is shutting down",
+                    ManagedProtocol.InvalidState);
+            }
+
+            var gate = new MutationGate();
+            DispatcherOperation<T> operation = dispatcher.InvokeAsync(() =>
+            {
+                if (!gate.TryBegin())
+                    throw new OperationCanceledException();
+                try
+                {
+                    return action();
+                }
+                finally
+                {
+                    gate.Complete();
+                }
+            }, DispatcherPriority.Send);
+
+            if (!operation.Task.Wait(UiTimeoutMilliseconds))
+            {
+                bool cancelled = gate.CancelBeforeStart();
+                bool aborted = operation.Abort();
+                if (cancelled)
+                {
+                    throw new CommandException(
+                        aborted
+                            ? "WPF mutation timed out and its queued dispatcher operation was aborted before execution"
+                            : "WPF mutation timed out and its cancellation gate prevented execution",
+                        ManagedProtocol.InvalidState);
+                }
+                if (operation.Task.IsCompleted || gate.IsCompleted)
+                    return operation.Task.GetAwaiter().GetResult();
+                throw new CommandException(
+                    "WPF mutation timed out after execution began; its outcome is indeterminate",
+                    ManagedProtocol.EPending);
+            }
+            return operation.Task.GetAwaiter().GetResult();
+        }
+
+        private static string CollectTreeOnDispatcher(ObjectRegistry registry)
+        {
+            Dictionary<long, WeakReference> snapshot = registry.CreateSnapshot();
+            string tree = InvokeOnDispatcher(
+                () => WalkAllWindows(registry, snapshot));
+            registry.Commit(snapshot);
+            return tree;
+        }
+
+        private static string WalkAllWindows(
+            ObjectRegistry registry, Dictionary<long, WeakReference> snapshot)
+        {
+            var builder = new StringBuilder();
+            var visited = new HashSet<DependencyObject>(ReferenceComparer.Instance);
+            builder.Append('[');
+
+            bool first = true;
+            WindowCollection windows = Application.Current.Windows;
+            for (int index = 0; index < windows.Count; index++)
+            {
+                Window window = windows[index];
+                if (window == null || visited.Contains(window))
+                    continue;
+                if (!first)
+                    builder.Append(',');
+                first = false;
+                SerializeElement(builder, window, registry, snapshot, visited);
+            }
+
+            builder.Append(']');
+            return builder.ToString();
+        }
+
+        private static void SerializeElement(
+            StringBuilder builder, DependencyObject element, ObjectRegistry registry,
+            Dictionary<long, WeakReference> snapshot,
+            HashSet<DependencyObject> visited)
+        {
+            visited.Add(element);
+            long managedHandle = registry.Track(element, snapshot);
+            builder.Append("{\"managedHandle\":").Append(managedHandle);
 
             string typeName = element.GetType().FullName ?? element.GetType().Name;
-            sb.Append("\"type\":\"").Append(EscapeJson(typeName)).Append('"');
+            builder.Append(",\"type\":");
+            ManagedProtocol.AppendJsonString(builder, typeName);
 
-            // Name (x:Name)
-            if (element is FrameworkElement fe)
+            if (element is Window)
             {
-                if (!string.IsNullOrEmpty(fe.Name))
-                    sb.Append(",\"name\":\"").Append(EscapeJson(fe.Name)).Append('"');
-
-                // Bounds
-                double w = fe.ActualWidth;
-                double h = fe.ActualHeight;
-                if (w > 0 && h > 0)
+                HwndSource source =
+                    PresentationSource.FromVisual((Window)element) as HwndSource;
+                if (source != null && source.Handle != IntPtr.Zero)
                 {
-                    sb.AppendFormat(",\"width\":{0:F1},\"height\":{1:F1}", w, h);
+                    builder.Append(",\"hwnd\":");
+                    ManagedProtocol.AppendJsonString(
+                        builder, source.Handle.ToInt64().ToString("X"));
+                }
+            }
 
-                    // Screen position
+            FrameworkElement frameworkElement = element as FrameworkElement;
+            if (frameworkElement != null)
+            {
+                if (!string.IsNullOrEmpty(frameworkElement.Name))
+                {
+                    builder.Append(",\"name\":");
+                    ManagedProtocol.AppendJsonString(builder, frameworkElement.Name);
+                }
+
+                double width = frameworkElement.ActualWidth;
+                double height = frameworkElement.ActualHeight;
+                if (width > 0 && height > 0)
+                {
+                    builder.AppendFormat(
+                        CultureInfo.InvariantCulture,
+                        ",\"width\":{0:F1},\"height\":{1:F1}", width, height);
                     try
                     {
-                        var source = PresentationSource.FromVisual(fe);
-                        if (source != null)
+                        PresentationSource source =
+                            PresentationSource.FromVisual(frameworkElement);
+                        if (source != null && source.CompositionTarget != null)
                         {
-                            // PointToScreen returns *device* pixels, while
-                            // ActualWidth/Height above are device-independent
-                            // units. Reporting one of each leaves the origin
-                            // scaled by the DPI factor and the size not, so at
-                            // 150% an element 613 units across the window is
-                            // reported at 920 — outside the window rect lvt
-                            // reads, which puts every annotation in the wrong
-                            // place and makes the bounds useless to a caller.
-                            //
-                            // TransformFromDevice converts back to the same
-                            // units as the size, which is also the space lvt
-                            // works in: it is DPI-unaware, so the window rect
-                            // and the UIA bounds it reads are already scaled.
-                            // On a DPI-unaware WPF app the transform is
-                            // identity, so this is a no-op there.
-                            Point screenPos = fe.PointToScreen(new Point(0, 0));
-                            var fromDevice = source.CompositionTarget.TransformFromDevice;
-                            screenPos = fromDevice.Transform(screenPos);
-                            sb.AppendFormat(",\"offsetX\":{0:F1},\"offsetY\":{1:F1}",
-                                screenPos.X, screenPos.Y);
+                            Point screenPosition =
+                                frameworkElement.PointToScreen(new Point(0, 0));
+                            screenPosition =
+                                source.CompositionTarget.TransformFromDevice.Transform(
+                                    screenPosition);
+                            builder.AppendFormat(
+                                CultureInfo.InvariantCulture,
+                                ",\"offsetX\":{0:F1},\"offsetY\":{1:F1}",
+                                screenPosition.X, screenPosition.Y);
                         }
                     }
-                    catch { /* PointToScreen can fail for non-rendered elements */ }
+                    catch
+                    {
+                    }
                 }
                 else
                 {
-                    // w<=0 or h<=0 used to mean total silence here: no width,
-                    // no height, no offset, indistinguishable from an element
-                    // that was never laid out at all or whose PresentationSource
-                    // lookup threw. zeroSize says explicitly "lvt read
-                    // ActualWidth/ActualHeight and they really are zero (or
-                    // negative before layout)", which is exactly the case a
-                    // user investigating a missing/invisible element needs to
-                    // be able to tell apart from a different failure.
-                    sb.Append(",\"zeroSize\":true");
+                    builder.Append(",\"zeroSize\":true");
                 }
 
-                // Text content for common controls. hasTextProperty distinguishes
-                // "no Text/Content/Header string property exists on this type"
-                // (key omitted) from "the property exists and is an empty
-                // string" (key emitted as ""), which GetTextContent's caller
-                // must be able to tell apart — collapsing them the way a plain
-                // IsNullOrEmpty check does means an empty TextBox is
-                // unrecoverably identical to a Border with no text at all.
-                string text = GetTextContent(fe, out bool hasTextProperty);
+                bool hasTextProperty;
+                string text = GetTextContent(frameworkElement, out hasTextProperty);
                 if (hasTextProperty)
-                    sb.Append(",\"text\":\"").Append(EscapeJson(text ?? "")).Append('"');
-
-                // Visibility/enabled.
-                //
-                // "visible":false / absent is kept exactly as before: lvt's
-                // generic click-safety check (see lvt_api.cpp centreOf) reads
-                // this boolean across every provider, so its shape cannot
-                // change here without touching every other provider too.
-                //
-                // "wpf.visibility" is new and additive, named like
-                // "winforms.visible" is for WinForms: WPF has three
-                // visibilities, and collapsing Hidden and Collapsed into the
-                // same boolean loses the answer to the single most common
-                // WPF layout question there is — Hidden still reserves its
-                // layout space and Collapsed does not, so "why is there a gap
-                // where nothing is showing" has opposite answers depending on
-                // which one this was.
-                if (fe.Visibility != Visibility.Visible)
                 {
-                    sb.Append(",\"visible\":false");
-                    sb.Append(",\"wpf.visibility\":\"").Append(fe.Visibility.ToString()).Append('"');
+                    builder.Append(",\"text\":");
+                    ManagedProtocol.AppendJsonString(builder, text ?? "");
                 }
-                if (!fe.IsEnabled)
-                    sb.Append(",\"enabled\":false");
-            }
 
-            // Children
-            int childCount = VisualTreeHelper.GetChildrenCount(element);
-            if (childCount > 0)
+                if (frameworkElement.Visibility != Visibility.Visible)
+                {
+                    builder.Append(",\"visible\":false,\"wpf.visibility\":");
+                    ManagedProtocol.AppendJsonString(
+                        builder, frameworkElement.Visibility.ToString());
+                }
+                if (!frameworkElement.IsEnabled)
+                    builder.Append(",\"enabled\":false");
+            }
+            else
             {
-                sb.Append(",\"children\":[");
-                for (int i = 0; i < childCount; i++)
+                FrameworkContentElement contentElement =
+                    element as FrameworkContentElement;
+                if (contentElement != null && !string.IsNullOrEmpty(contentElement.Name))
                 {
-                    if (i > 0) sb.Append(',');
-                    SerializeElement(sb, VisualTreeHelper.GetChild(element, i));
+                    builder.Append(",\"name\":");
+                    ManagedProtocol.AppendJsonString(builder, contentElement.Name);
                 }
-                sb.Append(']');
             }
 
-            sb.Append('}');
+            List<DependencyObject> children = GetChildren(element);
+            bool wroteChildren = false;
+            foreach (DependencyObject child in children)
+            {
+                if (child == null || visited.Contains(child))
+                    continue;
+                if (!wroteChildren)
+                {
+                    builder.Append(",\"children\":[");
+                    wroteChildren = true;
+                }
+                else
+                {
+                    builder.Append(',');
+                }
+                SerializeElement(builder, child, registry, snapshot, visited);
+            }
+            if (wroteChildren)
+                builder.Append(']');
+            builder.Append('}');
         }
 
-        private static string GetTextContent(FrameworkElement fe, out bool hasTextProperty)
+        private static List<DependencyObject> GetChildren(DependencyObject element)
         {
-            // Use reflection to get common text properties without hard type deps.
-            //
-            // hasTextProperty distinguishes "this element has no string-valued
-            // Text/Content/Header at all" from "it has one and it happens to be
-            // empty" - SerializeElement needs that to decide whether to omit the
-            // "text" key entirely or emit it as "". Content/Header are declared
-            // as `object`, so an empty string there is still a real answer;
-            // null or a non-string object is not, and we fall through to the
-            // next candidate rather than reporting a false "has no text".
+            var children = new List<DependencyObject>();
             try
             {
-                var textProp = fe.GetType().GetProperty("Text");
-                if (textProp != null && textProp.PropertyType == typeof(string))
+                int visualCount = VisualTreeHelper.GetChildrenCount(element);
+                for (int index = 0; index < visualCount; index++)
                 {
-                    var val = textProp.GetValue(fe) as string ?? "";
+                    DependencyObject child = VisualTreeHelper.GetChild(element, index);
+                    if (child != null)
+                        children.Add(child);
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                IEnumerable logicalChildren = LogicalTreeHelper.GetChildren(element);
+                foreach (object value in logicalChildren)
+                {
+                    DependencyObject child = value as DependencyObject;
+                    if (child != null &&
+                        !children.Any(existing => ReferenceEquals(existing, child)))
+                        children.Add(child);
+                }
+            }
+            catch
+            {
+            }
+            return children;
+        }
+
+        private static string GetTextContent(
+            FrameworkElement element, out bool hasTextProperty)
+        {
+            try
+            {
+                var textProperty = element.GetType().GetProperty("Text");
+                if (textProperty != null && textProperty.PropertyType == typeof(string))
+                {
+                    string value = textProperty.GetValue(element) as string ?? "";
                     hasTextProperty = true;
-                    return val.Length > 200 ? val.Substring(0, 200) : val;
+                    return value.Length > 200 ? value.Substring(0, 200) : value;
                 }
 
-                var contentProp = fe.GetType().GetProperty("Content");
-                if (contentProp != null)
+                foreach (string propertyName in new[] { "Content", "Header" })
                 {
-                    var val = contentProp.GetValue(fe);
-                    if (val is string s)
+                    var property = element.GetType().GetProperty(propertyName);
+                    string value = property == null
+                        ? null
+                        : property.GetValue(element) as string;
+                    if (value != null)
                     {
                         hasTextProperty = true;
-                        return s.Length > 200 ? s.Substring(0, 200) : s;
-                    }
-                }
-
-                var headerProp = fe.GetType().GetProperty("Header");
-                if (headerProp != null)
-                {
-                    var val = headerProp.GetValue(fe);
-                    if (val is string s)
-                    {
-                        hasTextProperty = true;
-                        return s.Length > 200 ? s.Substring(0, 200) : s;
+                        return value.Length > 200 ? value.Substring(0, 200) : value;
                     }
                 }
             }
-            catch { }
+            catch
+            {
+            }
 
             hasTextProperty = false;
             return null;
-        }
-
-        private static string EscapeJson(string s)
-        {
-            if (s == null) return "";
-            var sb = new StringBuilder(s.Length);
-            foreach (char c in s)
-            {
-                switch (c)
-                {
-                    case '"': sb.Append("\\\""); break;
-                    case '\\': sb.Append("\\\\"); break;
-                    case '\n': sb.Append("\\n"); break;
-                    case '\r': sb.Append("\\r"); break;
-                    case '\t': sb.Append("\\t"); break;
-                    default:
-                        if (c < 0x20)
-                            sb.AppendFormat("\\u{0:X4}", (int)c);
-                        else
-                            sb.Append(c);
-                        break;
-                }
-            }
-            return sb.ToString();
         }
     }
 }

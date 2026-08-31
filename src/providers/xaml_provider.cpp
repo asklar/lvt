@@ -16,6 +16,7 @@ static Element* find_core_window(Element& root) {
         if (el.className == "Windows.UI.Core.CoreWindow") {
             el.framework = "xaml";
             el.type = "CoreWindow";
+            el.providerHandle = 0;
             if (!coreWindow) coreWindow = &el;
         }
         for (auto& child : el.children) findCoreWindow(child);
@@ -34,7 +35,7 @@ static bool has_desktop_xaml_bridge(const Element& root) {
     return false;
 }
 
-void XamlProvider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties) {
+bool XamlProvider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties) {
     Element* coreWindow = find_core_window(root);
     if (!coreWindow) {
         // Desktop system-XAML islands (for example Windows Terminal, which
@@ -43,10 +44,11 @@ void XamlProvider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperti
         // hosted under this native bridge, so collect against that process
         // and graft the returned island beneath the matching bridge.
         if (!has_desktop_xaml_bridge(root))
-            return;
-        inject_and_collect_xaml_tree(root, hwnd, pid, L"", L"Windows.UI.Xaml.dll", "xaml",
-                                     L"VisualDiagConnection", fastProperties);
-        return;
+            return true;
+        return inject_and_collect_xaml_tree(
+            root, hwnd, pid, L"",
+            L"Windows.UI.Xaml.dll", "xaml",
+            L"VisualDiagConnection", fastProperties);
     }
 
     // UWP apps: the CoreWindow belongs to the actual app process (e.g. CalculatorApp.exe),
@@ -58,8 +60,10 @@ void XamlProvider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperti
         GetWindowThreadProcessId(coreHwnd, &corePid);
     }
 
-    inject_and_collect_xaml_tree(*coreWindow, hwnd, corePid, L"", L"Windows.UI.Xaml.dll", "xaml",
-                               L"VisualDiagConnection", fastProperties);
+    return inject_and_collect_xaml_tree(
+        *coreWindow, hwnd, corePid, L"",
+        L"Windows.UI.Xaml.dll", "xaml",
+        L"VisualDiagConnection", fastProperties);
 }
 
 std::shared_ptr<IFrameworkConnection> XamlProvider::open_connection(const Element& root, HWND hwnd, DWORD pid) {
@@ -91,13 +95,15 @@ std::shared_ptr<IFrameworkConnection> XamlProvider::open_connection(const Elemen
                                      L"VisualDiagConnection");
 }
 
-void XamlProvider::enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties) {
+bool XamlProvider::enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties) {
     Element* coreWindow = find_core_window(root);
-    if (coreWindow) {
-        connection.get_tree(*coreWindow, fastProperties);
-    } else if (has_desktop_xaml_bridge(root)) {
-        connection.get_tree(root, fastProperties);
-    }
+    if (coreWindow)
+        return connection.get_tree(
+            *coreWindow, fastProperties);
+    if (has_desktop_xaml_bridge(root))
+        return connection.get_tree(
+            root, fastProperties);
+    return false;
 }
 
 } // namespace lvt

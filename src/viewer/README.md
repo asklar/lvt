@@ -35,56 +35,34 @@ view (HWNDs, XAML/WPF/WinForms types).
 
 ## Architecture
 
-### It drives lvt.exe as a subprocess — it never links lvt_core
+### It speaks MCP to lvt.exe — it never links lvt_core
 
-The viewer is a plain WPF (.NET) app that shells out to `lvt.exe` and parses
-its stdout. It does not link `lvt_core`, embed a copy of it, or use P/Invoke
-into it. This keeps the GUI in the ecosystem it's easiest to build fast,
-iterable UI in (WPF), while lvt's actual tree-walking/UIA/injection logic
-stays exactly where it already lives and is already tested.
+The viewer is a plain WPF (.NET) app that launches
+`lvt.exe mcp --allow-input` and speaks MCP JSON-RPC over stdio. It does not
+link `lvt_core`, embed a copy of it, or use P/Invoke into it. This keeps the
+GUI in WPF while every tree walk, connection, action, property edit, and
+notification uses the same public session API an agent uses.
 
-### Data source: `lvt watch`, not `lvt dump` + polling, and not MCP
+### Live data source: subscribed MCP tree resources
 
-Three ways to get data out of lvt were on the table: shelling out to `dump`
-repeatedly, shelling out to `watch` once and reading its live diff stream, or
-launching `lvt mcp` and speaking MCP over stdio. **The viewer uses `watch`.**
+After `connect`, the viewer subscribes to the resource for that fixed-mode
+session:
 
-MCP was the obvious first thing to check, since it's the more modern,
-structured integration point — but reading `docs/mcp-server.md` and
-`mcp/src/server.rs` closely shows it has **no push/subscribe tool**. Its
-inspection tools (`get_uia_tree`, `get_visual_tree`, `find_elements`) are all
-pull; `wait_for` blocks on one condition and returns once. Getting live
-updates over MCP would mean polling `get_uia_tree` on an interval and
-diffing the results client-side — strictly worse than the CLI's `watch`
-verb, which already does exactly that diffing *inside* lvt (see
-`src/watch_diff.h`/`.cpp`) and streams the result as one JSON event per line.
-So MCP was set aside for this feature; it would be the right choice for a
-future request/response-shaped feature (e.g. a "run a query" panel), just
-not this one.
+- `lvt://session/sN/uia-tree`
+- `lvt://session/sN/visual-tree`
 
-Between `dump` and `watch`: a naive design seeds the tree with one `dump`
-call and then layers `watch`'s diffs on top. That races two independent
-walks of the target — `watch`'s *own* internal walk (what it diffs against)
-is a separate one from the external `dump` call, taken at a slightly
-different instant. A node that appeared or disappeared in that gap would
-never be corrected, because `watch`'s first tick only ever emits `added`
-events for its own starting snapshot, never `removed` events for state it
-never saw.
+The first `resources/read` returns a complete snapshot expressed as `added`
+events. Later changes arrive as standards-compliant unsolicited
+`notifications/resources/updated`; the viewer reads the resource again and
+receives the cached `added`/`removed`/`changed` patch. Snapshot/diff state
+lives in lvt, not in a second independent dump, so the initial tree and every
+later patch form one consistent sequence.
 
-**The viewer uses `lvt watch` as its only tree data source.** A freshly
-started `watch` process's first burst of `added` events already *is* a
-complete, self-consistent snapshot (`run_watch_loop` builds a tree, then
-calls `snapshot_added_events` on that exact tree before entering its diff
-loop), and every line after that is a true incremental diff against that
-same walk. There is only ever one walk in play, so there is nothing to race.
-See `Services/WatchSession.cs` and `Services/LiveTree.cs` for the
-implementation and a longer version of this reasoning in code comments.
-
-`lvt watch`'s trade-off is that it's poll-driven internally too (an interval
-loop, default 500ms; see `--interval`), not a true OS-level change
-notification — but it's lvt's own established mechanism for this, it needs
-no protocol beyond stdout, and 500ms is imperceptible for the demo scenarios
-this was built against (typing into a text box, resizing a window).
+See `Services/McpSession.cs` for the transport and
+`Services/LiveTree.cs` for targeted patch application. The resource producer
+currently diff-polls each session tree internally so property, text, state,
+and bounds changes are all observable; framework-native event sources can
+reduce that polling later without changing the Viewer protocol.
 
 ### Locating lvt.exe
 
@@ -116,20 +94,22 @@ expanded nodes stay expanded.
 
 ### Property editing
 
-Editing goes through the same action verbs the CLI already exposes
-(`toggle`, `set-value` — `src/providers/uia_actions.cpp`), invoked as
-one-shot subprocesses (`Services/LvtCli.cs`) exactly as documented in
-`docs/mcp-server.md`'s action tools. Only two properties are ever offered as
-editable, because they're the ones lvt already knows how to write:
-`Toggle.ToggleState` (via `toggle`) and `Value.Value`/`RangeValue.Value` (via
-`set-value`). Every other property is read-only. The element is addressed by
-its **durable key**, not its `eN` id, for the same reason `LiveTree` keys by
-it — an id can go stale between "user opens the property panel" and "user
-clicks Set".
+All editing uses tools on the same MCP session:
 
-After an edit, the viewer does not manually re-read anything: the next
-`watch` tick reports the change as a normal `changed` event, and the same
-live-update path that handles the target's own changes reflects it.
+- Both UIA and visual modes call `get_editable_properties` and render only the generic
+  descriptor metadata returned by the provider: read-only text, strings,
+  booleans, integers, numbers, and enums. `set_property` and `clear_property`
+  use opaque descriptor ids; the Viewer never sends a framework property
+  index or runtime type.
+
+Schemas are cached by `schemaId` while values are refreshed for the selected
+element, so controls sharing a schema reuse editor presentation. The same
+generic editors render UIA, XAML/WinUI3, WPF, WinForms, and curated
+Win32/Common Controls descriptors; no framework-specific Viewer template is
+required. Successful mutations update rows from provider effective readback
+metadata rather than submitted text. Structured terminal, transient, and
+ownership-lost failures feed the same bounded refresh policy. Elements are
+addressed by durable keys.
 
 ## Crosshair targeting
 
@@ -145,12 +125,9 @@ process.
 
 ## What's verified
 
-Verified end-to-end against a real, live Notepad instance: connecting,
-live tree population, live property-panel population (including
-`SupportedPatterns`, `AutomationId`, `Toggle.ToggleState` where present), a
-live text-value change (via `set-value`, reflected in the property panel with
-no manual refresh), and a live bounds update (resizing the target window,
-reflected the same way).
+The Viewer migration is validated against the MCP resource subscription and
+property-editing integration tests described in `tests/mcp_tests.cpp`, plus
+live UI testing of both modes.
 
 The crosshair-drag gesture itself has been verified with a real mouse on an
 unlocked desktop: a genuine mouse-down on the crosshair, drag over a real
@@ -175,18 +152,13 @@ full gesture has since been exercised directly.)
 
 ## Stretch/incomplete
 
-- Property editing covers exactly the two verbs above; nothing else in
-  `uia_actions.cpp` (`click`, `select`, `expand`, `scroll`, ...) is wired up
-  from the property panel. Extending it means adding another
-  `PropertyEditKind` and a small UI affordance per verb — the plumbing
-  (`LvtCli`, durable-key addressing) already generalizes.
+- UIA property editing intentionally covers Value/RangeValue and Toggle
+  patterns. Other actions remain available through MCP but are not property
+  row editors.
 - No icon/color legend for the framework color dots in the tree (Win32/XAML/
   WPF/WinForms/Avalonia/Chromium/UIA each get a distinct color —
   `Converters/FrameworkToBrushConverter.cs` — but there's no key explaining
   them in the UI yet).
-- Visual-tree mode (unchecking "UI Automation tree") reads and live-updates
-  identically to UIA mode, but property editing is UIA-only — visual-mode
-  sessions in lvt itself don't support `toggle`/`set-value` (see "Modes" in
-  `docs/mcp-server.md`), so the edit affordances simply won't apply to
-  visual-tree properties (they aren't named `Toggle.ToggleState`/`Value.Value`
-  there, so this falls out naturally rather than needing special-casing).
+- Visual property editing initially supports XAML/WinUI dependency properties.
+  Other visual providers are explicitly read-only until they expose an
+  equivalent typed property capability.

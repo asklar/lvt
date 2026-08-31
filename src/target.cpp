@@ -53,6 +53,40 @@ Architecture detect_process_architecture(DWORD pid) {
     return get_host_architecture();
 }
 
+uint64_t process_creation_identity(HANDLE process) {
+    if (!process)
+        return 0;
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (!GetProcessTimes(
+            process, &creation, &exit, &kernel, &user)) {
+        return 0;
+    }
+    ULARGE_INTEGER value{};
+    value.LowPart = creation.dwLowDateTime;
+    value.HighPart = creation.dwHighDateTime;
+    return value.QuadPart;
+}
+
+uint64_t process_creation_identity(DWORD pid) {
+    wil::unique_handle process(OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+        FALSE, pid));
+    return process_creation_identity(process.get());
+}
+
+bool process_identity_matches(
+    HANDLE process, DWORD expectedPid,
+    uint64_t expectedCreationIdentity) {
+    if (!process || !expectedPid || !expectedCreationIdentity)
+        return false;
+    if (WaitForSingleObject(process, 0) != WAIT_TIMEOUT)
+        return false;
+    if (GetProcessId(process) != expectedPid)
+        return false;
+    return process_creation_identity(process) ==
+           expectedCreationIdentity;
+}
+
 static std::string wstr_to_utf8(const wchar_t* ws, int len = -1) {
     if (!ws) return {};
     if (len < 0) len = static_cast<int>(wcslen(ws));
@@ -140,6 +174,8 @@ TargetInfo resolve_target(HWND hwnd, DWORD pid) {
         GetWindowThreadProcessId(info.hwnd, &info.pid);
     }
     if (info.pid) {
+        info.processCreationIdentity =
+            process_creation_identity(info.pid);
         info.processName = get_process_name(info.pid);
         info.architecture = detect_process_architecture(info.pid);
     }

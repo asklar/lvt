@@ -2,7 +2,7 @@
   "runtimeOptions": {
     "framework": {
       "name": "Microsoft.WindowsDesktop.App",
-      "version": "8.0.0",
+      "version": "6.0.0",
       "rollForward": "LatestMajor"
     }
   }

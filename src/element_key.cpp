@@ -1,10 +1,46 @@
 #include "element_key.h"
 #include <algorithm>
+#include <charconv>
 #include <iomanip>
 #include <map>
 #include <sstream>
 
 namespace lvt {
+
+bool parse_compact_xaml_key(const std::string& text, CompactXamlKey& out,
+                            std::string& error) {
+    std::string framework;
+    size_t digitsStart = 0;
+    if (text.rfind("xaml:0x", 0) == 0) {
+        framework = "xaml";
+        digitsStart = 7;
+    } else if (text.rfind("winui3:0x", 0) == 0) {
+        framework = "winui3";
+        digitsStart = 9;
+    } else {
+        error = "only compact XAML/WinUI3 keys (xaml:0xHANDLE or "
+                "winui3:0xHANDLE) support native property operations";
+        return false;
+    }
+
+    const char* first = text.data() + digitsStart;
+    const char* last = text.data() + text.size();
+    if (first == last) {
+        error = "XAML element key is missing its hexadecimal instance handle";
+        return false;
+    }
+
+    uint64_t handle = 0;
+    const auto parsed = std::from_chars(first, last, handle, 16);
+    if (parsed.ec != std::errc() || parsed.ptr != last || handle == 0) {
+        error = "XAML element key has an invalid hexadecimal instance handle";
+        return false;
+    }
+
+    out.framework = std::move(framework);
+    out.handle = handle;
+    return true;
+}
 
 std::string escape_key_part(const std::string& value) {
     std::string result;
@@ -46,25 +82,53 @@ static std::string hwnd_key(uintptr_t handle) {
     return out.str();
 }
 
-// XAML diagnostics InstanceHandles are already process-wide object
-// identities. Unlike a sibling index/name path, they do not change when an
-// element is reparented and do not need every ancestor repeated in every
-// descendant's key. They have also been observed stable across independent
-// diagnostics connections to the same live target, which the WinUI
-// integration test guards by dumping twice and querying in a third process.
-// Keep the structural algorithm as the fallback for providers/elements that
-// do not expose such an identity.
+static std::string provider_handle_key(uint64_t handle) {
+    std::ostringstream out;
+    out << "provider:0x" << std::hex << std::uppercase << handle;
+    return out.str();
+}
+
+bool has_process_wide_provider_identity(const Element& el) {
+    return el.providerHandle != 0 &&
+           (el.framework == "xaml" || el.framework == "winui3");
+}
+
+bool has_durable_provider_identity(const Element& el) {
+    return el.providerHandle != 0 &&
+           el.framework != "win32" && el.framework != "comctl";
+}
+
+// Framework-native handles are already object identities. XAML/WinUI handles
+// are runtime InstanceHandles; WPF/WinForms handles come from their persistent
+// managed object registries. Only XAML/WinUI opt into process-wide reparent
+// reconciliation; managed handles are session-scoped. Win32/common-control
+// HWNDs use nativeHandle so their keys do not depend on a property connection.
 static std::string compact_instance_key(const Element& el) {
-    if (el.nativeHandle == 0 ||
-        (el.framework != "xaml" && el.framework != "winui3"))
+    uint64_t handle = 0;
+    if ((el.framework == "win32" || el.framework == "comctl") &&
+        el.nativeLifetimeHandle != 0) {
+        handle = el.nativeLifetimeHandle;
+    } else if (
+        (el.framework == "win32" || el.framework == "comctl") &&
+        el.nativeHandle != 0) {
+        handle = static_cast<uint64_t>(el.nativeHandle);
+    } else if (el.providerHandle != 0 &&
+               (el.framework == "xaml" || el.framework == "winui3" ||
+                el.framework == "wpf" || el.framework == "winforms")) {
+        handle = el.providerHandle;
+    } else {
         return {};
+    }
 
     std::ostringstream out;
-    out << el.framework << ":0x" << std::hex << std::uppercase << el.nativeHandle;
+    out << el.framework << ":0x" << std::hex << std::uppercase << handle;
     return out.str();
 }
 
 std::string stable_name_key(const Element& el) {
+    if (!el.durableIdentity.empty())
+        return "identity:" + escape_key_part(el.durableIdentity);
+
     for (const char* name : {"AutomationId", "x:Name", "Name", "automationId", "name"}) {
         auto it = el.properties.find(name);
         if (it != el.properties.end() && !it->second.empty())
@@ -83,9 +147,17 @@ std::string stable_name_key(const Element& el) {
 // diffing, before this).
 static std::string discriminator_for_child(const Element& child, size_t childIndex,
                                            const std::map<std::string, int>& baseCounts,
+                                           const std::map<std::string, int>& providerCounts,
                                            const std::map<std::string, int>& hwndCounts,
                                            const std::map<std::string, int>& nameCounts) {
     auto base = base_identity_key(child);
+    if (has_durable_provider_identity(child)) {
+        auto provider = provider_handle_key(child.providerHandle);
+        auto full = base + "|" + provider;
+        auto count = providerCounts.find(full);
+        if (count == providerCounts.end() || count->second == 1)
+            return full;
+    }
     if (child.nativeHandle != 0) {
         auto hwnd = hwnd_key(child.nativeHandle);
         auto full = base + "|" + hwnd;
@@ -111,12 +183,15 @@ static std::string discriminator_for_child(const Element& child, size_t childInd
 
 static void assign_child_keys(Element& parent, const std::string& parentKey) {
     std::map<std::string, int> baseCounts;
+    std::map<std::string, int> providerCounts;
     std::map<std::string, int> hwndCounts;
     std::map<std::string, int> nameCounts;
 
     for (const auto& child : parent.children) {
         auto base = base_identity_key(child);
         baseCounts[base]++;
+        if (has_durable_provider_identity(child))
+            providerCounts[base + "|" + provider_handle_key(child.providerHandle)]++;
         if (child.nativeHandle != 0)
             hwndCounts[base + "|" + hwnd_key(child.nativeHandle)]++;
         auto name = stable_name_key(child);
@@ -130,17 +205,20 @@ static void assign_child_keys(Element& parent, const std::string& parentKey) {
         if (!compact.empty()) {
             child.key = std::move(compact);
         } else {
-            auto segment = discriminator_for_child(child, i, baseCounts, hwndCounts, nameCounts);
+            auto segment = discriminator_for_child(
+                child, i, baseCounts, providerCounts, hwndCounts, nameCounts);
             child.key = parentKey.empty() ? segment : parentKey + "/" + segment;
         }
         assign_child_keys(child, child.key);
     }
 }
 
-void assign_element_keys(Element& root) {
-    root.key = compact_instance_key(root);
-    if (root.key.empty())
-        root.key = base_identity_key(root);
+void assign_element_keys(Element& root, bool preserveExistingRoot) {
+    if (!preserveExistingRoot || root.key.empty()) {
+        root.key = compact_instance_key(root);
+        if (root.key.empty())
+            root.key = base_identity_key(root);
+    }
     assign_child_keys(root, root.key);
 }
 

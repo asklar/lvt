@@ -7,7 +7,7 @@ The Avalonia plugin adds visual tree inspection support for [Avalonia UI](https:
 The plugin follows the same DLL injection pattern as the built-in WPF provider:
 
 1. **Detection** — The plugin checks if `Avalonia.Base.dll` is loaded in the target process
-2. **Injection** — A native TAP DLL (`lvt_avalonia_tap_x64.dll`) is injected into the target process via `CreateRemoteThread` + `LoadLibraryW`
+2. **Injection** — The architecture-matched native TAP DLL (`lvt_avalonia_tap_x86.dll`, `lvt_avalonia_tap_x64.dll`, or `lvt_avalonia_tap_arm64.dll`) is injected into the target process via `CreateRemoteThread` + `LoadLibraryW`
 3. **CLR hosting** — The TAP DLL hosts the .NET runtime via `hostfxr` and loads the managed tree walker assembly (`LvtAvaloniaTreeWalker.dll`)
 4. **Tree walking** — The managed code walks the Avalonia visual tree using `Visual.VisualChildren` (via reflection), serializes each element's type, name, bounds, text content, and visibility to JSON
 5. **Communication** — The JSON tree is sent back to lvt over a named pipe
@@ -21,13 +21,23 @@ Copy the plugin files to `%USERPROFILE%\.lvt\plugins\`:
 ```
 %USERPROFILE%\.lvt\plugins\
 ├── lvt_avalonia_plugin.dll          # Plugin DLL (loaded by lvt)
-└── avalonia\                        # Subdirectory for TAP + managed DLLs
-    ├── lvt_avalonia_tap_x64.dll     # Native TAP DLL (injected into target)
+└── avalonia\                        # Complete matching-RID publish directory
+    ├── lvt_avalonia_tap_<arch>.dll  # Matching x86, x64, or ARM64 native TAP
     ├── LvtAvaloniaTreeWalker.dll    # Managed tree walker
-    └── LvtAvaloniaTreeWalker.runtimeconfig.json
+    ├── LvtAvaloniaTreeWalker.deps.json
+    ├── LvtAvaloniaTreeWalker.runtimeconfig.json
+    ├── Avalonia.*.dll               # Published managed dependencies
+    ├── av_libglesv2.dll             # Native assets for this package's RID
+    ├── libHarfBuzzSharp.dll
+    └── libSkiaSharp.dll
 ```
 
 > **Important:** The TAP DLL and managed assembly must be in the `avalonia\` subdirectory, not directly in the `plugins\` directory. This prevents the plugin loader from attempting to load them as plugins.
+> Keep the complete published `avalonia\` directory together; copying only the
+> tree walker and runtime config omits dependency and native runtime assets.
+> Release builds use a framework-dependent, RID-specific publish, so an x64
+> package contains only the `win-x64` native assets (and likewise for x86 and
+> ARM64), never Linux, macOS, or another Windows architecture.
 
 ### From source
 
@@ -38,6 +48,10 @@ dotnet build src/plugin_avalonia/LvtAvaloniaTreeWalker/LvtAvaloniaTreeWalker.csp
 # Build native components (from VS Developer Command Prompt)
 cmake --preset default
 cmake --build build
+
+# Or build the x86 binaries from an x86 developer environment
+cmake --preset x86
+cmake --build build-x86
 ```
 
 The build outputs plugin files to `build/plugins/` which can be copied to `%USERPROFILE%\.lvt\plugins\`.
@@ -92,9 +106,14 @@ $ lvt --name AvaloniaTestApp --format xml --depth 3
 
 ## Requirements
 
-- Target Avalonia app must be .NET 6+ (Avalonia 11.x)
-- Target process must match lvt's architecture (x64 or ARM64)
-- The .NET runtime (`hostfxr.dll`) must be installed on the system
+- Target Avalonia app must use CoreCLR 8 or newer (Avalonia 11.x)
+- Target process, `lvt.exe`, plugin DLL, and native TAP must all use the same
+  architecture: x86, x64, or ARM64
+- `LvtAvaloniaTreeWalker.dll` is AnyCPU and is shared unchanged by all three
+  native architectures
+- `hostfxr.dll` must already be loaded by the target (normal for Avalonia
+  apphosts, including self-contained apps), or an architecture-matched .NET
+  runtime must be installed for fallback discovery
 
 ## Persistent connections (optional)
 
@@ -103,12 +122,27 @@ $ lvt --name AvaloniaTestApp --format xml --depth 3
 `lvt_connection_close` (plus the existing `lvt_plugin_free`) must all be
 implemented before lvt enables the connection path. The optional
 `lvt_connection_poll_events`/`lvt_connection_events_free` pair adds push
-event draining. These functions let
-`watch` and MCP sessions reuse one connection across many tree refreshes instead of
-re-injecting every time — see that header's "Persistent connections" section and
-`docs/tap-dll-design.md`'s connection lifecycle for the pattern the built-in XAML/WinUI3
-providers already follow. This plugin does not implement them yet; it still uses the
-original one-shot `lvt_enrich_tree` path, which continues to work unchanged either way.
+event draining. Core automatically acquires and reuses a capable plugin in
+`watch` and MCP, forwards the same provider option/filter on every tree
+request, reconnects a dead handle, and closes it when the session ends. It
+does not silently switch a v2-capable session back to repeated one-shot
+injection after a connection failure. This plugin does not implement the
+group yet, so it continues to use `lvt_enrich_tree` on every refresh
+unchanged.
+
+One-shot injection is serialized per target process through remote
+`LoadLibraryW` completion. The five-second threshold is diagnostic only: if
+the remote thread is delayed by the target's loader lock, the caller retains
+connection ownership until that thread completes or the target exits. The
+remote DLL-path allocation is released only after completion, so a retry
+cannot launch a second load against an outstanding transaction or add an
+unbalanced TAP module reference.
+
+Persistent implementations must return an object or array of object nodes in
+the documented tree schema. Field types, nesting, and node counts are
+validated before grafting. Event arrays are bounded and every event must
+report the current `LvtConnectionEvent::struct_size`; core frees plugin-owned
+tree and event allocations on every path, including malformed responses.
 
 ## Test app
 

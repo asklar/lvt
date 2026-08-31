@@ -30,6 +30,11 @@ static json element_to_json(const Element& el) {
     if (!el.className.empty()) j["className"] = sanitize(el.className);
     if (!el.text.empty()) j["text"] = sanitize(el.text);
     j["bounds"] = bounds_to_json(el.bounds);
+    if (el.nativeHandle != 0) {
+        std::ostringstream handle;
+        handle << "0x" << std::hex << std::uppercase << el.nativeHandle;
+        j["nativeHandle"] = handle.str();
+    }
 
     if (!el.properties.empty()) {
         json props = json::object();

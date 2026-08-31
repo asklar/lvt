@@ -7,6 +7,7 @@
 #include "providers/provider.h"
 #include "providers/win32_provider.h"
 #include "providers/comctl_provider.h"
+#include "providers/native_property_connection.h"
 #if LVT_ENABLE_XAML
 #include "providers/xaml_provider.h"
 #endif
@@ -26,6 +27,41 @@
 #include <sstream>
 
 namespace lvt {
+
+namespace {
+
+constexpr const char* kIncompleteFrameworkPrefix = "lvt.incomplete.";
+
+} // namespace
+
+void mark_framework_refresh_incomplete(
+    Element& root, const std::string& framework) {
+    root.properties[kIncompleteFrameworkPrefix + framework] = "true";
+}
+
+bool framework_refresh_incomplete(
+    const Element& root, const std::string& framework) {
+    const auto found =
+        root.properties.find(kIncompleteFrameworkPrefix + framework);
+    return found != root.properties.end() && found->second == "true";
+}
+
+bool has_incomplete_framework_refresh(const Element& root) {
+    return std::any_of(
+        root.properties.begin(), root.properties.end(),
+        [](const auto& property) {
+            return property.first.rfind(kIncompleteFrameworkPrefix, 0) == 0 &&
+                   property.second == "true";
+        });
+}
+
+void copy_incomplete_framework_refresh_markers(
+    const Element& source, Element& destination) {
+    for (const auto& [name, value] : source.properties) {
+        if (name.rfind(kIncompleteFrameworkPrefix, 0) == 0)
+            destination.properties[name] = value;
+    }
+}
 
 static void assign_ids_recursive(Element& el, int& counter) {
     el.id = "e" + std::to_string(counter++);
@@ -183,29 +219,45 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
                    const ConnectionLookup& connectionLookup) {
     // Start with the Win32 provider as the base — it always applies
     Win32Provider win32;
-    Element root = win32.build(hwnd, maxDepth);
+    auto* win32Properties = connectionLookup
+        ? dynamic_cast<NativePropertyConnection*>(connectionLookup("win32"))
+        : nullptr;
+    Element root = win32.build(hwnd, maxDepth, win32Properties);
+    const auto targetArchitecture =
+        pid ? detect_process_architecture(pid) : Architecture::unknown;
 
     // Layer on framework-specific providers
     for (auto& fi : frameworks) {
         switch (fi.type) {
         case Framework::ComCtl: {
             ComCtlProvider comctl;
-            comctl.enrich(root);
+            auto* comctlProperties = connectionLookup
+                ? dynamic_cast<NativePropertyConnection*>(
+                      connectionLookup("comctl"))
+                : nullptr;
+            comctl.enrich(
+                root, targetArchitecture, comctlProperties);
             break;
         }
         case Framework::Xaml: {
 #if LVT_ENABLE_XAML
             XamlProvider xaml;
+            bool complete = false;
             auto connection = connectionLookup ? connectionLookup("xaml") : nullptr;
             if (connection && connection->is_alive()) {
-                xaml.enrich_with_connection(root, *connection, fastProperties);
+                complete = xaml.enrich_with_connection(
+                    root, *connection, fastProperties);
             } else if (!connectionLookup) {
                 // No ConnectionLookup at all means this is a one-shot CLI
                 // call (dump/query/screenshot) that never acquired a
                 // persistent connection by design - a single inject-collect-
                 // disconnect is the correct, minimal-footprint behavior here.
-                xaml.enrich(root, hwnd, pid, fastProperties);
+                complete = xaml.enrich(
+                    root, hwnd, pid, fastProperties);
             }
+            if (!complete)
+                mark_framework_refresh_incomplete(
+                    root, "xaml");
             // else: a ConnectionLookup was supplied (watch/MCP) but has no
             // alive connection for "xaml" right now. Skip enrichment for
             // this call rather than silently falling back to the one-shot
@@ -223,15 +275,21 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         case Framework::WinUI3: {
 #if LVT_ENABLE_WINUI3
             WinUI3Provider winui3;
+            bool complete = false;
             auto connection = connectionLookup ? connectionLookup("winui3") : nullptr;
             if (connection && connection->is_alive()) {
-                winui3.enrich_with_connection(root, *connection, fastProperties);
+                complete = winui3.enrich_with_connection(
+                    root, *connection, fastProperties);
             } else if (!connectionLookup) {
                 // See the matching comment in the Xaml case above: no
                 // lookup at all means a one-shot CLI call, where a single
                 // inject-collect-disconnect is correct by design.
-                winui3.enrich(root, hwnd, pid, fastProperties);
+                complete = winui3.enrich(
+                    root, hwnd, pid, fastProperties);
             }
+            if (!complete)
+                mark_framework_refresh_incomplete(
+                    root, "winui3");
             // else: lookup was supplied (watch/MCP) but returned no alive
             // connection - skip rather than silently reinject; see the
             // Xaml case above for the full rationale.
@@ -241,38 +299,56 @@ Element build_tree(HWND hwnd, DWORD pid, const std::vector<FrameworkInfo>& frame
         case Framework::Wpf: {
 #if LVT_ENABLE_WPF
             WpfProvider wpf;
-            wpf.enrich(root, hwnd, pid);
+            bool complete = false;
+            auto connection = connectionLookup ? connectionLookup("wpf") : nullptr;
+            if (connection && connection->is_alive()) {
+                complete = wpf.enrich_with_connection(root, *connection);
+            } else if (!connectionLookup) {
+                complete = wpf.enrich(root, hwnd, pid);
+            }
+            if (!complete)
+                mark_framework_refresh_incomplete(root, "wpf");
 #endif
             break;
         }
         case Framework::WinForms: {
 #if LVT_ENABLE_WINFORMS
             WinFormsProvider winforms;
-            winforms.enrich(root, hwnd, pid);
+            bool complete = false;
+            auto connection = connectionLookup ? connectionLookup("winforms") : nullptr;
+            if (connection && connection->is_alive()) {
+                complete = winforms.enrich_with_connection(root, *connection);
+            } else if (!connectionLookup) {
+                complete = winforms.enrich(root, hwnd, pid);
+            }
+            if (!complete)
+                mark_framework_refresh_incomplete(root, "winforms");
 #endif
             break;
         }
         case Framework::Plugin: {
-            // Look up the plugin by name and enrich
-            for (auto& p : get_plugins()) {
-                if (p.info && p.info->name && fi.name == p.info->name) {
-                    PluginFrameworkInfo pf;
-                    pf.name = fi.name;
-                    pf.version = fi.version;
-                    pf.plugin = &p;
-                    // A plugin's persistent connection (see plugin.h's
-                    // optional v2 functions) is looked up under its own
-                    // detected name, same as "xaml"/"winui3" - a caller
-                    // that acquired one via open_plugin_connection supplies
-                    // it through the same ConnectionLookup mechanism.
-                    auto connection = connectionLookup ? connectionLookup(fi.name) : nullptr;
-                    if (connection && connection->is_alive()) {
-                        connection->get_tree(root, fastProperties, pluginOption);
-                    } else {
-                        enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
-                    }
-                    break;
+            auto pf = find_plugin_framework(
+                fi.name, fi.version, fi.pluginToken);
+            if (!pf.plugin)
+                break;
+
+            const bool persistent =
+                plugin_supports_persistent_connections(*pf.plugin);
+            if (connectionLookup && persistent) {
+                // A long-running caller explicitly chose the persistent
+                // contract. A missing/dead/failed connection is surfaced as
+                // an incomplete refresh so the owner can reacquire it; never
+                // disguise that failure by one-shot reinjecting on this tick.
+                auto* connection =
+                    connectionLookup(plugin_connection_label(pf, hwnd));
+                if (!connection || !connection->is_alive() ||
+                    !connection->get_tree(root, fastProperties, pluginOption)) {
+                    mark_framework_refresh_incomplete(root, fi.name);
                 }
+            } else {
+                // One-shot CLI calls and plugins without the complete v2
+                // lifetime contract retain the v1 enrichment behavior.
+                enrich_with_plugin(root, hwnd, pid, pf, pluginOption);
             }
             break;
         }

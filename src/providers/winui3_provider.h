@@ -11,7 +11,7 @@ public:
     // Injects lvt_tap.dll via InitializeXamlDiagnosticsEx targeting
     // Microsoft.UI.Xaml.dll in the target process.
     // `fastProperties` — see xaml_diag_common.h's inject_and_collect_xaml_tree.
-    void enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties = false);
+    bool enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties = false);
 
     // Establishes a persistent connection (see framework_connection.h) for
     // reuse across many refreshes, e.g. by watch's loop or an MCP session —
@@ -22,7 +22,7 @@ public:
     // Refreshes `root` over the already-open `connection` instead of
     // re-injecting - the bridge-matching/grafting is unchanged, it just
     // reads from an existing connection rather than a fresh one-shot inject.
-    void enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties = false);
+    bool enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties = false);
 };
 
 } // namespace lvt

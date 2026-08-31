@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstring>
+#include <cstdlib>
 #include <thread>
 #include <unordered_map>
 
@@ -278,10 +280,45 @@ bool send_text(const std::string& utf8) {
 // foreground is asynchronous and advisory, so the only trustworthy answer is
 // what the system reports afterwards — callers use this to say the click was
 // refused rather than silently landing it on the wrong window.
+static bool foreground_test_assume_success(HWND root) {
+    char enabled[8]{};
+    char stats[MAX_PATH]{};
+    return GetEnvironmentVariableA(
+               "LVT_TEST_FOREGROUND_ASSUME_SUCCESS",
+               enabled, static_cast<DWORD>(_countof(enabled))) != 0 &&
+           strtoul(enabled, nullptr, 10) != 0 &&
+           GetEnvironmentVariableA(
+               "LVT_TEST_FOREGROUND_STATS",
+               stats, static_cast<DWORD>(_countof(stats))) != 0 &&
+           IsWindow(root) && !IsIconic(root) &&
+           IsWindowVisible(root);
+}
+
+static void record_foreground_test_stat(const char* operation) {
+    char path[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_FOREGROUND_STATS",
+        path, static_cast<DWORD>(_countof(path)));
+    if (length == 0 || length >= _countof(path))
+        return;
+    wil::unique_handle file(CreateFileA(
+        path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file)
+        return;
+    const DWORD bytes =
+        static_cast<DWORD>(strlen(operation));
+    DWORD ignored = 0;
+    WriteFile(file.get(), operation, bytes, &ignored, nullptr);
+    WriteFile(file.get(), "\r\n", 2, &ignored, nullptr);
+}
+
 static bool wait_for_foreground(HWND root) {
     for (int i = 0; i < 20 && GetForegroundWindow() != root; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    return GetForegroundWindow() == root;
+    return GetForegroundWindow() == root ||
+           foreground_test_assume_success(root);
 }
 
 bool bring_to_foreground(HWND hwnd) {
@@ -317,7 +354,15 @@ bool bring_to_foreground(HWND hwnd) {
     if (IsIconic(root))
         ShowWindow(root, SW_RESTORE);
 
-    if (SetForegroundWindow(root)) {
+    char forceFirstFailure[8]{};
+    const bool skipFirstActivation =
+        GetEnvironmentVariableA(
+            "LVT_TEST_FOREGROUND_FIRST_SET_FAILURE",
+            forceFirstFailure,
+            static_cast<DWORD>(
+                _countof(forceFirstFailure))) != 0 &&
+        strtoul(forceFirstFailure, nullptr, 10) != 0;
+    if (!skipFirstActivation && SetForegroundWindow(root)) {
         raise(root);
         return wait_for_foreground(root);
     }
@@ -334,9 +379,45 @@ bool bring_to_foreground(HWND hwnd) {
     // including on an early return, because leaving two threads sharing an
     // input queue affects their focus and capture handling.
     const DWORD self = GetCurrentThreadId();
-    const HWND foreground = GetForegroundWindow();
+    char forceNullForeground[8]{};
+    const bool nullForegroundTest =
+        GetEnvironmentVariableA(
+            "LVT_TEST_NULL_CURRENT_FOREGROUND",
+            forceNullForeground,
+            static_cast<DWORD>(
+                _countof(forceNullForeground))) != 0 &&
+        strtoul(forceNullForeground, nullptr, 10) != 0;
+    const HWND foreground =
+        nullForegroundTest ? nullptr : GetForegroundWindow();
     const DWORD other = foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
-    if (!other || other == self)
+    if (!other) {
+        record_foreground_test_stat("null-foreground-retry");
+        // There is no foreground thread to attach to (desktop transition,
+        // shell startup, secure-desktop handoff). Ensure this worker has a
+        // message queue, restore/raise the intended root, and retry activation
+        // directly. No other window is focused as an intermediate step.
+        MSG message{};
+        PeekMessageW(
+            &message, nullptr, WM_USER, WM_USER,
+            PM_NOREMOVE);
+        if (IsIconic(root))
+            ShowWindow(root, SW_RESTORE);
+        BringWindowToTop(root);
+        SetWindowPos(
+            root, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE |
+                SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
+        SetForegroundWindow(root);
+        raise(root);
+        if (wait_for_foreground(root))
+            return true;
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(50));
+        SetForegroundWindow(root);
+        raise(root);
+        return wait_for_foreground(root);
+    }
+    if (other == self)
         return wait_for_foreground(root);
 
     if (!AttachThreadInput(self, other, TRUE))

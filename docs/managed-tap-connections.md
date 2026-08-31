@@ -1,0 +1,170 @@
+# Managed WPF and WinForms TAP connections
+
+WPF and WinForms enrichment uses the same lifetime shape as the XAML providers: connect once for a watch or MCP session, read many trees, and disconnect once. A one-shot CLI command deliberately uses the same code path and releases the connection after its first tree.
+
+## Components
+
+- `providers/managed_connection.*` owns the native duplex pipe, command correlation, target-process liveness checks, serialization and clean disconnect.
+- `tap_managed/managed_tap_host.*` is compiled into both architecture-specific native TAP DLLs. It finds the CLR already used by the target, loads the managed assembly once, and blocks in its command server until that server exits.
+- `tap_wpf/WpfTreeWalker.cs` and `tap_winforms/WinFormsTreeWalker.cs` implement framework-specific tree walks and UI-thread dispatch.
+- `WpfProvider` and `WinFormsProvider` expose `open_connection` and `enrich_with_connection`, matching the other `IFrameworkConnection` providers.
+
+The native TAP names remain architecture-specific (`x86`, `x64`, `arm64`); the managed assemblies remain AnyCPU.
+The host ABI follows the official .NET declarations exactly: hostfxr exports
+use `HOSTFXR_CALLTYPE` (`__cdecl` on Windows), while all returned runtime
+delegates use `CORECLR_DELEGATE_CALLTYPE` (`__stdcall` on x86). The CoreCLR path
+requests the official default `component_entry_point_fn` by passing a null
+delegate type; its managed `RunServerCore(IntPtr, int)` method matches that
+signature. The named `RunServerDelegate` remains explicitly annotated
+`StdCall`, but the host does not depend on a custom-delegate thunk. This
+distinction is mandatory on x86, where mixing conventions corrupts ESP.
+
+## Lifetime
+
+```mermaid
+sequenceDiagram
+    participant lvt as lvt.exe
+    participant native as injected native TAP
+    participant managed as managed command server
+    participant ui as target UI thread
+
+    lvt->>lvt: CreateNamedPipe(duplex)
+    lvt->>native: LoadLibraryW once
+    native->>managed: host CLR and call RunServer(pipe)
+    managed->>lvt: READY + capabilities
+
+    loop each refresh
+        lvt->>managed: REQUEST id GET_TREE {}
+        managed->>ui: bounded dispatcher/BeginInvoke
+        ui->>managed: current tree + stable handles
+        managed->>lvt: RESPONSE id OK tree-json
+    end
+
+    opt selected-element property operation
+        lvt->>managed: GET_PROPERTIES / SET_PROPERTY / CLEAR_PROPERTY
+        managed->>ui: resolve opaque descriptor and marshal operation
+        ui->>managed: schema + live values, or mutation readback
+        managed->>lvt: correlated response
+    end
+
+    lvt->>managed: REQUEST id DISCONNECT {}
+    managed->>lvt: RESPONSE id OK {}
+    managed->>managed: clear per-connection reverse map
+    managed-->>native: RunServer returns
+    native->>native: FreeLibraryAndExitThread
+```
+
+The pipe also ends the command loop when lvt exits unexpectedly. Native reads and writes wait on both their overlapped-I/O event and the target process handle, so a target exit fails promptly instead of leaving a blocked thread. Before reconnecting, lvt verifies that the previous native TAP module has completed its safe worker-thread unload.
+Timed-out overlapped connect/read/write operations synchronously observe their
+`CancelIoEx` completion before stack-owned `OVERLAPPED`, event, or buffer
+storage is released.
+
+Connection bootstrap is serialized across lvt processes by a named mutex keyed
+by target PID and framework. The mutex covers module inspection, sidecar
+creation, `LoadLibraryW`, pipe acceptance, and the `READY` handshake, preventing
+simultaneous injectors from adding an unmatched module reference. Sidecar,
+mutex, and pipe ACLs are restricted to SYSTEM plus the current/target user.
+After every pipe connection, lvt verifies `GetNamedPipeClientProcessId` against
+the intended target PID before reading `READY`; mismatched clients are
+disconnected and the server resumes waiting.
+
+## Protocol
+
+Messages are UTF-8, tab-delimited, and newline-terminated:
+
+```text
+READY  {"protocol":1,"connectionId":"…","assemblyInstanceId":"…","serverStartCount":1,"commands":["GET_TREE","GET_PROPERTIES","SET_PROPERTY","CLEAR_PROPERTY","DISCONNECT"]}
+REQUEST  1  GET_TREE  {}
+RESPONSE 1  OK  [{...}]
+REQUEST  2  GET_PROPERTIES  42
+RESPONSE 2  OK  {"schemaId":"…","descriptors":[...],"values":[...]}
+REQUEST  3  SET_PROPERTY  42 descriptor-id-as-utf8-hex value-as-utf8-hex
+RESPONSE 3  OK  {"value":"read back from target"}
+REQUEST  4  DISCONNECT {}
+RESPONSE 4  OK  {}
+```
+
+Tabs above represent literal tab characters. Request IDs make responses unambiguous. Descriptor IDs and values use UTF-8 hexadecimal tokens, so whitespace and newlines cannot change framing. The managed server validates connection-scoped opaque descriptor IDs; callers never provide a CLR property name or type.
+
+## Identity and object lifetime
+
+Each managed assembly assigns controls/objects IDs through a `ConditionalWeakTable`. The table does not keep controls alive. Every connection maintains a reverse weak map containing only objects visited by the latest successful tree snapshot; it replaces that map on refresh and clears it on disconnect.
+The high 31 bits of each 64-bit handle identify the loaded managed assembly
+instance and the low 32 bits are its weak object sequence. Native DLL reconnects
+inside the same target reuse the already-loaded managed assembly and therefore
+preserve handles. A genuinely new assembly instance cannot accidentally resolve
+an old key.
+
+- WPF emits a managed handle for every visual or logical `DependencyObject`.
+- WinForms emits both the managed handle and an HWND when the control already owns one. Reading the tree never creates a handle merely to obtain identity.
+- Native `Element::providerHandle`, `properties.managedHandle`, and compact durable keys preserve managed identity across refreshes. WinForms keeps any existing HWND separately as `nativeHandle`; property routing always uses the 64-bit provider handle.
+
+On a fresh native reconnect the reverse map is initially empty. A property
+snapshot that receives an unknown handle performs one bounded `GET_TREE`
+hydration and retries once. Handles from the same live target/assembly resolve;
+stale or different-assembly handles remain explicit errors.
+
+## Typed property policies
+
+Schemas are connection-scoped, immutable metadata. Live values are returned separately on every `GET_PROPERTIES`; reconnecting creates a new descriptor namespace and invalidates old IDs.
+
+### WPF
+
+WPF enumerates `DependencyPropertyDescriptor` metadata for the target's runtime `Type` and caches it without retaining target objects. Only writable dependency properties with conservative scalar types are exposed. Ordinary CLR properties and object graphs are excluded. Editor kinds come from the dependency property's declared `PropertyType`; enum choices come from `Enum.GetValues`.
+
+Reads use `GetValue`. Mutations use `SetValue` and `ClearValue` on the application dispatcher and return a fresh readback. `ReadLocalValue` determines `overridden` and `canClear`; clearing removes the local value so style, inheritance, or default precedence resumes.
+
+### WinForms
+
+WinForms uses `TypeDescriptor.GetProperties(control)`, including custom type-description providers. The schema cache key combines runtime type, provider/type-descriptor identity, and a descriptor metadata signature. Cached entries contain no controls.
+
+Only browsable, readable/writable, non-indexed properties are considered. The allowlist is string, Boolean, character, numeric primitive/decimal, enum, and nullable forms, with exact built-in converter types audited before inclusion. Controls, object graphs, collections, delegates, images, fonts, and arbitrary converters are excluded.
+
+Reads and writes use the current `PropertyDescriptor`. Clear is advertised only for descriptors with reset metadata, is enabled live only when `CanResetValue` succeeds, and executes `ResetValue`. Set and reset responses contain the value read back from the target.
+
+## UI-thread rules
+
+The pipe thread never reads framework objects directly.
+
+- WPF queues tree and property work with `Application.Dispatcher.InvokeAsync` and applies a finite timeout.
+- WinForms records each control's owning top-level control/Form during the tree walk and queues property work through that owner's `BeginInvoke`; there is no direct off-thread fallback.
+
+A timeout returns a correlated command error while leaving the transport available for a later retry. Broken transport or target exit marks the native connection dead so the registry can replace it.
+Mutation dispatch uses an atomic queued/running/cancelled gate. A timeout that
+wins before the UI callback starts is definitive and the later callback cannot
+mutate. If execution already began, the result explicitly reports an
+indeterminate/in-progress outcome instead of claiming the mutation failed.
+
+If a WPF or WinForms `GET_TREE` fails after native HWND labeling, the provider
+marks the result as an incomplete framework refresh. Watch retries and retains
+its previous snapshot rather than emitting false subtree removals. MCP visual
+reads and resources likewise retry and refuse to advance their baseline to the
+host-only tree.
+
+## Runtime support
+
+- WPF and WinForms intentionally ship one managed helper assembly per
+  framework, not one per native architecture. Each helper is AnyCPU,
+  `net48`-compatible IL: that same DLL loads under .NET Framework 4.8 and
+  under supported CoreCLR processes. Only the native TAP DLL is
+  architecture-specific.
+- The adjacent runtime config does not retarget the managed assembly. It
+  selects `Microsoft.WindowsDesktop.App` 6.0 with `LatestMajor`, so CoreCLR
+  6 and newer can host the same `net48`-compatible IL assembly.
+- .NET Framework targets require **.NET Framework 4.8**, matching the managed
+  TAP assemblies' `net48` target.
+- CoreCLR WPF/WinForms targets require **Microsoft.WindowsDesktop.App 6.0 or
+  newer**. The component runtime configs request 6.0 with `LatestMajor`; the
+  same `net48` component assembly is API-compatible with the tested .NET 6 and
+  .NET 10 WindowsDesktop runtimes.
+- Active CoreCLR 3.1 and 5 are rejected explicitly rather than attempting to
+  load an incompatible component. .NET 7 is covered by the 6+ policy, although
+  the regression matrix pins the supported floor at .NET 6 LTS.
+- Integration tests exercise WPF and WinForms targets on .NET 6, .NET 10, and
+  .NET Framework 4.8. Do not retarget the helpers to `net6.0` or publish
+  per-architecture managed copies; doing so would split the single assembly
+  model that supports both CLR families.
+
+Connection registry handles also carry a generation and exact connection
+identity, so releasing holders from a dead generation cannot decrement a
+replacement entry.

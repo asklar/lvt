@@ -6,6 +6,8 @@ namespace WinUI3Sample;
 public sealed partial class MainWindow : Window
 {
     private int _clicks;
+    private readonly List<string> _items = [];
+    private bool _listIsSmall;
 
     public MainWindow()
     {
@@ -14,15 +16,27 @@ public sealed partial class MainWindow : Window
 
         // Long enough that the list virtualizes, so VirtualizedItem.Realize and
         // scrolling have something real to act on.
-        var items = new List<string>();
         for (int i = 0; i < 200; i++)
-            items.Add($"Item {i:D3}");
-        ItemsList.ItemsSource = items;
+            _items.Add($"Item {i:D3}");
+        ItemsList.ItemsSource = _items;
     }
 
     // Interaction tests need an effect a UIA walk can observe.
     private void OnPrimaryClick(object sender, RoutedEventArgs e)
     {
         StatusText.Text = $"clicks:{++_clicks}";
+    }
+
+    private void OnToggleListSizeClick(object sender, RoutedEventArgs e)
+    {
+        _listIsSmall = !_listIsSmall;
+        ItemsList.ItemsSource = _listIsSmall ? _items.GetRange(0, 1) : _items;
+    }
+
+    private void OnReorderListClick(object sender, RoutedEventArgs e)
+    {
+        _items.Reverse();
+        ItemsList.ItemsSource = null;
+        ItemsList.ItemsSource = _listIsSmall ? _items.GetRange(0, 1) : _items;
     }
 }

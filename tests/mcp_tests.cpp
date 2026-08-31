@@ -10,17 +10,26 @@
 #include <wil/resource.h>
 
 #include <windows.h>
+#include "lvt_config.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "apps/NativeControlsFixture/native_controls_fixture_ids.h"
+#include "exact_hwnd_recycle_test_support.h"
+
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+namespace native_fixture = lvt::native_fixture;
 
 namespace {
 
@@ -30,11 +39,285 @@ std::string get_lvt_path() {
     return (fs::path(exePath).parent_path() / "lvt.exe").string();
 }
 
+USHORT pe_machine(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return IMAGE_FILE_MACHINE_UNKNOWN;
+
+    uint16_t dosMagic = 0;
+    file.read(reinterpret_cast<char*>(&dosMagic), sizeof(dosMagic));
+    if (!file || dosMagic != IMAGE_DOS_SIGNATURE)
+        return IMAGE_FILE_MACHINE_UNKNOWN;
+
+    file.seekg(0x3c);
+    uint32_t peOffset = 0;
+    file.read(reinterpret_cast<char*>(&peOffset), sizeof(peOffset));
+    file.seekg(peOffset);
+    uint32_t peSignature = 0;
+    USHORT machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    file.read(reinterpret_cast<char*>(&peSignature), sizeof(peSignature));
+    file.read(reinterpret_cast<char*>(&machine), sizeof(machine));
+    return file && peSignature == IMAGE_NT_SIGNATURE
+        ? machine
+        : IMAGE_FILE_MACHINE_UNKNOWN;
+}
+
+constexpr USHORT test_machine() {
+#if defined(_M_ARM64)
+    return IMAGE_FILE_MACHINE_ARM64;
+#elif defined(_M_IX86)
+    return IMAGE_FILE_MACHINE_I386;
+#elif defined(_M_X64)
+    return IMAGE_FILE_MACHINE_AMD64;
+#else
+    return IMAGE_FILE_MACHINE_UNKNOWN;
+#endif
+}
+
+const char* machine_name(USHORT machine) {
+    switch (machine) {
+    case IMAGE_FILE_MACHINE_ARM64:
+        return "arm64";
+    case IMAGE_FILE_MACHINE_I386:
+        return "x86";
+    case IMAGE_FILE_MACHINE_AMD64:
+        return "x64";
+    default:
+        return "unknown";
+    }
+}
+
+std::string run_command(const std::string& command) {
+    std::string output;
+    char buffer[4096]{};
+    FILE* pipe = _popen(command.c_str(), "r");
+    if (!pipe)
+        return {};
+    while (fgets(buffer, static_cast<int>(sizeof(buffer)), pipe))
+        output += buffer;
+    _pclose(pipe);
+    return output;
+}
+
+std::string cmd_escape_arg(const std::string& argument) {
+    std::string escaped;
+    escaped.reserve(argument.size() * 2);
+    for (const char value : argument) {
+        if (value == '|' || value == '&' || value == '<' ||
+            value == '>' || value == '^') {
+            escaped += '^';
+        }
+        escaped += value;
+    }
+    return escaped;
+}
+
+std::string trim_crlf(const std::string& value) {
+    const auto end = value.find_last_not_of("\r\n");
+    return end == std::string::npos
+        ? std::string()
+        : value.substr(0, end + 1);
+}
+
 std::string read_text_file(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file)
         return {};
     return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+}
+
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(const char* name, const std::string& value)
+        : name_(name) {
+        const DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
+        if (needed > 0) {
+            previous_.resize(needed - 1);
+            GetEnvironmentVariableA(name, previous_.data(), needed);
+            hadPrevious_ = true;
+        }
+        SetEnvironmentVariableA(name, value.c_str());
+    }
+
+    ~ScopedEnvironmentVariable() {
+        SetEnvironmentVariableA(
+            name_.c_str(), hadPrevious_ ? previous_.c_str() : nullptr);
+    }
+
+private:
+    std::string name_;
+    std::string previous_;
+    bool hadPrevious_ = false;
+};
+
+class NativePublicationGate {
+public:
+    explicit NativePublicationGate(
+        const char* method, bool initiallyArmed = true) {
+        const auto serial = nextSerial_.fetch_add(1);
+        base_ =
+            "Local\\lvt-native-publication-" +
+            std::to_string(GetCurrentProcessId()) + "-" +
+            std::to_string(serial);
+        entered_.reset(CreateEventA(
+            nullptr, TRUE, FALSE, (base_ + "-entered").c_str()));
+        release_.reset(CreateEventA(
+            nullptr, TRUE, FALSE, (base_ + "-release").c_str()));
+        armed_.reset(CreateEventA(
+            nullptr, TRUE, initiallyArmed,
+            (base_ + "-armed").c_str()));
+        if (entered_ && release_ && armed_) {
+            gateVariable_ = std::make_unique<ScopedEnvironmentVariable>(
+                "LVT_TEST_NATIVE_PUBLICATION_GATE", base_);
+            methodVariable_ = std::make_unique<ScopedEnvironmentVariable>(
+                "LVT_TEST_NATIVE_PUBLICATION_METHOD", method);
+        }
+    }
+
+    ~NativePublicationGate() {
+        release();
+    }
+
+    bool valid() const {
+        return entered_ && release_ && armed_ &&
+               gateVariable_ && methodVariable_;
+    }
+
+    void arm() {
+        if (armed_)
+            SetEvent(armed_.get());
+    }
+
+    bool wait_until_entered() const {
+        return entered_ &&
+               WaitForSingleObject(entered_.get(), 10000) ==
+                   WAIT_OBJECT_0;
+    }
+
+    void release() {
+        if (release_)
+            SetEvent(release_.get());
+    }
+
+private:
+    inline static std::atomic<uint64_t> nextSerial_{1};
+    std::string base_;
+    wil::unique_handle entered_;
+    wil::unique_handle release_;
+    wil::unique_handle armed_;
+    std::unique_ptr<ScopedEnvironmentVariable> gateVariable_;
+    std::unique_ptr<ScopedEnvironmentVariable> methodVariable_;
+};
+
+class AuthorizationTestGate {
+public:
+    explicit AuthorizationTestGate(
+        const char* environmentVariable) {
+        const auto serial = nextSerial_.fetch_add(1);
+        base_ =
+            "Local\\lvt-authorization-" +
+            std::to_string(GetCurrentProcessId()) + "-" +
+            std::to_string(serial);
+        entered_.reset(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (base_ + "-entered").c_str()));
+        release_.reset(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (base_ + "-release").c_str()));
+        armed_.reset(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (base_ + "-armed").c_str()));
+        if (entered_ && release_ && armed_) {
+            variable_ =
+                std::make_unique<ScopedEnvironmentVariable>(
+                    environmentVariable, base_);
+        }
+    }
+
+    ~AuthorizationTestGate() {
+        release();
+    }
+
+    bool valid() const {
+        return entered_ && release_ && armed_ &&
+               variable_;
+    }
+
+    void arm() {
+        if (armed_)
+            SetEvent(armed_.get());
+    }
+
+    bool wait_until_entered() const {
+        return entered_ &&
+               WaitForSingleObject(
+                   entered_.get(), 10000) ==
+                   WAIT_OBJECT_0;
+    }
+
+    void release() {
+        if (release_)
+            SetEvent(release_.get());
+    }
+
+private:
+    inline static std::atomic<uint64_t> nextSerial_{1};
+    std::string base_;
+    wil::unique_handle entered_;
+    wil::unique_handle release_;
+    wil::unique_handle armed_;
+    std::unique_ptr<ScopedEnvironmentVariable> variable_;
+};
+
+fs::path plugin_stats_path(const std::string& testName) {
+    return fs::path(get_lvt_path()).parent_path() /
+           ("fake-plugin-mcp-" + testName + "-" +
+            std::to_string(GetCurrentProcessId()) + ".log");
+}
+
+std::vector<std::string> read_plugin_stats(const fs::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        lines.push_back(std::move(line));
+    }
+    return lines;
+}
+
+size_t count_plugin_stats(
+    const std::vector<std::string>& lines, const std::string& prefix) {
+    return static_cast<size_t>(std::count_if(
+        lines.begin(), lines.end(), [&prefix](const std::string& line) {
+            return line.rfind(prefix, 0) == 0;
+        }));
+}
+
+int count_tap_log_lines(const char* text, DWORD pid) {
+    wchar_t tempPath[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tempPath) == 0)
+        return 0;
+    std::ifstream log(std::wstring(tempPath) + L"lvt_tap.log", std::ios::binary);
+    int count = 0;
+    std::string line;
+    const auto processMarker =
+        "][" + std::to_string(pid) + "][";
+    while (std::getline(log, line)) {
+        if (line.find(processMarker) != std::string::npos &&
+            line.find(text) != std::string::npos)
+            ++count;
+    }
+    return count;
+}
+
+int count_tap_set_site_calls(DWORD pid) {
+    return count_tap_log_lines("SetSite called", pid);
+}
+
+int count_tap_get_enums_calls(DWORD pid) {
+    return count_tap_log_lines("GetEnums called once", pid);
 }
 
 // A live MCP conversation with `lvt mcp` over anonymous pipes.
@@ -112,8 +395,21 @@ public:
         return code;
     }
 
-    void notify(const std::string& method) {
-        write(json{{"jsonrpc", "2.0"}, {"method", method}});
+    void terminate_server() {
+        if (!started_)
+            return;
+        if (process_) {
+            TerminateProcess(process_.get(), 1);
+            WaitForSingleObject(process_.get(), 5000);
+        }
+        shutdown();
+    }
+
+    void notify(const std::string& method, const json& params = json()) {
+        json message{{"jsonrpc", "2.0"}, {"method", method}};
+        if (!params.is_null())
+            message["params"] = params;
+        write(message);
     }
 
     // Sends a request and returns its response, or a null json on timeout.
@@ -126,11 +422,45 @@ public:
     // genuinely overlap on the runtime's worker threads.
     int send_request(const std::string& method, const json& params = json::object()) {
         const int id = ++nextId_;
-        write(json{{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}});
+        auto requestParams = params;
+        if (protocolVersion_ >= "2026-07-28") {
+            requestParams["_meta"] = {
+                {"io.modelcontextprotocol/protocolVersion", protocolVersion_},
+                {"io.modelcontextprotocol/clientCapabilities", json::object()},
+            };
+        }
+        write(json{{"jsonrpc", "2.0"},
+                   {"id", id},
+                   {"method", method},
+                   {"params", std::move(requestParams)}});
         return id;
     }
 
     json await_response(int id) { return await(id); }
+
+    // Wait for a server-to-client notification already arriving on the stdio
+    // transport. This sends no request: a passing test proves the server
+    // initiated the message rather than answering a client poll.
+    json await_notification(const std::string& method, int timeoutSeconds = 30) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds);
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (size_t i = 0; i < messages_.size(); ++i) {
+                    if (!messages_[i].contains("id") &&
+                        messages_[i].value("method", "") == method) {
+                        auto found = messages_[i];
+                        messages_.erase(messages_.begin() + static_cast<ptrdiff_t>(i));
+                        return found;
+                    }
+                }
+            }
+            if (eof_ || std::chrono::steady_clock::now() >= deadline)
+                return json();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
 
     // Convenience for tools/call that returns the tool's parsed JSON payload.
     // `isError` reports whether the tool reported failure, which is distinct
@@ -173,15 +503,18 @@ public:
     }
 
     // initialize + initialized, the handshake every session begins with.
-    bool handshake(json* serverInfo = nullptr) {
+    bool handshake(
+        json* serverInfo = nullptr,
+        const std::string& protocolVersion = "2025-06-18") {
         auto response = request("initialize",
-                                json{{"protocolVersion", "2025-06-18"},
+                                json{{"protocolVersion", protocolVersion},
                                      {"capabilities", json::object()},
                                      {"clientInfo", json{{"name", "lvt-tests"}, {"version", "1"}}}});
         if (response.is_null() || !response.contains("result"))
             return false;
         if (serverInfo)
             *serverInfo = response["result"];
+        protocolVersion_ = response["result"].value("protocolVersion", protocolVersion);
         notify("notifications/initialized");
         return true;
     }
@@ -251,6 +584,7 @@ private:
     std::atomic<bool> stopping_{false};
     bool started_ = false;
     std::atomic<int> nextId_{0};
+    std::string protocolVersion_;
 };
 
 void collect_json_elements(const json& element, std::vector<const json*>& out) {
@@ -262,6 +596,105 @@ void collect_json_elements(const json& element, std::vector<const json*>& out) {
         return;
     for (const auto& child : *children)
         collect_json_elements(child, out);
+}
+
+const json* find_property_descriptor(const json& snapshot, const std::string& name) {
+    const auto descriptors = snapshot.find("descriptors");
+    if (descriptors == snapshot.end() || !descriptors->is_array())
+        return nullptr;
+    for (const auto& descriptor : *descriptors) {
+        if (descriptor.value("name", "") == name)
+            return &descriptor;
+    }
+    return nullptr;
+}
+
+const json* find_property_value(const json& snapshot, const std::string& descriptorId) {
+    const auto values = snapshot.find("values");
+    if (values == snapshot.end() || !values->is_array())
+        return nullptr;
+    for (const auto& value : *values) {
+        if (value.value("descriptorId", "") == descriptorId)
+            return &value;
+    }
+    return nullptr;
+}
+
+std::string typed_property_value(const json& snapshot, const std::string& name) {
+    const auto* descriptor = find_property_descriptor(snapshot, name);
+    if (!descriptor)
+        return {};
+    const auto* value =
+        find_property_value(snapshot, descriptor->value("descriptorId", ""));
+    return value ? value->value("value", "") : std::string();
+}
+
+void expect_typed_property_session_disconnected(const json& result) {
+    EXPECT_FALSE(result.value("ok", true)) << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorCode", ""),
+        "typed_property_session_disconnected")
+        << result.dump(2);
+    EXPECT_EQ(result.value("errorDisposition", ""), "ownershipLost")
+        << result.dump(2);
+    EXPECT_FALSE(result.value("retryable", true)) << result.dump(2);
+    EXPECT_FALSE(result.value("hresult", "").empty()) << result.dump(2);
+}
+
+void expect_typed_property_failure(
+    const json& result, const std::string& code,
+    const std::string& disposition, bool retryable) {
+    EXPECT_FALSE(result.value("ok", true)) << result.dump(2);
+    EXPECT_EQ(result.value("errorCode", ""), code) << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorDisposition", ""), disposition)
+        << result.dump(2);
+    EXPECT_EQ(result.value("retryable", !retryable), retryable)
+        << result.dump(2);
+    EXPECT_FALSE(result.value("error", "").empty()) << result.dump(2);
+    EXPECT_FALSE(result.value("hresult", "").empty()) << result.dump(2);
+}
+
+void expect_typed_property_target_not_authorized(
+    const json& result) {
+    EXPECT_FALSE(result.value("ok", true)) << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorCode", ""),
+        "typed_property_target_not_authorized")
+        << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorDisposition", ""),
+        "transient")
+        << result.dump(2);
+    EXPECT_TRUE(result.value("retryable", false))
+        << result.dump(2);
+    EXPECT_EQ(result.value("hresult", ""), "0xA0040201")
+        << result.dump(2);
+}
+
+void expect_typed_property_target_membership_lost(
+    const json& result) {
+    EXPECT_FALSE(result.value("ok", true)) << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorCode", ""),
+        "typed_property_target_not_authorized")
+        << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorDisposition", ""),
+        "terminal")
+        << result.dump(2);
+    EXPECT_FALSE(result.value("retryable", true))
+        << result.dump(2);
+    EXPECT_EQ(result.value("hresult", ""), "0xA0040201")
+        << result.dump(2);
+}
+
+bool descriptor_has_choice(const json& descriptor, const std::string& value) {
+    for (const auto& choice : descriptor.value("choices", json::array())) {
+        if (choice.value("value", "") == value)
+            return true;
+    }
+    return false;
 }
 
 // A JSON Schema checker covering exactly the keywords lvt's output schemas use:
@@ -368,19 +801,2905 @@ bool has_tool(const std::vector<std::string>& names, const std::string& name) {
     return std::find(names.begin(), names.end(), name) != names.end();
 }
 
+class ManagedSampleProcess {
+public:
+    bool start(const fs::path& executable) {
+        if (!fs::exists(executable))
+            return false;
+        STARTUPINFOA startup{sizeof(startup)};
+        PROCESS_INFORMATION processInfo{};
+        std::string command = "\"" + executable.string() + "\"";
+        if (!CreateProcessA(
+                nullptr, command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                executable.parent_path().string().c_str(), &startup, &processInfo)) {
+            return false;
+        }
+        process_.reset(processInfo.hProcess);
+        thread_.reset(processInfo.hThread);
+        pid_ = processInfo.dwProcessId;
+        WaitForInputIdle(process_.get(), 5000);
+
+        for (int attempt = 0; attempt < 30 && !hwnd_; ++attempt) {
+            EnumWindows([](HWND hwnd, LPARAM parameter) -> BOOL {
+                auto* self = reinterpret_cast<ManagedSampleProcess*>(parameter);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(hwnd, &owner);
+                if (owner == self->pid_ && IsWindowVisible(hwnd)) {
+                    self->hwnd_ = hwnd;
+                    return FALSE;
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(this));
+            if (!hwnd_)
+                Sleep(100);
+        }
+        return hwnd_ != nullptr;
+    }
+
+    ~ManagedSampleProcess() {
+        stop();
+    }
+
+    void stop() {
+        if (process_) {
+            TerminateProcess(process_.get(), 0);
+            WaitForSingleObject(process_.get(), 5000);
+        }
+        process_.reset();
+        thread_.reset();
+        pid_ = 0;
+        hwnd_ = nullptr;
+    }
+
+    DWORD pid() const { return pid_; }
+    HWND hwnd() const { return hwnd_; }
+
+    HWND hwnd_with_title(const char* expectedTitle) const {
+        struct Search {
+            DWORD pid = 0;
+            const char* title = nullptr;
+            HWND hwnd = nullptr;
+        } search{pid_, expectedTitle};
+        EnumWindows([](HWND hwnd, LPARAM parameter) -> BOOL {
+            auto* state =
+                reinterpret_cast<Search*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(hwnd, &owner);
+            if (owner != state->pid || !IsWindowVisible(hwnd))
+                return TRUE;
+            char title[256]{};
+            GetWindowTextA(
+                hwnd, title, static_cast<int>(sizeof(title)));
+            if (strcmp(title, state->title) != 0)
+                return TRUE;
+            state->hwnd = hwnd;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&search));
+        return search.hwnd;
+    }
+
+    static std::string hwnd_string(HWND hwnd) {
+        char buffer[32];
+        snprintf(
+            buffer, sizeof(buffer), "0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(hwnd)));
+        return buffer;
+    }
+
+    std::string hwnd_string() const {
+        return hwnd_string(hwnd_);
+    }
+
+private:
+    wil::unique_process_handle process_;
+    wil::unique_handle thread_;
+    DWORD pid_ = 0;
+    HWND hwnd_ = nullptr;
+};
+
+const json* find_fake_plugin_node(const json& root) {
+    std::vector<const json*> elements;
+    collect_json_elements(root, elements);
+    for (const auto* element : elements) {
+        if (element->value("type", "") == "FakePluginNode")
+            return element;
+    }
+    return nullptr;
+}
+
+std::unique_ptr<McpClient> start_plugin_mcp(
+    const fs::path& pluginDirectory, const fs::path& statsPath,
+    const std::string& failOpenAt, const std::string& failGetAt,
+    const std::string& delayMs, const std::string& emitEvents,
+    const std::string& delayDetectAt = "0",
+    const std::string& detectDelayMs = "0") {
+    ScopedEnvironmentVariable pluginPath(
+        "LVT_PLUGIN_DIR", pluginDirectory.string());
+    ScopedEnvironmentVariable enabled("LVT_FAKE_PLUGIN_ENABLE", "1");
+    ScopedEnvironmentVariable state(
+        "LVT_FAKE_PLUGIN_STATE", statsPath.string());
+    ScopedEnvironmentVariable fail(
+        "LVT_FAKE_PLUGIN_FAIL_GET_AT", failGetAt);
+    ScopedEnvironmentVariable malformed(
+        "LVT_FAKE_PLUGIN_MALFORMED_GET_AT", "0");
+    ScopedEnvironmentVariable failOpen(
+        "LVT_FAKE_PLUGIN_FAIL_OPEN_AT", failOpenAt);
+    ScopedEnvironmentVariable delay(
+        "LVT_FAKE_PLUGIN_GET_DELAY_MS", delayMs);
+    ScopedEnvironmentVariable events(
+        "LVT_FAKE_PLUGIN_EMIT_EVENTS", emitEvents);
+    ScopedEnvironmentVariable detectFile(
+        "LVT_FAKE_PLUGIN_DETECT_FILE", "");
+    ScopedEnvironmentVariable detectAt(
+        "LVT_FAKE_PLUGIN_DELAY_DETECT_AT", delayDetectAt);
+    ScopedEnvironmentVariable detectDelay(
+        "LVT_FAKE_PLUGIN_DETECT_DELAY_MS", detectDelayMs);
+    return std::make_unique<McpClient>(false);
+}
+
+TEST(McpPluginPersistent, ReusesPollsReconnectsAndDisconnectsConcurrently) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path("persistent");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_V2_DIR, statsPath, "1", "3", "250", "1");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+
+    auto connected = client->call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"title", "mcp-filter"},
+             {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    auto first =
+        client->call_tool("get_visual_tree", json{{"session", session}});
+    auto second =
+        client->call_tool("get_visual_tree", json{{"session", session}});
+    auto reconnected =
+        client->call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(first.contains("root")) << first.dump(2);
+    ASSERT_TRUE(second.contains("root")) << second.dump(2);
+    ASSERT_TRUE(reconnected.contains("root")) << reconnected.dump(2);
+    for (const auto* tree : {&first, &second, &reconnected}) {
+        const auto* node = find_fake_plugin_node((*tree)["root"]);
+        ASSERT_NE(node, nullptr);
+        EXPECT_EQ(
+            node->value("properties", json::object()).value("source", ""),
+            "persistent");
+        EXPECT_EQ(
+            node->value("properties", json::object()).value("filter", ""),
+            "mcp-filter");
+    }
+
+    const int readId = client->send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    const auto readStartedDeadline = GetTickCount64() + 5000;
+    while (GetTickCount64() < readStartedDeadline) {
+        if (count_plugin_stats(read_plugin_stats(statsPath), "get ") >= 5)
+            break;
+        Sleep(10);
+    }
+    ASSERT_GE(
+        count_plugin_stats(read_plugin_stats(statsPath), "get "), 5u);
+    const int disconnectId = client->send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+
+    const auto readResponse = client->await_response(readId);
+    const auto disconnectResponse = client->await_response(disconnectId);
+    ASSERT_TRUE(readResponse.contains("result")) << readResponse.dump(2);
+    ASSERT_TRUE(disconnectResponse.contains("result"))
+        << disconnectResponse.dump(2);
+    EXPECT_FALSE(readResponse["result"].value("isError", false));
+    EXPECT_FALSE(disconnectResponse["result"].value("isError", false));
+
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 3u);
+    EXPECT_EQ(count_plugin_stats(stats, "open_failed "), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "enrich "), 0u);
+    const auto gets = count_plugin_stats(stats, "get ");
+    const auto failures = count_plugin_stats(stats, "get_failed ");
+    EXPECT_EQ(gets, 5u);
+    EXPECT_EQ(failures, 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "free"), gets - failures);
+    EXPECT_EQ(count_plugin_stats(stats, "poll"), 4u)
+        << "five tree attempts with one failed build must poll only the four "
+           "successful plugin snapshots";
+    EXPECT_EQ(count_plugin_stats(stats, "events_free"), 4u);
+    for (const auto& line : stats) {
+        if (line.rfind("get ", 0) == 0)
+            EXPECT_NE(line.find("filter=mcp-filter"), std::string::npos);
+    }
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+TEST(McpPluginPersistent, CorrelationScopesVisualAndUiaEventPolling) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto pluginStatsPath =
+        plugin_stats_path("correlation-scope-plugin");
+    const auto uiaStatsPath =
+        plugin_stats_path("correlation-scope-uia");
+    std::error_code ec;
+    fs::remove(pluginStatsPath, ec);
+    fs::remove(uiaStatsPath, ec);
+    ScopedEnvironmentVariable uiaStats(
+        "LVT_TEST_UIA_EVENT_STATS", uiaStatsPath.string());
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_V2_DIR, pluginStatsPath,
+        "0", "0", "0", "1");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+        HWND edit = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner != fixture->pid)
+                return TRUE;
+            const HWND edit = GetDlgItem(
+                candidate, native_fixture::kEditId);
+            if (!edit)
+                return TRUE;
+            fixture->root = candidate;
+            fixture->edit = edit;
+            return FALSE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+    ASSERT_TRUE(IsWindow(fixture.edit));
+    char fixtureHwnd[32]{};
+    snprintf(
+        fixtureHwnd, sizeof(fixtureHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(fixture.root)));
+
+    const auto visualConnect = client->call_tool(
+        "connect",
+        json{{"hwnd", fixtureHwnd},
+             {"mode", "visual"}});
+    const auto uiaConnect = client->call_tool(
+        "connect",
+        json{{"hwnd", fixtureHwnd},
+             {"mode", "uia"}});
+    const auto visualSession =
+        visualConnect.value("session", "");
+    const auto uiaSession = uiaConnect.value("session", "");
+    ASSERT_FALSE(visualSession.empty()) << visualConnect.dump(2);
+    ASSERT_FALSE(uiaSession.empty()) << uiaConnect.dump(2);
+
+    auto initialUia = client->call_tool(
+        "get_uia_tree", json{{"session", uiaSession}});
+    ASSERT_TRUE(initialUia.contains("root")) << initialUia.dump(2);
+
+    auto pluginBefore = read_plugin_stats(pluginStatsPath);
+    auto uiaBefore = read_plugin_stats(uiaStatsPath);
+    auto correlated = client->call_tool(
+        "get_visual_tree",
+        json{{"session", visualSession}, {"correlate", true}});
+    ASSERT_TRUE(correlated.contains("root")) << correlated.dump(2);
+    auto pluginAfterCorrelation =
+        read_plugin_stats(pluginStatsPath);
+    auto uiaAfterCorrelation =
+        read_plugin_stats(uiaStatsPath);
+    EXPECT_EQ(
+        count_plugin_stats(pluginAfterCorrelation, "poll") -
+            count_plugin_stats(pluginBefore, "poll"),
+        1u)
+        << "one correlated visual request must poll visual plugins once, "
+           "not again during its UIA correlation walk";
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterCorrelation, "poll") -
+            count_plugin_stats(uiaBefore, "poll"),
+        1u);
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterCorrelation, "refresh") -
+            count_plugin_stats(uiaBefore, "refresh"),
+        1u);
+
+    HWND edit = fixture.edit;
+    ASSERT_TRUE(IsWindow(edit));
+    wchar_t original[256]{};
+    GetWindowTextW(
+        edit, original, static_cast<int>(_countof(original)));
+    ASSERT_TRUE(SetWindowTextW(
+        edit, L"queued UIA event must survive visual polling"));
+    NotifyWinEvent(
+        EVENT_OBJECT_VALUECHANGE, edit,
+        OBJID_CLIENT, CHILDID_SELF);
+    Sleep(500);
+
+    pluginBefore = pluginAfterCorrelation;
+    uiaBefore = uiaAfterCorrelation;
+    auto plainVisual = client->call_tool(
+        "get_visual_tree",
+        json{{"session", visualSession}});
+    ASSERT_TRUE(plainVisual.contains("root"))
+        << plainVisual.dump(2);
+    const auto pluginAfterVisual =
+        read_plugin_stats(pluginStatsPath);
+    const auto uiaAfterVisual =
+        read_plugin_stats(uiaStatsPath);
+    EXPECT_EQ(
+        count_plugin_stats(pluginAfterVisual, "poll") -
+            count_plugin_stats(pluginBefore, "poll"),
+        1u);
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterVisual, "poll"),
+        count_plugin_stats(uiaBefore, "poll"))
+        << "a visual-only snapshot consumed a retained UIA hint";
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterVisual, "refresh"),
+        count_plugin_stats(uiaBefore, "refresh"));
+
+    json refreshedUia;
+    for (int attempt = 0;
+         attempt < 3 && !refreshedUia.contains("root");
+         ++attempt) {
+        if (attempt > 0)
+            Sleep(static_cast<DWORD>(150 * attempt));
+        refreshedUia = client->call_tool(
+            "get_uia_tree", json{{"session", uiaSession}});
+    }
+    ASSERT_TRUE(refreshedUia.contains("root"))
+        << refreshedUia.dump(2);
+    const auto pluginAfterUia =
+        read_plugin_stats(pluginStatsPath);
+    const auto uiaAfterUia =
+        read_plugin_stats(uiaStatsPath);
+    EXPECT_EQ(
+        count_plugin_stats(pluginAfterUia, "poll"),
+        count_plugin_stats(pluginAfterVisual, "poll"))
+        << "a UIA snapshot polled a visual plugin";
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterUia, "poll") -
+            count_plugin_stats(uiaAfterVisual, "poll"),
+        1u);
+    EXPECT_EQ(
+        count_plugin_stats(uiaAfterUia, "refresh") -
+            count_plugin_stats(uiaAfterVisual, "refresh"),
+        1u);
+    bool retainedSnapshot = false;
+    for (size_t index = uiaAfterVisual.size();
+         index < uiaAfterUia.size(); ++index) {
+        retainedSnapshot =
+            retainedSnapshot ||
+            (uiaAfterUia[index].rfind("poll ", 0) == 0 &&
+             uiaAfterUia[index].find("snapshot=1") !=
+                 std::string::npos);
+    }
+    EXPECT_TRUE(retainedSnapshot)
+        << "the UIA hint queued after correlation was not retained "
+           "until the next UIA snapshot";
+
+    SetWindowTextW(edit, original);
+    client->shutdown();
+    fs::remove(pluginStatsPath, ec);
+    fs::remove(uiaStatsPath, ec);
+}
+
+TEST(McpUiaIdentity, TransientPersistentFailureUsesIdentityBoundFallback) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    ScopedEnvironmentVariable failConnected(
+        "LVT_TEST_UIA_FAIL_CONNECTED_TREE_ONCE", "1");
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    const auto tree = client.call_tool(
+        "get_uia_tree", json{{"session", session}});
+    EXPECT_TRUE(tree.contains("root"))
+        << "an unchanged target must preserve one-shot fallback: "
+        << tree.dump(2);
+}
+
+TEST(McpUiaIdentity, ConcurrentIdentityContentionIsTransientAndSessionRecovers) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(
+        NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const std::string eventName =
+        "Local\\LvtIdentityContention_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event contention(CreateEventA(
+        nullptr, TRUE, FALSE, eventName.c_str()));
+    ASSERT_TRUE(contention);
+    ScopedEnvironmentVariable contentionGate(
+        "LVT_TEST_UIA_IDENTITY_CONTENTION_EVENT",
+        eventName);
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "visual"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    bool isError = false;
+    auto tree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << tree.dump(2);
+    const auto key = tree["root"].value("key", "");
+    ASSERT_FALSE(key.empty());
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+
+    ASSERT_TRUE(SetEvent(contention.get()));
+    std::vector<std::pair<int, bool>> requests;
+    for (int index = 0; index < 3; ++index) {
+        requests.emplace_back(
+            client.send_request(
+                "tools/call",
+                json{{"name", "get_visual_tree"},
+                     {"arguments",
+                      json{{"session", session}}}}),
+            false);
+        requests.emplace_back(
+            client.send_request(
+                "tools/call",
+                json{{"name",
+                      "get_editable_properties"},
+                     {"arguments",
+                      json{{"session", session},
+                           {"element", key}}}}),
+            true);
+    }
+    for (const auto& [request, typed] : requests) {
+        const auto response =
+            client.await_response(request);
+        ASSERT_TRUE(response.contains("result"))
+            << response.dump(2);
+        const auto& result = response["result"];
+        ASSERT_TRUE(result.value("isError", false))
+            << response.dump(2);
+        ASSERT_TRUE(
+            result.contains("structuredContent"))
+            << response.dump(2);
+        const auto& error =
+            result["structuredContent"];
+        EXPECT_EQ(
+            error.value(
+                typed ? "errorCode" : "code", ""),
+            typed
+                ? "typed_property_identity_validation_failed"
+                : "targetIdentityValidationFailed")
+            << error.dump(2);
+        EXPECT_EQ(
+            error.value("errorDisposition", ""),
+            "transient")
+            << error.dump(2);
+        EXPECT_TRUE(
+            error.value("retryable", false))
+            << error.dump(2);
+        EXPECT_EQ(
+            error.value("hresult", ""),
+            "0x80010001")
+            << error.dump(2);
+    }
+    ASSERT_TRUE(ResetEvent(contention.get()));
+
+    auto recoveredTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError)
+        << "transient contention poisoned the visual session: "
+        << recoveredTree.dump(2);
+    auto recoveredProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "transient contention poisoned typed properties: "
+        << recoveredProperties.dump(2);
+}
+
+TEST(McpUiaIdentity, RuntimeIdFailuresPreserveTheirTransientHresults) {
+    const std::array<std::pair<const char*, const char*>, 5>
+        failures{{
+            {"property", "0x80010001"},
+            {"type", "0x80020005"},
+            {"bounds", "0x8002000B"},
+            {"element", "0x8007000E"},
+            {"process", "0x8001010A"},
+        }};
+
+    for (const auto& [stage, expectedHresult] :
+         failures) {
+        SCOPED_TRACE(stage);
+        ManagedSampleProcess sample;
+        ASSERT_TRUE(sample.start(
+            NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+        const std::string eventName =
+            "Local\\LvtRuntimeIdFailure_" +
+            std::to_string(GetCurrentProcessId()) +
+            "_" + std::to_string(GetTickCount64()) +
+            "_" + stage;
+        wil::unique_event failure(CreateEventA(
+            nullptr, TRUE, FALSE,
+            eventName.c_str()));
+        ASSERT_TRUE(failure);
+        ScopedEnvironmentVariable failureEvent(
+            "LVT_TEST_UIA_RUNTIME_ID_FAILURE_EVENT",
+            eventName);
+        ScopedEnvironmentVariable failureStage(
+            "LVT_TEST_UIA_RUNTIME_ID_FAILURE_STAGE",
+            stage);
+
+        McpClient client(false);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd", sample.hwnd_string()},
+                 {"mode", "visual"}});
+        const auto session =
+            connected.value("session", "");
+        ASSERT_FALSE(session.empty())
+            << connected.dump(2);
+        bool isError = false;
+        auto baseline = client.call_tool(
+            "get_visual_tree",
+            json{{"session", session}}, &isError);
+        ASSERT_FALSE(isError) << baseline.dump(2);
+
+        ASSERT_TRUE(SetEvent(failure.get()));
+        auto failed = client.call_tool(
+            "get_visual_tree",
+            json{{"session", session}}, &isError);
+        ASSERT_TRUE(isError) << failed.dump(2);
+        EXPECT_EQ(
+            failed.value("code", ""),
+            "targetIdentityValidationFailed")
+            << failed.dump(2);
+        EXPECT_EQ(
+            failed.value("errorDisposition", ""),
+            "transient")
+            << failed.dump(2);
+        EXPECT_TRUE(
+            failed.value("retryable", false))
+            << failed.dump(2);
+        EXPECT_EQ(
+            failed.value("hresult", ""),
+            expectedHresult)
+            << failed.dump(2);
+
+        ASSERT_TRUE(ResetEvent(failure.get()));
+        auto recovered = client.call_tool(
+            "get_visual_tree",
+            json{{"session", session}}, &isError);
+        EXPECT_FALSE(isError)
+            << recovered.dump(2);
+    }
+}
+
+TEST(McpUiaIdentity, ReplacementDuringFallbackFailsOwnershipLost) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+
+    const std::string base =
+        "Local\\LvtMcpUiaFallback_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, TRUE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable failConnected(
+        "LVT_TEST_UIA_FAIL_CONNECTED_TREE_ONCE", "1");
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_UIA_ONE_SHOT_AFTER_ELEMENT_GATE", base);
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    const int request = client.send_request(
+        "tools/call",
+        json{{"name", "get_uia_tree"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 20000),
+        WAIT_OBJECT_0)
+        << "the MCP fallback did not reach ElementFromHandle";
+
+    sample.stop();
+    ManagedSampleProcess replacement;
+    ASSERT_TRUE(replacement.start(
+        NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    SetEvent(release.get());
+
+    const auto response = client.await_response(request);
+    ASSERT_TRUE(response.contains("result"))
+        << response.dump(2);
+    EXPECT_TRUE(response["result"].value("isError", false))
+        << response.dump(2);
+    EXPECT_NE(
+        response.dump().find("ownershipLost"),
+        std::string::npos)
+        << response.dump(2);
+}
+
+TEST(
+    McpUiaIdentity,
+    ExactRecycleHardFailureDrainsPendingRequestAndServerRecovers) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner == fixture->pid &&
+                GetDlgItem(candidate, native_fixture::kEditId)) {
+                fixture->root = candidate;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+    const HWND edit =
+        GetDlgItem(fixture.root, native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(edit));
+    char editHwnd[32]{};
+    snprintf(
+        editHwnd, sizeof(editHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(edit)));
+
+    const std::string base =
+        "Local\\LvtMcpHardRecycle_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable failConnected(
+        "LVT_TEST_UIA_FAIL_CONNECTED_TREE_ONCE", "1");
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_UIA_ONE_SHOT_AFTER_ELEMENT_GATE", base);
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", editHwnd}, {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    const int request = client.send_request(
+        "tools/call",
+        json{{"name", "get_uia_tree"},
+             {"arguments", json{{"session", session}}}});
+    lvt::test_support::ScopedEventSignal releaseOnExit(
+        release.get());
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0)
+        << "the MCP fallback did not reach ElementFromHandle";
+
+    const bool suppressedBefore =
+        lvt::test_support::exact_hwnd_recycle_search_suppressed();
+    lvt::test_support::ExactHwndRecycleOptions options;
+    options.testMode =
+        lvt::test_support::ExactHwndRecycleTestMode::
+            forceHardFailure;
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            fixture.root, edit, native_fixture::kEditId,
+            options);
+    releaseOnExit.signal();
+    const auto response = client.await_response(request);
+
+    ASSERT_TRUE(response.contains("result"))
+        << response.dump(2);
+    EXPECT_TRUE(response["result"].value("isError", false))
+        << response.dump(2);
+    EXPECT_NE(
+        response.dump().find("ownershipLost"),
+        std::string::npos)
+        << response.dump(2);
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::hardFailure)
+        << recycled.reason;
+    EXPECT_EQ(
+        recycled.failureStage,
+        native_fixture::ExactHwndRecycleFailureStage::
+            createSearchCandidate);
+    EXPECT_EQ(recycled.peakHeldWindows, 0u);
+    EXPECT_EQ(recycled.remainingHeldWindows, 0u);
+    ASSERT_TRUE(IsWindow(recycled.replacement));
+    EXPECT_NE(recycled.replacement, edit);
+    EXPECT_EQ(
+        lvt::test_support::exact_hwnd_recycle_search_suppressed(),
+        suppressedBefore);
+
+    char replacementHwnd[32]{};
+    snprintf(
+        replacementHwnd, sizeof(replacementHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(
+                recycled.replacement)));
+    const auto replacementConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", replacementHwnd}, {"mode", "uia"}});
+    const auto replacementSession =
+        replacementConnected.value("session", "");
+    ASSERT_FALSE(replacementSession.empty())
+        << replacementConnected.dump(2);
+    const auto replacementTree = client.call_tool(
+        "get_uia_tree",
+        json{{"session", replacementSession}});
+    EXPECT_TRUE(replacementTree.contains("root"))
+        << replacementTree.dump(2);
+}
+
+TEST(McpUiaIdentity, ElementlessKeyboardActionsReturnStructuredOwnershipLost) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner == fixture->pid &&
+                GetDlgItem(candidate, native_fixture::kEditId)) {
+                fixture->root = candidate;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+    char fixtureHwnd[32]{};
+    snprintf(
+        fixtureHwnd, sizeof(fixtureHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(fixture.root)));
+
+    const std::string eventName =
+        "Local\\LvtMcpUiaLifetime_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event invalidated(CreateEventA(
+        nullptr, TRUE, FALSE, eventName.c_str()));
+    ASSERT_TRUE(invalidated);
+    ScopedEnvironmentVariable invalidation(
+        "LVT_TEST_UIA_LIFETIME_INVALIDATION_EVENT",
+        eventName);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", fixtureHwnd},
+             {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    const auto visualConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", fixtureHwnd},
+             {"mode", "visual"}});
+    const auto visualSession =
+        visualConnected.value("session", "");
+    ASSERT_FALSE(visualSession.empty())
+        << visualConnected.dump(2);
+
+    bool isError = false;
+    const auto stale = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", "uia:99.99.99"}},
+        &isError);
+    EXPECT_TRUE(isError) << stale.dump(2);
+    EXPECT_NE(
+        stale.value("errorCode", ""),
+        "typed_property_session_disconnected")
+        << "a missing element in a live target is not ownership loss: "
+        << stale.dump(2);
+
+    auto visualTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", visualSession}},
+        &isError);
+    ASSERT_FALSE(isError) << visualTree.dump(2);
+    const auto visualKey =
+        visualTree["root"].value("key", "");
+    ASSERT_FALSE(visualKey.empty());
+    auto visualProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", visualSession},
+             {"element", visualKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << visualProperties.dump(2);
+    const auto* visualText =
+        find_property_descriptor(
+            visualProperties, "Text");
+    ASSERT_NE(visualText, nullptr)
+        << visualProperties.dump(2);
+    const auto visualDescriptorId =
+        visualText->value("descriptorId", "");
+    ASSERT_FALSE(visualDescriptorId.empty());
+
+    SetEvent(invalidated.get());
+    auto frameworks = client.call_tool(
+        "get_frameworks",
+        json{{"session", visualSession}},
+        &isError);
+    ASSERT_TRUE(isError) << frameworks.dump(2);
+    EXPECT_EQ(
+        frameworks.value("code", ""),
+        "ownershipLost")
+        << frameworks.dump(2);
+    EXPECT_FALSE(frameworks.contains("frameworks"))
+        << frameworks.dump(2);
+    for (const char* tool :
+         {"get_visual_tree",
+          "get_visual_tree_changes"}) {
+        isError = false;
+        const auto result = client.call_tool(
+            tool,
+            json{{"session", visualSession}},
+            &isError);
+        EXPECT_TRUE(isError) << result.dump(2);
+        EXPECT_EQ(
+            result.value("code", ""),
+            "ownershipLost")
+            << result.dump(2);
+    }
+    const auto resourceUri =
+        "lvt://session/" + visualSession +
+        "/visual-tree";
+    const auto resource = client.request(
+        "resources/read",
+        json{{"uri", resourceUri}});
+    ASSERT_TRUE(resource.contains("error"))
+        << resource.dump(2);
+    ASSERT_TRUE(
+        resource["error"].contains("data") &&
+        resource["error"]["data"].is_object())
+        << resource.dump(2);
+    EXPECT_EQ(
+        resource["error"]["data"].value(
+            "code", ""),
+        "ownershipLost")
+        << resource.dump(2);
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"get_editable_properties",
+              json{{"session", visualSession},
+                   {"element", visualKey}}},
+             {"set_property",
+              json{{"session", visualSession},
+                   {"element", visualKey},
+                   {"descriptorId",
+                    visualDescriptorId},
+                   {"value", "must-not-set"}}},
+             {"clear_property",
+              json{{"session", visualSession},
+                   {"element", visualKey},
+                   {"descriptorId",
+                    visualDescriptorId}}}}) {
+        isError = false;
+        const auto result = client.call_tool(
+            tool, arguments, &isError);
+        EXPECT_TRUE(isError) << result.dump(2);
+        expect_typed_property_session_disconnected(
+            result);
+    }
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"type_text",
+              json{{"session", session},
+                   {"text", "must-not-type"}}},
+             {"press_key",
+              json{{"session", session},
+                   {"text", "A"}}}}) {
+        isError = false;
+        const auto result =
+            client.call_tool(tool, arguments, &isError);
+        EXPECT_TRUE(isError) << result.dump(2);
+        EXPECT_EQ(result.value("code", ""), "ownershipLost")
+            << result.dump(2);
+    }
+
+    for (const auto& [waitSession, element] :
+         std::vector<std::pair<std::string, std::string>>{
+             {session, "uia:99.99.99"},
+             {visualSession, "visual:e0"}}) {
+        isError = false;
+        const auto waiting = client.call_tool(
+            "wait_for",
+            json{{"session", waitSession},
+                 {"element", element},
+                 {"timeoutMs", 500}},
+            &isError);
+        EXPECT_TRUE(isError) << waiting.dump(2);
+        EXPECT_EQ(waiting.value("code", ""), "ownershipLost")
+            << waiting.dump(2);
+
+        isError = false;
+        const auto gone = client.call_tool(
+            "wait_for",
+            json{{"session", waitSession},
+                 {"element", element},
+                 {"gone", true},
+                 {"timeoutMs", 500}},
+            &isError);
+        EXPECT_FALSE(isError) << gone.dump(2);
+        EXPECT_TRUE(gone.value("ok", false))
+            << gone.dump(2);
+    }
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"type_text",
+              json{{"session", visualSession},
+                   {"text", "must-not-type"}}},
+             {"press_key",
+              json{{"session", visualSession},
+                   {"text", "A"}}},
+             {"window_action",
+              json{{"session", visualSession},
+                   {"action", "minimize"}}}}) {
+        isError = false;
+        const auto result =
+            client.call_tool(tool, arguments, &isError);
+        EXPECT_TRUE(isError) << result.dump(2);
+        EXPECT_EQ(result.value("code", ""), "ownershipLost")
+            << result.dump(2);
+    }
+
+}
+
+TEST(McpUiaIdentity, TypedMutationsDetectOwnershipLossAfterInitialCheck) {
+    const auto runMutation = [](const std::string& tool) {
+        SCOPED_TRACE(tool);
+        ManagedSampleProcess sample;
+        ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+        struct FixtureWindow {
+            DWORD pid;
+            HWND root = nullptr;
+        } fixture{sample.pid()};
+        EnumWindows(
+            [](HWND candidate, LPARAM parameter) -> BOOL {
+                auto* fixture =
+                    reinterpret_cast<FixtureWindow*>(parameter);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(candidate, &owner);
+                if (owner == fixture->pid &&
+                    GetDlgItem(candidate, native_fixture::kEditId)) {
+                    fixture->root = candidate;
+                    return FALSE;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&fixture));
+        ASSERT_TRUE(IsWindow(fixture.root));
+        char fixtureHwnd[32]{};
+        snprintf(
+            fixtureHwnd, sizeof(fixtureHwnd), "0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(fixture.root)));
+
+        const std::string suffix =
+            std::to_string(GetCurrentProcessId()) + "_" +
+            std::to_string(GetTickCount64()) + "_" + tool;
+        const std::string invalidationName =
+            "Local\\LvtTypedInvalidation_" + suffix;
+        const std::string gateBase =
+            "Local\\LvtTypedMutation_" + suffix;
+        wil::unique_event invalidated(CreateEventA(
+            nullptr, TRUE, FALSE, invalidationName.c_str()));
+        wil::unique_event entered(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-entered").c_str()));
+        wil::unique_event release(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-release").c_str()));
+        ASSERT_TRUE(invalidated);
+        ASSERT_TRUE(entered);
+        ASSERT_TRUE(release);
+        ScopedEnvironmentVariable invalidation(
+            "LVT_TEST_UIA_LIFETIME_INVALIDATION_EVENT",
+            invalidationName);
+        ScopedEnvironmentVariable mutationGate(
+            "LVT_TEST_UIA_BEFORE_PROPERTY_MUTATION_GATE",
+            gateBase);
+
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd", fixtureHwnd}, {"mode", "uia"}});
+        const auto session = connected.value("session", "");
+        ASSERT_FALSE(session.empty()) << connected.dump(2);
+        const auto inputs = client.call_tool(
+            "find_elements",
+            json{{"session", session},
+                 {"automationId",
+                  std::to_string(native_fixture::kEditId)}});
+        ASSERT_EQ(inputs["elements"].size(), 1u)
+            << inputs.dump(2);
+        const auto inputKey =
+            inputs["elements"][0].value("key", "");
+        bool isError = false;
+        const auto properties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", inputKey}},
+            &isError);
+        ASSERT_FALSE(isError) << properties.dump(2);
+        const auto* value = find_property_descriptor(
+            properties, "Value.Value");
+        ASSERT_NE(value, nullptr);
+        json arguments{
+            {"session", session},
+            {"element", inputKey},
+            {"descriptorId",
+             value->value("descriptorId", "")},
+        };
+        if (tool == "set_property")
+            arguments["value"] = "must-not-set";
+
+        const int request = client.send_request(
+            "tools/call",
+            json{{"name", tool},
+                 {"arguments", arguments}});
+        ASSERT_EQ(
+            WaitForSingleObject(entered.get(), 10000),
+            WAIT_OBJECT_0)
+            << tool << " did not reach the provider mutation gate";
+        SetEvent(invalidated.get());
+        SetEvent(release.get());
+
+        const auto response = client.await_response(request);
+        ASSERT_TRUE(response.contains("result"))
+            << response.dump(2);
+        EXPECT_TRUE(
+            response["result"].value("isError", false))
+            << response.dump(2);
+        json error;
+        for (const auto& block :
+             response["result"].value(
+                 "content", json::array())) {
+            if (block.value("type", "") == "text") {
+                error = json::parse(
+                    block.value("text", "{}"),
+                    nullptr, false);
+                break;
+            }
+        }
+        ASSERT_FALSE(error.is_discarded())
+            << response.dump(2);
+        expect_typed_property_session_disconnected(error);
+    };
+
+    runMutation("set_property");
+    runMutation("clear_property");
+}
+
+TEST(McpUiaIdentity, NonRecycleTypedReferenceResolutionRacesAreStructured) {
+    const auto runRace = [](const std::string& tool) {
+        ManagedSampleProcess sample;
+        ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+        struct FixtureWindow {
+            DWORD pid;
+            HWND root = nullptr;
+        } fixture{sample.pid()};
+        EnumWindows(
+            [](HWND candidate, LPARAM parameter) -> BOOL {
+                auto* fixture =
+                    reinterpret_cast<FixtureWindow*>(parameter);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(candidate, &owner);
+                if (owner == fixture->pid &&
+                    GetDlgItem(candidate, native_fixture::kEditId)) {
+                    fixture->root = candidate;
+                    return FALSE;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&fixture));
+        ASSERT_TRUE(IsWindow(fixture.root));
+        const HWND edit = GetDlgItem(
+            fixture.root, native_fixture::kEditId);
+        ASSERT_TRUE(IsWindow(edit));
+        char editHwnd[32]{};
+        snprintf(
+            editHwnd, sizeof(editHwnd), "0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(edit)));
+
+        const std::string gateBase =
+            "Local\\LvtTypedReference_" +
+            std::to_string(GetCurrentProcessId()) + "_" +
+            std::to_string(GetTickCount64()) + "_" + tool;
+        wil::unique_event entered(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-entered").c_str()));
+        wil::unique_event release(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-release").c_str()));
+        ASSERT_TRUE(entered);
+        ASSERT_TRUE(release);
+        ScopedEnvironmentVariable referenceGate(
+            "LVT_TEST_UIA_BEFORE_PROPERTY_REFERENCE_GATE",
+            gateBase);
+
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd", editHwnd}, {"mode", "uia"}});
+        const auto session = connected.value("session", "");
+        ASSERT_FALSE(session.empty()) << connected.dump(2);
+        const auto tree = client.call_tool(
+            "get_uia_tree", json{{"session", session}});
+        ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+        const auto runtimeId =
+            tree["root"]
+                .value("properties", json::object())
+                .value("RuntimeId", "");
+        ASSERT_FALSE(runtimeId.empty()) << tree.dump(2);
+        const auto inputRef = "uia:" + runtimeId;
+
+        bool isError = false;
+        const auto properties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", inputRef}},
+            &isError);
+        ASSERT_FALSE(isError) << properties.dump(2);
+        const auto* value = find_property_descriptor(
+            properties, "Value.Value");
+        ASSERT_NE(value, nullptr);
+        json arguments{
+            {"session", session},
+            {"element", inputRef},
+        };
+        if (tool != "get_editable_properties") {
+            arguments["descriptorId"] =
+                value->value("descriptorId", "");
+        }
+        if (tool == "set_property")
+            arguments["value"] = "must-not-set";
+
+        const int request = client.send_request(
+            "tools/call",
+            json{{"name", tool},
+                 {"arguments", arguments}});
+        ASSERT_EQ(
+            WaitForSingleObject(entered.get(), 10000),
+            WAIT_OBJECT_0)
+            << tool << " did not reach reference resolution";
+
+        sample.stop();
+        SetEvent(release.get());
+
+        const auto response = client.await_response(request);
+        ASSERT_TRUE(response.contains("result"))
+            << response.dump(2);
+        EXPECT_TRUE(
+            response["result"].value("isError", false))
+            << response.dump(2);
+        json error;
+        for (const auto& block :
+             response["result"].value(
+                 "content", json::array())) {
+            if (block.value("type", "") == "text") {
+                error = json::parse(
+                    block.value("text", "{}"),
+                    nullptr, false);
+                break;
+            }
+        }
+        ASSERT_FALSE(error.is_discarded())
+            << response.dump(2);
+        expect_typed_property_session_disconnected(error);
+    };
+
+    runRace("get_editable_properties");
+    runRace("clear_property");
+}
+
+TEST(
+    McpUiaIdentity,
+    ExactRecycledHwndTypedReferenceResolutionRaceIsStructured) {
+    if (lvt::test_support::exact_hwnd_recycle_search_suppressed()) {
+        GTEST_SKIP()
+            << lvt::test_support::exact_hwnd_recycle_unavailable_reason();
+    }
+
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner == fixture->pid &&
+                GetDlgItem(candidate, native_fixture::kEditId)) {
+                fixture->root = candidate;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+    const HWND edit = GetDlgItem(
+        fixture.root, native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(edit));
+    char editHwnd[32]{};
+    snprintf(
+        editHwnd, sizeof(editHwnd), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(edit)));
+
+    const std::string gateBase =
+        "Local\\LvtTypedReferenceExact_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (gateBase + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (gateBase + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable referenceGate(
+        "LVT_TEST_UIA_BEFORE_PROPERTY_REFERENCE_GATE",
+        gateBase);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", editHwnd}, {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    const auto tree = client.call_tool(
+        "get_uia_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto runtimeId =
+        tree["root"]
+            .value("properties", json::object())
+            .value("RuntimeId", "");
+    ASSERT_FALSE(runtimeId.empty()) << tree.dump(2);
+    const auto inputRef = "uia:" + runtimeId;
+
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", inputRef}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* value = find_property_descriptor(
+        properties, "Value.Value");
+    ASSERT_NE(value, nullptr);
+
+    const int request = client.send_request(
+        "tools/call",
+        json{
+            {"name", "set_property"},
+            {"arguments",
+             json{{"session", session},
+                  {"element", inputRef},
+                  {"descriptorId",
+                   value->value("descriptorId", "")},
+                  {"value", "must-not-set"}}}});
+    lvt::test_support::ScopedEventSignal releaseOnExit(
+        release.get());
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0)
+        << "set_property did not reach reference resolution";
+
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            fixture.root, edit, native_fixture::kEditId);
+    releaseOnExit.signal();
+    const auto response = client.await_response(request);
+    ASSERT_TRUE(response.contains("result"))
+        << response.dump(2);
+
+    if (lvt::test_support::exact_hwnd_recycle_is_unavailable(
+            recycled)) {
+        client.shutdown();
+        sample.stop();
+        GTEST_SKIP() << recycled.reason;
+    }
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::achieved)
+        << recycled.reason;
+    ASSERT_EQ(recycled.replacement, edit);
+
+    EXPECT_TRUE(
+        response["result"].value("isError", false))
+        << response.dump(2);
+    json error;
+    for (const auto& block :
+         response["result"].value(
+             "content", json::array())) {
+        if (block.value("type", "") == "text") {
+            error = json::parse(
+                block.value("text", "{}"),
+                nullptr, false);
+            break;
+        }
+    }
+    ASSERT_FALSE(error.is_discarded())
+        << response.dump(2);
+    expect_typed_property_session_disconnected(error);
+}
+
+TEST(McpUiaIdentity, AltTabSequenceRechecksForegroundBeforeDelete) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto uiaStats =
+        plugin_stats_path("uia-alt-tab-sequence");
+    const auto visualStats =
+        plugin_stats_path("visual-alt-tab-sequence");
+    std::error_code ec;
+    fs::remove(uiaStats, ec);
+    fs::remove(visualStats, ec);
+    ScopedEnvironmentVariable uiaForeground(
+        "LVT_TEST_UIA_FOREGROUND_SUCCESS", "1");
+    ScopedEnvironmentVariable uiaGate(
+        "LVT_TEST_UIA_AFTER_FOREGROUND_GATE",
+        "Local\\LvtUnusedForegroundGate");
+    ScopedEnvironmentVariable uiaOutput(
+        "LVT_TEST_UIA_SEND_INPUT_STATS", uiaStats.string());
+    ScopedEnvironmentVariable uiaSuppress(
+        "LVT_TEST_UIA_SUPPRESS_SEND_INPUT", "1");
+    ScopedEnvironmentVariable uiaSteal(
+        "LVT_TEST_UIA_FOREGROUND_STEAL_AT", "2");
+    ScopedEnvironmentVariable visualForeground(
+        "LVT_TEST_VISUAL_FOREGROUND_SUCCESS", "1");
+    ScopedEnvironmentVariable visualOutput(
+        "LVT_TEST_VISUAL_SEND_INPUT_STATS",
+        visualStats.string());
+    ScopedEnvironmentVariable visualSuppress(
+        "LVT_TEST_VISUAL_SUPPRESS_SEND_INPUT", "1");
+    ScopedEnvironmentVariable visualSteal(
+        "LVT_TEST_VISUAL_FOREGROUND_STEAL_AT", "2");
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto uiaConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()}, {"mode", "uia"}});
+    const auto visualConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const auto uiaSession =
+        uiaConnected.value("session", "");
+    const auto visualSession =
+        visualConnected.value("session", "");
+    ASSERT_FALSE(uiaSession.empty()) << uiaConnected.dump(2);
+    ASSERT_FALSE(visualSession.empty())
+        << visualConnected.dump(2);
+
+    ShowWindow(sample.hwnd(), SW_MINIMIZE);
+    Sleep(100);
+    ASSERT_TRUE(IsIconic(sample.hwnd()));
+    for (const auto& session :
+         {uiaSession, visualSession}) {
+        bool isError = false;
+        const auto result = client.call_tool(
+            "press_key",
+            json{{"session", session},
+                 {"text", "Alt+Tab;Delete"}},
+            &isError);
+        EXPECT_FALSE(isError) << result.dump(2);
+    }
+    EXPECT_FALSE(IsIconic(sample.hwnd()))
+        << "unconditional visual activation must restore a minimized root";
+
+    for (const auto& statsPath :
+         {uiaStats, visualStats}) {
+        const auto stats = read_plugin_stats(statsPath);
+        EXPECT_EQ(
+            count_plugin_stats(stats, "press-key"), 2u)
+            << statsPath.string();
+        EXPECT_EQ(
+            count_plugin_stats(stats, "reactivate"), 1u)
+            << "the second chord must re-activate after Alt+Tab: "
+            << statsPath.string();
+    }
+    const auto visualActivationStats =
+        read_plugin_stats(visualStats);
+    EXPECT_EQ(
+        count_plugin_stats(
+            visualActivationStats, "activate"),
+        2u)
+        << "visual mode must activate initially even when already foreground, "
+           "then activate again after the simulated Alt+Tab";
+    fs::remove(uiaStats, ec);
+    fs::remove(visualStats, ec);
+}
+
+TEST(McpUiaIdentity, VisualMinimizedClickAlwaysRunsActivation) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath =
+        plugin_stats_path("visual-minimized-click");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+    ScopedEnvironmentVariable visualForeground(
+        "LVT_TEST_VISUAL_FOREGROUND_SUCCESS", "1");
+    ScopedEnvironmentVariable visualOutput(
+        "LVT_TEST_VISUAL_SEND_INPUT_STATS",
+        statsPath.string());
+    ScopedEnvironmentVariable visualSuppress(
+        "LVT_TEST_VISUAL_SUPPRESS_SEND_INPUT", "1");
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "visual"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    const auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto rootRef =
+        tree["root"].value("ref", "");
+    ASSERT_FALSE(rootRef.empty()) << tree.dump(2);
+
+    ShowWindow(sample.hwnd(), SW_MINIMIZE);
+    ASSERT_TRUE(IsIconic(sample.hwnd()));
+    bool isError = false;
+    const auto clicked = client.call_tool(
+        "click",
+        json{{"session", session},
+             {"element", rootRef}},
+        &isError);
+    EXPECT_FALSE(isError) << clicked.dump(2);
+    EXPECT_FALSE(IsIconic(sample.hwnd()));
+
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "activate"), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "click"), 1u);
+    fs::remove(statsPath, ec);
+}
+
+TEST(McpUiaIdentity, WindowPatternCloseSucceedsWhenTargetDisappears) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const HWND target = sample.hwnd();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()}, {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    const auto tree = client.call_tool(
+        "get_uia_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto runtimeId =
+        tree["root"]
+            .value("properties", json::object())
+            .value("RuntimeId", "");
+    ASSERT_FALSE(runtimeId.empty()) << tree.dump(2);
+
+    bool isError = false;
+    const auto closed = client.call_tool(
+        "window_action",
+        json{{"session", session},
+             {"element", "uia:" + runtimeId},
+             {"action", "close"}},
+        &isError);
+    EXPECT_FALSE(isError) << closed.dump(2);
+    EXPECT_TRUE(closed.value("ok", false)) << closed.dump(2);
+    EXPECT_EQ(closed.value("method", ""), "WindowPattern.Close")
+        << closed.dump(2);
+    const auto deadline = GetTickCount64() + 5000;
+    while (IsWindow(target) && GetTickCount64() < deadline)
+        Sleep(20);
+    EXPECT_FALSE(IsWindow(target));
+}
+
+TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
+    if (lvt::test_support::exact_hwnd_recycle_search_suppressed()) {
+        GTEST_SKIP()
+            << lvt::test_support::exact_hwnd_recycle_unavailable_reason();
+    }
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    struct FixtureWindow {
+        DWORD pid;
+        HWND root = nullptr;
+    } fixture{sample.pid()};
+    EnumWindows(
+        [](HWND candidate, LPARAM parameter) -> BOOL {
+            auto* fixture =
+                reinterpret_cast<FixtureWindow*>(parameter);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(candidate, &owner);
+            if (owner == fixture->pid &&
+                GetDlgItem(candidate, native_fixture::kEditId)) {
+                fixture->root = candidate;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&fixture));
+    ASSERT_TRUE(IsWindow(fixture.root));
+
+    const HWND original = GetDlgItem(
+        fixture.root, native_fixture::kEditId);
+    ASSERT_TRUE(IsWindow(original));
+    char originalText[32]{};
+    snprintf(
+        originalText, sizeof(originalText), "0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(original)));
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connected = client.call_tool(
+        "connect",
+        json{{"hwnd", originalText}, {"mode", "uia"}});
+    const auto session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    const auto visualConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", originalText}, {"mode", "visual"}});
+    const auto visualSession =
+        visualConnected.value("session", "");
+    ASSERT_FALSE(visualSession.empty())
+        << visualConnected.dump(2);
+    const auto initialTree = client.call_tool(
+        "get_uia_tree", json{{"session", session}});
+    ASSERT_TRUE(initialTree.contains("root"))
+        << initialTree.dump(2);
+    const auto runtimeId =
+        initialTree["root"]
+            .value("properties", json::object())
+            .value("RuntimeId", "");
+    ASSERT_FALSE(runtimeId.empty()) << initialTree.dump(2);
+    const auto inputRef = "uia:" + runtimeId;
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", inputRef}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* value = find_property_descriptor(
+        properties, "Value.Value");
+    ASSERT_NE(value, nullptr);
+    const auto descriptorId =
+        value->value("descriptorId", "");
+
+    auto initialVisualTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", visualSession}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << initialVisualTree.dump(2);
+    const auto visualKey =
+        initialVisualTree["root"].value("key", "");
+    ASSERT_EQ(
+        visualKey.rfind("win32:0x", 0), 0u)
+        << initialVisualTree.dump(2);
+    auto visualProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", visualSession},
+             {"element", visualKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << visualProperties.dump(2);
+    const auto* visualText =
+        find_property_descriptor(
+            visualProperties, "Text");
+    ASSERT_NE(visualText, nullptr)
+        << visualProperties.dump(2);
+    const auto visualDescriptorId =
+        visualText->value("descriptorId", "");
+    ASSERT_FALSE(visualDescriptorId.empty());
+
+    const auto visualResourceUri =
+        "lvt://session/" + visualSession +
+        "/visual-tree";
+
+    const auto recycled =
+        lvt::test_support::recycle_event_child_exact(
+            fixture.root, original,
+            native_fixture::kEditId);
+    if (lvt::test_support::exact_hwnd_recycle_is_unavailable(
+            recycled)) {
+        client.shutdown();
+        sample.stop();
+        GTEST_SKIP() << recycled.reason;
+    }
+    ASSERT_EQ(
+        recycled.outcome,
+        lvt::test_support::ExactHwndRecycleOutcome::achieved)
+        << recycled.reason;
+    ASSERT_EQ(recycled.replacement, original);
+
+    bool treeError = false;
+    const auto tree = client.call_tool(
+        "get_uia_tree",
+        json{{"session", session}}, &treeError);
+    EXPECT_TRUE(treeError) << tree.dump(2);
+    EXPECT_NE(
+        tree.dump().find("ownershipLost"),
+        std::string::npos)
+        << tree.dump(2);
+
+    for (const char* tool :
+         {"get_visual_tree",
+          "get_visual_tree_changes"}) {
+        bool visualTreeError = false;
+        const auto staleTree = client.call_tool(
+            tool,
+            json{{"session", visualSession}},
+            &visualTreeError);
+        EXPECT_TRUE(visualTreeError)
+            << staleTree.dump(2);
+        EXPECT_EQ(
+            staleTree.value("code", ""),
+            "ownershipLost")
+            << staleTree.dump(2);
+    }
+
+    const auto staleResource = client.request(
+        "resources/read",
+        json{{"uri", visualResourceUri}});
+    EXPECT_TRUE(staleResource.contains("error"))
+        << staleResource.dump(2);
+    EXPECT_NE(
+        staleResource.dump().find("ownershipLost"),
+        std::string::npos)
+        << staleResource.dump(2);
+    ASSERT_TRUE(
+        staleResource["error"].contains("data") &&
+        staleResource["error"]["data"].is_object())
+        << staleResource.dump(2);
+    EXPECT_EQ(
+        staleResource["error"]["data"].value(
+            "code", ""),
+        "ownershipLost")
+        << staleResource.dump(2);
+
+    for (const auto& [tool, text] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"type_text", "must-not-type"},
+             {"press_key", "A"}}) {
+        bool actionError = false;
+        const auto action = client.call_tool(
+            tool,
+            json{{"session", session}, {"text", text}},
+            &actionError);
+        EXPECT_TRUE(actionError) << action.dump(2);
+        EXPECT_EQ(
+            action.value("code", ""),
+            "ownershipLost")
+            << action.dump(2);
+    }
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"type_text",
+              json{{"session", visualSession},
+                   {"text", "must-not-type"}}},
+             {"press_key",
+              json{{"session", visualSession},
+                   {"text", "A"}}},
+             {"window_action",
+              json{{"session", visualSession},
+                   {"action", "minimize"}}}}) {
+        bool actionError = false;
+        const auto action = client.call_tool(
+            tool, arguments, &actionError);
+        EXPECT_TRUE(actionError) << action.dump(2);
+        EXPECT_EQ(
+            action.value("code", ""),
+            "ownershipLost")
+            << action.dump(2);
+    }
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"get_editable_properties",
+              json{{"session", session},
+                   {"element", inputRef}}},
+             {"set_property",
+              json{{"session", session},
+                   {"element", inputRef},
+                   {"descriptorId", descriptorId},
+                   {"value", "must-not-set"}}},
+             {"clear_property",
+              json{{"session", session},
+                   {"element", inputRef},
+                   {"descriptorId", descriptorId}}}}) {
+        isError = false;
+        const auto result = client.call_tool(
+            tool, arguments, &isError);
+        EXPECT_TRUE(isError) << result.dump(2);
+        expect_typed_property_session_disconnected(result);
+    }
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"get_editable_properties",
+              json{{"session", visualSession},
+                   {"element", visualKey}}},
+             {"set_property",
+              json{{"session", visualSession},
+                   {"element", visualKey},
+                   {"descriptorId",
+                    visualDescriptorId},
+                   {"value", "must-not-set"}}},
+             {"clear_property",
+              json{{"session", visualSession},
+                   {"element", visualKey},
+                   {"descriptorId",
+                    visualDescriptorId}}}}) {
+        isError = false;
+        const auto result = client.call_tool(
+            tool, arguments, &isError);
+        EXPECT_TRUE(isError) << result.dump(2);
+        expect_typed_property_session_disconnected(
+            result);
+    }
+}
+
+TEST(McpUiaIdentity, ScreenshotLifetimeFenceNeverPublishesReplacementCapture) {
+    int exactAchieved = 0;
+    const auto runCase = [&](
+        const char* mode,
+        lvt::test_support::ExactHwndRecycleTestMode recycleMode,
+        bool inlineImage) {
+        ManagedSampleProcess sample;
+        ASSERT_TRUE(sample.start(
+            NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+        struct FixtureWindow {
+            DWORD pid = 0;
+            HWND root = nullptr;
+        } fixture{sample.pid()};
+        EnumWindows(
+            [](HWND candidate, LPARAM parameter) -> BOOL {
+                auto* fixture =
+                    reinterpret_cast<FixtureWindow*>(
+                        parameter);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(
+                    candidate, &owner);
+                if (owner == fixture->pid &&
+                    GetDlgItem(
+                        candidate,
+                        native_fixture::kEditId)) {
+                    fixture->root = candidate;
+                    return FALSE;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&fixture));
+        ASSERT_TRUE(IsWindow(fixture.root));
+        const HWND original = GetDlgItem(
+            fixture.root, native_fixture::kEditId);
+        ASSERT_TRUE(IsWindow(original));
+
+        const std::string gateBase =
+            "Local\\LvtScreenshotFence_" +
+            std::to_string(GetCurrentProcessId()) +
+            "_" + std::to_string(GetTickCount64()) +
+            "_" + mode +
+            (inlineImage ? "_inline" : "_path");
+        wil::unique_event entered(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-entered").c_str()));
+        wil::unique_event release(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-release").c_str()));
+        ASSERT_TRUE(entered);
+        ASSERT_TRUE(release);
+        ScopedEnvironmentVariable fakeCapture(
+            "LVT_TEST_FAKE_SCREENSHOT_CAPTURE", "1");
+        ScopedEnvironmentVariable captureGate(
+            "LVT_TEST_SCREENSHOT_AFTER_CAPTURE_GATE",
+            gateBase);
+
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd",
+                  ManagedSampleProcess::hwnd_string(
+                      original)},
+                 {"mode", mode}});
+        const auto session =
+            connected.value("session", "");
+        ASSERT_FALSE(session.empty())
+            << connected.dump(2);
+
+        const auto output =
+            fs::path(get_lvt_path()).parent_path() /
+            ("screenshot-fence-" +
+             std::to_string(GetCurrentProcessId()) +
+             "-" + mode + ".png");
+        const std::string sentinel =
+            "existing caller file";
+        std::error_code ignored;
+        fs::remove(output, ignored);
+        if (!inlineImage) {
+            std::ofstream file(
+                output, std::ios::binary);
+            file << sentinel;
+            ASSERT_TRUE(file.good());
+        }
+        auto cleanup = wil::scope_exit([&] {
+            SetEvent(release.get());
+            fs::remove(output, ignored);
+        });
+
+        json arguments{{"session", session}};
+        if (!inlineImage)
+            arguments["path"] = output.string();
+        const int request = client.send_request(
+            "tools/call",
+            json{{"name", "screenshot"},
+                 {"arguments", arguments}});
+        ASSERT_EQ(
+            WaitForSingleObject(
+                entered.get(), 10000),
+            WAIT_OBJECT_0)
+            << "screenshot did not reach the post-capture gate";
+
+        lvt::test_support::ExactHwndRecycleOptions options;
+        options.testMode = recycleMode;
+        options.rememberUnavailable = false;
+        const auto recycled =
+            lvt::test_support::recycle_event_child_exact(
+                fixture.root, original,
+                native_fixture::kEditId, options);
+        ASSERT_NE(
+            recycled.outcome,
+            lvt::test_support::ExactHwndRecycleOutcome::
+                hardFailure)
+            << recycled.reason;
+        SetEvent(release.get());
+
+        const auto response =
+            client.await_response(request);
+        ASSERT_TRUE(response.contains("result"))
+            << response.dump(2);
+        const auto& result = response["result"];
+        ASSERT_TRUE(result.value("isError", false))
+            << response.dump(2);
+        const auto error =
+            result.value(
+                "structuredContent", json::object());
+        EXPECT_EQ(
+            error.value("code", ""),
+            "ownershipLost")
+            << error.dump(2);
+        EXPECT_FALSE(error.contains("imageBase64"))
+            << error.dump(2);
+
+        if (!inlineImage) {
+            std::ifstream file(
+                output, std::ios::binary);
+            const std::string current(
+                (std::istreambuf_iterator<char>(file)),
+                std::istreambuf_iterator<char>());
+            EXPECT_EQ(current, sentinel)
+                << "replacement capture overwrote the caller output";
+            const auto stagingPrefix =
+                output.filename().string() +
+                ".lvt-staging-";
+            for (const auto& entry :
+                 fs::directory_iterator(
+                     output.parent_path())) {
+                EXPECT_NE(
+                    entry.path().filename().string().rfind(
+                        stagingPrefix, 0),
+                    0u)
+                    << "screenshot staging file leaked: "
+                    << entry.path();
+            }
+        }
+        if (recycleMode ==
+                lvt::test_support::ExactHwndRecycleTestMode::
+                    normal &&
+            recycled.outcome ==
+                lvt::test_support::ExactHwndRecycleOutcome::
+                    achieved) {
+            ++exactAchieved;
+        }
+    };
+
+    runCase(
+        "uia",
+        lvt::test_support::ExactHwndRecycleTestMode::
+            forceUnavailable,
+        false);
+    runCase(
+        "visual",
+        lvt::test_support::ExactHwndRecycleTestMode::
+            forceUnavailable,
+        true);
+    runCase(
+        "uia",
+        lvt::test_support::ExactHwndRecycleTestMode::normal,
+        true);
+    runCase(
+        "visual",
+        lvt::test_support::ExactHwndRecycleTestMode::normal,
+        false);
+    if (exactAchieved == 0) {
+        RecordProperty(
+            "exactHwndRecycle",
+            "unavailable in shared USER handle table");
+    }
+}
+
+TEST(McpPluginPersistent, SharesRegistryConnectionAcrossSessions) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path("shared");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_V2_DIR, statsPath, "0", "0", "0", "0");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+
+    const auto connect = [&](const char* filter) {
+        const auto result = client->call_tool(
+            "connect",
+            json{{"hwnd", sample.hwnd_string()},
+                 {"title", filter},
+                 {"mode", "visual"}});
+        return result.value("session", "");
+    };
+    const std::string firstSession = connect("first-filter");
+    const std::string secondSession = connect("second-filter");
+    ASSERT_FALSE(firstSession.empty());
+    ASSERT_FALSE(secondSession.empty());
+
+    const auto readAndCheck =
+        [&](const std::string& session, const char* expectedFilter) {
+            const auto tree = client->call_tool(
+                "get_visual_tree", json{{"session", session}});
+            ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+            const auto* node = find_fake_plugin_node(tree["root"]);
+            ASSERT_NE(node, nullptr);
+            EXPECT_EQ(
+                node->value("properties", json::object()).value("filter", ""),
+                expectedFilter);
+        };
+    readAndCheck(firstSession, "first-filter");
+    readAndCheck(secondSession, "second-filter");
+    EXPECT_EQ(
+        count_plugin_stats(read_plugin_stats(statsPath), "open "), 1u);
+
+    bool isError = false;
+    client->call_tool(
+        "disconnect", json{{"session", firstSession}}, &isError);
+    ASSERT_FALSE(isError);
+    EXPECT_EQ(
+        count_plugin_stats(read_plugin_stats(statsPath), "close"), 0u);
+
+    readAndCheck(secondSession, "second-filter");
+    client->call_tool(
+        "disconnect", json{{"session", secondSession}}, &isError);
+    ASSERT_FALSE(isError);
+
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "get "), 3u);
+    EXPECT_EQ(count_plugin_stats(stats, "free"), 3u);
+    EXPECT_EQ(count_plugin_stats(stats, "poll"), 3u)
+        << "each successful plugin snapshot must have one post-success poll";
+    EXPECT_EQ(count_plugin_stats(stats, "events_free"), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 1u);
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+TEST(McpPluginPersistent, DisconnectDuringDetectionNeverFallsBackOneShot) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path("disconnect-detection");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_V2_DIR, statsPath, "0", "0", "0", "0",
+        "2", "500");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+    const auto connected = client->call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    const int readId = client->send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    const auto detectionDeadline = GetTickCount64() + 5000;
+    while (GetTickCount64() < detectionDeadline) {
+        if (count_plugin_stats(read_plugin_stats(statsPath), "detect ") >= 2)
+            break;
+        Sleep(10);
+    }
+    ASSERT_GE(
+        count_plugin_stats(read_plugin_stats(statsPath), "detect "), 2u);
+
+    const int disconnectId = client->send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+    const auto readResponse = client->await_response(readId);
+    const auto disconnectResponse = client->await_response(disconnectId);
+    ASSERT_TRUE(readResponse.contains("result")) << readResponse.dump(2);
+    ASSERT_TRUE(disconnectResponse.contains("result"))
+        << disconnectResponse.dump(2);
+    EXPECT_FALSE(readResponse["result"].value("isError", false));
+    EXPECT_FALSE(disconnectResponse["result"].value("isError", false));
+
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "enrich "), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "get "), 1u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 1u);
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+TEST(McpPluginPersistent, PreservesDetectingPluginIdentityAndAlias) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path("identity");
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client = start_plugin_mcp(
+        LVT_FAKE_PLUGIN_IDENTITY_DIR, statsPath, "0", "0", "0", "0");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+    const auto connected = client->call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"title", "identity-filter"},
+             {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    ASSERT_TRUE(connected.contains("frameworks"));
+    EXPECT_EQ(
+        std::count(
+            connected["frameworks"].begin(), connected["frameworks"].end(),
+            "shared-alias test"),
+        2);
+
+    const auto tree =
+        client->call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    std::set<std::string> pluginNames;
+    std::vector<const json*> elements;
+    collect_json_elements(tree["root"], elements);
+    for (const auto* element : elements) {
+        if (element->value("type", "") != "FakePluginNode")
+            continue;
+        EXPECT_EQ(element->value("framework", ""), "shared-alias");
+        const auto properties =
+            element->value("properties", json::object());
+        EXPECT_EQ(properties.value("filter", ""), "identity-filter");
+        pluginNames.insert(properties.value("plugin", ""));
+    }
+    EXPECT_EQ(
+        pluginNames,
+        (std::set<std::string>{"fake-plugin-a", "fake-plugin-b"}));
+
+    bool isError = false;
+    client->call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError);
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "get "), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 2u);
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+void verify_legacy_plugin_mcp_fallback(
+    const fs::path& pluginDirectory, const std::string& variant) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+    const auto statsPath = plugin_stats_path(variant);
+    std::error_code ec;
+    fs::remove(statsPath, ec);
+
+    auto client =
+        start_plugin_mcp(pluginDirectory, statsPath, "0", "0", "0", "0");
+    ASSERT_TRUE(client->started());
+    ASSERT_TRUE(client->handshake());
+    const auto connected = client->call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"title", "legacy-filter"},
+             {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto tree = client->call_tool(
+            "get_visual_tree", json{{"session", session}});
+        ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+        const auto* node = find_fake_plugin_node(tree["root"]);
+        ASSERT_NE(node, nullptr);
+        EXPECT_EQ(
+            node->value("properties", json::object()).value("source", ""),
+            "one-shot");
+        EXPECT_EQ(
+            node->value("properties", json::object()).value("filter", ""),
+            "legacy-filter");
+    }
+
+    bool isError = false;
+    client->call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    EXPECT_FALSE(isError);
+    const auto stats = read_plugin_stats(statsPath);
+    EXPECT_EQ(count_plugin_stats(stats, "enrich "), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "free"), 2u);
+    EXPECT_EQ(count_plugin_stats(stats, "open "), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "get "), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "poll"), 0u);
+    EXPECT_EQ(count_plugin_stats(stats, "close"), 0u);
+
+    client->shutdown();
+    fs::remove(statsPath, ec);
+}
+
+TEST(McpPluginPersistent, V1AndPartialV2RemainOneShot) {
+    verify_legacy_plugin_mcp_fallback(
+        LVT_FAKE_PLUGIN_V1_DIR, "legacy");
+    verify_legacy_plugin_mcp_fallback(
+        LVT_FAKE_PLUGIN_PARTIAL_DIR, "partial");
+}
+
+class ManagedSampleUiBlock {
+public:
+    bool enter(const wchar_t* framework, DWORD pid) {
+        const std::wstring prefix =
+            L"Local\\Lvt" + std::wstring(framework) +
+            L"SampleUiBlock_" + std::to_wstring(pid);
+        trigger_.reset(OpenEventW(
+            EVENT_MODIFY_STATE, FALSE, (prefix + L"_trigger").c_str()));
+        entered_.reset(OpenEventW(
+            SYNCHRONIZE, FALSE, (prefix + L"_entered").c_str()));
+        release_.reset(OpenEventW(
+            EVENT_MODIFY_STATE, FALSE, (prefix + L"_release").c_str()));
+        if (!trigger_ || !entered_ || !release_)
+            return false;
+        if (!SetEvent(trigger_.get()))
+            return false;
+        active_ =
+            WaitForSingleObject(entered_.get(), 5000) == WAIT_OBJECT_0;
+        return active_;
+    }
+
+    void release() {
+        if (active_) {
+            SetEvent(release_.get());
+            active_ = false;
+        }
+    }
+
+    ~ManagedSampleUiBlock() {
+        release();
+    }
+
+private:
+    wil::unique_handle trigger_;
+    wil::unique_handle entered_;
+    wil::unique_handle release_;
+    bool active_ = false;
+};
+
+int count_managed_tap_starts(const wchar_t* logName, DWORD pid) {
+    wchar_t tempPath[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tempPath) == 0)
+        return 0;
+    std::ifstream log(std::wstring(tempPath) + logName, std::ios::binary);
+    const std::string pidMarker = "[pid=" + std::to_string(pid) + " ";
+    int count = 0;
+    std::string line;
+    while (std::getline(log, line)) {
+        if (line.find(pidMarker) != std::string::npos &&
+            line.find("Persistent managed TAP worker starting") != std::string::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+const json* find_managed_named_element(const json& root, const std::string& name) {
+    std::vector<const json*> elements;
+    collect_json_elements(root, elements);
+    for (const auto* element : elements) {
+        if (element->value("properties", json::object()).value("name", "") == name)
+            return element;
+    }
+    return nullptr;
+}
+
+void verify_managed_window_property_authorization(
+    const fs::path& executable,
+    const char* secondaryWindowEnvironment,
+    const char* primaryTitle,
+    const char* secondaryTitle,
+    const char* primaryElementName,
+    const char* primarySiblingName,
+    const char* secondaryElementName,
+    const char* propertyName) {
+    ScopedEnvironmentVariable enableSecondary(
+        secondaryWindowEnvironment, "1");
+    const std::string failureEventName =
+        "Local\\LvtManagedTreeFailure_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event failManagedTree(CreateEventA(
+        nullptr, TRUE, FALSE,
+        failureEventName.c_str()));
+    ASSERT_TRUE(failManagedTree);
+    ScopedEnvironmentVariable failureEvent(
+        "LVT_TEST_MANAGED_FAIL_TREE_EVENT",
+        failureEventName);
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(executable));
+
+    HWND primaryHwnd = nullptr;
+    HWND secondaryHwnd = nullptr;
+    for (int attempt = 0;
+         attempt < 50 &&
+         (!primaryHwnd || !secondaryHwnd);
+         ++attempt) {
+        primaryHwnd =
+            sample.hwnd_with_title(primaryTitle);
+        secondaryHwnd =
+            sample.hwnd_with_title(secondaryTitle);
+        if (!primaryHwnd || !secondaryHwnd)
+            Sleep(100);
+    }
+    ASSERT_TRUE(IsWindow(primaryHwnd));
+    ASSERT_TRUE(IsWindow(secondaryHwnd));
+    ASSERT_NE(primaryHwnd, secondaryHwnd);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto connectWindow =
+        [&](HWND hwnd) {
+            auto connected = client.call_tool(
+                "connect",
+                json{{"hwnd", ManagedSampleProcess::hwnd_string(hwnd)},
+                     {"mode", "visual"}});
+            EXPECT_FALSE(connected.value("session", "").empty())
+                << connected.dump(2);
+            return connected.value("session", "");
+        };
+    const auto primarySession =
+        connectWindow(primaryHwnd);
+    const auto secondarySession =
+        connectWindow(secondaryHwnd);
+    ASSERT_FALSE(primarySession.empty());
+    ASSERT_FALSE(secondarySession.empty());
+
+    bool isError = false;
+    auto primaryTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", primarySession}}, &isError);
+    ASSERT_FALSE(isError) << primaryTree.dump(2);
+    auto secondaryTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", secondarySession}}, &isError);
+    ASSERT_FALSE(isError) << secondaryTree.dump(2);
+    const auto* primaryElement =
+        find_managed_named_element(
+            primaryTree["root"], primaryElementName);
+    const auto* primarySibling =
+        find_managed_named_element(
+            primaryTree["root"], primarySiblingName);
+    const auto* secondaryElement =
+        find_managed_named_element(
+            secondaryTree["root"], secondaryElementName);
+    ASSERT_NE(primaryElement, nullptr)
+        << primaryTree.dump(2);
+    ASSERT_NE(primarySibling, nullptr)
+        << primaryTree.dump(2);
+    ASSERT_NE(secondaryElement, nullptr)
+        << secondaryTree.dump(2);
+    const auto primaryKey =
+        primaryElement->value("key", "");
+    const auto siblingKey =
+        primarySibling->value("key", "");
+    const auto secondaryKey =
+        secondaryElement->value("key", "");
+    ASSERT_FALSE(primaryKey.empty());
+    ASSERT_FALSE(siblingKey.empty());
+    ASSERT_FALSE(secondaryKey.empty());
+    ASSERT_NE(primaryKey, secondaryKey);
+
+    auto primaryProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession},
+             {"element", primaryKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << primaryProperties.dump(2);
+    const auto* primaryDescriptor =
+        find_property_descriptor(
+            primaryProperties, propertyName);
+    ASSERT_NE(primaryDescriptor, nullptr)
+        << primaryProperties.dump(2);
+    const auto primaryDescriptorId =
+        primaryDescriptor->value(
+            "descriptorId", "");
+    const auto originalPrimaryValue =
+        typed_property_value(
+            primaryProperties, propertyName);
+    ASSERT_FALSE(primaryDescriptorId.empty());
+    auto secondaryProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession},
+             {"element", secondaryKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << secondaryProperties.dump(2);
+    const auto* secondaryDescriptor =
+        find_property_descriptor(
+            secondaryProperties, propertyName);
+    ASSERT_NE(secondaryDescriptor, nullptr)
+        << secondaryProperties.dump(2);
+    ASSERT_TRUE(
+        secondaryDescriptor->value(
+            "supportsClear", false))
+        << secondaryDescriptor->dump(2);
+    const auto descriptorId =
+        secondaryDescriptor->value(
+            "descriptorId", "");
+    const auto originalValue =
+        typed_property_value(
+            secondaryProperties, propertyName);
+    ASSERT_FALSE(descriptorId.empty());
+
+    auto crossRead = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession},
+             {"element", secondaryKey}},
+        &isError);
+    ASSERT_TRUE(isError) << crossRead.dump(2);
+    expect_typed_property_target_not_authorized(
+        crossRead);
+
+    auto crossSet = client.call_tool(
+        "set_property",
+        json{{"session", primarySession},
+             {"element", secondaryKey},
+             {"descriptorId", descriptorId},
+             {"value", "cross-window write"}},
+        &isError);
+    ASSERT_TRUE(isError) << crossSet.dump(2);
+    expect_typed_property_target_not_authorized(
+        crossSet);
+
+    auto crossClear = client.call_tool(
+        "clear_property",
+        json{{"session", primarySession},
+             {"element", secondaryKey},
+             {"descriptorId", descriptorId}},
+        &isError);
+    ASSERT_TRUE(isError) << crossClear.dump(2);
+    expect_typed_property_target_not_authorized(
+        crossClear);
+
+    auto unchanged = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession},
+             {"element", secondaryKey}},
+        &isError);
+    ASSERT_FALSE(isError) << unchanged.dump(2);
+    EXPECT_EQ(
+        typed_property_value(unchanged, propertyName),
+        originalValue);
+
+    auto ownSet = client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryKey},
+             {"descriptorId", descriptorId},
+             {"value", "session-owned write"}},
+        &isError);
+    ASSERT_FALSE(isError) << ownSet.dump(2);
+    auto ownClear = client.call_tool(
+        "clear_property",
+        json{{"session", secondarySession},
+             {"element", secondaryKey},
+             {"descriptorId", descriptorId}},
+        &isError);
+    ASSERT_FALSE(isError) << ownClear.dump(2);
+    auto ownRestore = client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryKey},
+             {"descriptorId", descriptorId},
+             {"value", originalValue}},
+        &isError);
+    ASSERT_FALSE(isError) << ownRestore.dump(2);
+
+    auto scoped = client.call_tool(
+        "get_visual_tree",
+        json{{"session", primarySession},
+             {"element", primaryKey},
+             {"depth", 0}},
+        &isError);
+    ASSERT_FALSE(isError) << scoped.dump(2);
+    auto siblingAfterScope = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession},
+             {"element", siblingKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << "a scoped response revoked another published descendant: "
+        << siblingAfterScope.dump(2);
+
+    ASSERT_TRUE(SetEvent(failManagedTree.get()));
+    auto failedSnapshot = client.call_tool(
+        "get_visual_tree",
+        json{{"session", primarySession}},
+        &isError);
+    ASSERT_TRUE(ResetEvent(
+        failManagedTree.get()));
+    ASSERT_TRUE(isError)
+        << failedSnapshot.dump(2);
+    EXPECT_NE(
+        failedSnapshot.value("error", "")
+            .find("temporarily unavailable"),
+        std::string::npos)
+        << failedSnapshot.dump(2);
+    auto siblingAfterFailure =
+        client.call_tool(
+            "get_editable_properties",
+            json{{"session", primarySession},
+                 {"element", siblingKey}},
+            &isError);
+    ASSERT_FALSE(isError)
+        << "an incomplete snapshot replaced the last complete "
+           "authorization set: "
+        << siblingAfterFailure.dump(2);
+
+    auto changes = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", primarySession}},
+        &isError);
+    ASSERT_FALSE(isError) << changes.dump(2);
+    const auto resourceUri =
+        "lvt://session/" + primarySession +
+        "/visual-tree";
+    auto subscribed = client.request(
+        "resources/subscribe",
+        json{{"uri", resourceUri}});
+    ASSERT_TRUE(subscribed.contains("result"))
+        << subscribed.dump(2);
+    auto initialRead = client.request(
+        "resources/read",
+        json{{"uri", resourceUri}});
+    ASSERT_TRUE(initialRead.contains("result"))
+        << initialRead.dump(2);
+
+    const int fullRequest = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments",
+              json{{"session", primarySession}}}});
+    const int scopedRequest = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments",
+              json{{"session", primarySession},
+                   {"element", primaryKey},
+                   {"depth", 0}}}});
+    const int changesRequest = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree_changes"},
+             {"arguments",
+              json{{"session", primarySession}}}});
+    const int resourceRequest = client.send_request(
+        "resources/read",
+        json{{"uri", resourceUri}});
+    for (const int request :
+         {fullRequest, scopedRequest, changesRequest}) {
+        const auto response =
+            client.await_response(request);
+        ASSERT_TRUE(response.contains("result"))
+            << response.dump(2);
+        EXPECT_FALSE(
+            response["result"].value(
+                "isError", true))
+            << response.dump(2);
+    }
+    const auto resourceResponse =
+        client.await_response(resourceRequest);
+    ASSERT_TRUE(resourceResponse.contains("result"))
+        << resourceResponse.dump(2);
+
+    auto siblingAfterConcurrentReads =
+        client.call_tool(
+            "get_editable_properties",
+            json{{"session", primarySession},
+                 {"element", siblingKey}},
+            &isError);
+    ASSERT_FALSE(isError)
+        << siblingAfterConcurrentReads.dump(2);
+    crossRead = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession},
+             {"element", secondaryKey}},
+        &isError);
+    ASSERT_TRUE(isError) << crossRead.dump(2);
+    expect_typed_property_target_not_authorized(
+        crossRead);
+
+    const auto freshSession =
+        connectWindow(primaryHwnd);
+    ASSERT_FALSE(freshSession.empty());
+    auto beforeFreshSnapshot = client.call_tool(
+        "get_editable_properties",
+        json{{"session", freshSession},
+             {"element", primaryKey}},
+        &isError);
+    ASSERT_TRUE(isError)
+        << beforeFreshSnapshot.dump(2);
+    expect_typed_property_target_not_authorized(
+        beforeFreshSnapshot);
+    auto freshTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", freshSession}}, &isError);
+    ASSERT_FALSE(isError) << freshTree.dump(2);
+    auto afterFreshSnapshot = client.call_tool(
+        "get_editable_properties",
+        json{{"session", freshSession},
+             {"element", primaryKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << afterFreshSnapshot.dump(2);
+
+    auto unsubscribed = client.request(
+        "resources/unsubscribe",
+        json{{"uri", resourceUri}});
+    EXPECT_TRUE(unsubscribed.contains("result"))
+        << unsubscribed.dump(2);
+    Sleep(750);
+    auto beforeReparent = client.call_tool(
+        "get_visual_tree",
+        json{{"session", primarySession}},
+        &isError);
+    ASSERT_FALSE(isError) << beforeReparent.dump(2);
+
+    DWORD_PTR reparented = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            primaryHwnd, 0x84D1, 0, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            5000, &reparented),
+        0);
+    ASSERT_EQ(reparented, 1u);
+
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"get_editable_properties",
+              json{{"session", primarySession},
+                   {"element", primaryKey}}},
+             {"set_property",
+              json{{"session", primarySession},
+                   {"element", primaryKey},
+                   {"descriptorId", primaryDescriptorId},
+                   {"value", "must-not-cross-window"}}},
+             {"clear_property",
+              json{{"session", primarySession},
+                   {"element", primaryKey},
+                   {"descriptorId", primaryDescriptorId}}}}) {
+        isError = false;
+        const auto denied = client.call_tool(
+            tool, arguments, &isError);
+        ASSERT_TRUE(isError) << denied.dump(2);
+        expect_typed_property_target_membership_lost(
+            denied);
+    }
+
+    auto siblingAfterReparent = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession},
+             {"element", siblingKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << "a moved element must not poison the live session: "
+        << siblingAfterReparent.dump(2);
+
+    auto movedTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", secondarySession}},
+        &isError);
+    ASSERT_FALSE(isError) << movedTree.dump(2);
+    const auto* movedElement =
+        find_managed_named_element(
+            movedTree["root"], primaryElementName);
+    ASSERT_NE(movedElement, nullptr)
+        << movedTree.dump(2);
+    EXPECT_EQ(
+        movedElement->value("key", ""),
+        primaryKey);
+    auto movedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession},
+             {"element", primaryKey}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << movedProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(
+            movedProperties, propertyName),
+        originalPrimaryValue)
+        << "the denied old-session mutation changed the moved element";
+
+    auto primaryAfterMove = client.call_tool(
+        "get_visual_tree",
+        json{{"session", primarySession}},
+        &isError);
+    ASSERT_FALSE(isError) << primaryAfterMove.dump(2);
+    auto revokedAfterSnapshot = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession},
+             {"element", primaryKey}},
+        &isError);
+    ASSERT_TRUE(isError)
+        << revokedAfterSnapshot.dump(2);
+    expect_typed_property_target_not_authorized(
+        revokedAfterSnapshot);
+}
+
+void verify_managed_mcp_connection(
+    const fs::path& executable, const std::string& elementName,
+    const std::string& keyPrefix, const wchar_t* logName) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(executable));
+    const int startsBefore = count_managed_tap_starts(logName, sample.pid());
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    auto connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    auto first = client.call_tool("get_visual_tree", json{{"session", session}});
+    auto second = client.call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(first.contains("root")) << first.dump(2);
+    ASSERT_TRUE(second.contains("root")) << second.dump(2);
+    const json* firstElement = find_managed_named_element(first["root"], elementName);
+    const json* secondElement = find_managed_named_element(second["root"], elementName);
+    ASSERT_NE(firstElement, nullptr);
+    ASSERT_NE(secondElement, nullptr);
+    const std::string firstKey = firstElement->value("key", "");
+    const std::string firstHandle =
+        firstElement->value("properties", json::object()).value("managedHandle", "");
+    EXPECT_EQ(firstKey.rfind(keyPrefix, 0), 0u);
+    EXPECT_FALSE(firstHandle.empty());
+    EXPECT_EQ(secondElement->value("key", ""), firstKey);
+    EXPECT_EQ(secondElement->value("properties", json::object()).value("managedHandle", ""),
+              firstHandle);
+
+    bool isError = false;
+    auto disconnected =
+        client.call_tool("disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << disconnected.dump(2);
+    EXPECT_EQ(count_managed_tap_starts(logName, sample.pid()) - startsBefore, 1)
+        << "two MCP tree reads must reuse exactly one managed TAP injection";
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string reconnectedSession = connected.value("session", "");
+    ASSERT_FALSE(reconnectedSession.empty()) << connected.dump(2);
+    auto third =
+        client.call_tool("get_visual_tree", json{{"session", reconnectedSession}});
+    ASSERT_TRUE(third.contains("root")) << third.dump(2);
+    const json* thirdElement = find_managed_named_element(third["root"], elementName);
+    ASSERT_NE(thirdElement, nullptr);
+    EXPECT_EQ(thirdElement->value("key", ""), firstKey);
+    EXPECT_EQ(thirdElement->value("properties", json::object()).value("managedHandle", ""),
+              firstHandle);
+    client.call_tool("disconnect", json{{"session", reconnectedSession}}, &isError);
+    ASSERT_FALSE(isError);
+    EXPECT_EQ(count_managed_tap_starts(logName, sample.pid()) - startsBefore, 2)
+        << "disconnect must tear down cleanly so a new MCP session can reconnect";
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string brokenPipeSession = connected.value("session", "");
+    ASSERT_FALSE(brokenPipeSession.empty()) << connected.dump(2);
+    auto beforeBreak =
+        client.call_tool("get_visual_tree", json{{"session", brokenPipeSession}});
+    ASSERT_TRUE(beforeBreak.contains("root")) << beforeBreak.dump(2);
+    client.terminate_server();
+
+    McpClient recovered(false);
+    ASSERT_TRUE(recovered.started());
+    ASSERT_TRUE(recovered.handshake());
+    connected = recovered.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string recoveredSession = connected.value("session", "");
+    ASSERT_FALSE(recoveredSession.empty()) << connected.dump(2);
+    bool recoveredPropertyError = false;
+    auto recoveredProperties = recovered.call_tool(
+        "get_editable_properties",
+        json{{"session", recoveredSession}, {"element", firstKey}},
+        &recoveredPropertyError);
+    ASSERT_TRUE(recoveredPropertyError)
+        << recoveredProperties.dump(2);
+    EXPECT_EQ(
+        recoveredProperties.value("errorCode", ""),
+        "typed_property_target_not_authorized")
+        << "a new MCP session must publish its own complete snapshot before "
+           "reusing a compact managed key";
+    auto afterBreak =
+        recovered.call_tool("get_visual_tree", json{{"session", recoveredSession}});
+    ASSERT_TRUE(afterBreak.contains("root")) << afterBreak.dump(2);
+    const json* recoveredElement =
+        find_managed_named_element(afterBreak["root"], elementName);
+    ASSERT_NE(recoveredElement, nullptr);
+    EXPECT_EQ(recoveredElement->value("key", ""), firstKey);
+    EXPECT_EQ(
+        recoveredElement->value("properties", json::object()).value("managedHandle", ""),
+        firstHandle);
+    recoveredProperties = recovered.call_tool(
+        "get_editable_properties",
+        json{{"session", recoveredSession}, {"element", firstKey}},
+        &recoveredPropertyError);
+    ASSERT_FALSE(recoveredPropertyError)
+        << recoveredProperties.dump(2);
+    EXPECT_FALSE(
+        recoveredProperties.value("descriptors", json::array()).empty());
+    recovered.call_tool("disconnect", json{{"session", recoveredSession}}, &isError);
+    ASSERT_FALSE(isError);
+    EXPECT_EQ(count_managed_tap_starts(logName, sample.pid()) - startsBefore, 4)
+        << "a broken MCP transport must let the managed server exit and reconnect";
+}
+
 // The sample app is the target for anything that needs known AutomationIds.
 class McpSampleFixture : public ::testing::Test {
 protected:
     static void SetUpTestSuite() {
         const fs::path exe = WINUI3_SAMPLE_EXE_PATH;
-        if (!fs::exists(exe))
+        if (!fs::exists(exe)) {
+            s_skip_reason = "the WinUI3 sample app is not available at " + exe.string();
             return;
+        }
+        const auto fixtureMachine = pe_machine(exe);
+        if (fixtureMachine != IMAGE_FILE_MACHINE_UNKNOWN &&
+            test_machine() != IMAGE_FILE_MACHINE_UNKNOWN &&
+            fixtureMachine != test_machine()) {
+            s_skip_reason =
+                "WinUI3 fixture architecture mismatch: tests are " +
+                std::string(machine_name(test_machine())) + ", fixture is " +
+                machine_name(fixtureMachine);
+            return;
+        }
         STARTUPINFOA si{sizeof(si)};
         PROCESS_INFORMATION pi{};
         std::string cmd = exe.string();
+        SetEnvironmentVariableA("LVT_TEST_SECONDARY_WINDOW", "1");
         if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr,
-                            exe.parent_path().string().c_str(), &si, &pi))
+                            exe.parent_path().string().c_str(), &si, &pi)) {
+            SetEnvironmentVariableA("LVT_TEST_SECONDARY_WINDOW", nullptr);
+            s_skip_reason =
+                "failed to launch the WinUI3 sample app (error " +
+                std::to_string(GetLastError()) + ")";
             return;
+        }
+        SetEnvironmentVariableA("LVT_TEST_SECONDARY_WINDOW", nullptr);
         s_process.reset(pi.hProcess);
         s_thread.reset(pi.hThread);
         WaitForInputIdle(s_process.get(), 10000);
@@ -412,6 +3731,8 @@ protected:
             if (!s_hwnd)
                 Sleep(500);
         }
+        if (!s_hwnd)
+            s_skip_reason = "the WinUI3 sample app did not create its test window";
     }
 
     static void TearDownTestSuite() {
@@ -422,9 +3743,20 @@ protected:
         s_hwnd = nullptr;
     }
 
+    void SetUp() override {
+        if (!s_hwnd)
+            GTEST_SKIP() << (s_skip_reason.empty()
+                ? "the WinUI3 sample app is not available"
+                : s_skip_reason);
+        if (!IsWindow(s_hwnd))
+            GTEST_SKIP() << "the WinUI3 sample app's window closed during the run";
+    }
+
     void SkipIfNotReady() {
         if (!s_hwnd)
-            GTEST_SKIP() << "the WinUI3 sample app is not available";
+            GTEST_SKIP() << (s_skip_reason.empty()
+                ? "the WinUI3 sample app is not available"
+                : s_skip_reason);
         // Every test in this fixture shares one app instance, so if it has gone
         // away the remaining tests would all fail with unrelated-looking
         // errors. Saying so once is far easier to act on.
@@ -439,9 +3771,40 @@ protected:
         return buf;
     }
 
+    static DWORD process_id() {
+        return s_process ? GetProcessId(s_process.get()) : 0;
+    }
+
+    static std::string secondary_hwnd_string() {
+        struct Search {
+            DWORD pid;
+            HWND hwnd = nullptr;
+        } search{GetProcessId(s_process.get())};
+        EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+            auto* state = reinterpret_cast<Search*>(lParam);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != state->pid || !IsWindowVisible(hwnd))
+                return TRUE;
+            char title[256]{};
+            GetWindowTextA(hwnd, title, sizeof(title));
+            if (strcmp(title, "LVT Native Secondary") != 0)
+                return TRUE;
+            state->hwnd = hwnd;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&search));
+        if (!search.hwnd)
+            return {};
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "0x%p",
+                 static_cast<void*>(search.hwnd));
+        return buffer;
+    }
+
     // Connect and return the session id, failing the test if it does not work.
-    static std::string connect(McpClient& client) {
-        auto result = client.call_tool("connect", json{{"hwnd", hwnd_string()}});
+    static std::string connect(McpClient& client, const std::string& mode = "uia") {
+        auto result = client.call_tool(
+            "connect", json{{"hwnd", hwnd_string()}, {"mode", mode}});
         return result.value("session", "");
     }
 
@@ -456,11 +3819,139 @@ protected:
     static wil::unique_process_handle s_process;
     static wil::unique_handle s_thread;
     static HWND s_hwnd;
+    static std::string s_skip_reason;
 };
 
 wil::unique_process_handle McpSampleFixture::s_process;
 wil::unique_handle McpSampleFixture::s_thread;
 HWND McpSampleFixture::s_hwnd = nullptr;
+std::string McpSampleFixture::s_skip_reason;
+
+class NativeMcpFixture : public ::testing::Test {
+protected:
+    static void SetUpTestSuite() {
+        const fs::path exe = NATIVE_CONTROLS_FIXTURE_EXE_PATH;
+        ASSERT_TRUE(fs::exists(exe));
+
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        std::wstring command = L"\"" + exe.wstring() + L"\"";
+        ASSERT_TRUE(CreateProcessW(
+            nullptr, command.data(), nullptr, nullptr, FALSE, 0,
+            nullptr, nullptr, &startup, &process));
+        s_process.reset(process.hProcess);
+        s_thread.reset(process.hThread);
+        s_pid = process.dwProcessId;
+        WaitForInputIdle(s_process.get(), 5000);
+
+        for (int attempt = 0; attempt < 50 && !s_hwnd; ++attempt) {
+            EnumWindows(
+                [](HWND hwnd, LPARAM parameter) -> BOOL {
+                    DWORD pid = 0;
+                    GetWindowThreadProcessId(hwnd, &pid);
+                    if (pid != s_pid)
+                        return TRUE;
+                    wchar_t className[128]{};
+                    GetClassNameW(
+                        hwnd, className,
+                        static_cast<int>(_countof(className)));
+                    if (wcscmp(
+                            className,
+                            native_fixture::kWindowClass) == 0) {
+                        *reinterpret_cast<HWND*>(parameter) = hwnd;
+                        return FALSE;
+                    }
+                    return TRUE;
+                },
+                reinterpret_cast<LPARAM>(&s_hwnd));
+            if (!s_hwnd)
+                Sleep(100);
+        }
+        ASSERT_NE(s_hwnd, nullptr);
+    }
+
+    static void TearDownTestSuite() {
+        if (s_hwnd && IsWindow(s_hwnd))
+            PostMessageW(s_hwnd, native_fixture::kCloseMessage, 0, 0);
+        if (s_process)
+            WaitForSingleObject(s_process.get(), 5000);
+        s_process.reset();
+        s_thread.reset();
+        s_hwnd = nullptr;
+        s_pid = 0;
+    }
+
+    static std::string hwnd_string() {
+        char value[32]{};
+        snprintf(
+            value, sizeof(value), "0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(s_hwnd)));
+        return value;
+    }
+
+    static std::string connect(McpClient& client) {
+        auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd", hwnd_string()}, {"mode", "visual"}});
+        return connected.value("session", "");
+    }
+
+    static std::string control_key(int id) {
+        const HWND hwnd = GetDlgItem(s_hwnd, id);
+        if (!hwnd)
+            return {};
+        char value[32]{};
+        snprintf(
+            value, sizeof(value), "0x%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(hwnd)));
+        const auto output = run_command(
+            "\"" + get_lvt_path() +
+            "\" dump --hwnd " + value);
+        const auto tree =
+            json::parse(output, nullptr, false);
+        return tree.is_discarded()
+            ? std::string()
+            : tree.value("root", json::object())
+                  .value("key", "");
+    }
+
+    static const json* find_by_class(
+        const json& tree, const std::string& className) {
+        std::vector<const json*> elements;
+        collect_json_elements(tree, elements);
+        for (const auto* element : elements) {
+            if (element->value("className", "") == className)
+                return element;
+        }
+        return nullptr;
+    }
+
+    static const json* find_child(
+        const json& parent, const std::string& type,
+        const std::string& text) {
+        std::vector<const json*> elements;
+        collect_json_elements(parent, elements);
+        for (const auto* element : elements) {
+            if (element->value("type", "") == type &&
+                element->value("text", "") == text) {
+                return element;
+            }
+        }
+        return nullptr;
+    }
+
+    static wil::unique_process_handle s_process;
+    static wil::unique_handle s_thread;
+    static DWORD s_pid;
+    static HWND s_hwnd;
+};
+
+wil::unique_process_handle NativeMcpFixture::s_process;
+wil::unique_handle NativeMcpFixture::s_thread;
+DWORD NativeMcpFixture::s_pid = 0;
+HWND NativeMcpFixture::s_hwnd = nullptr;
 
 } // namespace
 
@@ -490,6 +3981,7 @@ TEST(McpServer, ReadOnlyByDefaultAndInputOnlyWithTheFlag) {
     static constexpr const char* kMutating[] = {
         "click", "type_text", "press_key", "set_value", "toggle", "invoke",
         "scroll", "select", "set_expanded", "focus", "select_text", "window_action",
+        "set_property", "clear_property",
     };
 
     {
@@ -505,6 +3997,7 @@ TEST(McpServer, ReadOnlyByDefaultAndInputOnlyWithTheFlag) {
         EXPECT_TRUE(has_tool(names, "connect"));
         EXPECT_TRUE(has_tool(names, "screenshot"));
     }
+
     {
         McpClient full(true);
         ASSERT_TRUE(full.started());
@@ -514,6 +4007,768 @@ TEST(McpServer, ReadOnlyByDefaultAndInputOnlyWithTheFlag) {
             EXPECT_TRUE(has_tool(names, tool)) << tool << " should be exposed with --allow-input";
     }
 }
+
+#if LVT_ENABLE_WPF && LVT_WITH_MANAGED
+TEST(McpManagedFrameworks, WpfConnectionPersistsAcrossTreeReads) {
+    verify_managed_mcp_connection(
+        WPF_SAMPLE_EXE_PATH, "OkButton", "wpf:0x", L"lvt_wpf_tap.log");
+}
+
+TEST(McpManagedFrameworks, WpfPropertyHandlesStayInsideTheirSessionWindow) {
+    verify_managed_window_property_authorization(
+        WPF_SAMPLE_EXE_PATH,
+        "LVT_TEST_SECONDARY_WPF_WINDOW",
+        "LVT WPF Sample",
+        "LVT WPF Secondary",
+        "NameBox",
+        "OkButton",
+        "SecondaryNameBox",
+        "Text");
+}
+
+TEST(McpManagedFrameworks, WpfTypedDependencyProperties) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WPF_SAMPLE_EXE_PATH));
+    const int startsBefore =
+        count_managed_tap_starts(L"lvt_wpf_tap.log", sample.pid());
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const json* button = find_managed_named_element(tree["root"], "OkButton");
+    const json* textBox = find_managed_named_element(tree["root"], "NameBox");
+    const json* window =
+        find_managed_named_element(tree["root"], "MainWindowRoot");
+    ASSERT_NE(button, nullptr);
+    ASSERT_NE(textBox, nullptr);
+    ASSERT_NE(window, nullptr);
+    const std::string buttonKey = button->value("key", "");
+    const std::string textBoxKey = textBox->value("key", "");
+    ASSERT_EQ(buttonKey.rfind("wpf:0x", 0), 0u);
+    ASSERT_EQ(textBoxKey.rfind("wpf:0x", 0), 0u);
+
+    bool isError = false;
+    auto buttonProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", buttonKey}}, &isError);
+    ASSERT_FALSE(isError) << buttonProperties.dump(2);
+    auto repeatedButtonProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", buttonKey}}, &isError);
+    ASSERT_FALSE(isError) << repeatedButtonProperties.dump(2);
+    EXPECT_EQ(
+        repeatedButtonProperties.value("schemaId", ""),
+        buttonProperties.value("schemaId", ""));
+
+    const auto* opacity = find_property_descriptor(buttonProperties, "Opacity");
+    const auto* enabled = find_property_descriptor(buttonProperties, "IsEnabled");
+    const auto* alignment =
+        find_property_descriptor(buttonProperties, "HorizontalAlignment");
+    ASSERT_NE(opacity, nullptr) << buttonProperties.dump(2);
+    ASSERT_NE(enabled, nullptr) << buttonProperties.dump(2);
+    ASSERT_NE(alignment, nullptr) << buttonProperties.dump(2);
+    EXPECT_EQ(opacity->value("kind", ""), "number");
+    EXPECT_EQ(enabled->value("kind", ""), "boolean");
+    EXPECT_EQ(alignment->value("kind", ""), "enum");
+    EXPECT_TRUE(opacity->value("supportsClear", false));
+    EXPECT_TRUE(enabled->value("supportsClear", false));
+    EXPECT_TRUE(alignment->value("supportsClear", false));
+    EXPECT_EQ(find_property_descriptor(buttonProperties, "ActualWidth"), nullptr)
+        << "read-only dependency properties must be excluded";
+
+    auto windowProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", window->value("key", "")}},
+        &isError);
+    ASSERT_FALSE(isError) << windowProperties.dump(2);
+    EXPECT_EQ(
+        find_property_descriptor(windowProperties, "OrdinaryClrProperty"),
+        nullptr) << "ordinary CLR properties must not enter the WPF DP schema";
+
+    std::set<std::string> alignmentChoices;
+    for (const auto& choice : alignment->value("choices", json::array()))
+        alignmentChoices.insert(choice.value("value", ""));
+    EXPECT_TRUE(alignmentChoices.contains("Left"));
+    EXPECT_TRUE(alignmentChoices.contains("Right"));
+    EXPECT_TRUE(alignmentChoices.contains("Stretch"));
+
+    const std::string opacityId = opacity->value("descriptorId", "");
+    const std::string enabledId = enabled->value("descriptorId", "");
+    const std::string alignmentId = alignment->value("descriptorId", "");
+    ASSERT_FALSE(opacityId.empty());
+    ASSERT_FALSE(enabledId.empty());
+    ASSERT_FALSE(alignmentId.empty());
+    EXPECT_NEAR(
+        std::stod(typed_property_value(buttonProperties, "Opacity")), 0.75, 0.001);
+    EXPECT_EQ(typed_property_value(buttonProperties, "IsEnabled"), "true");
+    EXPECT_EQ(
+        typed_property_value(buttonProperties, "HorizontalAlignment"), "Left");
+
+    auto setOpacity = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", opacityId}, {"value", "0.4"}},
+        &isError);
+    ASSERT_FALSE(isError) << setOpacity.dump(2);
+    EXPECT_NEAR(std::stod(setOpacity.value("value", "")), 0.4, 0.001);
+    EXPECT_EQ(setOpacity.value("runtimeType", ""), "System.Double");
+    EXPECT_EQ(setOpacity.value("source", ""), "Local");
+    EXPECT_TRUE(setOpacity.value("canClear", false));
+    EXPECT_TRUE(setOpacity.value("overridden", false));
+    auto changedButton = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", buttonKey}}, &isError);
+    ASSERT_FALSE(isError) << changedButton.dump(2);
+    const auto* changedOpacityValue =
+        find_property_value(changedButton, opacityId);
+    ASSERT_NE(changedOpacityValue, nullptr);
+    EXPECT_TRUE(changedOpacityValue->value("canClear", false));
+    EXPECT_TRUE(changedOpacityValue->value("overridden", false));
+    EXPECT_EQ(changedOpacityValue->value("source", ""), "Local");
+    auto clearOpacity = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", opacityId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearOpacity.dump(2);
+    EXPECT_TRUE(clearOpacity.value("cleared", false));
+    EXPECT_NEAR(std::stod(clearOpacity.value("value", "")), 0.75, 0.001);
+    EXPECT_EQ(clearOpacity.value("runtimeType", ""), "System.Double");
+    EXPECT_NE(clearOpacity.value("source", ""), "Local");
+    EXPECT_FALSE(clearOpacity.value("canClear", true));
+    EXPECT_FALSE(clearOpacity.value("overridden", true));
+    auto restoredButton = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", buttonKey}}, &isError);
+    ASSERT_FALSE(isError) << restoredButton.dump(2);
+    const auto* restoredOpacity =
+        find_property_value(restoredButton, opacityId);
+    ASSERT_NE(restoredOpacity, nullptr);
+    EXPECT_FALSE(restoredOpacity->value("canClear", true));
+    EXPECT_FALSE(restoredOpacity->value("overridden", true));
+    EXPECT_NE(restoredOpacity->value("source", ""), "Local");
+
+    auto setEnabled = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", enabledId}, {"value", "false"}},
+        &isError);
+    ASSERT_FALSE(isError) << setEnabled.dump(2);
+    EXPECT_EQ(setEnabled.value("value", ""), "false");
+    auto clearEnabled = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", enabledId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearEnabled.dump(2);
+    EXPECT_EQ(clearEnabled.value("value", ""), "true");
+
+    auto setAlignment = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", alignmentId}, {"value", "Right"}},
+        &isError);
+    ASSERT_FALSE(isError) << setAlignment.dump(2);
+    EXPECT_EQ(setAlignment.value("value", ""), "Right");
+    auto clearAlignment = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", buttonKey},
+             {"descriptorId", alignmentId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearAlignment.dump(2);
+    EXPECT_EQ(clearAlignment.value("value", ""), "Left");
+
+    auto textProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", textBoxKey}}, &isError);
+    ASSERT_FALSE(isError) << textProperties.dump(2);
+    const auto* text = find_property_descriptor(textProperties, "Text");
+    ASSERT_NE(text, nullptr) << textProperties.dump(2);
+    EXPECT_EQ(text->value("kind", ""), "string");
+    const std::string textId = text->value("descriptorId", "");
+    auto setText = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", textBoxKey},
+             {"descriptorId", textId}, {"value", "Grace Hopper"}},
+        &isError);
+    ASSERT_FALSE(isError) << setText.dump(2);
+    EXPECT_EQ(setText.value("value", ""), "Grace Hopper");
+    auto clearText = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", textBoxKey},
+             {"descriptorId", textId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearText.dump(2);
+    EXPECT_EQ(clearText.value("value", ""), "");
+
+    auto deadIdentity = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", "wpf:0x7FFFFFFFFFFFFFFF"}},
+        &isError);
+    EXPECT_TRUE(isError) << deadIdentity.dump(2);
+    EXPECT_EQ(
+        deadIdentity.value("errorCode", ""),
+        "typed_property_target_not_authorized");
+
+    auto disconnected = client.call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << disconnected.dump(2);
+    EXPECT_EQ(
+        count_managed_tap_starts(L"lvt_wpf_tap.log", sample.pid()) -
+            startsBefore,
+        1) << "tree and dependency-property commands must share one injection";
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string reconnectedSession = connected.value("session", "");
+    ASSERT_FALSE(reconnectedSession.empty()) << connected.dump(2);
+    auto hydratedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", reconnectedSession}, {"element", buttonKey}},
+        &isError);
+    ASSERT_TRUE(isError) << hydratedProperties.dump(2);
+    EXPECT_EQ(
+        hydratedProperties.value("errorCode", ""),
+        "typed_property_target_not_authorized");
+    auto reconnectedTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", reconnectedSession}}, &isError);
+    ASSERT_FALSE(isError) << reconnectedTree.dump(2);
+    hydratedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", reconnectedSession}, {"element", buttonKey}},
+        &isError);
+    ASSERT_FALSE(isError) << hydratedProperties.dump(2);
+    EXPECT_NE(
+        hydratedProperties.value("schemaId", ""),
+        buttonProperties.value("schemaId", ""));
+    auto staleDescriptor = client.call_tool(
+        "set_property",
+        json{{"session", reconnectedSession},
+             {"element", buttonKey},
+             {"descriptorId", opacityId},
+             {"value", "0.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << staleDescriptor.dump(2);
+    expect_typed_property_failure(
+        staleDescriptor, "typed_property_invalid_descriptor",
+        "terminal", false);
+    EXPECT_NE(
+        staleDescriptor.value("error", "").find("stale"),
+        std::string::npos);
+    client.call_tool(
+        "disconnect", json{{"session", reconnectedSession}}, &isError);
+    ASSERT_FALSE(isError);
+}
+#endif
+
+#if LVT_ENABLE_WINFORMS && LVT_WITH_MANAGED
+TEST(McpManagedFrameworks, WinFormsConnectionPersistsAcrossTreeReads) {
+    verify_managed_mcp_connection(
+        WINFORMS_SAMPLE_EXE_PATH, "okButton", "winforms:0x",
+        L"lvt_winforms_tap.log");
+}
+
+TEST(McpManagedFrameworks, WinFormsPropertyHandlesStayInsideTheirSessionWindow) {
+    verify_managed_window_property_authorization(
+        WINFORMS_SAMPLE_EXE_PATH,
+        "LVT_TEST_SECONDARY_WINFORMS_WINDOW",
+        "LVT WinForms Sample",
+        "LVT WinForms Secondary",
+        "inputTextBox",
+        "okButton",
+        "secondaryInputTextBox",
+        "Text");
+}
+
+TEST(McpManagedFrameworks, WinFormsChildHwndSessionOwnsOnlyItsSubtree) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_SAMPLE_EXE_PATH));
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto formConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "visual"}});
+    const auto formSession =
+        formConnected.value("session", "");
+    ASSERT_FALSE(formSession.empty());
+    auto formTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", formSession}});
+    const auto* panel = find_managed_named_element(
+        formTree["root"], "childScopePanel");
+    const auto* sibling = find_managed_named_element(
+        formTree["root"], "okButton");
+    ASSERT_NE(panel, nullptr) << formTree.dump(2);
+    ASSERT_NE(sibling, nullptr) << formTree.dump(2);
+    const auto panelHwnd = panel->value(
+        "properties", json::object()).value("hwnd", "");
+    ASSERT_FALSE(panelHwnd.empty());
+
+    auto childConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", panelHwnd}, {"mode", "visual"}});
+    const auto childSession =
+        childConnected.value("session", "");
+    ASSERT_FALSE(childSession.empty())
+        << childConnected.dump(2);
+    bool isError = false;
+    auto childTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", childSession}}, &isError);
+    ASSERT_FALSE(isError) << childTree.dump(2);
+    const auto* childPanel = find_managed_named_element(
+        childTree["root"], "childScopePanel");
+    const auto* textBox = find_managed_named_element(
+        childTree["root"], "childScopeTextBox");
+    ASSERT_NE(childPanel, nullptr) << childTree.dump(2);
+    ASSERT_NE(textBox, nullptr) << childTree.dump(2);
+
+    auto panelProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", childSession},
+             {"element", childPanel->value("key", "")}},
+        &isError);
+    ASSERT_FALSE(isError) << panelProperties.dump(2);
+    const auto textKey = textBox->value("key", "");
+    auto textProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", childSession},
+             {"element", textKey}},
+        &isError);
+    ASSERT_FALSE(isError) << textProperties.dump(2);
+    const auto* text = find_property_descriptor(
+        textProperties, "Text");
+    ASSERT_NE(text, nullptr) << textProperties.dump(2);
+    const auto descriptorId =
+        text->value("descriptorId", "");
+    auto set = client.call_tool(
+        "set_property",
+        json{{"session", childSession},
+             {"element", textKey},
+             {"descriptorId", descriptorId},
+             {"value", "child session value"}},
+        &isError);
+    ASSERT_FALSE(isError) << set.dump(2);
+    auto clear = client.call_tool(
+        "clear_property",
+        json{{"session", childSession},
+             {"element", textKey},
+             {"descriptorId", descriptorId}},
+        &isError);
+    ASSERT_FALSE(isError) << clear.dump(2);
+
+    auto denied = client.call_tool(
+        "get_editable_properties",
+        json{{"session", childSession},
+             {"element", sibling->value("key", "")}},
+        &isError);
+    EXPECT_TRUE(isError) << denied.dump(2);
+    expect_typed_property_target_not_authorized(denied);
+}
+
+TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_SAMPLE_EXE_PATH));
+    const int startsBefore =
+        count_managed_tap_starts(L"lvt_winforms_tap.log", sample.pid());
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const json* form = find_managed_named_element(tree["root"], "MainForm");
+    ASSERT_NE(form, nullptr);
+    const std::string formKey = form->value("key", "");
+    ASSERT_EQ(formKey.rfind("winforms:0x", 0), 0u);
+
+    bool isError = false;
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    auto repeated = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << repeated.dump(2);
+    EXPECT_EQ(
+        repeated.value("schemaId", ""), properties.value("schemaId", ""));
+
+    const auto* text = find_property_descriptor(properties, "EditableText");
+    const auto* retry = find_property_descriptor(properties, "RetryCount");
+    const auto* mode = find_property_descriptor(properties, "Mode");
+    const auto* providerText =
+        find_property_descriptor(properties, "ProviderText");
+    const auto* throwing =
+        find_property_descriptor(properties, "ThrowingValue");
+    ASSERT_NE(text, nullptr) << properties.dump(2);
+    ASSERT_NE(retry, nullptr) << properties.dump(2);
+    ASSERT_NE(mode, nullptr) << properties.dump(2);
+    ASSERT_NE(providerText, nullptr) << properties.dump(2);
+    ASSERT_NE(throwing, nullptr) << properties.dump(2);
+    EXPECT_EQ(text->value("kind", ""), "string");
+    EXPECT_EQ(retry->value("kind", ""), "integer");
+    EXPECT_EQ(mode->value("kind", ""), "enum");
+    EXPECT_EQ(providerText->value("kind", ""), "string");
+    EXPECT_TRUE(text->value("supportsClear", false));
+    EXPECT_TRUE(providerText->value("supportsClear", false));
+    EXPECT_EQ(find_property_descriptor(properties, "ReadOnlyValue"), nullptr);
+    EXPECT_EQ(find_property_descriptor(properties, "UnsafeFontProperty"), nullptr);
+    EXPECT_EQ(find_property_descriptor(properties, "Controls"), nullptr);
+
+    std::set<std::string> modeChoices;
+    for (const auto& choice : mode->value("choices", json::array()))
+        modeChoices.insert(choice.value("value", ""));
+    EXPECT_EQ(
+        modeChoices,
+        (std::set<std::string>{"Advanced", "Basic", "Expert"}));
+
+    const std::string textId = text->value("descriptorId", "");
+    const std::string retryId = retry->value("descriptorId", "");
+    const std::string modeId = mode->value("descriptorId", "");
+    const std::string providerTextId =
+        providerText->value("descriptorId", "");
+    const std::string throwingId = throwing->value("descriptorId", "");
+
+    auto setText = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", textId}, {"value", "Changed text"}},
+        &isError);
+    ASSERT_FALSE(isError) << setText.dump(2);
+    EXPECT_EQ(setText.value("value", ""), "Changed text");
+    EXPECT_EQ(setText.value("runtimeType", ""), "System.String");
+    EXPECT_EQ(setText.value("source", ""), "Modified");
+    EXPECT_TRUE(setText.value("canClear", false));
+    EXPECT_TRUE(setText.value("overridden", false));
+    auto changed = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << changed.dump(2);
+    const auto* changedText = find_property_value(changed, textId);
+    ASSERT_NE(changedText, nullptr);
+    EXPECT_TRUE(changedText->value("canClear", false));
+    EXPECT_TRUE(changedText->value("overridden", false));
+    EXPECT_EQ(changedText->value("source", ""), "Modified");
+    auto clearText = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", textId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearText.dump(2);
+    EXPECT_TRUE(clearText.value("cleared", false));
+    EXPECT_EQ(clearText.value("value", ""), "Default text");
+    EXPECT_EQ(clearText.value("runtimeType", ""), "System.String");
+    EXPECT_EQ(clearText.value("source", ""), "Default");
+    EXPECT_FALSE(clearText.value("canClear", true));
+    EXPECT_FALSE(clearText.value("overridden", true));
+    auto resetSnapshot = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << resetSnapshot.dump(2);
+    const auto* resetTextValue =
+        find_property_value(resetSnapshot, textId);
+    ASSERT_NE(resetTextValue, nullptr);
+    EXPECT_FALSE(resetTextValue->value("canClear", true));
+    EXPECT_FALSE(resetTextValue->value("overridden", true));
+    EXPECT_EQ(resetTextValue->value("source", ""), "Default");
+
+    auto setRetry = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", retryId}, {"value", "9"}},
+        &isError);
+    ASSERT_FALSE(isError) << setRetry.dump(2);
+    EXPECT_EQ(setRetry.value("value", ""), "9");
+    auto clearRetry = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", retryId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearRetry.dump(2);
+    EXPECT_EQ(clearRetry.value("value", ""), "5");
+
+    auto setMode = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", modeId}, {"value", "Advanced"}},
+        &isError);
+    ASSERT_FALSE(isError) << setMode.dump(2);
+    EXPECT_EQ(setMode.value("value", ""), "Advanced");
+    auto clearMode = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", modeId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearMode.dump(2);
+    EXPECT_EQ(clearMode.value("value", ""), "Basic");
+
+    auto setProviderText = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", providerTextId}, {"value", "Custom descriptor"}},
+        &isError);
+    ASSERT_FALSE(isError) << setProviderText.dump(2);
+    EXPECT_EQ(setProviderText.value("value", ""), "Custom descriptor");
+    auto clearProviderText = client.call_tool(
+        "clear_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", providerTextId}},
+        &isError);
+    ASSERT_FALSE(isError) << clearProviderText.dump(2);
+    EXPECT_EQ(clearProviderText.value("value", ""), "Provider default");
+
+    auto setterFailure = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", throwingId}, {"value", "rejected"}},
+        &isError);
+    EXPECT_TRUE(isError) << setterFailure.dump(2);
+    EXPECT_NE(
+        setterFailure.value("error", "").find("rejected"),
+        std::string::npos);
+
+    auto invalidNumber = client.call_tool(
+        "set_property",
+        json{{"session", session}, {"element", formKey},
+             {"descriptorId", retryId}, {"value", "9.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << invalidNumber.dump(2);
+    expect_typed_property_failure(
+        invalidNumber, "typed_property_invalid_value",
+        "terminal", false);
+
+    auto deadIdentity = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", "winforms:0x7FFFFFFFFFFFFFFF"}},
+        &isError);
+    EXPECT_TRUE(isError) << deadIdentity.dump(2);
+    EXPECT_EQ(
+        deadIdentity.value("errorCode", ""),
+        "typed_property_target_not_authorized");
+
+    auto disconnected = client.call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << disconnected.dump(2);
+    EXPECT_EQ(
+        count_managed_tap_starts(L"lvt_winforms_tap.log", sample.pid()) -
+            startsBefore,
+        1) << "tree and TypeDescriptor property commands must share one injection";
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string reconnectedSession = connected.value("session", "");
+    ASSERT_FALSE(reconnectedSession.empty()) << connected.dump(2);
+    auto hydratedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", reconnectedSession}, {"element", formKey}},
+        &isError);
+    ASSERT_TRUE(isError) << hydratedProperties.dump(2);
+    EXPECT_EQ(
+        hydratedProperties.value("errorCode", ""),
+        "typed_property_target_not_authorized");
+    auto reconnectedTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", reconnectedSession}}, &isError);
+    ASSERT_FALSE(isError) << reconnectedTree.dump(2);
+    hydratedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", reconnectedSession}, {"element", formKey}},
+        &isError);
+    ASSERT_FALSE(isError) << hydratedProperties.dump(2);
+    EXPECT_NE(
+        hydratedProperties.value("schemaId", ""),
+        properties.value("schemaId", ""));
+    auto staleDescriptor = client.call_tool(
+        "set_property",
+        json{{"session", reconnectedSession},
+             {"element", formKey},
+             {"descriptorId", textId},
+             {"value", "stale"}},
+        &isError);
+    EXPECT_TRUE(isError) << staleDescriptor.dump(2);
+    expect_typed_property_failure(
+        staleDescriptor, "typed_property_invalid_descriptor",
+        "terminal", false);
+    EXPECT_NE(
+        staleDescriptor.value("error", "").find("stale"),
+        std::string::npos);
+    client.call_tool(
+        "disconnect", json{{"session", reconnectedSession}}, &isError);
+    ASSERT_FALSE(isError);
+}
+
+TEST(McpManagedFrameworks, FailedWinFormsRefreshDoesNotAdvanceSnapshot) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_SAMPLE_EXE_PATH));
+
+    McpClient owner(false);
+    ASSERT_TRUE(owner.started());
+    ASSERT_TRUE(owner.handshake());
+    auto ownerConnected = owner.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string ownerSession = ownerConnected.value("session", "");
+    ASSERT_FALSE(ownerSession.empty()) << ownerConnected.dump(2);
+    auto ownerTree = owner.call_tool(
+        "get_visual_tree", json{{"session", ownerSession}});
+    ASSERT_TRUE(ownerTree.contains("root")) << ownerTree.dump(2);
+
+    McpClient observer(false);
+    ASSERT_TRUE(observer.started());
+    ASSERT_TRUE(observer.handshake());
+    auto observerConnected = observer.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    const std::string observerSession =
+        observerConnected.value("session", "");
+    ASSERT_FALSE(observerSession.empty()) << observerConnected.dump(2);
+
+    bool isError = false;
+    auto failed = observer.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", observerSession}}, &isError);
+    EXPECT_TRUE(isError) << failed.dump(2);
+    EXPECT_NE(
+        failed.value("error", "").find("temporarily unavailable"),
+        std::string::npos) << failed.dump(2);
+
+    owner.call_tool(
+        "disconnect", json{{"session", ownerSession}}, &isError);
+    ASSERT_FALSE(isError);
+
+    auto recovered = observer.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", observerSession}}, &isError);
+    ASSERT_FALSE(isError) << recovered.dump(2);
+    EXPECT_TRUE(recovered.value("snapshot", false))
+        << "the failed host-only refresh must not create or advance a baseline";
+    EXPECT_FALSE(recovered.value("events", json::array()).empty());
+    observer.call_tool(
+        "disconnect", json{{"session", observerSession}}, &isError);
+    ASSERT_FALSE(isError);
+}
+
+TEST(McpManagedFrameworks, DisconnectWinsQueuedPropertyRequests) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_SAMPLE_EXE_PATH));
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    std::string session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    const json* form = find_managed_named_element(tree["root"], "MainForm");
+    ASSERT_NE(form, nullptr);
+    const std::string formKey = form->value("key", "");
+    bool isError = false;
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* text = find_property_descriptor(properties, "EditableText");
+    ASSERT_NE(text, nullptr);
+    const std::string textId = text->value("descriptorId", "");
+
+    ManagedSampleUiBlock block;
+    ASSERT_TRUE(block.enter(L"WinForms", sample.pid()));
+    const int slowTreeId = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    Sleep(150);
+    const int setId = client.send_request(
+        "tools/call",
+        json{{"name", "set_property"},
+             {"arguments",
+              json{{"session", session},
+                   {"element", formKey},
+                   {"descriptorId", textId},
+                   {"value", "must not land"}}}});
+    const int disconnectId = client.send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+    Sleep(150);
+    block.release();
+
+    auto slowTreeResponse = client.await_response(slowTreeId);
+    auto setResponse = client.await_response(setId);
+    auto disconnectResponse = client.await_response(disconnectId);
+    ASSERT_TRUE(slowTreeResponse.contains("result")) << slowTreeResponse.dump(2);
+    ASSERT_TRUE(setResponse.contains("result")) << setResponse.dump(2);
+    EXPECT_TRUE(setResponse["result"].value("isError", false))
+        << "a property mutation queued behind disconnect must be refused";
+    ASSERT_TRUE(disconnectResponse.contains("result"))
+        << disconnectResponse.dump(2);
+    EXPECT_FALSE(disconnectResponse["result"].value("isError", false));
+
+    connected = client.call_tool(
+        "connect", json{{"hwnd", sample.hwnd_string()}, {"mode", "visual"}});
+    session = connected.value("session", "");
+    ASSERT_FALSE(session.empty()) << connected.dump(2);
+    auto refreshedTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << refreshedTree.dump(2);
+    properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", formKey}}, &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    EXPECT_EQ(typed_property_value(properties, "EditableText"), "Default text")
+        << "disconnect must prevent the queued mutation and connection-map leak";
+    text = find_property_descriptor(properties, "EditableText");
+    ASSERT_NE(text, nullptr);
+
+    ASSERT_TRUE(block.enter(L"WinForms", sample.pid()));
+    const int secondSlowTreeId = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    Sleep(150);
+    const int getId = client.send_request(
+        "tools/call",
+        json{{"name", "get_editable_properties"},
+             {"arguments",
+              json{{"session", session}, {"element", formKey}}}});
+    const int secondDisconnectId = client.send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+    Sleep(150);
+    block.release();
+
+    (void)client.await_response(secondSlowTreeId);
+    auto getResponse = client.await_response(getId);
+    auto secondDisconnectResponse =
+        client.await_response(secondDisconnectId);
+    ASSERT_TRUE(getResponse.contains("result")) << getResponse.dump(2);
+    EXPECT_TRUE(getResponse["result"].value("isError", false))
+        << "a property read queued behind disconnect must be refused";
+    ASSERT_TRUE(secondDisconnectResponse.contains("result"))
+        << secondDisconnectResponse.dump(2);
+    EXPECT_FALSE(secondDisconnectResponse["result"].value("isError", false));
+}
+#endif
 
 TEST(McpServer, CallingAWithheldToolIsRejectedRatherThanSilentlyIgnored) {
     McpClient client(false);
@@ -564,6 +4819,32 @@ TEST(McpServer, ToolFailuresComeBackAsToolErrorsNotProtocolErrors) {
     EXPECT_NE(result.value("error", "").find("unknown session"), std::string::npos)
         << result.dump(2);
     EXPECT_FALSE(result.value("ok", true));
+}
+
+TEST(McpServer, TypedPropertyMissingSessionsHaveDisposition) {
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    const std::array<std::pair<const char*, json>, 3> calls{{
+        {"get_editable_properties",
+         json{{"session", "missing-session"}, {"element", "uia:1"}}},
+        {"set_property",
+         json{{"session", "missing-session"},
+              {"element", "uia:1"},
+              {"descriptorId", "missing"},
+              {"value", "value"}}},
+        {"clear_property",
+         json{{"session", "missing-session"},
+              {"element", "uia:1"},
+              {"descriptorId", "missing"}}},
+    }};
+    for (const auto& [tool, arguments] : calls) {
+        bool isError = false;
+        auto result = client.call_tool(tool, arguments, &isError);
+        EXPECT_TRUE(isError) << tool << ": " << result.dump(2);
+        expect_typed_property_session_disconnected(result);
+    }
 }
 
 TEST(McpServer, ConnectingToNothingFailsWithAReadableMessage) {
@@ -842,6 +5123,3306 @@ TEST_F(McpSampleFixture, VisualTreeIsAvailableAndDiffersFromTheUiaTree) {
     // The visual tree shows implementation structure — HWNDs and framework
     // types — that the UIA tree deliberately hides.
     EXPECT_NE(visual.dump().find("win32"), std::string::npos);
+}
+
+TEST_F(McpSampleFixture, TypedPropertySchemasAndDiffsReuseOnePersistentInjection) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto schemas = output_schemas(client);
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+    const auto targetPid = process_id();
+    const int setSiteBefore = count_tap_set_site_calls(targetPid);
+    const int getEnumsBefore = count_tap_get_enums_calls(targetPid);
+
+    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(visual.contains("root")) << visual.dump(2);
+    std::vector<const json*> elements;
+    collect_json_elements(visual["root"], elements);
+    const json* button = nullptr;
+    const json* status = nullptr;
+    for (const auto* element : elements) {
+        const auto name =
+            element->value("properties", json::object()).value("name", "");
+        if (name == "PrimaryButton")
+            button = element;
+        else if (name == "StatusText")
+            status = element;
+    }
+
+    const auto runUiaTypedProperties = [&] {
+        SCOPED_TRACE("UIA typed properties are provider-driven and deterministic");
+        SkipIfNotReady();
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto schemas = output_schemas(client);
+        const auto session = connect(client);
+        ASSERT_FALSE(session.empty());
+
+        bool isError = false;
+        auto input = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "InputBox"}});
+        ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
+        const auto inputKey = input["elements"][0].value("key", "");
+
+        auto inputProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", inputKey}}, &isError);
+        ASSERT_FALSE(isError) << inputProperties.dump(2);
+        std::string schemaError;
+        EXPECT_TRUE(schema_allows(
+            schemas.at("get_editable_properties"), inputProperties, schemaError))
+            << schemaError;
+        const auto* valueDescriptor =
+            find_property_descriptor(inputProperties, "Value.Value");
+        ASSERT_NE(valueDescriptor, nullptr) << inputProperties.dump(2);
+        EXPECT_EQ(valueDescriptor->value("kind", ""), "string");
+        EXPECT_TRUE(valueDescriptor->value("writable", false));
+        EXPECT_FALSE(valueDescriptor->value("supportsClear", true));
+        const auto valueDescriptorId = valueDescriptor->value("descriptorId", "");
+        const auto originalText =
+            typed_property_value(inputProperties, "Value.Value");
+
+        auto repeated = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", inputKey}}, &isError);
+        ASSERT_FALSE(isError) << repeated.dump(2);
+        EXPECT_EQ(
+            repeated.value("schemaId", ""),
+            inputProperties.value("schemaId", ""));
+        const auto* repeatedValue =
+            find_property_descriptor(repeated, "Value.Value");
+        ASSERT_NE(repeatedValue, nullptr);
+        EXPECT_EQ(
+            repeatedValue->value("descriptorId", ""), valueDescriptorId);
+
+        const auto changedText = "typed UIA value";
+        auto setValue = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", inputKey},
+                 {"descriptorId", valueDescriptorId},
+                 {"value", changedText}},
+            &isError);
+        ASSERT_FALSE(isError) << setValue.dump(2);
+        EXPECT_EQ(setValue.value("value", ""), changedText);
+        EXPECT_EQ(setValue.value("runtimeType", ""), "String");
+        EXPECT_EQ(
+            setValue.value("source", ""),
+            "UIAutomation.ValuePattern");
+        EXPECT_FALSE(setValue.value("canClear", true));
+        EXPECT_FALSE(setValue.value("overridden", true));
+        auto changedInput = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", inputKey}}, &isError);
+        ASSERT_FALSE(isError) << changedInput.dump(2);
+        EXPECT_EQ(typed_property_value(changedInput, "Value.Value"), changedText);
+
+        auto readOnly = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ReadOnlyBox"}});
+        ASSERT_EQ(readOnly["elements"].size(), 1u) << readOnly.dump(2);
+        auto readOnlyProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", readOnly["elements"][0].value("key", "")}},
+            &isError);
+        ASSERT_FALSE(isError) << readOnlyProperties.dump(2);
+        const auto* readOnlyValue =
+            find_property_descriptor(readOnlyProperties, "Value.Value");
+        ASSERT_NE(readOnlyValue, nullptr);
+        EXPECT_EQ(readOnlyValue->value("kind", ""), "readonly");
+        EXPECT_FALSE(readOnlyValue->value("writable", true));
+        auto refusedReadOnly = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", readOnly["elements"][0].value("key", "")},
+                 {"descriptorId",
+                  readOnlyValue->value("descriptorId", "")},
+                 {"value", "must not change"}},
+            &isError);
+        EXPECT_TRUE(isError) << refusedReadOnly.dump(2);
+        expect_typed_property_failure(
+            refusedReadOnly, "typed_property_read_only",
+            "terminal", false);
+
+        auto slider = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "LevelSlider"}});
+        ASSERT_EQ(slider["elements"].size(), 1u) << slider.dump(2);
+        const auto sliderKey = slider["elements"][0].value("key", "");
+        auto sliderProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", sliderKey}}, &isError);
+        ASSERT_FALSE(isError) << sliderProperties.dump(2);
+        const auto* range =
+            find_property_descriptor(sliderProperties, "RangeValue.Value");
+        ASSERT_NE(range, nullptr) << sliderProperties.dump(2);
+        EXPECT_EQ(range->value("kind", ""), "number");
+        EXPECT_DOUBLE_EQ(range->value("minimum", -1.0), 0.0);
+        EXPECT_DOUBLE_EQ(range->value("maximum", -1.0), 100.0);
+        EXPECT_FALSE(range->contains("step"));
+        const auto rangeDescriptorId = range->value("descriptorId", "");
+        const auto originalRange =
+            typed_property_value(sliderProperties, "RangeValue.Value");
+        auto outOfBounds = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", sliderKey},
+                 {"descriptorId", rangeDescriptorId},
+                 {"value", "101"}},
+            &isError);
+        EXPECT_TRUE(isError) << outOfBounds.dump(2);
+        expect_typed_property_failure(
+            outOfBounds, "typed_property_out_of_bounds",
+            "terminal", false);
+
+        auto readOnlyRange = client.call_tool(
+            "find_elements",
+            json{{"session", session}, {"automationId", "ReadOnlyRange"}});
+        ASSERT_EQ(readOnlyRange["elements"].size(), 1u) << readOnlyRange.dump(2);
+        auto readOnlyRangeProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", readOnlyRange["elements"][0].value("key", "")}},
+            &isError);
+        ASSERT_FALSE(isError) << readOnlyRangeProperties.dump(2);
+        const auto* readOnlyRangeDescriptor =
+            find_property_descriptor(
+                readOnlyRangeProperties, "RangeValue.Value");
+        ASSERT_NE(readOnlyRangeDescriptor, nullptr)
+            << readOnlyRangeProperties.dump(2);
+        EXPECT_EQ(readOnlyRangeDescriptor->value("kind", ""), "readonly");
+        EXPECT_FALSE(readOnlyRangeDescriptor->value("writable", true));
+        EXPECT_DOUBLE_EQ(
+            readOnlyRangeDescriptor->value("minimum", -1.0), 0.0);
+        EXPECT_DOUBLE_EQ(
+            readOnlyRangeDescriptor->value("maximum", -1.0), 100.0);
+
+        const auto requestedRange = "075.1300";
+        auto setRange = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", sliderKey},
+                 {"descriptorId", rangeDescriptorId},
+                 {"value", requestedRange}},
+            &isError);
+        ASSERT_FALSE(isError) << setRange.dump(2);
+        const auto providerRange = setRange.value("value", "");
+        ASSERT_FALSE(providerRange.empty()) << setRange.dump(2);
+        EXPECT_EQ(setRange.value("runtimeType", ""), "Double");
+        EXPECT_EQ(
+            setRange.value("source", ""),
+            "UIAutomation.RangeValuePattern");
+        EXPECT_FALSE(setRange.value("canClear", true));
+        EXPECT_FALSE(setRange.value("overridden", true));
+        EXPECT_NE(providerRange, requestedRange)
+            << "RangeValue mutation returned the caller's spelling instead of provider readback";
+        auto rangeAfter = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", sliderKey}}, &isError);
+        ASSERT_FALSE(isError) << rangeAfter.dump(2);
+        EXPECT_EQ(
+            typed_property_value(rangeAfter, "RangeValue.Value"), providerRange)
+            << rangeAfter.dump(2);
+
+        auto checkbox = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ReadyCheckBox"}});
+        ASSERT_EQ(checkbox["elements"].size(), 1u) << checkbox.dump(2);
+        const auto checkboxKey = checkbox["elements"][0].value("key", "");
+        auto checkboxProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", checkboxKey}}, &isError);
+        ASSERT_FALSE(isError) << checkboxProperties.dump(2);
+        const auto* toggle =
+            find_property_descriptor(checkboxProperties, "Toggle.ToggleState");
+        ASSERT_NE(toggle, nullptr) << checkboxProperties.dump(2);
+        EXPECT_EQ(toggle->value("kind", ""), "enum");
+        EXPECT_TRUE(descriptor_has_choice(*toggle, "Off"));
+        EXPECT_TRUE(descriptor_has_choice(*toggle, "On"));
+        EXPECT_FALSE(descriptor_has_choice(*toggle, "Indeterminate"));
+        const auto toggleDescriptorId = toggle->value("descriptorId", "");
+        const auto originalToggle =
+            typed_property_value(checkboxProperties, "Toggle.ToggleState");
+        const auto wantedToggle = originalToggle == "On" ? "Off" : "On";
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto setToggle = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", checkboxKey},
+                     {"descriptorId", toggleDescriptorId},
+                     {"value", wantedToggle}},
+                &isError);
+            ASSERT_FALSE(isError) << setToggle.dump(2);
+            EXPECT_EQ(setToggle.value("value", ""), wantedToggle);
+            EXPECT_EQ(
+                setToggle.value("runtimeType", ""), "ToggleState");
+            EXPECT_EQ(
+                setToggle.value("source", ""),
+                "UIAutomation.TogglePattern");
+        }
+        auto toggleAfter = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", checkboxKey}}, &isError);
+        ASSERT_FALSE(isError) << toggleAfter.dump(2);
+        EXPECT_EQ(
+            typed_property_value(toggleAfter, "Toggle.ToggleState"), wantedToggle)
+            << "setting the same toggle state twice must not cycle away from it\n"
+            << toggleAfter.dump(2);
+
+        auto combo = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ChoiceCombo"}});
+        ASSERT_EQ(combo["elements"].size(), 1u) << combo.dump(2);
+        auto comboProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", combo["elements"][0].value("key", "")}},
+            &isError);
+        ASSERT_FALSE(isError) << comboProperties.dump(2);
+        const auto* expand =
+            find_property_descriptor(comboProperties, "ExpandCollapse.State");
+        ASSERT_NE(expand, nullptr) << comboProperties.dump(2);
+        EXPECT_TRUE(descriptor_has_choice(*expand, "Expanded"));
+        EXPECT_TRUE(descriptor_has_choice(*expand, "Collapsed"));
+        auto setExpanded = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", combo["elements"][0].value("key", "")},
+                 {"descriptorId", expand->value("descriptorId", "")},
+                 {"value", "Expanded"}},
+            &isError);
+        ASSERT_FALSE(isError) << setExpanded.dump(2);
+        EXPECT_EQ(setExpanded.value("value", ""), "Expanded");
+        EXPECT_EQ(
+            setExpanded.value("runtimeType", ""),
+            "ExpandCollapseState");
+        auto expandedCombo = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ChoiceCombo"}});
+        ASSERT_FALSE(expandedCombo["elements"].empty());
+        auto expandedProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session},
+                 {"element", expandedCombo["elements"][0].value("key", "")}},
+            &isError);
+        ASSERT_FALSE(isError) << expandedProperties.dump(2);
+        EXPECT_EQ(
+            typed_property_value(expandedProperties, "ExpandCollapse.State"),
+            "Expanded");
+        const auto* collapse =
+            find_property_descriptor(expandedProperties, "ExpandCollapse.State");
+        ASSERT_NE(collapse, nullptr);
+        auto setCollapsed = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", expandedCombo["elements"][0].value("key", "")},
+                 {"descriptorId", collapse->value("descriptorId", "")},
+                 {"value", "Collapsed"}},
+            &isError);
+        ASSERT_FALSE(isError) << setCollapsed.dump(2);
+        EXPECT_EQ(setCollapsed.value("value", ""), "Collapsed");
+
+        auto item = client.call_tool(
+            "find_elements",
+            json{{"session", session}, {"name", "Item 000"}, {"type", "ListItem"}});
+        if (!item["elements"].empty()) {
+            const auto itemKey = item["elements"][0].value("key", "");
+            auto itemProperties = client.call_tool(
+                "get_editable_properties",
+                json{{"session", session}, {"element", itemKey}}, &isError);
+            ASSERT_FALSE(isError) << itemProperties.dump(2);
+            const auto* selection =
+                find_property_descriptor(itemProperties, "SelectionItem.Action");
+            ASSERT_NE(selection, nullptr) << itemProperties.dump(2);
+            EXPECT_EQ(selection->value("kind", ""), "command");
+            EXPECT_TRUE(descriptor_has_choice(*selection, "select"));
+            EXPECT_TRUE(descriptor_has_choice(*selection, "add"));
+            EXPECT_TRUE(descriptor_has_choice(*selection, "remove"));
+            auto add = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", itemKey},
+                     {"descriptorId", selection->value("descriptorId", "")},
+                     {"value", "add"}},
+                &isError);
+            ASSERT_FALSE(isError) << add.dump(2);
+            EXPECT_EQ(add.value("value", ""), "Selected");
+            EXPECT_EQ(add.value("runtimeType", ""), "Command");
+            EXPECT_EQ(
+                add.value("source", ""),
+                "UIAutomation.SelectionItemPattern");
+
+            auto currentItem = client.call_tool(
+                "find_elements",
+                json{{"session", session}, {"name", "Item 000"}, {"type", "ListItem"}});
+            ASSERT_FALSE(currentItem["elements"].empty());
+            auto selectedProperties = client.call_tool(
+                "get_editable_properties",
+                json{{"session", session},
+                     {"element", currentItem["elements"][0].value("key", "")}},
+                &isError);
+            ASSERT_FALSE(isError) << selectedProperties.dump(2);
+            EXPECT_EQ(
+                typed_property_value(selectedProperties, "SelectionItem.Action"),
+                "Selected");
+            const auto* remove =
+                find_property_descriptor(selectedProperties, "SelectionItem.Action");
+            ASSERT_NE(remove, nullptr);
+            auto removed = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", currentItem["elements"][0].value("key", "")},
+                     {"descriptorId", remove->value("descriptorId", "")},
+                     {"value", "remove"}},
+                &isError);
+            ASSERT_FALSE(isError) << removed.dump(2);
+            EXPECT_EQ(removed.value("value", ""), "Not selected");
+
+            auto replacementItem = client.call_tool(
+                "find_elements",
+                json{{"session", session}, {"name", "Item 000"}, {"type", "ListItem"}});
+            ASSERT_FALSE(replacementItem["elements"].empty());
+            auto replacementProperties = client.call_tool(
+                "get_editable_properties",
+                json{{"session", session},
+                     {"element", replacementItem["elements"][0].value("key", "")}},
+                &isError);
+            ASSERT_FALSE(isError) << replacementProperties.dump(2);
+            const auto* replace =
+                find_property_descriptor(replacementProperties, "SelectionItem.Action");
+            ASSERT_NE(replace, nullptr);
+            auto selected = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", replacementItem["elements"][0].value("key", "")},
+                     {"descriptorId", replace->value("descriptorId", "")},
+                     {"value", "select"}},
+                &isError);
+            ASSERT_FALSE(isError) << selected.dump(2);
+            EXPECT_EQ(selected.value("value", ""), "Selected");
+
+            auto selectedItem = client.call_tool(
+                "find_elements",
+                json{{"session", session}, {"name", "Item 000"}, {"type", "ListItem"}});
+            ASSERT_FALSE(selectedItem["elements"].empty());
+            auto selectedSnapshot = client.call_tool(
+                "get_editable_properties",
+                json{{"session", session},
+                     {"element", selectedItem["elements"][0].value("key", "")}},
+                &isError);
+            ASSERT_FALSE(isError) << selectedSnapshot.dump(2);
+            const auto* selectedDescriptor =
+                find_property_descriptor(selectedSnapshot, "SelectionItem.Action");
+            ASSERT_NE(selectedDescriptor, nullptr);
+            auto finalRemove = client.call_tool(
+                "set_property",
+                json{{"session", session},
+                     {"element", selectedItem["elements"][0].value("key", "")},
+                     {"descriptorId", selectedDescriptor->value("descriptorId", "")},
+                     {"value", "remove"}},
+                &isError);
+            EXPECT_FALSE(isError) << finalRemove.dump(2);
+            EXPECT_EQ(
+                finalRemove.value("value", ""), "Not selected");
+        }
+
+        auto list = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "ItemsList"}});
+        ASSERT_EQ(list["elements"].size(), 1u) << list.dump(2);
+        const auto listKey = list["elements"][0].value("key", "");
+        auto listProperties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", listKey}}, &isError);
+        ASSERT_FALSE(isError) << listProperties.dump(2);
+        const auto* scroll =
+            find_property_descriptor(listProperties, "Scroll.Action");
+        ASSERT_NE(scroll, nullptr) << listProperties.dump(2);
+        EXPECT_EQ(scroll->value("kind", ""), "command");
+        EXPECT_TRUE(descriptor_has_choice(*scroll, "up"));
+        EXPECT_TRUE(descriptor_has_choice(*scroll, "down"));
+        EXPECT_FALSE(descriptor_has_choice(*scroll, "left"));
+        EXPECT_FALSE(descriptor_has_choice(*scroll, "right"));
+        const auto beforeScroll = typed_property_value(listProperties, "Scroll.Action");
+        auto scrolled = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", listKey},
+                 {"descriptorId", scroll->value("descriptorId", "")},
+                 {"value", "down"}},
+            &isError);
+        ASSERT_FALSE(isError) << scrolled.dump(2);
+        EXPECT_EQ(scrolled.value("runtimeType", ""), "Command");
+        EXPECT_EQ(
+            scrolled.value("source", ""),
+            "UIAutomation.ScrollPattern");
+        EXPECT_FALSE(scrolled.value("value", "").empty());
+        auto afterScroll = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", listKey}}, &isError);
+        ASSERT_FALSE(isError) << afterScroll.dump(2);
+        EXPECT_NE(
+            typed_property_value(afterScroll, "Scroll.Action"), beforeScroll);
+
+        auto clear = client.call_tool(
+            "clear_property",
+            json{{"session", session},
+                 {"element", sliderKey},
+                 {"descriptorId", rangeDescriptorId}},
+            &isError);
+        EXPECT_TRUE(isError) << clear.dump(2);
+        expect_typed_property_failure(
+            clear, "typed_property_unsupported",
+            "terminal", false);
+        schemaError.clear();
+        EXPECT_TRUE(schema_allows(
+            schemas.at("clear_property"), clear, schemaError))
+            << schemaError << "\n" << clear.dump(2);
+        EXPECT_NE(clear.dump().find("does not expose a generic clear"), std::string::npos)
+            << clear.dump(2);
+
+        auto restoreRange = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", sliderKey},
+                 {"descriptorId", rangeDescriptorId},
+                 {"value", originalRange}},
+            &isError);
+        EXPECT_FALSE(isError) << restoreRange.dump(2);
+        auto restoreToggle = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", checkboxKey},
+                 {"descriptorId", toggleDescriptorId},
+                 {"value", originalToggle}},
+            &isError);
+        EXPECT_FALSE(isError) << restoreToggle.dump(2);
+        auto restoreText = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", inputKey},
+                 {"descriptorId", valueDescriptorId},
+                 {"value", originalText}},
+            &isError);
+        EXPECT_FALSE(isError) << restoreText.dump(2);
+    };
+
+    const auto runUiaResourceRefresh = [&] {
+        SCOPED_TRACE("UIA typed property mutation refreshes subscribed resource");
+        SkipIfNotReady();
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto session = connect(client);
+        ASSERT_FALSE(session.empty());
+
+        auto input = client.call_tool(
+            "find_elements", json{{"session", session}, {"automationId", "InputBox"}});
+        ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
+        const auto inputKey = input["elements"][0].value("key", "");
+
+        bool isError = false;
+        auto properties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", inputKey}}, &isError);
+        ASSERT_FALSE(isError) << properties.dump(2);
+        const auto* value =
+            find_property_descriptor(properties, "Value.Value");
+        ASSERT_NE(value, nullptr);
+        const auto descriptorId = value->value("descriptorId", "");
+        const auto original = typed_property_value(properties, "Value.Value");
+
+        const auto uri = "lvt://session/" + session + "/uia-tree";
+        auto subscribed = client.request("resources/subscribe", json{{"uri", uri}});
+        ASSERT_TRUE(subscribed.contains("result")) << subscribed.dump(2);
+        auto initialRead = client.request("resources/read", json{{"uri", uri}});
+        ASSERT_TRUE(initialRead.contains("result")) << initialRead.dump(2);
+
+        auto changed = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", inputKey},
+                 {"descriptorId", descriptorId},
+                 {"value", "typed resource mutation"}},
+            &isError);
+        ASSERT_FALSE(isError) << changed.dump(2);
+
+        auto notification =
+            client.await_notification("notifications/resources/updated", 20);
+        ASSERT_FALSE(notification.is_null())
+            << "no resource update followed a generic UIA property mutation";
+        auto read = client.request("resources/read", json{{"uri", uri}});
+        ASSERT_TRUE(read.contains("result")) << read.dump(2);
+        const auto patch = json::parse(
+            read["result"]["contents"][0].value("text", ""), nullptr, false);
+        ASSERT_FALSE(patch.is_discarded()) << read.dump(2);
+        bool sawValueChange = false;
+        for (const auto& event : patch.value("events", json::array())) {
+            const auto fields = event.value("fields", json::object());
+            sawValueChange = sawValueChange ||
+                             (event.value("key", "") == inputKey &&
+                              fields.contains("properties.Value.Value"));
+        }
+        EXPECT_TRUE(sawValueChange) << patch.dump(2);
+
+        auto unsubscribed = client.request("resources/unsubscribe", json{{"uri", uri}});
+        EXPECT_TRUE(unsubscribed.contains("result")) << unsubscribed.dump(2);
+        auto restored = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", inputKey},
+                 {"descriptorId", descriptorId},
+                 {"value", original}},
+            &isError);
+        EXPECT_FALSE(isError) << restored.dump(2);
+    };
+    ASSERT_NE(button, nullptr);
+    ASSERT_NE(status, nullptr);
+    const auto key = button->value("key", "");
+    const auto statusKey = status->value("key", "");
+    ASSERT_EQ(key.rfind("winui3:0x", 0), 0u);
+    ASSERT_EQ(statusKey.rfind("winui3:0x", 0), 0u);
+
+    bool isError = false;
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    ASSERT_TRUE(properties.contains("descriptors")) << properties.dump(2);
+    ASSERT_TRUE(properties.contains("values")) << properties.dump(2);
+    ASSERT_FALSE(properties.value("schemaId", "").empty()) << properties.dump(2);
+    std::string schemaError;
+    EXPECT_TRUE(schema_allows(
+        schemas.at("get_editable_properties"), properties, schemaError)) << schemaError;
+
+    const auto* opacity = find_property_descriptor(properties, "Opacity");
+    ASSERT_NE(opacity, nullptr) << "PrimaryButton did not report Opacity";
+    EXPECT_TRUE(opacity->value("writable", false));
+    EXPECT_EQ(opacity->value("kind", ""), "number");
+    const auto opacityDescriptorId = opacity->value("descriptorId", "");
+    ASSERT_FALSE(opacityDescriptorId.empty());
+    EXPECT_FALSE(opacity->contains("propertyIndex"));
+    EXPECT_FALSE(opacity->contains("valueType"));
+
+    auto repeatedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
+    ASSERT_FALSE(isError) << repeatedProperties.dump(2);
+    EXPECT_EQ(
+        repeatedProperties.value("schemaId", ""),
+        properties.value("schemaId", ""));
+    const auto* repeatedOpacity =
+        find_property_descriptor(repeatedProperties, "Opacity");
+    ASSERT_NE(repeatedOpacity, nullptr);
+    EXPECT_EQ(
+        repeatedOpacity->value("descriptorId", ""), opacityDescriptorId);
+
+    auto initialChanges = client.call_tool(
+        "get_visual_tree_changes", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << initialChanges.dump(2);
+    EXPECT_TRUE(initialChanges.value("snapshot", false));
+    EXPECT_FALSE(initialChanges.value("events", json::array()).empty());
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("get_visual_tree_changes"), initialChanges, schemaError)) << schemaError;
+
+    auto statusProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << statusProperties.dump(2);
+    const auto* textProperty =
+        find_property_descriptor(statusProperties, "Text");
+    ASSERT_NE(textProperty, nullptr) << "StatusText did not report Text";
+    EXPECT_TRUE(textProperty->value("propertyType", "").ends_with("String"));
+    EXPECT_EQ(textProperty->value("kind", ""), "string")
+        << "TextBlock.Text must be classified from PropertyChainValue.Type, "
+           "not the current value's runtime ValueType";
+    const auto textDescriptorId =
+        textProperty->value("descriptorId", "");
+    ASSERT_FALSE(textDescriptorId.empty());
+    const auto originalText = typed_property_value(statusProperties, "Text");
+    const auto changedText = "mcp \"quoted\"\nvalue";
+
+    const auto* textAlignment =
+        find_property_descriptor(statusProperties, "TextAlignment");
+    ASSERT_NE(textAlignment, nullptr)
+        << "StatusText did not report TextAlignment";
+    EXPECT_EQ(textAlignment->value("kind", ""), "enum");
+    const auto alignmentDescriptorId =
+        textAlignment->value("descriptorId", "");
+    ASSERT_FALSE(alignmentDescriptorId.empty());
+    const auto alignmentChoices =
+        textAlignment->value("choices", json::array());
+    ASSERT_FALSE(alignmentChoices.empty()) << textAlignment->dump(2);
+    std::string centerValue;
+    for (const auto& choice : alignmentChoices) {
+        if (choice.value("label", "") == "Center") {
+            centerValue = choice.value("value", "");
+            break;
+        }
+    }
+    ASSERT_FALSE(centerValue.empty()) << alignmentChoices.dump(2);
+    const auto originalAlignment =
+        typed_property_value(statusProperties, "TextAlignment");
+    ASSERT_FALSE(originalAlignment.empty());
+
+    auto setAlignment = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", alignmentDescriptorId},
+             {"value", centerValue}},
+        &isError);
+    ASSERT_FALSE(isError) << setAlignment.dump(2);
+    EXPECT_EQ(setAlignment.value("value", ""), centerValue)
+        << "enum mutation must return canonical effective readback, not raw numeric storage";
+    EXPECT_FALSE(setAlignment.value("runtimeType", "").empty());
+    EXPECT_FALSE(setAlignment.value("overridden", true));
+    EXPECT_TRUE(setAlignment.value("canClear", false));
+    EXPECT_NE(setAlignment.value("source", "").find("Local"), std::string::npos);
+    auto centeredProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << centeredProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(centeredProperties, "TextAlignment"),
+        centerValue);
+    EXPECT_EQ(
+        centeredProperties.value("schemaId", ""),
+        statusProperties.value("schemaId", ""));
+    const auto* centeredAlignment =
+        find_property_descriptor(centeredProperties, "TextAlignment");
+    ASSERT_NE(centeredAlignment, nullptr);
+    EXPECT_EQ(
+        centeredAlignment->value("descriptorId", ""),
+        alignmentDescriptorId);
+
+    auto invalidAlignment = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", alignmentDescriptorId},
+             {"value", "__not_a_text_alignment__"}},
+        &isError);
+    EXPECT_TRUE(isError) << invalidAlignment.dump(2);
+    auto afterInvalidAlignment = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << afterInvalidAlignment.dump(2);
+    EXPECT_EQ(
+        typed_property_value(afterInvalidAlignment, "TextAlignment"),
+        centerValue);
+
+    auto restoreAlignment = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", alignmentDescriptorId},
+             {"value", originalAlignment}},
+        &isError);
+    ASSERT_FALSE(isError) << restoreAlignment.dump(2);
+
+    const auto* manipulationMode =
+        find_property_descriptor(statusProperties, "ManipulationMode");
+    ASSERT_NE(manipulationMode, nullptr)
+        << "StatusText did not report ManipulationMode";
+    EXPECT_EQ(manipulationMode->value("kind", ""), "enum");
+    const auto manipulationDescriptorId =
+        manipulationMode->value("descriptorId", "");
+    ASSERT_FALSE(manipulationDescriptorId.empty());
+    const auto manipulationChoices =
+        manipulationMode->value("choices", json::array());
+    bool hasTranslateX = false;
+    bool hasScale = false;
+    for (const auto& choice : manipulationChoices) {
+        hasTranslateX =
+            hasTranslateX || choice.value("value", "") == "TranslateX";
+        hasScale = hasScale || choice.value("value", "") == "Scale";
+    }
+    ASSERT_TRUE(hasTranslateX) << manipulationChoices.dump(2);
+    ASSERT_TRUE(hasScale) << manipulationChoices.dump(2);
+    const auto originalManipulationMode =
+        typed_property_value(statusProperties, "ManipulationMode");
+    ASSERT_FALSE(originalManipulationMode.empty());
+
+    auto setManipulationMode = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", manipulationDescriptorId},
+             {"value", " TranslateX , Scale "}},
+        &isError);
+    ASSERT_FALSE(isError) << setManipulationMode.dump(2);
+    EXPECT_EQ(
+        setManipulationMode.value("value", ""),
+        "TranslateX,Scale");
+    auto compositeProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << compositeProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(compositeProperties, "ManipulationMode"),
+        "TranslateX,Scale");
+
+    auto invalidManipulationMode = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", manipulationDescriptorId},
+             {"value", "TranslateX,NotAFlag"}},
+        &isError);
+    EXPECT_TRUE(isError) << invalidManipulationMode.dump(2);
+    auto afterInvalidManipulation = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << afterInvalidManipulation.dump(2);
+    EXPECT_EQ(
+        typed_property_value(
+            afterInvalidManipulation, "ManipulationMode"),
+        "TranslateX,Scale");
+
+    auto restoreManipulationMode = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", manipulationDescriptorId},
+             {"value", originalManipulationMode}},
+        &isError);
+    ASSERT_FALSE(isError) << restoreManipulationMode.dump(2);
+
+    const auto* textDecorations =
+        find_property_descriptor(statusProperties, "TextDecorations");
+    ASSERT_NE(textDecorations, nullptr)
+        << "StatusText did not report TextDecorations";
+    EXPECT_EQ(textDecorations->value("kind", ""), "enum");
+    const auto decorationsDescriptorId =
+        textDecorations->value("descriptorId", "");
+    ASSERT_FALSE(decorationsDescriptorId.empty());
+    const auto decorationChoices =
+        textDecorations->value("choices", json::array());
+    std::string expectedDecorations;
+    bool hasUnderline = false;
+    bool hasStrikethrough = false;
+    for (const auto& choice : decorationChoices) {
+        const auto choiceValue = choice.value("value", "");
+        if (choiceValue != "Underline" &&
+            choiceValue != "Strikethrough") {
+            continue;
+        }
+        hasUnderline = hasUnderline || choiceValue == "Underline";
+        hasStrikethrough =
+            hasStrikethrough || choiceValue == "Strikethrough";
+        if (!expectedDecorations.empty())
+            expectedDecorations += ",";
+        expectedDecorations += choiceValue;
+    }
+    ASSERT_TRUE(hasUnderline) << decorationChoices.dump(2);
+    ASSERT_TRUE(hasStrikethrough) << decorationChoices.dump(2);
+    const auto originalDecorations =
+        typed_property_value(statusProperties, "TextDecorations");
+    ASSERT_FALSE(originalDecorations.empty());
+
+    auto setDecorations = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", decorationsDescriptorId},
+             {"value", " Strikethrough , Underline "}},
+        &isError);
+    ASSERT_FALSE(isError) << setDecorations.dump(2);
+    EXPECT_EQ(
+        setDecorations.value("value", ""), expectedDecorations);
+    auto decoratedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << decoratedProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(decoratedProperties, "TextDecorations"),
+        expectedDecorations);
+
+    auto invalidDecorations = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", decorationsDescriptorId},
+             {"value", "Underline,NotADecoration"}},
+        &isError);
+    EXPECT_TRUE(isError) << invalidDecorations.dump(2);
+    auto afterInvalidDecorations = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << afterInvalidDecorations.dump(2);
+    EXPECT_EQ(
+        typed_property_value(
+            afterInvalidDecorations, "TextDecorations"),
+        expectedDecorations);
+
+    auto restoreDecorations = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", decorationsDescriptorId},
+             {"value", originalDecorations}},
+        &isError);
+    ASSERT_FALSE(isError) << restoreDecorations.dump(2);
+
+    auto unknown = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", "not-a-real-descriptor"},
+             {"value", "0.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << unknown.dump(2);
+
+    auto mismatched = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", opacityDescriptorId},
+             {"value", "0.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << mismatched.dump(2);
+
+    auto clientMetadata = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", opacityDescriptorId},
+             {"propertyIndex", 1},
+             {"valueType", "String"},
+             {"value", "0.5"}},
+        &isError);
+    EXPECT_TRUE(isError) << clientMetadata.dump(2);
+
+    auto set = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", opacityDescriptorId},
+             {"value", "0.5000"}},
+        &isError);
+    ASSERT_FALSE(isError) << set.dump(2);
+    EXPECT_TRUE(set.value("ok", false));
+    ASSERT_TRUE(set.contains("value")) << set.dump(2);
+    EXPECT_NE(set.value("value", ""), "0.5000")
+        << "set_property must return the framework's effective formatting, not echo input";
+    EXPECT_NEAR(std::stod(set.value("value", "")), 0.5, 0.001);
+    EXPECT_FALSE(set.value("runtimeType", "").empty());
+    EXPECT_FALSE(set.value("overridden", true));
+    EXPECT_TRUE(set.value("canClear", false));
+    EXPECT_NE(set.value("source", "").find("Local"), std::string::npos);
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("set_property"), set, schemaError)) << schemaError;
+
+    auto setText = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", textDescriptorId},
+             {"value", changedText}},
+        &isError);
+    ASSERT_FALSE(isError) << setText.dump(2);
+    auto changedStatus = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << changedStatus.dump(2);
+
+    auto changedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
+    ASSERT_FALSE(isError) << changedProperties.dump(2);
+    ASSERT_FALSE(typed_property_value(changedProperties, "Opacity").empty());
+    EXPECT_NEAR(
+        std::stod(typed_property_value(changedProperties, "Opacity")), 0.5, 0.001);
+    EXPECT_EQ(typed_property_value(changedStatus, "Text"), changedText)
+        << "spaces, quotes, and newlines must survive the persistent TAP protocol";
+
+    auto changes = client.call_tool(
+        "get_visual_tree_changes", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << changes.dump(2);
+    EXPECT_FALSE(changes.value("snapshot", true));
+    bool sawTextChange = false;
+    for (const auto& event : changes.value("events", json::array())) {
+        const auto fields = event.value("fields", json::object());
+        sawTextChange = sawTextChange || fields.contains("text") ||
+                        fields.contains("properties.Text");
+    }
+    EXPECT_TRUE(sawTextChange) << changes.dump(2);
+
+    auto clear = client.call_tool(
+        "clear_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", opacityDescriptorId}},
+        &isError);
+    ASSERT_FALSE(isError) << clear.dump(2);
+    EXPECT_TRUE(clear.value("cleared", false));
+    ASSERT_TRUE(clear.contains("value")) << clear.dump(2);
+    EXPECT_NEAR(std::stod(clear.value("value", "")), 1.0, 0.001);
+    EXPECT_FALSE(clear.value("runtimeType", "").empty());
+    EXPECT_FALSE(clear.value("overridden", true));
+    EXPECT_FALSE(clear.value("canClear", true));
+    EXPECT_FALSE(clear.value("source", "").empty());
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("clear_property"), clear, schemaError)) << schemaError;
+
+    auto restoreText = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", textDescriptorId},
+             {"value", originalText}},
+        &isError);
+    ASSERT_FALSE(isError) << restoreText.dump(2);
+
+    auto clearedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
+    ASSERT_FALSE(isError) << clearedProperties.dump(2);
+    ASSERT_FALSE(typed_property_value(clearedProperties, "Opacity").empty());
+    EXPECT_NEAR(
+        std::stod(typed_property_value(clearedProperties, "Opacity")), 1.0, 0.001);
+    EXPECT_EQ(
+        typed_property_value(clearedProperties, "Opacity"),
+        clear.value("value", ""))
+        << "clear_property readback must match the subsequent property snapshot";
+
+    auto afterClear = client.call_tool(
+        "get_visual_tree_changes", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << afterClear.dump(2);
+    EXPECT_FALSE(afterClear.value("snapshot", true));
+
+    auto disconnected = client.call_tool(
+        "disconnect", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << disconnected.dump(2);
+    EXPECT_EQ(count_tap_set_site_calls(targetPid) - setSiteBefore, 1)
+        << "one MCP session must reuse one TAP injection across tree reads and "
+           "get/set/clear property operations";
+    EXPECT_EQ(count_tap_get_enums_calls(targetPid) - getEnumsBefore, 1)
+        << "one persistent XAML connection must fetch its enum catalog once";
+    runUiaTypedProperties();
+    runUiaResourceRefresh();
+}
+
+TEST_F(NativeMcpFixture, NativeTypedPropertiesUseGenericContractAndInputGate) {
+    McpClient readOnly(false);
+    ASSERT_TRUE(readOnly.started());
+    ASSERT_TRUE(readOnly.handshake());
+    const auto readOnlySession = connect(readOnly);
+    ASSERT_FALSE(readOnlySession.empty());
+
+    auto readOnlyTree = readOnly.call_tool(
+        "get_visual_tree", json{{"session", readOnlySession}});
+    ASSERT_TRUE(readOnlyTree.contains("root")) << readOnlyTree.dump(2);
+    const auto* readOnlyGeneric = find_by_class(
+        readOnlyTree["root"], "LvtNativePropertyFixtureText");
+    ASSERT_NE(readOnlyGeneric, nullptr);
+    const auto readOnlyKey = readOnlyGeneric->value("key", "");
+    ASSERT_EQ(readOnlyKey.rfind("win32:0x", 0), 0u);
+
+    bool isError = false;
+    auto readOnlyProperties = readOnly.call_tool(
+        "get_editable_properties",
+        json{{"session", readOnlySession}, {"element", readOnlyKey}},
+        &isError);
+    ASSERT_FALSE(isError) << readOnlyProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(readOnlyProperties, "Text"),
+        "Generic child seed");
+
+    auto refused = readOnly.call_tool(
+        "set_property",
+        json{{"session", readOnlySession},
+             {"element", readOnlyKey},
+             {"descriptorId",
+              find_property_descriptor(readOnlyProperties, "Text")
+                  ->value("descriptorId", "")},
+             {"value", "must not be written"}},
+        &isError);
+    EXPECT_TRUE(isError) << refused.dump(2);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto schemas = output_schemas(client);
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto* generic =
+        find_by_class(tree["root"], "LvtNativePropertyFixtureText");
+    const auto* combo =
+        find_by_class(tree["root"], "ComboBox");
+    const auto* status =
+        find_by_class(tree["root"], "msctls_statusbar32");
+    ASSERT_NE(generic, nullptr);
+    ASSERT_NE(combo, nullptr);
+    ASSERT_NE(status, nullptr);
+
+    const auto genericKey = generic->value("key", "");
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    std::string schemaError;
+    EXPECT_TRUE(schema_allows(
+        schemas.at("get_editable_properties"), properties, schemaError))
+        << schemaError;
+    const auto* text = find_property_descriptor(properties, "Text");
+    const auto* enabled = find_property_descriptor(properties, "Enabled");
+    ASSERT_NE(text, nullptr);
+    ASSERT_NE(enabled, nullptr);
+    EXPECT_EQ(text->value("kind", ""), "string");
+    EXPECT_EQ(enabled->value("kind", ""), "boolean");
+    EXPECT_TRUE(text->value("writable", false));
+    EXPECT_FALSE(text->contains("message"));
+    EXPECT_FALSE(text->contains("wParam"));
+    EXPECT_FALSE(text->contains("lParam"));
+
+    auto repeated = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << repeated.dump(2);
+    EXPECT_EQ(
+        repeated.value("schemaId", ""),
+        properties.value("schemaId", ""));
+    EXPECT_EQ(
+        find_property_descriptor(repeated, "Text")
+            ->value("descriptorId", ""),
+        text->value("descriptorId", ""));
+
+    const auto changedText =
+        std::string(reinterpret_cast<const char*>(u8"MCP ✓ 東京"));
+    auto changed = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", genericKey},
+             {"descriptorId", text->value("descriptorId", "")},
+             {"value", changedText}},
+        &isError);
+    ASSERT_FALSE(isError) << changed.dump(2);
+    EXPECT_EQ(changed.value("value", ""), changedText);
+    EXPECT_EQ(changed.value("runtimeType", ""), "String");
+    EXPECT_EQ(changed.value("source", ""), "native");
+    EXPECT_FALSE(changed.value("canClear", true));
+    EXPECT_FALSE(changed.value("overridden", true));
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("set_property"), changed, schemaError))
+        << schemaError;
+
+    auto changedProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << changedProperties.dump(2);
+    EXPECT_EQ(
+        typed_property_value(changedProperties, "Text"), changedText);
+
+    for (const std::string value : {"", "Generic child seed"}) {
+        auto setText = client.call_tool(
+            "set_property",
+            json{{"session", session},
+                 {"element", genericKey},
+                 {"descriptorId", text->value("descriptorId", "")},
+                 {"value", value}},
+            &isError);
+        ASSERT_FALSE(isError) << setText.dump(2);
+        EXPECT_EQ(setText.value("value", ""), value);
+    }
+
+    auto unknown = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", genericKey},
+             {"descriptorId", "native-v1:not-a-descriptor"},
+             {"value", "value"}},
+        &isError);
+    EXPECT_TRUE(isError) << unknown.dump(2);
+    expect_typed_property_failure(
+        unknown, "typed_property_invalid_descriptor",
+        "terminal", false);
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("set_property"), unknown, schemaError))
+        << schemaError << "\n" << unknown.dump(2);
+
+    DWORD_PTR siblingValue = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kGetOutOfTreeHwndMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000,
+            &siblingValue),
+        0);
+    char siblingRef[64]{};
+    snprintf(
+        siblingRef, sizeof(siblingRef), "win32:0x%llX",
+        static_cast<unsigned long long>(siblingValue));
+    auto outOfTree = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", siblingRef}},
+        &isError);
+    EXPECT_TRUE(isError) << outOfTree.dump(2);
+    EXPECT_NE(
+        outOfTree.value("error", "").find("unknown"),
+        std::string::npos);
+
+    const auto comboKey = combo->value("key", "");
+    auto comboProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", comboKey}},
+        &isError);
+    ASSERT_FALSE(isError) << comboProperties.dump(2);
+    const auto* selected =
+        find_property_descriptor(comboProperties, "SelectedIndex");
+    ASSERT_NE(selected, nullptr);
+    EXPECT_TRUE(selected->value("supportsClear", false));
+    auto cleared = client.call_tool(
+        "clear_property",
+        json{{"session", session},
+             {"element", comboKey},
+             {"descriptorId", selected->value("descriptorId", "")}},
+        &isError);
+    ASSERT_FALSE(isError) << cleared.dump(2);
+    EXPECT_TRUE(cleared.value("cleared", false));
+    EXPECT_EQ(cleared.value("value", ""), "-1");
+    EXPECT_EQ(cleared.value("runtimeType", ""), "Int32");
+    EXPECT_EQ(cleared.value("source", ""), "native");
+    EXPECT_FALSE(cleared.value("canClear", true));
+    EXPECT_FALSE(cleared.value("overridden", true));
+    schemaError.clear();
+    EXPECT_TRUE(schema_allows(
+        schemas.at("clear_property"), cleared, schemaError))
+        << schemaError;
+    auto restored = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", comboKey},
+             {"descriptorId", selected->value("descriptorId", "")},
+             {"value", "1"}},
+        &isError);
+    ASSERT_FALSE(isError) << restored.dump(2);
+
+    ASSERT_GE(status->value("children", json::array()).size(), 2u);
+    const auto firstPartKey =
+        (*status)["children"][0].value("key", "");
+    const auto secondPartKey =
+        (*status)["children"][1].value("key", "");
+    auto firstPart = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", firstPartKey}},
+        &isError);
+    ASSERT_FALSE(isError) << firstPart.dump(2);
+    auto secondPart = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", secondPartKey}},
+        &isError);
+    ASSERT_FALSE(isError) << secondPart.dump(2);
+    EXPECT_EQ(
+        firstPart.value("schemaId", ""),
+        secondPart.value("schemaId", ""))
+        << "status parts should reuse one cached native schema";
+
+    const auto parallelSession = connect(client);
+    ASSERT_FALSE(parallelSession.empty());
+    auto beforeParallelRefresh = client.call_tool(
+        "get_editable_properties",
+        json{{"session", parallelSession}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError) << beforeParallelRefresh.dump(2);
+    auto parallelTree = client.call_tool(
+        "get_visual_tree", json{{"session", parallelSession}},
+        &isError);
+    ASSERT_FALSE(isError) << parallelTree.dump(2);
+    const auto* parallelGeneric = find_by_class(
+        parallelTree["root"], "LvtNativePropertyFixtureText");
+    ASSERT_NE(parallelGeneric, nullptr);
+    auto parallelProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", parallelSession},
+             {"element", parallelGeneric->value("key", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << parallelProperties.dump(2);
+    auto narrowedParallelTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", parallelSession}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << narrowedParallelTree.dump(2);
+    auto retainedParallelSibling = client.call_tool(
+        "get_editable_properties",
+        json{{"session", parallelSession}, {"element", comboKey}},
+        &isError);
+    EXPECT_FALSE(isError) << retainedParallelSibling.dump(2);
+
+    const auto scopedSession = connect(client);
+    ASSERT_FALSE(scopedSession.empty());
+    auto scopedTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", scopedSession}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << scopedTree.dump(2);
+    auto scopedGenericProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", scopedSession}, {"element", genericKey}},
+        &isError);
+    EXPECT_FALSE(isError) << scopedGenericProperties.dump(2);
+    auto underlyingSibling = client.call_tool(
+        "get_editable_properties",
+        json{{"session", scopedSession}, {"element", comboKey}},
+        &isError);
+    EXPECT_FALSE(isError) << underlyingSibling.dump(2);
+}
+
+TEST_F(NativeMcpFixture, NativeKeysRoundTripBetweenOneShotAndMcp) {
+    const auto oneShotOutput = run_command(
+        "\"" + get_lvt_path() + "\" --hwnd " + hwnd_string());
+    const auto oneShot = json::parse(
+        oneShotOutput, nullptr, false);
+    ASSERT_FALSE(oneShot.is_discarded()) << oneShotOutput;
+    ASSERT_TRUE(oneShot.contains("root"));
+    const auto* oneShotGeneric = find_by_class(
+        oneShot["root"], "LvtNativePropertyFixtureText");
+    const auto* oneShotList = find_by_class(
+        oneShot["root"], "SysListView32");
+    ASSERT_NE(oneShotGeneric, nullptr);
+    ASSERT_NE(oneShotList, nullptr);
+    const auto* oneShotBeta = find_child(
+        *oneShotList, "ListViewItem", "Beta row");
+    ASSERT_NE(oneShotBeta, nullptr);
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    const auto persistent = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << persistent.dump(2);
+    ASSERT_TRUE(persistent.contains("root"));
+    const auto* persistentGeneric = find_by_class(
+        persistent["root"], "LvtNativePropertyFixtureText");
+    const auto* persistentList = find_by_class(
+        persistent["root"], "SysListView32");
+    ASSERT_NE(persistentGeneric, nullptr);
+    ASSERT_NE(persistentList, nullptr);
+    const auto* persistentBeta = find_child(
+        *persistentList, "ListViewItem", "Beta row");
+    ASSERT_NE(persistentBeta, nullptr);
+
+    EXPECT_EQ(
+        persistent["root"].value("key", ""),
+        oneShot["root"].value("key", ""));
+    EXPECT_EQ(
+        persistentGeneric->value("key", ""),
+        oneShotGeneric->value("key", ""));
+    EXPECT_EQ(
+        persistentBeta->value("key", ""),
+        oneShotBeta->value("key", ""));
+
+    const auto dumpKey = oneShotBeta->value("key", "");
+    const auto scoped = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}, {"element", dumpKey}},
+        &isError);
+    ASSERT_FALSE(isError) << scoped.dump(2);
+    ASSERT_TRUE(scoped.contains("root"));
+    EXPECT_EQ(scoped["root"].value("key", ""), dumpKey);
+    EXPECT_EQ(scoped["root"].value("text", ""), "Beta row");
+
+    const auto mcpKey = persistentBeta->value("key", "");
+    const auto queried = run_command(
+        "\"" + get_lvt_path() + "\" --hwnd " + hwnd_string() +
+        " query " + cmd_escape_arg(mcpKey) + " index");
+    EXPECT_EQ(trim_crlf(queried), "1")
+        << "a persistent MCP key must resolve in a one-shot query";
+}
+
+TEST_F(
+    NativeMcpFixture,
+    DurableIdentityChangeRemovesOldKeyAndAddsOneShotKey) {
+    auto restore = wil::scope_exit([&] {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kRestoreListViewIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored);
+    });
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto initialTree = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << initialTree.dump(2);
+    const auto* initialList = find_by_class(
+        initialTree["root"], "SysListView32");
+    ASSERT_NE(initialList, nullptr);
+    const auto* alpha = find_child(
+        *initialList, "ListViewItem", "Alpha row");
+    ASSERT_NE(alpha, nullptr);
+    const auto oldKey = alpha->value("key", "");
+    ASSERT_FALSE(oldKey.empty());
+
+    auto baseline = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+    ASSERT_TRUE(baseline.value("snapshot", false));
+
+    DWORD_PTR changed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kMutateListViewIdentityMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &changed),
+        0);
+
+    const auto oneShotOutput = run_command(
+        "\"" + get_lvt_path() + "\" --hwnd " + hwnd_string());
+    const auto oneShot = json::parse(
+        oneShotOutput, nullptr, false);
+    ASSERT_FALSE(oneShot.is_discarded()) << oneShotOutput;
+    const auto* oneShotList = find_by_class(
+        oneShot["root"], "SysListView32");
+    ASSERT_NE(oneShotList, nullptr);
+    const auto* replacement = find_child(
+        *oneShotList, "ListViewItem", "External replacement");
+    ASSERT_NE(replacement, nullptr);
+    const auto freshKey = replacement->value("key", "");
+    ASSERT_FALSE(freshKey.empty());
+    ASSERT_NE(freshKey, oldKey);
+
+    auto changes = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << changes.dump(2);
+    ASSERT_FALSE(changes.value("snapshot", true))
+        << changes.dump(2);
+    bool removedOld = false;
+    bool addedFresh = false;
+    bool reusedOld = false;
+    for (const auto& event :
+         changes.value("events", json::array())) {
+        const auto key = event.value("key", "");
+        const auto type = event.value("event", "");
+        removedOld =
+            removedOld || (type == "removed" && key == oldKey);
+        addedFresh =
+            addedFresh || (type == "added" && key == freshKey);
+        reusedOld =
+            reusedOld || (type != "removed" && key == oldKey);
+    }
+    EXPECT_TRUE(removedOld) << changes.dump(2);
+    EXPECT_TRUE(addedFresh) << changes.dump(2);
+    EXPECT_FALSE(reusedOld) << changes.dump(2);
+
+    auto scoped = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}, {"element", freshKey}},
+        &isError);
+    ASSERT_FALSE(isError) << scoped.dump(2);
+    EXPECT_EQ(
+        scoped["root"].value("text", ""),
+        "External replacement");
+
+    const auto queried = run_command(
+        "\"" + get_lvt_path() + "\" --hwnd " + hwnd_string() +
+        " query " + cmd_escape_arg(freshKey) + " index");
+    EXPECT_EQ(trim_crlf(queried), "0");
+}
+
+TEST_F(
+    NativeMcpFixture,
+    OverlappingScopedTreeCannotInvalidateTargetsInLaterFullResponse) {
+    NativePublicationGate gate("get_visual_tree");
+    ASSERT_TRUE(gate.valid());
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    const auto comboKey = control_key(native_fixture::kComboBoxId);
+    ASSERT_FALSE(genericKey.empty());
+    ASSERT_FALSE(comboKey.empty());
+
+    const int full = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_TRUE(gate.wait_until_entered())
+        << "the full response did not reach the post-publication gate";
+
+    const int scoped = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments",
+              json{{"session", session}, {"element", genericKey}}}});
+    const auto scopedResponse = client.await_response(scoped);
+    ASSERT_TRUE(scopedResponse.contains("result"))
+        << scopedResponse.dump(2);
+    ASSERT_FALSE(scopedResponse["result"].value("isError", true))
+        << scopedResponse.dump(2);
+
+    gate.release();
+    const auto fullResponse = client.await_response(full);
+    ASSERT_TRUE(fullResponse.contains("result"))
+        << fullResponse.dump(2);
+    ASSERT_FALSE(fullResponse["result"].value("isError", true))
+        << fullResponse.dump(2);
+    const auto fullTree = json::parse(
+        fullResponse["result"]["content"][0].value("text", "{}"),
+        nullptr, false);
+    ASSERT_FALSE(fullTree.is_discarded())
+        << fullResponse.dump(2);
+    ASSERT_NE(find_by_class(fullTree["root"], "ComboBox"), nullptr)
+        << fullTree.dump(2);
+
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", comboKey}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "a key in the later-delivered full response was revoked by "
+           "the overlapping scoped response: "
+        << properties.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    OlderTreeChangeWalkCannotOverwriteNewerBaseline) {
+    const std::string base =
+        "Local\\LvtTreeBaseline_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, TRUE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_TREE_BASELINE_GATE", base);
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto baseline = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+    const auto resourceUri =
+        "lvt://session/" + session +
+        "/visual-tree";
+    auto initialResource = client.request(
+        "resources/read",
+        json{{"uri", resourceUri}});
+    ASSERT_TRUE(initialResource.contains("result"))
+        << initialResource.dump(2);
+    ASSERT_TRUE(ResetEvent(entered.get()));
+
+    const int older = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree_changes"},
+             {"arguments",
+              json{{"session", session},
+                   {"reset", true}}}});
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0);
+    const HWND generic = GetDlgItem(
+        s_hwnd, native_fixture::kGenericTextId);
+    ASSERT_TRUE(IsWindow(generic));
+    const std::wstring original = L"Generic child seed";
+    ASSERT_TRUE(SetWindowTextW(
+        generic, L"newer baseline value"));
+    auto newer = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session},
+             {"reset", true}},
+        &isError);
+    ASSERT_FALSE(isError) << newer.dump(2);
+    EXPECT_TRUE(newer.value("snapshot", false))
+        << newer.dump(2);
+    ASSERT_FALSE(newer.value("events", json::array()).empty())
+        << newer.dump(2);
+
+    char revokedKeyBuffer[64]{};
+    snprintf(
+        revokedKeyBuffer, sizeof(revokedKeyBuffer),
+        "win32:0x%llX",
+        static_cast<unsigned long long>(
+            reinterpret_cast<uintptr_t>(generic)));
+    const std::string revokedKey = revokedKeyBuffer;
+    DWORD_PTR reparented = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kReparentGenericOutOfTreeMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &reparented),
+        0);
+    auto revokingTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << revokingTree.dump(2);
+    SetEvent(release.get());
+    const auto olderResponse =
+        client.await_response(older);
+    ASSERT_TRUE(olderResponse.contains("result"))
+        << olderResponse.dump(2);
+    EXPECT_FALSE(
+        olderResponse["result"].value("isError", true))
+        << olderResponse.dump(2);
+    const auto olderPayload = json::parse(
+        olderResponse["result"]["content"][0]
+            .value("text", "{}"),
+        nullptr, false);
+    ASSERT_FALSE(olderPayload.is_discarded())
+        << olderResponse.dump(2);
+    EXPECT_TRUE(
+        olderPayload.value("snapshot", false))
+        << olderPayload.dump(2);
+    EXPECT_FALSE(
+        olderPayload.value(
+            "events", json::array()).empty())
+        << olderPayload.dump(2);
+    for (const auto& event :
+         olderPayload.value("events", json::array())) {
+        EXPECT_NE(event.value("key", ""), revokedKey)
+            << "stale reset returned a key revoked by a later visual read";
+    }
+
+    auto next = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << next.dump(2);
+    EXPECT_TRUE(next.value("events", json::array()).empty())
+        << "an older walk reversed the newer baseline: "
+        << next.dump(2);
+    SendMessageTimeoutW(
+        s_hwnd,
+        native_fixture::kRestoreGenericParentMessage,
+        0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+        2000, &reparented);
+    SetWindowTextW(generic, original.c_str());
+}
+
+TEST_F(
+    NativeMcpFixture,
+    OverlappingScopedTreeCannotInvalidateTargetsInLaterTreeChangeResponse) {
+    NativePublicationGate gate("get_visual_tree_changes");
+    ASSERT_TRUE(gate.valid());
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    const auto comboKey = control_key(native_fixture::kComboBoxId);
+    ASSERT_FALSE(genericKey.empty());
+    ASSERT_FALSE(comboKey.empty());
+
+    const int changes = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree_changes"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_TRUE(gate.wait_until_entered())
+        << "the tree-change response did not reach the publication gate";
+
+    const int scoped = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments",
+              json{{"session", session}, {"element", genericKey}}}});
+    const auto scopedResponse = client.await_response(scoped);
+    ASSERT_TRUE(scopedResponse.contains("result"))
+        << scopedResponse.dump(2);
+    ASSERT_FALSE(scopedResponse["result"].value("isError", true))
+        << scopedResponse.dump(2);
+
+    gate.release();
+    const auto changesResponse = client.await_response(changes);
+    ASSERT_TRUE(changesResponse.contains("result"))
+        << changesResponse.dump(2);
+    ASSERT_FALSE(changesResponse["result"].value("isError", true))
+        << changesResponse.dump(2);
+    const auto patch = json::parse(
+        changesResponse["result"]["content"][0].value("text", "{}"),
+        nullptr, false);
+    ASSERT_FALSE(patch.is_discarded())
+        << changesResponse.dump(2);
+    ASSERT_TRUE(patch.value("snapshot", false))
+        << patch.dump(2);
+    const auto events =
+        patch.value("events", json::array());
+    const bool returnedCombo = std::any_of(
+        events.begin(), events.end(),
+        [&comboKey](const json& event) {
+            return event.value("key", "") == comboKey;
+        });
+    ASSERT_TRUE(returnedCombo) << patch.dump(2);
+
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", comboKey}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "a key in the later-delivered tree-change response was revoked "
+           "by the overlapping scoped response: "
+        << properties.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    OverlappingScopedTreeCannotInvalidateTargetsInLaterResourceSnapshot) {
+    NativePublicationGate gate("get_visual_tree_changes");
+    ASSERT_TRUE(gate.valid());
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    const auto comboKey = control_key(native_fixture::kComboBoxId);
+    ASSERT_FALSE(genericKey.empty());
+    ASSERT_FALSE(comboKey.empty());
+    const auto uri =
+        "lvt://session/" + session + "/visual-tree";
+
+    const int resourceRead = client.send_request(
+        "resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(gate.wait_until_entered())
+        << "the resource snapshot did not reach the publication gate";
+
+    const int scoped = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments",
+              json{{"session", session}, {"element", genericKey}}}});
+    const auto scopedResponse = client.await_response(scoped);
+    ASSERT_TRUE(scopedResponse.contains("result"))
+        << scopedResponse.dump(2);
+    ASSERT_FALSE(scopedResponse["result"].value("isError", true))
+        << scopedResponse.dump(2);
+
+    gate.release();
+    const auto resourceResponse =
+        client.await_response(resourceRead);
+    ASSERT_TRUE(resourceResponse.contains("result"))
+        << resourceResponse.dump(2);
+    ASSERT_FALSE(
+        resourceResponse["result"]
+            .value("contents", json::array())
+            .empty())
+        << resourceResponse.dump(2);
+    const auto patch = json::parse(
+        resourceResponse["result"]["contents"][0]
+            .value("text", "{}"),
+        nullptr, false);
+    ASSERT_FALSE(patch.is_discarded())
+        << resourceResponse.dump(2);
+    const auto events =
+        patch.value("events", json::array());
+    const bool returnedCombo = std::any_of(
+        events.begin(), events.end(),
+        [&comboKey](const json& event) {
+            return event.value("key", "") == comboKey;
+        });
+    ASSERT_TRUE(returnedCombo) << patch.dump(2);
+
+    bool isError = false;
+    const auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", comboKey}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "a key in the later-delivered resource snapshot was revoked by "
+           "the overlapping scoped response: "
+        << properties.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    CompleteSnapshotInvalidatesTargetReparentedOutOfSessionRoot) {
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    ASSERT_FALSE(genericKey.empty());
+
+    bool isError = false;
+    const auto initial = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << initial.dump(2);
+    const auto baseline = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+
+    DWORD_PTR oldParent = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kReparentGenericOutOfTreeMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &oldParent),
+        0);
+    auto restore = wil::scope_exit([&] {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kRestoreGenericParentMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored);
+    });
+
+    const auto promptlyRejected = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError)
+        << "a target that moved out of the session root remained usable "
+           "until the next snapshot: "
+        << promptlyRejected.dump(2);
+
+    const auto withoutGeneric = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << withoutGeneric.dump(2);
+    EXPECT_EQ(
+        find_by_class(
+            withoutGeneric["root"],
+            "LvtNativePropertyFixtureText"),
+        nullptr)
+        << withoutGeneric.dump(2);
+    const auto rejected = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError)
+        << "a complete root snapshot retained a target that moved out "
+           "of the session root: "
+        << rejected.dump(2);
+
+    DWORD_PTR ignored = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kRestoreGenericParentMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored),
+        0);
+    restore.release();
+    const auto restoredTree = client.call_tool(
+        "get_visual_tree", json{{"session", session}},
+        &isError);
+    ASSERT_FALSE(isError) << restoredTree.dump(2);
+    const auto restoredProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_FALSE(isError) << restoredProperties.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    DisconnectClearsTargetsWhilePublishedResponseAwaitsDelivery) {
+    NativePublicationGate gate("get_visual_tree");
+    ASSERT_TRUE(gate.valid());
+    const std::string skippedCommitName =
+        "Local\\LvtSkippedAuthorizationCommit_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event skippedCommit(CreateEventA(
+        nullptr, TRUE, FALSE,
+        skippedCommitName.c_str()));
+    ASSERT_TRUE(skippedCommit);
+    ScopedEnvironmentVariable skippedCommitEvent(
+        "LVT_TEST_AUTHORIZATION_COMMIT_SKIPPED_EVENT",
+        skippedCommitName);
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    const auto genericKey = control_key(native_fixture::kGenericTextId);
+    ASSERT_FALSE(genericKey.empty());
+
+    const int tree = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_TRUE(gate.wait_until_entered())
+        << "the tree response did not reach the publication gate";
+
+    const int disconnect = client.send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+    const auto disconnectResponse =
+        client.await_response(disconnect);
+    ASSERT_TRUE(disconnectResponse.contains("result"))
+        << disconnectResponse.dump(2);
+    ASSERT_FALSE(
+        disconnectResponse["result"].value("isError", true))
+        << disconnectResponse.dump(2);
+
+    gate.release();
+    const auto treeResponse = client.await_response(tree);
+    ASSERT_TRUE(treeResponse.contains("result"))
+        << treeResponse.dump(2);
+    ASSERT_FALSE(treeResponse["result"].value("isError", true))
+        << treeResponse.dump(2);
+    EXPECT_EQ(
+        WaitForSingleObject(skippedCommit.get(), 5000),
+        WAIT_OBJECT_0)
+        << "the delayed post-disconnect authorization commit was not rejected";
+
+    bool isError = false;
+    const auto disconnected = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError) << disconnected.dump(2);
+
+    const auto replacement = connect(client);
+    ASSERT_FALSE(replacement.empty());
+    const auto unpublished = client.call_tool(
+        "get_editable_properties",
+        json{{"session", replacement}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError)
+        << "disconnect leaked published targets into a replacement session: "
+        << unpublished.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    NativePropertyLeaseDoesNotDeadlockSnapshotPublication) {
+    AuthorizationTestGate propertyGate(
+        "LVT_TEST_NATIVE_PROPERTY_LEASE_GATE");
+    AuthorizationTestGate publicationGate(
+        "LVT_TEST_AUTHORIZATION_PUBLICATION_GATE");
+    NativePublicationGate treeGate(
+        "get_visual_tree", false);
+    ASSERT_TRUE(propertyGate.valid());
+    ASSERT_TRUE(publicationGate.valid());
+    ASSERT_TRUE(treeGate.valid());
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto* generic =
+        find_by_class(
+            tree["root"],
+            "LvtNativePropertyFixtureText");
+    ASSERT_NE(generic, nullptr);
+    const auto genericKey = generic->value("key", "");
+    ASSERT_EQ(genericKey.rfind("win32:0x", 0), 0u);
+
+    bool isError = false;
+    auto baseline = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+
+    propertyGate.arm();
+    publicationGate.arm();
+    treeGate.arm();
+
+    const int refresh = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_TRUE(treeGate.wait_until_entered())
+        << "the refresh did not finish its target-guarded tree walk";
+
+    const int property = client.send_request(
+        "tools/call",
+        json{{"name", "get_editable_properties"},
+             {"arguments",
+              json{{"session", session},
+                   {"element", genericKey}}}});
+    ASSERT_TRUE(propertyGate.wait_until_entered())
+        << "the native property request did not acquire its authorization lease";
+
+    treeGate.release();
+    ASSERT_TRUE(publicationGate.wait_until_entered())
+        << "the completed snapshot did not reach authorization publication";
+
+    publicationGate.release();
+    propertyGate.release();
+
+    const auto propertyResponse =
+        client.await_response(property);
+    const auto refreshResponse =
+        client.await_response(refresh);
+    ASSERT_TRUE(propertyResponse.contains("result"))
+        << propertyResponse.dump(2);
+    ASSERT_TRUE(refreshResponse.contains("result"))
+        << refreshResponse.dump(2);
+    EXPECT_FALSE(
+        propertyResponse["result"].value("isError", true))
+        << propertyResponse.dump(2);
+    EXPECT_FALSE(
+        refreshResponse["result"].value("isError", true))
+        << refreshResponse.dump(2);
+}
+
+TEST_F(
+    NativeMcpFixture,
+    DestroyedNativeChildRemainsAStaleElementNotSessionLoss) {
+    DWORD_PTR created = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kCreateEventChildMessage,
+            0, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &created),
+        0);
+    const HWND child = reinterpret_cast<HWND>(
+        static_cast<uintptr_t>(created));
+    ASSERT_TRUE(IsWindow(child));
+    auto cleanup = wil::scope_exit([&] {
+        DWORD_PTR ignored = 0;
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kDestroyEventChildMessage,
+            0, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &ignored);
+    });
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    bool isError = false;
+    auto tree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << tree.dump(2);
+
+    std::vector<const json*> elements;
+    collect_json_elements(tree["root"], elements);
+    const auto publishedChild = std::find_if(
+        elements.begin(), elements.end(),
+        [](const json* element) {
+            return element->value("text", "") ==
+                "Event child";
+        });
+    ASSERT_NE(publishedChild, elements.end())
+        << tree.dump(2);
+    const std::string childKey =
+        (*publishedChild)->value("key", "");
+    ASSERT_EQ(childKey.rfind("win32:0x", 0), 0u);
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", childKey}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* text =
+        find_property_descriptor(properties, "Text");
+    ASSERT_NE(text, nullptr) << properties.dump(2);
+
+    DWORD_PTR destroyed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd,
+            native_fixture::kDestroyEventChildMessage,
+            0, 0,
+            SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+            2000, &destroyed),
+        0);
+    cleanup.release();
+
+    auto stale = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", childKey},
+             {"descriptorId",
+              text->value("descriptorId", "")},
+             {"value", "must not be written"}},
+        &isError);
+    ASSERT_TRUE(isError) << stale.dump(2);
+    expect_typed_property_failure(
+        stale, "typed_property_stale_element",
+        "terminal", false);
+
+    auto healthy = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    EXPECT_FALSE(isError)
+        << "a stale child invalidated the live root session: "
+        << healthy.dump(2);
+}
+
+TEST_F(NativeMcpFixture, DisconnectRacingNativePropertyReadDoesNotRecreateSession) {
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto tree = client.call_tool(
+        "get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    const auto* generic =
+        find_by_class(tree["root"], "LvtNativePropertyFixtureText");
+    const auto* toolbar =
+        find_by_class(tree["root"], "ToolbarWindow32");
+    ASSERT_NE(generic, nullptr);
+    ASSERT_NE(toolbar, nullptr);
+    const auto* apply =
+        find_child(*toolbar, "ToolbarButton", "Apply");
+    ASSERT_NE(apply, nullptr);
+    const auto genericKey = generic->value("key", "");
+    const auto applyKey = apply->value("key", "");
+
+    bool isError = false;
+    auto baseline = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", applyKey}},
+        &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+
+    DWORD_PTR armed = 0;
+    ASSERT_NE(
+        SendMessageTimeoutW(
+            s_hwnd, native_fixture::kArmDelayedPointerMessage,
+            0, 0, SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 2000, &armed),
+        0);
+
+    const int slow = client.send_request(
+        "tools/call",
+        json{{"name", "get_editable_properties"},
+             {"arguments",
+              json{{"session", session}, {"element", applyKey}}}});
+    Sleep(100);
+    const int queued = client.send_request(
+        "tools/call",
+        json{{"name", "get_editable_properties"},
+             {"arguments",
+              json{{"session", session}, {"element", genericKey}}}});
+    const int disconnecting = client.send_request(
+        "tools/call",
+        json{{"name", "disconnect"},
+             {"arguments", json{{"session", session}}}});
+
+    auto slowResponse = client.await_response(slow);
+    auto queuedResponse = client.await_response(queued);
+    auto disconnected = client.await_response(disconnecting);
+    ASSERT_TRUE(slowResponse.contains("result"));
+    ASSERT_TRUE(queuedResponse.contains("result"));
+    ASSERT_TRUE(disconnected.contains("result"));
+    EXPECT_TRUE(slowResponse["result"].value("isError", false));
+    EXPECT_TRUE(queuedResponse["result"].value("isError", false))
+        << queuedResponse.dump(2);
+    EXPECT_FALSE(disconnected["result"].value("isError", true))
+        << disconnected.dump(2);
+
+    auto oldSession = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError) << oldSession.dump(2);
+    expect_typed_property_session_disconnected(oldSession);
+
+    const auto replacement = connect(client);
+    ASSERT_FALSE(replacement.empty());
+    auto beforeRefresh = client.call_tool(
+        "get_editable_properties",
+        json{{"session", replacement}, {"element", genericKey}},
+        &isError);
+    EXPECT_TRUE(isError) << beforeRefresh.dump(2);
+    EXPECT_NE(
+        beforeRefresh.value("error", "").find("unknown"),
+        std::string::npos);
+
+    auto replacementTree = client.call_tool(
+        "get_visual_tree", json{{"session", replacement}},
+        &isError);
+    ASSERT_FALSE(isError) << replacementTree.dump(2);
+    const auto* replacementGeneric = find_by_class(
+        replacementTree["root"], "LvtNativePropertyFixtureText");
+    ASSERT_NE(replacementGeneric, nullptr);
+    auto replacementProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", replacement},
+             {"element", replacementGeneric->value("key", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << replacementProperties.dump(2);
+}
+
+TEST_F(McpSampleFixture, TypedPropertyConnectionErrorsHaveDisposition) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto temporarilyUnavailable = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", "xaml:0x1"}},
+        &isError);
+    ASSERT_TRUE(isError) << temporarilyUnavailable.dump(2);
+    EXPECT_EQ(
+        temporarilyUnavailable.value("errorCode", ""),
+        "typed_property_target_not_authorized");
+    EXPECT_EQ(
+        temporarilyUnavailable.value("errorDisposition", ""),
+        "transient");
+    EXPECT_TRUE(temporarilyUnavailable.value("retryable", false));
+
+    auto unsupported = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", "unsupported_plugin:0x1"}},
+        &isError);
+    ASSERT_TRUE(isError) << unsupported.dump(2);
+    EXPECT_EQ(
+        unsupported.value("errorCode", ""),
+        "typed_property_provider_unsupported");
+    EXPECT_EQ(unsupported.value("errorDisposition", ""), "terminal");
+    EXPECT_FALSE(unsupported.value("retryable", true));
+
+    auto visual = client.call_tool(
+        "get_visual_tree", json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << visual.dump(2);
+    std::vector<const json*> elements;
+    collect_json_elements(visual["root"], elements);
+    const json* button = nullptr;
+    for (const auto* element : elements) {
+        if (element->value("properties", json::object())
+                .value("name", "") == "PrimaryButton") {
+            button = element;
+            break;
+        }
+    }
+    ASSERT_NE(button, nullptr);
+    auto recovered = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", button->value("key", "")}},
+        &isError);
+    EXPECT_FALSE(isError) << recovered.dump(2);
+    EXPECT_FALSE(recovered.value("schemaId", "").empty())
+        << recovered.dump(2);
+}
+
+TEST_F(
+    McpSampleFixture,
+    TransientUiaPropertyResolutionFailuresRemainRetryable) {
+    SkipIfNotReady();
+    const std::string referenceEventName =
+        "Local\\LvtUiaPropertyReferenceFailure_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    const std::string actionEventName =
+        "Local\\LvtUiaPropertyActionFailure_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event referenceFailure(CreateEventA(
+        nullptr, TRUE, FALSE,
+        referenceEventName.c_str()));
+    wil::unique_event actionFailure(CreateEventA(
+        nullptr, TRUE, FALSE,
+        actionEventName.c_str()));
+    ASSERT_TRUE(referenceFailure);
+    ASSERT_TRUE(actionFailure);
+    ScopedEnvironmentVariable referenceFailureEvent(
+        "LVT_TEST_UIA_PROPERTY_REFERENCE_FAILURE_EVENT",
+        referenceEventName);
+    ScopedEnvironmentVariable actionFailureEvent(
+        "LVT_TEST_UIA_PROPERTY_ACTION_ROOT_FAILURE_EVENT",
+        actionEventName);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    auto input = client.call_tool(
+        "find_elements",
+        json{{"session", session},
+             {"automationId", "InputBox"}});
+    ASSERT_EQ(input["elements"].size(), 1u)
+        << input.dump(2);
+    const auto key =
+        input["elements"][0].value("key", "");
+    bool isError = false;
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* value =
+        find_property_descriptor(
+            properties, "Value.Value");
+    ASSERT_NE(value, nullptr) << properties.dump(2);
+    const auto descriptorId =
+        value->value("descriptorId", "");
+    const auto original =
+        typed_property_value(
+            properties, "Value.Value");
+
+    ASSERT_TRUE(SetEvent(referenceFailure.get()));
+    auto referenceError = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", original}},
+        &isError);
+    ASSERT_TRUE(isError) << referenceError.dump(2);
+    expect_typed_property_failure(
+        referenceError,
+        "typed_property_connection_unavailable",
+        "transient", true);
+    EXPECT_EQ(
+        referenceError.value("hresult", ""),
+        "0x80010001")
+        << referenceError.dump(2);
+
+    ASSERT_TRUE(SetEvent(actionFailure.get()));
+    auto rootError = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", original}},
+        &isError);
+    ASSERT_TRUE(isError) << rootError.dump(2);
+    expect_typed_property_failure(
+        rootError, "typed_property_provider_busy",
+        "transient", true);
+    EXPECT_EQ(
+        rootError.value("hresult", ""),
+        "0x80040201")
+        << rootError.dump(2);
+
+    auto recovered = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", original}},
+        &isError);
+    EXPECT_FALSE(isError) << recovered.dump(2);
+}
+
+TEST_F(
+    McpSampleFixture,
+    RejectedPartialHostRefreshPreservesPropertyAuthorization) {
+    SkipIfNotReady();
+    const std::string eventName =
+        "Local\\LvtPartialXamlHost_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event partialHost(CreateEventA(
+        nullptr, TRUE, FALSE, eventName.c_str()));
+    ASSERT_TRUE(partialHost);
+    ScopedEnvironmentVariable partialHostGate(
+        "LVT_TEST_PARTIAL_XAML_HOST_EVENT",
+        eventName);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto tree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << tree.dump(2);
+    const auto* button =
+        find_managed_named_element(
+            tree["root"], "PrimaryButton");
+    ASSERT_NE(button, nullptr) << tree.dump(2);
+    const auto key = button->value("key", "");
+    ASSERT_EQ(key.rfind("winui3:0x", 0), 0u);
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+
+    auto baseline = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+    const auto resourceUri =
+        "lvt://session/" + session +
+        "/visual-tree";
+    auto resourceBaseline = client.request(
+        "resources/read",
+        json{{"uri", resourceUri}});
+    ASSERT_TRUE(resourceBaseline.contains("result"))
+        << resourceBaseline.dump(2);
+
+    ASSERT_TRUE(SetEvent(partialHost.get()));
+    auto rejectedPlain = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_TRUE(isError) << rejectedPlain.dump(2);
+    EXPECT_NE(
+        rejectedPlain.value("error", "")
+            .find("previous complete snapshot"),
+        std::string::npos)
+        << rejectedPlain.dump(2);
+    auto rejectedReset = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session},
+             {"reset", true}},
+        &isError);
+    ASSERT_TRUE(isError) << rejectedReset.dump(2);
+    auto rejectedOptions = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session},
+             {"fast", true}},
+        &isError);
+    ASSERT_TRUE(isError) << rejectedOptions.dump(2);
+    auto rejected = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_TRUE(isError) << rejected.dump(2);
+    EXPECT_NE(
+        rejected.value("error", "")
+            .find("temporarily lost"),
+        std::string::npos)
+        << rejected.dump(2);
+    auto afterRejectedTool = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << "a rejected per-host tool snapshot replaced authorization: "
+        << afterRejectedTool.dump(2);
+
+    auto rejectedResource = client.request(
+        "resources/read",
+        json{{"uri", resourceUri}});
+    ASSERT_TRUE(rejectedResource.contains("error"))
+        << rejectedResource.dump(2);
+    auto afterRejectedResource = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    ASSERT_FALSE(isError)
+        << "a rejected per-host resource snapshot replaced authorization: "
+        << afterRejectedResource.dump(2);
+
+    ASSERT_TRUE(ResetEvent(partialHost.get()));
+    auto recovered = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << recovered.dump(2);
+    auto recoveredProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", key}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << recoveredProperties.dump(2);
+}
+
+TEST_F(
+    McpSampleFixture,
+    InitialPartialHostSnapshotIsRejected) {
+    SkipIfNotReady();
+    const std::string eventName =
+        "Local\\LvtInitialPartialXamlHost_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event partialHost(CreateEventA(
+        nullptr, TRUE, TRUE, eventName.c_str()));
+    ASSERT_TRUE(partialHost);
+    const std::string newHostName =
+        eventName + "_new";
+    wil::unique_event newHost(CreateEventA(
+        nullptr, TRUE, FALSE, newHostName.c_str()));
+    ASSERT_TRUE(newHost);
+    ScopedEnvironmentVariable partialHostGate(
+        "LVT_TEST_PARTIAL_XAML_HOST_EVENT",
+        eventName);
+    ScopedEnvironmentVariable newHostGate(
+        "LVT_TEST_NEW_EMPTY_XAML_HOST_EVENT",
+        newHostName);
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto rejected = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_TRUE(isError) << rejected.dump(2);
+    EXPECT_NE(
+        rejected.value("error", "")
+            .find("previous complete snapshot"),
+        std::string::npos)
+        << rejected.dump(2);
+    ASSERT_TRUE(ResetEvent(partialHost.get()));
+    auto recovered = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    EXPECT_FALSE(isError) << recovered.dump(2);
+    ASSERT_TRUE(SetEvent(newHost.get()));
+    auto newHostRejected = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    EXPECT_TRUE(isError) << newHostRejected.dump(2);
+}
+
+TEST_F(
+    McpSampleFixture,
+    XamlPropertyOperationsRejectLiveRootGraphReparent) {
+    SkipIfNotReady();
+    const std::string eventName =
+        "Local\\LvtXamlPropertyReparent_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event reparented(CreateEventA(
+        nullptr, TRUE, FALSE, eventName.c_str()));
+    ASSERT_TRUE(reparented);
+    ScopedEnvironmentVariable reparentGate(
+        "LVT_TEST_XAML_PROPERTY_REPARENT_EVENT",
+        eventName);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto tree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << tree.dump(2);
+    const auto* status =
+        find_managed_named_element(
+            tree["root"], "StatusText");
+    const auto* button =
+        find_managed_named_element(
+            tree["root"], "PrimaryButton");
+    ASSERT_NE(status, nullptr) << tree.dump(2);
+    ASSERT_NE(button, nullptr) << tree.dump(2);
+    const auto statusKey = status->value("key", "");
+    const auto buttonKey = button->value("key", "");
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", statusKey}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* text =
+        find_property_descriptor(properties, "Text");
+    ASSERT_NE(text, nullptr) << properties.dump(2);
+    ASSERT_TRUE(text->value("supportsClear", false));
+    const auto descriptorId =
+        text->value("descriptorId", "");
+
+    ASSERT_TRUE(SetEvent(reparented.get()));
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"get_editable_properties",
+              json{{"session", session},
+                   {"element", statusKey}}},
+             {"set_property",
+              json{{"session", session},
+                   {"element", statusKey},
+                   {"descriptorId", descriptorId},
+                   {"value", "must-not-cross-root"}}},
+             {"clear_property",
+              json{{"session", session},
+                   {"element", statusKey},
+                   {"descriptorId", descriptorId}}}}) {
+        isError = false;
+        const auto denied = client.call_tool(
+            tool, arguments, &isError);
+        ASSERT_TRUE(isError) << denied.dump(2);
+        expect_typed_property_target_membership_lost(
+            denied);
+    }
+
+    ASSERT_TRUE(ResetEvent(reparented.get()));
+    auto unaffected = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", buttonKey}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "a moved XAML object poisoned its live session: "
+        << unaffected.dump(2);
+}
+
+TEST_F(McpSampleFixture, ResourcesMatchEachSessionsFixedTreeMode) {
+    SkipIfNotReady();
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    json serverInfo;
+    ASSERT_TRUE(client.handshake(&serverInfo));
+    ASSERT_TRUE(serverInfo["capabilities"].contains("resources"))
+        << serverInfo.dump(2);
+    EXPECT_TRUE(serverInfo["capabilities"]["resources"].value("subscribe", false));
+
+    const auto uiaSession = connect(client);
+    const auto visualSession = connect(client, "visual");
+    ASSERT_FALSE(uiaSession.empty());
+    ASSERT_FALSE(visualSession.empty());
+
+    auto listed = client.request("resources/list");
+    ASSERT_TRUE(listed.contains("result")) << listed.dump(2);
+    std::vector<std::string> uris;
+    for (const auto& resource : listed["result"].value("resources", json::array()))
+        uris.push_back(resource.value("uri", ""));
+
+    const auto uiaUri = "lvt://session/" + uiaSession + "/uia-tree";
+    const auto wrongUiaUri = "lvt://session/" + uiaSession + "/visual-tree";
+    const auto visualUri = "lvt://session/" + visualSession + "/visual-tree";
+    const auto wrongVisualUri = "lvt://session/" + visualSession + "/uia-tree";
+    EXPECT_NE(std::find(uris.begin(), uris.end(), uiaUri), uris.end());
+    EXPECT_NE(std::find(uris.begin(), uris.end(), visualUri), uris.end());
+    EXPECT_EQ(std::find(uris.begin(), uris.end(), wrongUiaUri), uris.end());
+    EXPECT_EQ(std::find(uris.begin(), uris.end(), wrongVisualUri), uris.end());
+}
+
+TEST_F(McpSampleFixture, UiaTypedPropertiesStayScopedToEachWindowInOneProcess) {
+    SkipIfNotReady();
+    const auto secondaryHwnd = secondary_hwnd_string();
+    if (secondaryHwnd.empty())
+        GTEST_SKIP() << "the sample app's secondary window is unavailable";
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto primarySession = connect(client);
+    ASSERT_FALSE(primarySession.empty());
+    const auto secondaryConnect = client.call_tool(
+        "connect", json{{"hwnd", secondaryHwnd}, {"mode", "uia"}});
+    const auto secondarySession = secondaryConnect.value("session", "");
+    ASSERT_FALSE(secondarySession.empty()) << secondaryConnect.dump(2);
+
+    auto primaryInput = client.call_tool(
+        "find_elements",
+        json{{"session", primarySession}, {"automationId", "InputBox"}});
+    auto secondaryInput = client.call_tool(
+        "find_elements",
+        json{{"session", secondarySession}, {"automationId", "2001"}});
+    ASSERT_EQ(primaryInput["elements"].size(), 1u) << primaryInput.dump(2);
+    ASSERT_EQ(secondaryInput["elements"].size(), 1u) << secondaryInput.dump(2);
+    EXPECT_TRUE(client.call_tool(
+        "find_elements",
+        json{{"session", primarySession}, {"automationId", "2001"}})
+                    ["elements"].empty());
+    EXPECT_TRUE(client.call_tool(
+        "find_elements",
+        json{{"session", secondarySession}, {"automationId", "InputBox"}})
+                    ["elements"].empty());
+
+    const auto primaryKey = primaryInput["elements"][0].value("key", "");
+    const auto secondaryKey = secondaryInput["elements"][0].value("key", "");
+    bool isError = false;
+    auto primaryProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession}, {"element", primaryKey}}, &isError);
+    ASSERT_FALSE(isError) << primaryProperties.dump(2);
+    auto secondaryProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession}, {"element", secondaryKey}}, &isError);
+    ASSERT_FALSE(isError) << secondaryProperties.dump(2);
+    const auto* primaryValue =
+        find_property_descriptor(primaryProperties, "Value.Value");
+    const auto* secondaryValue =
+        find_property_descriptor(secondaryProperties, "Value.Value");
+    ASSERT_NE(primaryValue, nullptr);
+    ASSERT_NE(secondaryValue, nullptr);
+    const auto originalPrimary =
+        typed_property_value(primaryProperties, "Value.Value");
+    const auto originalSecondary =
+        typed_property_value(secondaryProperties, "Value.Value");
+
+    auto setPrimary = client.call_tool(
+        "set_property",
+        json{{"session", primarySession},
+             {"element", primaryKey},
+             {"descriptorId", primaryValue->value("descriptorId", "")},
+             {"value", "primary isolated"}},
+        &isError);
+    ASSERT_FALSE(isError) << setPrimary.dump(2);
+    auto setSecondary = client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryKey},
+             {"descriptorId", secondaryValue->value("descriptorId", "")},
+             {"value", "secondary isolated"}},
+        &isError);
+    ASSERT_FALSE(isError) << setSecondary.dump(2);
+
+    auto primaryAfter = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession}, {"element", primaryKey}}, &isError);
+    ASSERT_FALSE(isError) << primaryAfter.dump(2);
+    auto secondaryAfter = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession}, {"element", secondaryKey}}, &isError);
+    ASSERT_FALSE(isError) << secondaryAfter.dump(2);
+    EXPECT_EQ(typed_property_value(primaryAfter, "Value.Value"), "primary isolated");
+    EXPECT_EQ(typed_property_value(secondaryAfter, "Value.Value"), "secondary isolated");
+
+    auto primaryCheck = client.call_tool(
+        "find_elements",
+        json{{"session", primarySession}, {"automationId", "ReadyCheckBox"}});
+    auto secondaryCheck = client.call_tool(
+        "find_elements",
+        json{{"session", secondarySession}, {"automationId", "2002"}});
+    ASSERT_EQ(primaryCheck["elements"].size(), 1u);
+    ASSERT_EQ(secondaryCheck["elements"].size(), 1u);
+    const auto primaryCheckKey = primaryCheck["elements"][0].value("key", "");
+    const auto secondaryCheckKey = secondaryCheck["elements"][0].value("key", "");
+    auto primaryCheckProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession}, {"element", primaryCheckKey}}, &isError);
+    auto secondaryCheckProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession}, {"element", secondaryCheckKey}}, &isError);
+    ASSERT_FALSE(isError);
+    const auto* primaryToggle =
+        find_property_descriptor(primaryCheckProperties, "Toggle.ToggleState");
+    const auto* secondaryToggle =
+        find_property_descriptor(secondaryCheckProperties, "Toggle.ToggleState");
+    ASSERT_NE(primaryToggle, nullptr);
+    ASSERT_NE(secondaryToggle, nullptr);
+    const auto originalPrimaryToggle =
+        typed_property_value(primaryCheckProperties, "Toggle.ToggleState");
+    const auto originalSecondaryToggle =
+        typed_property_value(secondaryCheckProperties, "Toggle.ToggleState");
+
+    auto primaryOff = client.call_tool(
+        "set_property",
+        json{{"session", primarySession},
+             {"element", primaryCheckKey},
+             {"descriptorId", primaryToggle->value("descriptorId", "")},
+             {"value", "Off"}},
+        &isError);
+    ASSERT_FALSE(isError) << primaryOff.dump(2);
+    auto secondaryOn = client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryCheckKey},
+             {"descriptorId", secondaryToggle->value("descriptorId", "")},
+             {"value", "On"}},
+        &isError);
+    ASSERT_FALSE(isError) << secondaryOn.dump(2);
+
+    auto primaryToggleAfter = client.call_tool(
+        "get_editable_properties",
+        json{{"session", primarySession}, {"element", primaryCheckKey}}, &isError);
+    auto secondaryToggleAfter = client.call_tool(
+        "get_editable_properties",
+        json{{"session", secondarySession}, {"element", secondaryCheckKey}}, &isError);
+    ASSERT_FALSE(isError);
+    EXPECT_EQ(
+        typed_property_value(primaryToggleAfter, "Toggle.ToggleState"), "Off");
+    EXPECT_EQ(
+        typed_property_value(secondaryToggleAfter, "Toggle.ToggleState"), "On");
+
+    client.call_tool(
+        "set_property",
+        json{{"session", primarySession},
+             {"element", primaryKey},
+             {"descriptorId", primaryValue->value("descriptorId", "")},
+             {"value", originalPrimary}},
+        &isError);
+    client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryKey},
+             {"descriptorId", secondaryValue->value("descriptorId", "")},
+             {"value", originalSecondary}},
+        &isError);
+    client.call_tool(
+        "set_property",
+        json{{"session", primarySession},
+             {"element", primaryCheckKey},
+             {"descriptorId", primaryToggle->value("descriptorId", "")},
+             {"value", originalPrimaryToggle}},
+        &isError);
+    client.call_tool(
+        "set_property",
+        json{{"session", secondarySession},
+             {"element", secondaryCheckKey},
+             {"descriptorId", secondaryToggle->value("descriptorId", "")},
+             {"value", originalSecondaryToggle}},
+        &isError);
+    EXPECT_FALSE(isError);
+}
+
+TEST_F(McpSampleFixture, UiaTypedPropertiesPreserveOriginatingViewIdentity) {
+    SkipIfNotReady();
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto raw = client.call_tool(
+        "find_elements",
+        json{{"session", session},
+             {"automationId", "RawOnlyInput"},
+             {"view", "raw"}});
+    ASSERT_EQ(raw["elements"].size(), 1u) << raw.dump(2);
+    const auto rawRef = raw["elements"][0].value("ref", "");
+    const auto rawKey = raw["elements"][0].value("key", "");
+
+    bool isError = false;
+    auto rawProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", rawKey}}, &isError);
+    ASSERT_FALSE(isError) << rawProperties.dump(2);
+    EXPECT_NE(
+        find_property_descriptor(rawProperties, "Value.Value"), nullptr);
+
+    auto rawElement = client.call_tool(
+        "get_element_properties",
+        json{{"session", session},
+             {"element", rawRef},
+             {"view", "raw"},
+             {"properties", json::array({"RuntimeId"})}},
+        &isError);
+    ASSERT_FALSE(isError) << rawElement.dump(2);
+    const auto runtimeId =
+        rawElement["properties"].value("RuntimeId", "");
+    ASSERT_FALSE(runtimeId.empty()) << rawElement.dump(2);
+    auto directRuntime = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", "uia:" + runtimeId}},
+        &isError);
+    ASSERT_FALSE(isError) << directRuntime.dump(2);
+    EXPECT_EQ(
+        directRuntime.value("schemaId", ""),
+        rawProperties.value("schemaId", ""));
+
+    auto positional = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", rawRef}}, &isError);
+    EXPECT_TRUE(isError) << positional.dump(2);
+    EXPECT_NE(positional.dump().find("originating raw/control/content view"),
+              std::string::npos) << positional.dump(2);
+
+    auto content = client.call_tool(
+        "find_elements",
+        json{{"session", session},
+             {"automationId", "InputBox"},
+             {"view", "content"}});
+    ASSERT_EQ(content["elements"].size(), 1u) << content.dump(2);
+    auto contentProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", content["elements"][0].value("key", "")}},
+        &isError);
+    ASSERT_FALSE(isError) << contentProperties.dump(2);
+    EXPECT_NE(
+        find_property_descriptor(contentProperties, "Value.Value"), nullptr);
+
+    auto rawAfterOtherViews = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", rawKey}}, &isError);
+    ASSERT_FALSE(isError) << rawAfterOtherViews.dump(2);
+    EXPECT_EQ(
+        rawAfterOtherViews.value("schemaId", ""),
+        rawProperties.value("schemaId", ""));
+}
+
+TEST_F(McpSampleFixture, UiaIdentityScopeIgnoresTimeoutAndPropertyChurn) {
+    SkipIfNotReady();
+
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto raw = client.call_tool(
+        "find_elements",
+        json{{"session", session},
+             {"automationId", "RawOnlyInput"},
+             {"view", "raw"}});
+    ASSERT_EQ(raw["elements"].size(), 1u) << raw.dump(2);
+    const auto rawKey = raw["elements"][0].value("key", "");
+    ASSERT_FALSE(rawKey.empty());
+
+    const std::array<const char*, 4> properties{
+        "Name", "AutomationId", "HelpText", "RuntimeId"};
+    bool isError = false;
+    for (int i = 0; i < 24; ++i) {
+        auto requested = json::array(
+            {properties[static_cast<size_t>(i) % properties.size()]});
+        if (i % 3 == 0)
+            requested.push_back("RuntimeId");
+        auto tree = client.call_tool(
+            "get_uia_tree",
+            json{{"session", session},
+                 {"view", "raw"},
+                 {"depth", 0},
+                 {"timeoutMs", 10000 + i},
+                 {"properties", std::move(requested)}},
+            &isError);
+        ASSERT_FALSE(isError)
+            << "UIA identity scope was exhausted by non-identity option "
+               "combinations at iteration "
+            << i << ": " << tree.dump(2);
+        ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    }
+
+    for (const auto* view : {"control", "content"}) {
+        auto tree = client.call_tool(
+            "get_uia_tree",
+            json{{"session", session},
+                 {"view", view},
+                 {"depth", 0},
+                 {"timeoutMs", 10100},
+                 {"properties", json::array({"Name"})}},
+            &isError);
+        ASSERT_FALSE(isError) << view << ": " << tree.dump(2);
+        ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
+    }
+
+    auto rawProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", rawKey}},
+        &isError);
+    ASSERT_FALSE(isError) << rawProperties.dump(2);
+    EXPECT_NE(
+        find_property_descriptor(rawProperties, "Value.Value"), nullptr);
+}
+
+TEST_F(McpSampleFixture, TypedScrollRejectsAStaleMissingScrollPattern) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto list = client.call_tool(
+        "find_elements",
+        json{{"session", session}, {"automationId", "ItemsList"}});
+    auto toggleSize = client.call_tool(
+        "find_elements",
+        json{{"session", session}, {"automationId", "ToggleListSizeButton"}});
+    ASSERT_EQ(list["elements"].size(), 1u) << list.dump(2);
+    ASSERT_EQ(toggleSize["elements"].size(), 1u) << toggleSize.dump(2);
+    const auto listKey = list["elements"][0].value("key", "");
+    const auto toggleKey = toggleSize["elements"][0].value("key", "");
+
+    bool isError = false;
+    auto before = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", listKey}}, &isError);
+    ASSERT_FALSE(isError) << before.dump(2);
+    const auto* scroll =
+        find_property_descriptor(before, "Scroll.Action");
+    ASSERT_NE(scroll, nullptr) << before.dump(2);
+    ASSERT_TRUE(scroll->value("writable", false));
+    const auto staleDescriptor = scroll->value("descriptorId", "");
+
+    auto shrink = client.call_tool(
+        "click",
+        json{{"session", session}, {"element", toggleKey}}, &isError);
+    ASSERT_FALSE(isError) << shrink.dump(2);
+
+    auto changed = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", listKey}}, &isError);
+    ASSERT_FALSE(isError) << changed.dump(2);
+    const auto* changedScroll =
+        find_property_descriptor(changed, "Scroll.Action");
+    if (changedScroll) {
+        EXPECT_FALSE(changedScroll->value("writable", true));
+        EXPECT_NE(changedScroll->value("descriptorId", ""), staleDescriptor);
+    }
+
+    auto stale = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", listKey},
+             {"descriptorId", staleDescriptor},
+             {"value", "down"}},
+        &isError);
+    EXPECT_TRUE(isError) << stale.dump(2);
+    EXPECT_EQ(stale.value("errorDisposition", ""), "terminal")
+        << stale.dump(2);
+    EXPECT_FALSE(stale.value("retryable", true))
+        << stale.dump(2);
+    EXPECT_FALSE(stale.value("hresult", "").empty())
+        << stale.dump(2);
+    EXPECT_NE(stale.dump().find("stale"), std::string::npos)
+        << stale.dump(2);
+    EXPECT_EQ(stale.dump().find("ScrollItemPattern"), std::string::npos)
+        << "typed directional scroll must not fall back to ScrollIntoView";
+
+    auto restore = client.call_tool(
+        "click",
+        json{{"session", session}, {"element", toggleKey}}, &isError);
+    EXPECT_FALSE(isError) << restore.dump(2);
+}
+
+TEST_F(McpSampleFixture, RangeValueMutationReturnsProviderReadback) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    auto slider = client.call_tool(
+        "find_elements",
+        json{{"session", session}, {"automationId", "LevelSlider"}});
+    ASSERT_EQ(slider["elements"].size(), 1u) << slider.dump(2);
+    const auto key = slider["elements"][0].value("key", "");
+    bool isError = false;
+    auto before = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
+    ASSERT_FALSE(isError) << before.dump(2);
+    const auto* range =
+        find_property_descriptor(before, "RangeValue.Value");
+    ASSERT_NE(range, nullptr) << before.dump(2);
+    const auto descriptorId = range->value("descriptorId", "");
+    const auto original = typed_property_value(before, "RangeValue.Value");
+
+    const auto requested = "075.1300";
+    auto mutation = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", requested}},
+        &isError);
+    ASSERT_FALSE(isError) << mutation.dump(2);
+    const auto readback = mutation.value("value", "");
+    ASSERT_FALSE(readback.empty()) << mutation.dump(2);
+    EXPECT_NE(readback, requested);
+
+    auto after = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", key}}, &isError);
+    ASSERT_FALSE(isError) << after.dump(2);
+    EXPECT_EQ(typed_property_value(after, "RangeValue.Value"), readback);
+
+    auto restore = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", key},
+             {"descriptorId", descriptorId},
+             {"value", original}},
+        &isError);
+    EXPECT_FALSE(isError) << restore.dump(2);
+}
+
+TEST_F(McpSampleFixture, ResourceSubscriptionPushesVisualPropertyChange) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+    auto visual = client.call_tool("get_visual_tree", json{{"session", session}});
+    ASSERT_TRUE(visual.contains("root")) << visual.dump(2);
+    std::vector<const json*> elements;
+    collect_json_elements(visual["root"], elements);
+    const json* status = nullptr;
+    for (const auto* element : elements) {
+        if (element->value("properties", json::object()).value("name", "") == "StatusText") {
+            status = element;
+            break;
+        }
+    }
+    ASSERT_NE(status, nullptr);
+    const auto statusKey = status->value("key", "");
+    ASSERT_EQ(statusKey.rfind("winui3:0x", 0), 0u);
+
+    bool isError = false;
+    auto statusProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session}, {"element", statusKey}}, &isError);
+    ASSERT_FALSE(isError) << statusProperties.dump(2);
+    const auto* textProperty =
+        find_property_descriptor(statusProperties, "Text");
+    ASSERT_NE(textProperty, nullptr) << statusProperties.dump(2);
+    const auto textDescriptorId =
+        textProperty->value("descriptorId", "");
+    const auto originalText = typed_property_value(statusProperties, "Text");
+
+    auto listed = client.request("resources/list");
+    ASSERT_TRUE(listed.contains("result")) << listed.dump(2);
+    const auto uri = "lvt://session/" + session + "/visual-tree";
+    bool foundResource = false;
+    for (const auto& resource : listed["result"].value("resources", json::array()))
+        foundResource = foundResource || resource.value("uri", "") == uri;
+    ASSERT_TRUE(foundResource) << listed.dump(2);
+
+    auto subscribed = client.request("resources/subscribe", json{{"uri", uri}});
+    ASSERT_TRUE(subscribed.contains("result")) << subscribed.dump(2);
+
+    auto initialRead = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(initialRead.contains("result")) << initialRead.dump(2);
+    ASSERT_FALSE(initialRead["result"].value("contents", json::array()).empty());
+    const auto initialPatch = json::parse(
+        initialRead["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_FALSE(initialPatch.is_discarded()) << initialRead.dump(2);
+    EXPECT_TRUE(initialPatch.value("snapshot", false));
+
+    // Direct tools and subscribed resources are independent consumers. Give
+    // the direct tool its own baseline before the mutation; consuming its
+    // later diff must not advance or steal the resource stream's baseline.
+    auto directInitial = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}, {"fast", true}}, &isError);
+    ASSERT_FALSE(isError) << directInitial.dump(2);
+    EXPECT_TRUE(directInitial.value("snapshot", false));
+
+    const auto changedText = "resource visual mutation";
+    auto changed = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", textDescriptorId},
+             {"value", changedText}},
+        &isError);
+    ASSERT_FALSE(isError) << changed.dump(2);
+
+    auto directChanged = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}, {"fast", true}}, &isError);
+    ASSERT_FALSE(isError) << directChanged.dump(2);
+    EXPECT_FALSE(directChanged.value("snapshot", true));
+
+    // No request is issued between the action and this receive. The message
+    // must originate at the server after its periodic diff observes a
+    // non-structural property/text mutation.
+    auto notification =
+        client.await_notification("notifications/resources/updated", 20);
+    ASSERT_FALSE(notification.is_null())
+        << "no unsolicited resource update arrived after the visual tree changed";
+    EXPECT_EQ(notification["params"].value("uri", ""), uri);
+
+    auto read = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(read.contains("result")) << read.dump(2);
+    ASSERT_FALSE(read["result"].value("contents", json::array()).empty());
+    const auto patch = json::parse(
+        read["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_FALSE(patch.is_discarded()) << read.dump(2);
+    EXPECT_EQ(patch.value("tree", ""), "visual");
+    EXPECT_FALSE(patch.value("snapshot", true));
+    EXPECT_FALSE(patch.value("events", json::array()).empty());
+    bool sawTextChange = false;
+    for (const auto& event : patch.value("events", json::array())) {
+        const auto fields = event.value("fields", json::object());
+        sawTextChange = sawTextChange ||
+                        (event.value("key", "") == statusKey &&
+                         (fields.contains("text") || fields.contains("properties.Text")));
+    }
+    EXPECT_TRUE(sawTextChange) << patch.dump(2);
+
+    auto unsubscribed = client.request("resources/unsubscribe", json{{"uri", uri}});
+    EXPECT_TRUE(unsubscribed.contains("result")) << unsubscribed.dump(2);
+    auto restored = client.call_tool(
+        "set_property",
+        json{{"session", session},
+             {"element", statusKey},
+             {"descriptorId", textDescriptorId},
+             {"value", originalText}},
+        &isError);
+    EXPECT_FALSE(isError) << restored.dump(2);
+}
+
+TEST_F(McpSampleFixture, ResourceSubscriptionPushesUiaValueChange) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    auto input = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "InputBox"}});
+    ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
+    const auto inputKey = input["elements"][0].value("key", "");
+    auto before = client.call_tool(
+        "get_element_properties",
+        json{{"session", session},
+             {"element", inputKey},
+             {"properties", json::array({"Value.Value"})}});
+    const auto originalValue = before["properties"].value("Value.Value", "");
+
+    const auto uri = "lvt://session/" + session + "/uia-tree";
+    auto subscribed = client.request("resources/subscribe", json{{"uri", uri}});
+    ASSERT_TRUE(subscribed.contains("result")) << subscribed.dump(2);
+
+    bool isError = false;
+    const auto changedValue = "resource UIA mutation";
+    auto changed = client.call_tool(
+        "set_value",
+        json{{"session", session}, {"element", inputKey}, {"text", changedValue}},
+        &isError);
+    ASSERT_FALSE(isError) << changed.dump(2);
+
+    // No client request occurs between the mutation response and this await.
+    // A passing test therefore proves standards-compliant server push rather
+    // than a hidden resources/read polling loop in the client.
+    auto notification =
+        client.await_notification("notifications/resources/updated", 20);
+    ASSERT_FALSE(notification.is_null())
+        << "no unsolicited UIA resource update arrived after Value.Value changed";
+    EXPECT_EQ(notification["params"].value("uri", ""), uri);
+
+    auto read = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(read.contains("result")) << read.dump(2);
+    ASSERT_FALSE(read["result"].value("contents", json::array()).empty());
+    const auto patch = json::parse(
+        read["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_FALSE(patch.is_discarded()) << read.dump(2);
+    EXPECT_EQ(patch.value("tree", ""), "uia");
+    EXPECT_TRUE(patch.value("snapshot", false));
+    bool sawValueChange = false;
+    for (const auto& event : patch.value("events", json::array())) {
+        const auto fields = event.value("fields", json::object());
+        sawValueChange = sawValueChange ||
+                         (event.value("key", "") == inputKey &&
+                          (fields.contains("text") ||
+                           fields.contains("properties.Value.Value")));
+    }
+    EXPECT_TRUE(sawValueChange) << patch.dump(2);
+
+    auto unsubscribed = client.request("resources/unsubscribe", json{{"uri", uri}});
+    EXPECT_TRUE(unsubscribed.contains("result")) << unsubscribed.dump(2);
+    auto restored = client.call_tool(
+        "set_value",
+        json{{"session", session}, {"element", inputKey}, {"text", originalValue}},
+        &isError);
+    EXPECT_FALSE(isError) << restored.dump(2);
+}
+
+TEST_F(McpSampleFixture, ModernListenPushesAndCancelsUiaResourceUpdates) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake(nullptr, "2026-07-28"));
+
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+    auto checkbox = client.call_tool(
+        "find_elements", json{{"session", session}, {"automationId", "ReadyCheckBox"}});
+    ASSERT_EQ(checkbox["elements"].size(), 1u) << checkbox.dump(2);
+    const auto checkboxRef = checkbox["elements"][0].value("ref", "");
+    const auto checkboxKey = checkbox["elements"][0].value("key", "");
+    const auto uri = "lvt://session/" + session + "/uia-tree";
+
+    const int listenId = client.send_request(
+        "subscriptions/listen",
+        json{{"notifications",
+              json{{"resourceSubscriptions", json::array({uri})}}}});
+    auto acknowledged =
+        client.await_notification("notifications/subscriptions/acknowledged", 20);
+    ASSERT_FALSE(acknowledged.is_null()) << "modern listen was not acknowledged";
+
+    // Modern rmcp acknowledges before entering ServerHandler::listen. The
+    // server therefore publishes the cached initial snapshot once it is ready.
+    auto initialNotification =
+        client.await_notification("notifications/resources/updated", 20);
+    ASSERT_FALSE(initialNotification.is_null());
+    auto initialRead = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(initialRead.contains("result")) << initialRead.dump(2);
+    const auto initialPatch = json::parse(
+        initialRead["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_TRUE(initialPatch.value("snapshot", false)) << initialPatch.dump(2);
+
+    bool isError = false;
+    auto toggled = client.call_tool(
+        "toggle", json{{"session", session}, {"element", checkboxRef}}, &isError);
+    ASSERT_FALSE(isError) << toggled.dump(2);
+
+    // No request is sent between the mutation and this receive.
+    auto changedNotification =
+        client.await_notification("notifications/resources/updated", 20);
+    ASSERT_FALSE(changedNotification.is_null())
+        << "modern subscription did not push the UIA change";
+    auto changedRead = client.request("resources/read", json{{"uri", uri}});
+    ASSERT_TRUE(changedRead.contains("result")) << changedRead.dump(2);
+    const auto patch = json::parse(
+        changedRead["result"]["contents"][0].value("text", ""), nullptr, false);
+    ASSERT_FALSE(patch.value("snapshot", true)) << patch.dump(2);
+    bool sawToggleChange = false;
+    for (const auto& event : patch.value("events", json::array())) {
+        const auto fields = event.value("fields", json::object());
+        sawToggleChange = sawToggleChange ||
+                          (event.value("key", "") == checkboxKey &&
+                           fields.contains("properties.Toggle.ToggleState"));
+    }
+    EXPECT_TRUE(sawToggleChange) << patch.dump(2);
+
+    client.notify(
+        "notifications/cancelled",
+        json{{"requestId", listenId}, {"reason", "test complete"}});
+    Sleep(750);
+
+    auto restored = client.call_tool(
+        "toggle", json{{"session", session}, {"element", checkboxRef}}, &isError);
+    EXPECT_FALSE(isError) << restored.dump(2);
+    auto afterCancellation =
+        client.await_notification("notifications/resources/updated", 2);
+    EXPECT_TRUE(afterCancellation.is_null())
+        << "a cancelled modern subscription must stop its resource watcher";
 }
 
 // --- driving the app ----------------------------------------------------
@@ -1124,6 +8705,64 @@ TEST_F(McpSampleFixture, DisconnectRacingVisualReadKeepsServerAndConnectionSafe)
     EXPECT_TRUE(healthy.contains("apps")) << healthy.dump(2);
 }
 
+TEST_F(McpSampleFixture, DisconnectRacingTypedPropertyDoesNotRecreateSession) {
+    SkipIfNotReady();
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+
+    for (int round = 0; round < 5; ++round) {
+        const auto session = connect(client);
+        ASSERT_FALSE(session.empty());
+        auto input = client.call_tool(
+            "find_elements",
+            json{{"session", session}, {"automationId", "InputBox"}});
+        ASSERT_EQ(input["elements"].size(), 1u) << input.dump(2);
+        const auto key = input["elements"][0].value("key", "");
+        bool isError = false;
+        auto properties = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", key}}, &isError);
+        ASSERT_FALSE(isError) << properties.dump(2);
+        const auto* descriptor =
+            find_property_descriptor(properties, "Value.Value");
+        ASSERT_NE(descriptor, nullptr);
+
+        const int propertyId = client.send_request(
+            "tools/call",
+            json{{"name", "set_property"},
+                 {"arguments",
+                  json{{"session", session},
+                       {"element", key},
+                       {"descriptorId", descriptor->value("descriptorId", "")},
+                       {"value", typed_property_value(properties, "Value.Value")}}}});
+        const int disconnectId = client.send_request(
+            "tools/call",
+            json{{"name", "disconnect"},
+                 {"arguments", json{{"session", session}}}});
+
+        auto disconnectResponse = client.await_response(disconnectId);
+        auto propertyResponse = client.await_response(propertyId);
+        ASSERT_FALSE(disconnectResponse.is_null());
+        ASSERT_FALSE(propertyResponse.is_null());
+        ASSERT_TRUE(disconnectResponse.contains("result"))
+            << disconnectResponse.dump(2);
+        EXPECT_FALSE(disconnectResponse["result"].value("isError", false))
+            << disconnectResponse.dump(2);
+        ASSERT_TRUE(propertyResponse.contains("result"))
+            << propertyResponse.dump(2);
+
+        auto afterDisconnect = client.call_tool(
+            "get_editable_properties",
+            json{{"session", session}, {"element", key}}, &isError);
+        EXPECT_TRUE(isError) << afterDisconnect.dump(2);
+        expect_typed_property_session_disconnected(afterDisconnect);
+    }
+
+    auto healthy = client.call_tool("list_apps", json::object());
+    EXPECT_TRUE(healthy.contains("apps")) << healthy.dump(2);
+}
+
 TEST_F(McpSampleFixture, ConcurrentRequestsAcrossTwoSessionsDoNotCrossOver) {
     SkipIfNotReady();
     McpClient client(false);
@@ -1137,20 +8776,21 @@ TEST_F(McpSampleFixture, ConcurrentRequestsAcrossTwoSessionsDoNotCrossOver) {
     ASSERT_FALSE(sampleSession.empty());
 
     auto apps = client.call_tool("list_apps", json::object());
-    std::string otherHwnd;
+    std::string otherSession;
     for (const auto& app : apps["apps"]) {
         const auto name = app.value("processName", "");
         if (name.find("WinUI3Sample") == std::string::npos && !name.empty()) {
-            otherHwnd = app.value("hwnd", "");
-            break;
+            auto other = client.call_tool(
+                "connect",
+                json{{"hwnd", app.value("hwnd", "")}});
+            otherSession = other.value("session", "");
+            if (!otherSession.empty())
+                break;
         }
     }
-    if (otherHwnd.empty())
-        GTEST_SKIP() << "no second window to test session isolation with";
-
-    auto other = client.call_tool("connect", json{{"hwnd", otherHwnd}});
-    const auto otherSession = other.value("session", "");
-    ASSERT_FALSE(otherSession.empty());
+    if (otherSession.empty())
+        GTEST_SKIP()
+            << "no connectable second window to test session isolation with";
     ASSERT_NE(sampleSession, otherSession);
 
     // Prove the baseline before testing it under load: if the sample session
@@ -1315,7 +8955,7 @@ TEST_F(McpSampleFixture, InlineScreenshotsDoNotLeaveTempFilesBehind) {
 
 TEST_F(McpSampleFixture, SessionsFailCleanlyOnceTheirWindowIsGone) {
     SkipIfNotReady();
-    McpClient client(false);
+    McpClient client(true);
     ASSERT_TRUE(client.started());
     ASSERT_TRUE(client.handshake());
 
@@ -1382,6 +9022,38 @@ TEST_F(McpSampleFixture, SessionsFailCleanlyOnceTheirWindowIsGone) {
     EXPECT_TRUE(isError) << "a session whose window closed must not keep answering";
     EXPECT_NE(result.value("error", "").find("closed"), std::string::npos)
         << "the error should say the window closed: " << result.dump(2);
+    EXPECT_EQ(result.value("code", ""), "ownershipLost")
+        << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorDisposition", ""),
+        "ownershipLost")
+        << result.dump(2);
+    EXPECT_FALSE(result.value("retryable", true))
+        << result.dump(2);
+
+    const std::array<std::pair<const char*, json>, 3> typedCalls{{
+        {"get_editable_properties",
+         json{{"session", session}, {"element", "uia:1"}}},
+        {"set_property",
+         json{{"session", session},
+              {"element", "uia:1"},
+              {"descriptorId", "missing"},
+              {"value", "value"}}},
+        {"clear_property",
+         json{{"session", session},
+              {"element", "uia:1"},
+              {"descriptorId", "missing"}}},
+    }};
+    for (const auto& [tool, arguments] : typedCalls) {
+        auto typedResult =
+            client.call_tool(tool, arguments, &isError);
+        EXPECT_TRUE(isError) << tool << ": " << typedResult.dump(2);
+        expect_typed_property_session_disconnected(typedResult);
+        EXPECT_EQ(
+            typedResult.value("hresult", ""),
+            "0x80070578")
+            << tool << ": " << typedResult.dump(2);
+    }
 
     // And the server must still be usable for everything else.
     auto apps = client.call_tool("list_apps", json::object());
@@ -2836,28 +10508,44 @@ TEST_F(McpSampleFixture, AnOccludedElementNamesWhatIsInTheWay) {
     // the window in the way.
     auto tree = client.call_tool("get_visual_tree", json{{"session", session}});
     ASSERT_TRUE(tree.contains("root")) << tree.dump(2);
-    const auto& rootBounds = tree["root"]["bounds"];
-    const int bottom = rootBounds.value("y", 0) + rootBounds.value("height", 0);
-
     std::vector<const json*> all;
     collect_json_elements(tree["root"], all);
     const json* below = nullptr;
     for (const auto* node : all) {
         const auto& b = (*node)["bounds"];
-        if (b.value("height", 0) > 0 && b.value("width", 0) > 0 && b.value("y", 0) > bottom &&
+        const POINT centre{
+            b.value("x", 0) + b.value("width", 0) / 2,
+            b.value("y", 0) + b.value("height", 0) / 2,
+        };
+        const HWND obstruction =
+            GetAncestor(WindowFromPoint(centre), GA_ROOT);
+        if (b.value("height", 0) > 0 &&
+            b.value("width", 0) > 0 &&
+            MonitorFromPoint(
+                centre, MONITOR_DEFAULTTONULL) &&
+            obstruction && obstruction != s_hwnd &&
             !node->value("ref", "").empty()) {
             below = node;
             break;
         }
     }
     if (!below)
-        GTEST_SKIP() << "no element sits outside the window, so nothing is occluded";
+        GTEST_SKIP()
+            << "no on-monitor element is currently covered by another window";
 
     bool isError = false;
     auto result = client.call_tool(
         "click", json{{"session", session}, {"element", below->value("ref", "")}}, &isError);
     ASSERT_TRUE(isError) << result.dump(2);
     const auto message = result.value("error", "");
+    if (message.find(
+            "could not be brought to the foreground") !=
+        std::string::npos) {
+        GTEST_SKIP()
+            << "Windows foreground policy prevented the occlusion "
+               "precondition: "
+            << message;
+    }
     EXPECT_NE(message.find("covered by"), std::string::npos) << message;
     EXPECT_EQ(message.find("covered by another window"), std::string::npos)
         << "the refusal must name the window in the way, not just say there is one: " << message;
@@ -2942,6 +10630,55 @@ TEST(McpServer, EveryToolDeclaresAnOutputSchemaAndAnnotations) {
     }
 }
 
+TEST(McpServer, MutationFailureSchemasAdmitProviderSemantics) {
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto schemas = output_schemas(client);
+
+    const std::vector<std::pair<std::string, json>> failures{
+        {"set_property",
+         json{{"ok", false},
+              {"errorCode", "typed_property_readback_failed"},
+              {"errorDisposition", "transient"},
+              {"retryable", true},
+              {"error",
+               "SetProperty succeeded, but effective-value readback failed"},
+              {"hresult", "0x80004005"}}},
+        {"clear_property",
+         json{{"ok", false},
+              {"errorCode", "typed_property_timeout"},
+              {"errorDisposition", "transient"},
+              {"retryable", true},
+              {"error",
+               "mutation timed out after execution began; its outcome is indeterminate"},
+              {"hresult", "0x8000000A"}}},
+        {"set_property",
+         json{{"ok", false},
+              {"errorCode", "typed_property_stale_element"},
+              {"errorDisposition", "terminal"},
+              {"retryable", false},
+              {"error",
+               "The UI Automation child element became unavailable"},
+              {"hresult", "0x80040201"}}},
+        {"clear_property",
+         json{{"ok", false},
+              {"errorCode", "typed_property_target_not_authorized"},
+              {"errorDisposition", "transient"},
+              {"retryable", true},
+              {"error",
+               "The element was not published by this session"},
+              {"hresult", "0xA0040201"}}},
+    };
+
+    for (const auto& [tool, failure] : failures) {
+        std::string why;
+        EXPECT_TRUE(schema_allows(
+            schemas.at(tool), failure, why))
+            << tool << ": " << why << "\n" << failure.dump(2);
+    }
+}
+
 TEST(McpServer, ReadOnlyToolsAreMarkedReadOnly) {
     McpClient readOnly(false);
     ASSERT_TRUE(readOnly.started());
@@ -3017,6 +10754,7 @@ TEST_F(McpSampleFixture, StructuredContentMatchesTheTextAndTheDeclaredSchema) {
         {"connect", json{{"hwnd", hwnd_string()}}},
         {"get_frameworks", json{{"session", session}}},
         {"get_uia_tree", json{{"session", session}, {"depth", 3}}},
+        {"get_uia_tree_changes", json{{"session", session}}},
         {"get_visual_tree", json{{"session", session}, {"depth", 3}, {"correlate", true}}},
         {"find_elements", json{{"session", session}, {"type", "Button"}}},
         {"get_element_properties", json{{"session", session}, {"element", ref}}},

@@ -35,7 +35,7 @@ public static class Logger
     /// Logs one line, tagged with an elapsed-ms timestamp (comparable across
     /// a single run the way the TAP DLL's GetTickCount64 timestamps are) and
     /// a short category so a log can be filtered/grepped by subsystem
-    /// (e.g. "watch", "tree", "picker", "highlight").
+    /// (e.g. "mcp", "tree", "picker", "highlight").
     /// </summary>
     public static void Log(string category, string message)
     {

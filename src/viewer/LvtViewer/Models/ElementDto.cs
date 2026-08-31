@@ -16,8 +16,8 @@ public sealed class BoundsDto
 
 /// <summary>
 /// Mirrors lvt::Element (src/element.h) as serialized to JSON. Used both for
-/// the one-shot "dump" output and for the "element" field of a watch "added"
-/// event. Property names are matched case-insensitively against lvt's JSON,
+/// tree output and for the "element" field of an MCP "added" patch event.
+/// Property names are matched case-insensitively against lvt's JSON,
 /// so this does not need explicit JsonPropertyName attributes.
 /// </summary>
 public sealed class ElementDto
