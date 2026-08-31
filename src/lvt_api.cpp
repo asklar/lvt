@@ -395,6 +395,27 @@ void signal_skipped_authorization_commit_for_testing() {
         SetEvent(event.get());
 }
 
+bool publish_session_property_authorization_locked(
+    const Session& session,
+    StagedPropertyAuthorization& staged) {
+    if (!staged.complete)
+        return true;
+    std::lock_guard<std::mutex> authorizationLock(
+        g_propertyAuthorizationMutex);
+    auto& current =
+        g_sessionAuthorizedPropertyTargets[session.id];
+    if (staged.generation < current.generation)
+        return false;
+    current.targets = std::move(staged.targets);
+    current.providerRoots =
+        std::move(staged.providerRoots);
+    current.injectedHosts =
+        std::move(staged.injectedHosts);
+    current.generation = staged.generation;
+    staged.complete = false;
+    return true;
+}
+
 void commit_session_property_authorization(
     const Session& session,
     StagedPropertyAuthorization staged) {
@@ -417,18 +438,8 @@ void commit_session_property_authorization(
         return;
     }
 
-    std::lock_guard<std::mutex> authorizationLock(
-        g_propertyAuthorizationMutex);
-    auto& current =
-        g_sessionAuthorizedPropertyTargets[session.id];
-    if (staged.generation < current.generation)
-        return;
-    current.targets = std::move(staged.targets);
-    current.providerRoots =
-        std::move(staged.providerRoots);
-    current.injectedHosts =
-        std::move(staged.injectedHosts);
-    current.generation = staged.generation;
+    publish_session_property_authorization_locked(
+        session, staged);
 }
 
 bool staged_authorization_preserves_populated_hosts(
@@ -2913,6 +2924,7 @@ std::string tree_snapshot_options_key(const json& params, bool uia) {
 
 json method_get_tree_changes(const json& params, bool uia) {
     const auto session = require_session(params);
+    for (int resetRetry = 0;; ++resetRetry) {
     lvt::Element current;
     std::string error;
     bool truncated = false;
@@ -2978,31 +2990,43 @@ json method_get_tree_changes(const json& params, bool uia) {
             }
             if (reset || found == g_treeSnapshots.end() ||
                 found->second.optionsKey != optionsKey) {
-                snapshot = true;
-                changes = lvt::snapshot_added_events(current);
-                g_treeSnapshots[key] = TreeSnapshot{
-                    std::move(current), optionsKey,
-                    walkGeneration};
+                if (!uia &&
+                    !publish_session_property_authorization_locked(
+                        session, stagedAuthorization)) {
+                    retryReset = reset;
+                    publishAuthorization = false;
+                    changes.clear();
+                } else {
+                    publishAuthorization = false;
+                    snapshot = true;
+                    changes = lvt::snapshot_added_events(current);
+                    g_treeSnapshots[key] = TreeSnapshot{
+                        std::move(current), optionsKey,
+                        walkGeneration};
+                }
             } else {
-                changes = lvt::diff_trees(found->second.tree, current);
-                found->second.tree = std::move(current);
-                found->second.generation = walkGeneration;
+                if (!uia &&
+                    !publish_session_property_authorization_locked(
+                        session, stagedAuthorization)) {
+                    publishAuthorization = false;
+                    changes.clear();
+                } else {
+                    publishAuthorization = false;
+                    changes = lvt::diff_trees(found->second.tree, current);
+                    found->second.tree = std::move(current);
+                    found->second.generation = walkGeneration;
+                }
             }
         }
 
     }
 
     if (retryReset) {
-        const int retry =
-            get_int(params, "_generationRetry", 0);
-        if (retry >= 3) {
+        if (resetRetry >= 3) {
             throw std::runtime_error(
                 "could not obtain a generation-current reset snapshot; retry the request");
         }
-        json retryParams = params;
-        retryParams["_generationRetry"] = retry + 1;
-        return method_get_tree_changes(
-            retryParams, uia);
+        continue;
     }
 
     json events = json::array();
@@ -3026,6 +3050,7 @@ json method_get_tree_changes(const json& params, bool uia) {
         }
     }
     return out;
+    }
 }
 
 json method_get_frameworks(const json& params) {
