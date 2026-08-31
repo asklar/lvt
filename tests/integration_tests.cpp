@@ -5512,6 +5512,20 @@ TEST_F(
         readAvailable();
         return ready();
     };
+    const auto settleOutput = [&] {
+        size_t previousSize = output.size();
+        for (int stableReads = 0;
+             stableReads < 3;) {
+            Sleep(100);
+            readAvailable();
+            if (output.size() == previousSize) {
+                ++stableReads;
+            } else {
+                previousSize = output.size();
+                stableReads = 0;
+            }
+        }
+    };
 
     ASSERT_TRUE(waitFor(
         [&] { return eventSeen(0, "added", alphaKey); },
@@ -5546,6 +5560,7 @@ TEST_F(
                 phaseStart, "added", alphaKey);
         },
         10000)) << output;
+    settleOutput();
 
     phaseStart = output.size();
     ASSERT_NE(
