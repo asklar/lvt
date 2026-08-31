@@ -238,7 +238,10 @@ static void graft_json_node(const json& j, Element& parent, const std::string& f
 // persistent connection's repeated get_tree() calls (see XamlDiagConnection
 // below) share exactly one implementation of this logic instead of two
 // copies that could drift apart.
-static void graft_xaml_tree_json(const json& treeJson, Element& root, const std::string& frameworkLabel) {
+static bool graft_xaml_tree_json(const json& treeJson, Element& root, const std::string& frameworkLabel) {
+    bool grafted = false;
+    const bool rootIsCoreWindow =
+        root.className == "Windows.UI.Core.CoreWindow";
     // Graft XAML elements into corresponding bridge windows.
     // Each DesktopWindowXamlSource root maps 1:1 to a DesktopChildSiteBridge HWND.
     // We match by best-fit size: the XAML root's first child dimensions are compared
@@ -270,7 +273,12 @@ static void graft_xaml_tree_json(const json& treeJson, Element& root, const std:
         for (auto& node : treeJson) {
             std::string typeName = sanitize(node.value("type", ""));
             if (typeName.find("DesktopWindowXamlSource") == std::string::npos) {
-                graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
+                if (rootIsCoreWindow) {
+                    graft_json_node(
+                        node, root, frameworkLabel,
+                        root.bounds.x, root.bounds.y);
+                    grafted = true;
+                }
                 continue;
             }
 
@@ -304,8 +312,11 @@ static void graft_xaml_tree_json(const json& treeJson, Element& root, const std:
             // benefit. Only drop outright when multiple roots are actually
             // competing for the same bridges.
             if (contentW <= 0 && contentH <= 0) {
-                if (!multipleRootsAmbiguous)
+                if (!multipleRootsAmbiguous &&
+                    rootIsCoreWindow) {
                     graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
+                    grafted = true;
+                }
                 continue;
             }
 
@@ -374,23 +385,23 @@ static void graft_xaml_tree_json(const json& treeJson, Element& root, const std:
                 double baseX = bridge->bounds.x;
                 double baseY = bridge->bounds.y;
                 graft_json_node(node, *bridge, frameworkLabel, baseX, baseY);
-            } else if (!multipleRootsAmbiguous) {
-                // No DesktopChildSiteBridge matched at all — including the
-                // case where this window has none to begin with (classic
-                // system XAML doesn't use the WinUI3 Islands bridge model,
-                // so `bridges` is always empty there). With only one root in
-                // play there is no sibling window's content to confuse this
-                // with, so fall back to the legacy graft-under-root
-                // behavior exactly as before this fix.
+                grafted = true;
+            } else if (!multipleRootsAmbiguous &&
+                       rootIsCoreWindow) {
                 graft_json_node(node, root, frameworkLabel, root.bounds.x, root.bounds.y);
+                grafted = true;
             }
             // Otherwise: multiple roots were genuinely competing and none
             // matched confidently enough — drop this root rather than
             // misattach it to the wrong window.
         }
     } else if (treeJson.is_object()) {
-        graft_json_node(treeJson, root, frameworkLabel);
+        if (rootIsCoreWindow) {
+            graft_json_node(treeJson, root, frameworkLabel);
+            grafted = true;
+        }
     }
+    return grafted;
 }
 
 // Buffered line I/O over the persistent duplex pipe lvt.exe creates and the
@@ -577,8 +588,8 @@ public:
                 fprintf(stderr, "lvt: failed to parse XAML tree JSON: %s\n", e.what());
                 return false;
             }
-            graft_xaml_tree_json(treeJson, root, m_frameworkLabel);
-            return true;
+            return graft_xaml_tree_json(
+                treeJson, root, m_frameworkLabel);
         }
     }
 

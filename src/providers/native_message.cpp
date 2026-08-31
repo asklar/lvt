@@ -1,6 +1,8 @@
 #include "native_message.h"
 
 #include <CommCtrl.h>
+#include <objbase.h>
+#include <wil/resource.h>
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +17,10 @@ namespace lvt {
 namespace {
 
 constexpr size_t kMaximumDeferredPointerMessages = 64;
+constexpr wchar_t kNativeLifetimeProperty[] =
+    L"LVT.NativeWindowLifetime.{8A169CF2-53A2-4E09-A9F0-23B9B70213B8}";
 std::atomic<size_t> g_pointerMessageSlots{0};
+std::atomic<uint32_t> g_nativeLifetimeCounter{1};
 std::mutex g_permanentRetirementMutex;
 struct PermanentRetirement {
     HANDLE process = nullptr;
@@ -140,7 +145,85 @@ NativeMessageResult capture_native_window_identity(
     identity.pid = pid;
     identity.normalizedClass = normalize_native_class_name(
         native_utf16_to_utf8(std::wstring_view(className, copied)));
+    uint32_t lifetimeToken = static_cast<uint32_t>(
+        reinterpret_cast<ULONG_PTR>(
+            GetPropW(hwnd, kNativeLifetimeProperty)));
+    if (lifetimeToken == 0) {
+        wchar_t mutexName[96]{};
+        swprintf_s(
+            mutexName,
+            L"Local\\LvtNativeLifetime-%llX",
+            static_cast<unsigned long long>(
+                reinterpret_cast<uintptr_t>(hwnd)));
+        wil::unique_mutex_nothrow installMutex(
+            CreateMutexW(nullptr, FALSE, mutexName));
+        const DWORD waitResult = installMutex
+            ? WaitForSingleObject(
+                  installMutex.get(), 5000)
+            : WAIT_FAILED;
+        if (waitResult == WAIT_OBJECT_0 ||
+            waitResult == WAIT_ABANDONED) {
+            auto release = wil::scope_exit([&] {
+                ReleaseMutex(installMutex.get());
+            });
+            lifetimeToken = static_cast<uint32_t>(
+                reinterpret_cast<ULONG_PTR>(
+                    GetPropW(
+                        hwnd,
+                        kNativeLifetimeProperty)));
+            if (lifetimeToken == 0) {
+                GUID tokenGuid{};
+                if (SUCCEEDED(CoCreateGuid(&tokenGuid))) {
+                    lifetimeToken =
+                        tokenGuid.Data1 ^
+                        (static_cast<uint32_t>(
+                             tokenGuid.Data2) << 16) ^
+                        tokenGuid.Data3;
+                } else {
+                    lifetimeToken =
+                        g_nativeLifetimeCounter.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                }
+                if (lifetimeToken == 0)
+                    lifetimeToken = 1;
+                if (!SetPropW(
+                        hwnd, kNativeLifetimeProperty,
+                        reinterpret_cast<HANDLE>(
+                            static_cast<ULONG_PTR>(
+                                lifetimeToken)))) {
+                    lifetimeToken = 0;
+                } else {
+                    lifetimeToken =
+                        static_cast<uint32_t>(
+                            reinterpret_cast<ULONG_PTR>(
+                                GetPropW(
+                                    hwnd,
+                                    kNativeLifetimeProperty)));
+                }
+            }
+        }
+    }
+    identity.lifetimeToken = lifetimeToken;
     return success();
+}
+
+uint64_t native_window_provider_handle(
+    const NativeWindowIdentity& identity) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    const auto append = [&hash](uint64_t value) {
+        for (size_t index = 0;
+             index < sizeof(value); ++index) {
+            hash ^= static_cast<unsigned char>(
+                value >> (index * 8));
+            hash *= UINT64_C(1099511628211);
+        }
+    };
+    append(static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(identity.hwnd)));
+    append(identity.lifetimeToken);
+    hash &= ~UINT64_C(0x8000000000000000);
+    return hash == 0 ? 1 : hash;
 }
 
 NativeMessageResult validate_native_window(
@@ -154,6 +237,12 @@ NativeMessageResult validate_native_window(
         return failure(
             ERROR_INVALID_WINDOW_HANDLE,
             "The native window class changed; the handle may have been reused");
+    }
+    if (identity.lifetimeToken != 0 &&
+        current.lifetimeToken != identity.lifetimeToken) {
+        return failure(
+            ERROR_INVALID_WINDOW_HANDLE,
+            "The native window lifetime changed; the handle was reused");
     }
     return success();
 }

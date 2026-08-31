@@ -15,6 +15,7 @@ struct NativeWindowIdentity {
     HWND hwnd = nullptr;
     DWORD pid = 0;
     std::string normalizedClass;
+    uint32_t lifetimeToken = 0;
 };
 
 struct NativeMessageResult {
@@ -29,6 +30,8 @@ struct NativeMessageResult {
 std::string normalize_native_class_name(std::string_view className);
 NativeMessageResult capture_native_window_identity(
     HWND hwnd, DWORD expectedPid, NativeWindowIdentity& identity);
+uint64_t native_window_provider_handle(
+    const NativeWindowIdentity& identity);
 NativeMessageResult validate_native_window(
     const NativeWindowIdentity& identity);
 NativeMessageResult send_native_message(

@@ -194,10 +194,16 @@ void ComCtlProvider::enrich_recursive(
     if (!hwnd)
         return;
 
+    DWORD elementPid = 0;
+    GetWindowThreadProcessId(hwnd, &elementPid);
+    const Architecture elementArchitecture =
+        elementPid != 0
+            ? detect_process_architecture(elementPid)
+            : Architecture::unknown;
     const bool pointerAllowed =
         native_pointer_operations_allowed(
-            get_host_architecture(), targetArchitecture) &&
-        (!properties || properties->pointer_operations_allowed());
+            get_host_architecture(),
+            elementArchitecture);
 
     if (el.className == "SysListView32") {
         enrich_listview(el, hwnd, pointerAllowed, properties);
@@ -224,6 +230,8 @@ void ComCtlProvider::enrich_listview(
 
     el.type = "ListView";
     el.framework = "comctl";
+    el.nativeLifetimeHandle =
+        native_window_provider_handle(identity);
     if (properties)
         el.providerHandle = properties->register_hwnd(hwnd);
 
@@ -348,6 +356,8 @@ void ComCtlProvider::enrich_treeview(
 
     el.type = "TreeView";
     el.framework = "comctl";
+    el.nativeLifetimeHandle =
+        native_window_provider_handle(identity);
     if (properties)
         el.providerHandle = properties->register_hwnd(hwnd);
 
@@ -384,6 +394,8 @@ void ComCtlProvider::enrich_toolbar(
 
     el.type = "Toolbar";
     el.framework = "comctl";
+    el.nativeLifetimeHandle =
+        native_window_provider_handle(identity);
     if (properties)
         el.providerHandle = properties->register_hwnd(hwnd);
 
@@ -485,6 +497,8 @@ void ComCtlProvider::enrich_statusbar(
 
     el.type = "StatusBar";
     el.framework = "comctl";
+    el.nativeLifetimeHandle =
+        native_window_provider_handle(identity);
     if (properties)
         el.providerHandle = properties->register_hwnd(hwnd);
 
@@ -544,6 +558,8 @@ void ComCtlProvider::enrich_tabcontrol(
 
     el.type = "TabControl";
     el.framework = "comctl";
+    el.nativeLifetimeHandle =
+        native_window_provider_handle(identity);
     if (properties)
         el.providerHandle = properties->register_hwnd(hwnd);
 

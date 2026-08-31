@@ -13,16 +13,31 @@ static void label_winui3_windows(Element& el) {
     if (el.className == "Microsoft.UI.Content.DesktopChildSiteBridge") {
         el.framework = "winui3";
         el.type = "DesktopChildSiteBridge";
+        el.providerHandle = 0;
     } else if (el.className == "InputNonClientPointerSource") {
         el.framework = "winui3";
         el.type = "InputNonClientPointerSource";
+        el.providerHandle = 0;
     } else if (el.className == "InputSiteWindowClass") {
         el.framework = "winui3";
         el.type = "InputSite";
+        el.providerHandle = 0;
     }
     for (auto& child : el.children) {
         label_winui3_windows(child);
     }
+}
+
+static bool has_winui3_host(const Element& el) {
+    if (el.className ==
+        "Microsoft.UI.Content.DesktopChildSiteBridge") {
+        return true;
+    }
+    for (const auto& child : el.children) {
+        if (has_winui3_host(child))
+            return true;
+    }
+    return false;
 }
 
 // Find the FrameworkUdk.dll path loaded in the target process
@@ -49,8 +64,10 @@ static std::wstring find_framework_udk(DWORD pid) {
     return {};
 }
 
-void WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties) {
+bool WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProperties) {
     label_winui3_windows(root);
+    if (!has_winui3_host(root))
+        return true;
 
     // Try XAML diagnostics injection for the full visual tree
     // WinUI3 registers "WinUIVisualDiagConnection" endpoints
@@ -60,10 +77,12 @@ void WinUI3Provider::enrich(Element& root, HWND hwnd, DWORD pid, bool fastProper
     // Windows.UI.Xaml.dll here would use the wrong endpoint flavor.
     std::wstring frameworkUdk = find_framework_udk(pid);
     if (frameworkUdk.empty())
-        return;
+        return false;
 
-    inject_and_collect_xaml_tree(root, hwnd, pid, L"", frameworkUdk, "winui3",
-                               L"WinUIVisualDiagConnection", fastProperties);
+    return inject_and_collect_xaml_tree(
+        root, hwnd, pid, L"", frameworkUdk,
+        "winui3", L"WinUIVisualDiagConnection",
+        fastProperties);
 }
 
 std::shared_ptr<IFrameworkConnection> WinUI3Provider::open_connection(HWND hwnd, DWORD pid) {
@@ -74,9 +93,12 @@ std::shared_ptr<IFrameworkConnection> WinUI3Provider::open_connection(HWND hwnd,
                                      L"WinUIVisualDiagConnection");
 }
 
-void WinUI3Provider::enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties) {
+bool WinUI3Provider::enrich_with_connection(Element& root, IFrameworkConnection& connection, bool fastProperties) {
     label_winui3_windows(root);
-    connection.get_tree(root, fastProperties);
+    if (!has_winui3_host(root))
+        return true;
+    return connection.get_tree(
+        root, fastProperties);
 }
 
 } // namespace lvt

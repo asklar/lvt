@@ -1171,6 +1171,7 @@ struct WatchScopeAnchor {
     std::string path;
     std::string framework;
     uintptr_t nativeHandle = 0;
+    uint64_t nativeLifetimeHandle = 0;
     uint64_t providerHandle = 0;
     bool nativeIdentity = false;
     bool durableProviderIdentity = false;
@@ -1231,6 +1232,8 @@ static void update_watch_scope_anchor(
     anchor.framework = location.element->framework;
     anchor.nativeHandle =
         location.element->nativeHandle;
+    anchor.nativeLifetimeHandle =
+        location.element->nativeLifetimeHandle;
     anchor.providerHandle =
         location.element->providerHandle;
     anchor.durableProviderIdentity =
@@ -1284,8 +1287,12 @@ static bool watch_scope_direct_identity_matches(
         }
     }
     if (anchor.nativeIdentity &&
-        location.element->nativeHandle ==
-            anchor.nativeHandle) {
+        (anchor.nativeLifetimeHandle != 0
+             ? location.element->nativeLifetimeHandle ==
+                   anchor.nativeLifetimeHandle
+             : location.element->nativeLifetimeHandle == 0 &&
+                   location.element->nativeHandle ==
+                       anchor.nativeHandle)) {
         return true;
     }
     if ((anchor.durableProviderIdentity ||

@@ -106,6 +106,10 @@ bool has_durable_provider_identity(const Element& el) {
 static std::string compact_instance_key(const Element& el) {
     uint64_t handle = 0;
     if ((el.framework == "win32" || el.framework == "comctl") &&
+        el.nativeLifetimeHandle != 0) {
+        handle = el.nativeLifetimeHandle;
+    } else if (
+        (el.framework == "win32" || el.framework == "comctl") &&
         el.nativeHandle != 0) {
         handle = static_cast<uint64_t>(el.nativeHandle);
     } else if (el.providerHandle != 0 &&

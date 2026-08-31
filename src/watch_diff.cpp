@@ -197,6 +197,7 @@ void reconcile_children(const Element& prevParent, Element& currParent,
     auto& currChildren = currParent.children;
 
     std::unordered_map<uint64_t, size_t> prevByProviderHandle;
+    std::unordered_map<uint64_t, size_t> prevByNativeLifetime;
     std::unordered_map<uintptr_t, size_t> prevByNativeHandle;
     std::unordered_map<std::string, size_t> prevByName;
     struct DurableCandidate {
@@ -218,7 +219,10 @@ void reconcile_children(const Element& prevParent, Element& currParent,
         }
         if (has_durable_provider_identity(p))
             prevByProviderHandle.emplace(p.providerHandle, i);
-        if (p.nativeHandle != 0)
+        if (p.nativeLifetimeHandle != 0)
+            prevByNativeLifetime.emplace(
+                p.nativeLifetimeHandle, i);
+        else if (p.nativeHandle != 0)
             prevByNativeHandle.emplace(p.nativeHandle, i);
         auto name = stable_name_key(p);
         if (!name.empty())
@@ -291,7 +295,20 @@ void reconcile_children(const Element& prevParent, Element& currParent,
                 base_identity_key(prevChildren[it->second]) == base_identity_key(c))
                 matchIdx = it->second;
         }
-        if (!matchIdx && c.nativeHandle != 0) {
+        if (!matchIdx && c.nativeLifetimeHandle != 0) {
+            auto it = prevByNativeLifetime.find(
+                c.nativeLifetimeHandle);
+            if (it != prevByNativeLifetime.end() &&
+                !prevUsed[it->second] &&
+                base_identity_key(prevChildren[it->second]) ==
+                    base_identity_key(c)) {
+                matchIdx = it->second;
+            }
+        }
+        if (!matchIdx && c.nativeLifetimeHandle != 0)
+            continue;
+        if (!matchIdx && c.nativeLifetimeHandle == 0 &&
+            c.nativeHandle != 0) {
             auto it = prevByNativeHandle.find(c.nativeHandle);
             if (it != prevByNativeHandle.end() && !prevUsed[it->second] &&
                 base_identity_key(prevChildren[it->second]) == base_identity_key(c))

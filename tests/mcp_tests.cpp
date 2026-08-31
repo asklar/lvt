@@ -3901,12 +3901,20 @@ protected:
         const HWND hwnd = GetDlgItem(s_hwnd, id);
         if (!hwnd)
             return {};
-        char value[64]{};
+        char value[32]{};
         snprintf(
-            value, sizeof(value), "win32:0x%llX",
+            value, sizeof(value), "0x%llX",
             static_cast<unsigned long long>(
                 reinterpret_cast<uintptr_t>(hwnd)));
-        return value;
+        const auto output = run_command(
+            "\"" + get_lvt_path() +
+            "\" dump --hwnd " + value);
+        const auto tree =
+            json::parse(output, nullptr, false);
+        return tree.is_discarded()
+            ? std::string()
+            : tree.value("root", json::object())
+                  .value("key", "");
     }
 
     static const json* find_by_class(
@@ -7131,13 +7139,19 @@ TEST_F(
         json{{"session", session}}, &isError);
     ASSERT_FALSE(isError) << tree.dump(2);
 
-    char keyBuffer[64]{};
-    snprintf(
-        keyBuffer, sizeof(keyBuffer),
-        "win32:0x%llX",
-        static_cast<unsigned long long>(
-            reinterpret_cast<uintptr_t>(child)));
-    const std::string childKey = keyBuffer;
+    std::vector<const json*> elements;
+    collect_json_elements(tree["root"], elements);
+    const auto publishedChild = std::find_if(
+        elements.begin(), elements.end(),
+        [](const json* element) {
+            return element->value("text", "") ==
+                "Event child";
+        });
+    ASSERT_NE(publishedChild, elements.end())
+        << tree.dump(2);
+    const std::string childKey =
+        (*publishedChild)->value("key", "");
+    ASSERT_EQ(childKey.rfind("win32:0x", 0), 0u);
     auto properties = client.call_tool(
         "get_editable_properties",
         json{{"session", session},

@@ -27,6 +27,11 @@ struct Element {
     // Native pointer-sized identity such as HWND.
     uintptr_t nativeHandle = 0;
 
+    // Public durable identity for native HWND keys. This is separate from
+    // providerHandle so read-only/cross-process HWNDs can retain stable keys
+    // even when they are not eligible for mutation registration.
+    uint64_t nativeLifetimeHandle = 0;
+
     // Framework/provider object identity. Kept separately because some
     // providers use fixed-width wire handles that are wider than uintptr_t on
     // x86 (XAML InstanceHandle is MIDL_uhyper).

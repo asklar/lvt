@@ -1746,15 +1746,22 @@ struct NativePropertyConnection::Impl {
             return 0;
         if (hwnd != root.hwnd && !IsChild(root.hwnd, hwnd))
             return 0;
+        if (identity.lifetimeToken == 0)
+            return 0;
 
         if (kind == TargetKind::hwnd) {
             const uint64_t handle =
-                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(hwnd));
+                native_window_provider_handle(identity);
             std::lock_guard<std::mutex> lock(mutex);
             auto [found, inserted] = targets.emplace(handle, Target{});
             if (inserted) {
                 found->second.kind = kind;
                 found->second.window = std::move(identity);
+            } else if (
+                found->second.window.hwnd != hwnd ||
+                found->second.window.lifetimeToken !=
+                    identity.lifetimeToken) {
+                return 0;
             }
             return handle;
         }
@@ -1762,6 +1769,7 @@ struct NativePropertyConnection::Impl {
         std::ostringstream key;
         key << target_kind_name(kind) << ':'
             << hex_u64(reinterpret_cast<uintptr_t>(hwnd)) << ':'
+            << hex_u64(identity.lifetimeToken) << ':'
             << index << ':' << hex_u64(itemHandle) << ':' << commandId;
 
         std::lock_guard<std::mutex> lock(mutex);

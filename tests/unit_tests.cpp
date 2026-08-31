@@ -662,7 +662,7 @@ TEST(ElementKeys, WinFormsManagedIdentitySurvivesHwndRecreation) {
     EXPECT_NE(reusedHwnd.key, original.key);
 }
 
-TEST(ElementKeys, NativeKeysDoNotDependOnPropertyConnection) {
+TEST(ElementKeys, NativeHwndKeysUsePublishedLifetimeIdentity) {
     Element oneShot;
     oneShot.type = "Window";
     oneShot.className = "FixtureWindow";
@@ -684,8 +684,8 @@ TEST(ElementKeys, NativeKeysDoNotDependOnPropertyConnection) {
     oneShot.children.push_back(std::move(list));
 
     Element persistent = oneShot;
-    persistent.providerHandle = UINT64_C(0x1234);
-    persistent.children[0].providerHandle = UINT64_C(0x5678);
+    persistent.nativeLifetimeHandle = UINT64_C(0x123456);
+    persistent.children[0].nativeLifetimeHandle = UINT64_C(0x56789A);
     persistent.children[0].children[0].providerHandle =
         UINT64_C(0x8000000000000042);
 
@@ -694,11 +694,18 @@ TEST(ElementKeys, NativeKeysDoNotDependOnPropertyConnection) {
 
     EXPECT_EQ(oneShot.key, "win32:0x1234");
     EXPECT_EQ(oneShot.children[0].key, "comctl:0x5678");
-    EXPECT_EQ(persistent.key, oneShot.key);
-    EXPECT_EQ(persistent.children[0].key, oneShot.children[0].key);
+    EXPECT_EQ(persistent.key, "win32:0x123456");
     EXPECT_EQ(
-        persistent.children[0].children[0].key,
-        oneShot.children[0].children[0].key);
+        persistent.children[0].key,
+        "comctl:0x56789A");
+    EXPECT_NE(persistent.key, oneShot.key);
+    EXPECT_NE(
+        persistent.children[0].key,
+        oneShot.children[0].key);
+    EXPECT_NE(
+        persistent.children[0].children[0].key.find(
+            "identity:item-text\\:Alpha row"),
+        std::string::npos);
     EXPECT_EQ(
         oneShot.children[0].children[0].key.find("8000000000000042"),
         std::string::npos);

@@ -1,4 +1,5 @@
 #include "win32_provider.h"
+#include "native_message.h"
 #include "native_property_connection.h"
 #include <vector>
 
@@ -78,8 +79,15 @@ Element Win32Provider::build_element(
     NativePropertyConnection* properties) {
     Element el;
     el.nativeHandle = reinterpret_cast<uintptr_t>(hwnd);
-    if (properties)
+    NativeWindowIdentity identity;
+    if (capture_native_window_identity(
+            hwnd, 0, identity).ok) {
+        el.nativeLifetimeHandle =
+            native_window_provider_handle(identity);
+    }
+    if (properties) {
         el.providerHandle = properties->register_hwnd(hwnd);
+    }
     el.framework = "win32";
     el.className = get_window_class(hwnd);
     el.type = classify_window(el.className);

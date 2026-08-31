@@ -275,6 +275,9 @@ bool session_target_ownership_lost(HRESULT hresult) {
         {"code", ownershipLost
                      ? "ownershipLost"
                      : "targetIdentityValidationFailed"},
+        {"errorCode", ownershipLost
+                          ? "typed_property_session_disconnected"
+                          : "typed_property_identity_validation_failed"},
         {"errorDisposition", ownershipLost
                                  ? "ownershipLost"
                                  : "transient"},
@@ -654,7 +657,7 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         }
     }
 
-    std::lock_guard<std::mutex> lock(g_connectionsMutex);
+    std::unique_lock<std::mutex> lock(g_connectionsMutex);
     auto [entryIt, _] = g_sessionConnections.try_emplace(session.id);
     auto& entry = entryIt->second;
 
@@ -698,7 +701,6 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
     if (needWin32 || needComCtl || needXaml || needWinUI3 ||
         needWpf || needWinForms || !neededPlugins.empty()) {
         if (needWin32) {
-            validate_target();
             const auto registryKey =
                 native_connection_registry_key(
                     "win32", session.hwnd, session.id);
@@ -713,7 +715,6 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
                 entry.emplace_back("win32", std::move(handle));
         }
         if (needComCtl) {
-            validate_target();
             const auto registryKey =
                 native_connection_registry_key(
                     "comctl", session.hwnd, session.id);
@@ -744,7 +745,6 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
             validate_target();
             lvt::Element probeTree =
                 lvt::build_tree(session.hwnd, session.pid, {});
-            validate_target();
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "xaml",
                 [&probeTree](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -757,7 +757,6 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 #endif
 #if LVT_ENABLE_WINUI3
         if (needWinUI3) {
-            validate_target();
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "winui3",
                 [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -770,7 +769,6 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 #endif
 #if LVT_ENABLE_WPF
         if (needWpf) {
-            validate_target();
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "wpf",
                 [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -783,7 +781,6 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
 #endif
 #if LVT_ENABLE_WINFORMS
         if (needWinForms) {
-            validate_target();
             auto handle = lvt::ConnectionRegistry::instance().acquire(
                 session.pid, session.hwnd, "winforms",
                 [](HWND hwnd, DWORD pid) -> std::shared_ptr<lvt::IFrameworkConnection> {
@@ -795,7 +792,6 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         }
 #endif
         for (const auto& plugin : neededPlugins) {
-            validate_target();
             const auto label =
                 lvt::plugin_connection_label(plugin, session.hwnd);
             auto handle = lvt::ConnectionRegistry::instance().acquire(
@@ -820,6 +816,8 @@ lvt::ConnectionLookup connection_lookup_for_session(const Session& session,
         if (handle)
             connections.emplace_back(label, handle.shared());
     }
+    lock.unlock();
+    validate_target();
     return [connections = std::move(connections)](
                const std::string& label) -> lvt::IFrameworkConnection* {
         for (const auto& [lbl, connection] : connections) {
@@ -2610,12 +2608,9 @@ std::shared_ptr<lvt::IFrameworkConnection> typed_property_connection(
         });
 
     std::shared_ptr<lvt::IFrameworkConnection> connection;
+    ensure_typed_property_session_active(session);
     {
         std::lock_guard<std::mutex> lock(g_connectionsMutex);
-        if (!session_is_active(session.id)) {
-            throw_typed_property_session_disconnected(
-                "this session was disconnected while the request was waiting");
-        }
         const auto entry = g_sessionConnections.find(session.id);
         if (entry != g_sessionConnections.end()) {
             for (const auto& [label, handle] : entry->second) {
