@@ -1329,7 +1329,7 @@ TEST(McpUiaIdentity, ReplacementDuringFallbackFailsOwnershipLost) {
         std::to_string(GetCurrentProcessId()) + "_" +
         std::to_string(GetTickCount64());
     wil::unique_event entered(CreateEventA(
-        nullptr, TRUE, FALSE,
+        nullptr, TRUE, TRUE,
         (base + "-entered").c_str()));
     wil::unique_event release(CreateEventA(
         nullptr, TRUE, FALSE,
@@ -6311,6 +6311,75 @@ TEST_F(
 
 TEST_F(
     NativeMcpFixture,
+    OlderTreeChangeWalkCannotOverwriteNewerBaseline) {
+    const std::string base =
+        "Local\\LvtTreeBaseline_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event entered(CreateEventA(
+        nullptr, TRUE, TRUE,
+        (base + "-entered").c_str()));
+    wil::unique_event release(CreateEventA(
+        nullptr, TRUE, FALSE,
+        (base + "-release").c_str()));
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(release);
+    ScopedEnvironmentVariable gate(
+        "LVT_TEST_TREE_BASELINE_GATE", base);
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client);
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto baseline = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << baseline.dump(2);
+    ASSERT_TRUE(ResetEvent(entered.get()));
+
+    const int older = client.send_request(
+        "tools/call",
+        json{{"name", "get_visual_tree_changes"},
+             {"arguments", json{{"session", session}}}});
+    ASSERT_EQ(
+        WaitForSingleObject(entered.get(), 10000),
+        WAIT_OBJECT_0);
+    const HWND generic = GetDlgItem(
+        s_hwnd, native_fixture::kGenericTextId);
+    ASSERT_TRUE(IsWindow(generic));
+    const std::wstring original = L"Generic child seed";
+    ASSERT_TRUE(SetWindowTextW(
+        generic, L"newer baseline value"));
+    auto newer = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << newer.dump(2);
+    ASSERT_FALSE(newer.value("events", json::array()).empty())
+        << newer.dump(2);
+
+    SetEvent(release.get());
+    const auto olderResponse =
+        client.await_response(older);
+    ASSERT_TRUE(olderResponse.contains("result"))
+        << olderResponse.dump(2);
+    EXPECT_FALSE(
+        olderResponse["result"].value("isError", true))
+        << olderResponse.dump(2);
+
+    auto next = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << next.dump(2);
+    EXPECT_TRUE(next.value("events", json::array()).empty())
+        << "an older walk reversed the newer baseline: "
+        << next.dump(2);
+    SetWindowTextW(generic, original.c_str());
+}
+
+TEST_F(
+    NativeMcpFixture,
     OverlappingScopedTreeCannotInvalidateTargetsInLaterTreeChangeResponse) {
     NativePublicationGate gate("get_visual_tree_changes");
     ASSERT_TRUE(gate.valid());
@@ -6874,6 +6943,56 @@ TEST_F(
         &isError);
     EXPECT_FALSE(isError)
         << recoveredProperties.dump(2);
+}
+
+TEST_F(
+    McpSampleFixture,
+    InitialPartialHostSnapshotIsRejected) {
+    SkipIfNotReady();
+    const std::string eventName =
+        "Local\\LvtInitialPartialXamlHost_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event partialHost(CreateEventA(
+        nullptr, TRUE, TRUE, eventName.c_str()));
+    ASSERT_TRUE(partialHost);
+    const std::string newHostName =
+        eventName + "_new";
+    wil::unique_event newHost(CreateEventA(
+        nullptr, TRUE, FALSE, newHostName.c_str()));
+    ASSERT_TRUE(newHost);
+    ScopedEnvironmentVariable partialHostGate(
+        "LVT_TEST_PARTIAL_XAML_HOST_EVENT",
+        eventName);
+    ScopedEnvironmentVariable newHostGate(
+        "LVT_TEST_NEW_EMPTY_XAML_HOST_EVENT",
+        newHostName);
+    McpClient client(false);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto rejected = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_TRUE(isError) << rejected.dump(2);
+    EXPECT_NE(
+        rejected.value("error", "")
+            .find("previous complete snapshot"),
+        std::string::npos)
+        << rejected.dump(2);
+    ASSERT_TRUE(ResetEvent(partialHost.get()));
+    auto recovered = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    EXPECT_FALSE(isError) << recovered.dump(2);
+    ASSERT_TRUE(SetEvent(newHost.get()));
+    auto newHostRejected = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    EXPECT_TRUE(isError) << newHostRejected.dump(2);
 }
 
 TEST_F(

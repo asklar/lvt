@@ -158,6 +158,7 @@ struct TreeSnapshotKey {
 struct TreeSnapshot {
     lvt::Element tree;
     std::string optionsKey;
+    uint64_t generation = 0;
 };
 
 std::mutex g_treeSnapshotsMutex;
@@ -305,7 +306,7 @@ struct SessionPropertyAuthorization {
 };
 std::map<std::string, SessionPropertyAuthorization>
     g_sessionAuthorizedPropertyTargets;
-std::atomic<uint64_t> g_nextPropertyAuthorizationGeneration{1};
+std::atomic<uint64_t> g_nextTreeWalkGeneration{1};
 
 struct StagedPropertyAuthorization {
     std::set<AuthorizedPropertyTarget> targets;
@@ -377,9 +378,6 @@ StagedPropertyAuthorization stage_session_property_authorization(
         session, root, true, std::nullopt, staged);
     collect_injected_host_state(
         root, staged.injectedHosts);
-    staged.generation =
-        g_nextPropertyAuthorizationGeneration.fetch_add(
-            1);
     staged.complete = true;
     return staged;
 }
@@ -436,6 +434,11 @@ void commit_session_property_authorization(
 bool staged_authorization_preserves_populated_hosts(
     const Session& session,
     const StagedPropertyAuthorization& staged) {
+    for (const auto& [_, populated] :
+         staged.injectedHosts) {
+        if (!populated)
+            return false;
+    }
     std::lock_guard<std::mutex> lock(
         g_propertyAuthorizationMutex);
     const auto current =
@@ -870,6 +873,31 @@ void wait_for_screenshot_capture_test_gate() {
         releaseName.c_str()));
     if (!entered || !release)
         return;
+    SetEvent(entered.get());
+    WaitForSingleObject(release.get(), 30000);
+}
+
+void wait_for_tree_baseline_test_gate() {
+    char base[192]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_TREE_BASELINE_GATE",
+        base, static_cast<DWORD>(_countof(base)));
+    if (length == 0 || length >= _countof(base))
+        return;
+    const std::string enteredName =
+        std::string(base) + "-entered";
+    const std::string releaseName =
+        std::string(base) + "-release";
+    wil::unique_handle entered(OpenEventA(
+        EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE,
+        enteredName.c_str()));
+    wil::unique_handle release(OpenEventA(
+        SYNCHRONIZE, FALSE, releaseName.c_str()));
+    if (!entered || !release ||
+        WaitForSingleObject(entered.get(), 0) ==
+            WAIT_OBJECT_0) {
+        return;
+    }
     SetEvent(entered.get());
     WaitForSingleObject(release.get(), 30000);
 }
@@ -1402,6 +1430,20 @@ bool force_partial_injected_host_for_testing() {
                WAIT_OBJECT_0;
 }
 
+bool force_new_empty_injected_host_for_testing() {
+    char eventName[192]{};
+    const DWORD length = GetEnvironmentVariableA(
+        "LVT_TEST_NEW_EMPTY_XAML_HOST_EVENT",
+        eventName, static_cast<DWORD>(_countof(eventName)));
+    if (length == 0 || length >= _countof(eventName))
+        return false;
+    wil::unique_handle event(OpenEventA(
+        SYNCHRONIZE, FALSE, eventName));
+    return event &&
+           WaitForSingleObject(event.get(), 0) ==
+               WAIT_OBJECT_0;
+}
+
 bool remove_framework_content(
     lvt::Element& element,
     const std::string& framework) {
@@ -1430,7 +1472,11 @@ bool remove_framework_content(
 
 bool inject_partial_host_for_testing(
     lvt::Element& root) {
-    if (!force_partial_injected_host_for_testing())
+    const bool partial =
+        force_partial_injected_host_for_testing();
+    const bool newEmpty =
+        force_new_empty_injected_host_for_testing();
+    if (!partial && !newEmpty)
         return false;
 
     lvt::Element* host = nullptr;
@@ -1452,10 +1498,11 @@ bool inject_partial_host_for_testing(
                 findHost(child);
         };
     findHost(root);
-    if (!host ||
-        !remove_framework_content(*host, framework)) {
+    if (!host)
         return false;
-    }
+    if (partial &&
+        !remove_framework_content(*host, framework))
+        return false;
 
     lvt::Element populatedHost;
     populatedHost.framework = framework;
@@ -1467,15 +1514,17 @@ bool inject_partial_host_for_testing(
             : host->nativeHandle + 1;
     populatedHost.key =
         host->key + "|test-partial-host";
-    lvt::Element content;
-    content.framework = framework;
-    content.className =
-        framework == "winui3"
-            ? "Microsoft.UI.Xaml.Controls.Grid"
-            : "Windows.UI.Xaml.Controls.Grid";
-    content.type = "Grid";
-    populatedHost.children.push_back(
-        std::move(content));
+    if (partial) {
+        lvt::Element content;
+        content.framework = framework;
+        content.className =
+            framework == "winui3"
+                ? "Microsoft.UI.Xaml.Controls.Grid"
+                : "Windows.UI.Xaml.Controls.Grid";
+        content.type = "Grid";
+        populatedHost.children.push_back(
+            std::move(content));
+    }
     root.children.push_back(
         std::move(populatedHost));
     return true;
@@ -1493,7 +1542,8 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
                     bool* truncated = nullptr,
                     bool targetAlreadyLocked = false,
                     StagedPropertyAuthorization*
-                        stagedAuthorization = nullptr) {
+                        stagedAuthorization = nullptr,
+                    uint64_t* walkGeneration = nullptr) {
     if (truncated)
         *truncated = false;
     if (stagedAuthorization)
@@ -1510,6 +1560,10 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
         error = "this session was disconnected while the request was waiting";
         return false;
     }
+    const uint64_t generation =
+        g_nextTreeWalkGeneration.fetch_add(1);
+    if (walkGeneration)
+        *walkGeneration = generation;
     if (uia) {
 #ifdef LVT_ENABLE_UIA
         lvt::UiaProvider provider;
@@ -1701,6 +1755,7 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             auto staged =
                 stage_session_property_authorization(
                     session, tree);
+            staged.generation = generation;
             if (!staged_authorization_preserves_populated_hosts(
                     session, staged)) {
                 error =
@@ -2862,9 +2917,10 @@ json method_get_tree_changes(const json& params, bool uia) {
     std::string error;
     bool truncated = false;
     StagedPropertyAuthorization stagedAuthorization;
+    uint64_t walkGeneration = 0;
     if (!build_tree_for(
             session, params, uia, current, error, &truncated,
-            false, &stagedAuthorization))
+            false, &stagedAuthorization, &walkGeneration))
         throw std::runtime_error(error);
     if (truncated) {
         throw std::runtime_error(
@@ -2874,6 +2930,7 @@ json method_get_tree_changes(const json& params, bool uia) {
         ensure_session_target_identity_current(
             session, "before publishing visual tree changes");
     }
+    wait_for_tree_baseline_test_gate();
 
     const TreeSnapshotKey key{
         session.id,
@@ -2895,21 +2952,29 @@ json method_get_tree_changes(const json& params, bool uia) {
 
         std::lock_guard<std::mutex> snapshotsLock(g_treeSnapshotsMutex);
         auto found = g_treeSnapshots.find(key);
-        if (!uia && !reset && found != g_treeSnapshots.end() &&
-            found->second.optionsKey == optionsKey &&
-            lost_populated_injected_host(found->second.tree, current)) {
-            throw std::runtime_error(
-                "one XAML/WinUI host temporarily lost its framework subtree; "
-                "the previous MCP snapshot was preserved");
-        }
-        if (reset || found == g_treeSnapshots.end() ||
-            found->second.optionsKey != optionsKey) {
-            snapshot = true;
-            changes = lvt::snapshot_added_events(current);
-            g_treeSnapshots[key] = TreeSnapshot{std::move(current), optionsKey};
+        if (found != g_treeSnapshots.end() &&
+            walkGeneration < found->second.generation) {
+            changes.clear();
         } else {
-            changes = lvt::diff_trees(found->second.tree, current);
-            found->second.tree = std::move(current);
+            if (!uia && !reset && found != g_treeSnapshots.end() &&
+                found->second.optionsKey == optionsKey &&
+                lost_populated_injected_host(found->second.tree, current)) {
+                throw std::runtime_error(
+                    "one XAML/WinUI host temporarily lost its framework subtree; "
+                    "the previous MCP snapshot was preserved");
+            }
+            if (reset || found == g_treeSnapshots.end() ||
+                found->second.optionsKey != optionsKey) {
+                snapshot = true;
+                changes = lvt::snapshot_added_events(current);
+                g_treeSnapshots[key] = TreeSnapshot{
+                    std::move(current), optionsKey,
+                    walkGeneration};
+            } else {
+                changes = lvt::diff_trees(found->second.tree, current);
+                found->second.tree = std::move(current);
+                found->second.generation = walkGeneration;
+            }
         }
     }
 
@@ -3188,6 +3253,12 @@ json method_screenshot(const json& params, bool allowInput) {
     wait_for_screenshot_capture_test_gate();
     ensure_session_target_identity_current(
         session, "immediately after screenshot capture");
+    TargetGuard publicationGuard(session.hwnd);
+    if (!session_is_active(session.id))
+        throw std::runtime_error(
+            "this session was disconnected before the screenshot could be published");
+    ensure_session_target_identity_current(
+        session, "before final screenshot publication");
 
     json out{{"annotated", annotated}};
     // Which tree the ids came from, since they are not interchangeable.

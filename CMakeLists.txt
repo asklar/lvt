@@ -45,6 +45,10 @@ option(LVT_ENABLE_UIA      "UI Automation tree output (--uia)"                  
 # The MCP server needs a Rust toolchain, which not every contributor has, so it
 # is opt-in locally. CI and the release build turn it on explicitly.
 option(LVT_ENABLE_MCP      "MCP server mode (lvt mcp); requires a Rust toolchain" OFF)
+if(LVT_ENABLE_MCP AND NOT LVT_ENABLE_UIA)
+    message(FATAL_ERROR
+        "LVT_ENABLE_MCP requires LVT_ENABLE_UIA so every session has an exact, non-recyclable window identity")
+endif()
 
 option(LVT_BUILD_TOOL    "Build the lvt command-line tool"                     ON)
 option(LVT_BUILD_MANAGED "Build managed .NET assemblies (requires .NET SDK)"   ON)
