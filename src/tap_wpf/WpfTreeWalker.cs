@@ -470,7 +470,7 @@ namespace LvtWpfTap
             {
                 throw new CommandException(
                     "The WPF element no longer belongs to the authorized session window",
-                    ManagedProtocol.EAccessDenied);
+                    ManagedProtocol.TargetOutsideSession);
             }
         }
 

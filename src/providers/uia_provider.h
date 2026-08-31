@@ -36,7 +36,8 @@ struct UiaTargetIdentity {
 
 std::optional<UiaTargetIdentity> capture_uia_target_identity(
     HWND hwnd, DWORD expectedPid,
-    uint64_t expectedProcessCreationIdentity = 0);
+    uint64_t expectedProcessCreationIdentity = 0,
+    HRESULT* status = nullptr);
 HRESULT validate_uia_target_identity(
     const UiaTargetIdentity& identity);
 bool is_uia_target_ownership_failure(HRESULT hresult);
@@ -216,7 +217,8 @@ public:
         const UiaTargetIdentity& identity,
         const UiaOptions& options,
         bool* truncated = nullptr,
-        bool* ownershipLost = nullptr);
+        bool* ownershipLost = nullptr,
+        HRESULT* status = nullptr);
 };
 
 // Reusable UIA client for callers that read the same target repeatedly (watch,
@@ -236,7 +238,8 @@ public:
     bool get_tree(Element& root, bool fastProperties,
                   const std::string& providerOption = {}) override;
     bool get_tree_with_options(Element& root, const UiaOptions& options,
-                               bool* truncated = nullptr);
+                               bool* truncated = nullptr,
+                               HRESULT* status = nullptr);
     bool attach_property_identities(
         Element& root, const UiaOptions& options,
         bool completeSnapshot = true);
@@ -268,7 +271,7 @@ public:
 
 private:
     explicit UiaConnection(UiaTargetIdentity identity);
-    bool validate_target_identity_locked() const;
+    HRESULT validate_target_identity_locked() const;
 
     struct State;
 

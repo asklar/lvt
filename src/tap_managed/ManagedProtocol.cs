@@ -81,6 +81,7 @@ namespace LvtManagedTap
         public const uint NotFound = 0x80070490;
         public const uint InvalidState = 0x8007139F;
         public const uint EPending = 0x8000000A;
+        public const uint TargetOutsideSession = 0x80040201;
 
         public static bool TryParseRequest(string line, out ManagedRequest request)
         {

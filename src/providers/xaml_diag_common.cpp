@@ -611,11 +611,13 @@ public:
 
     PropertySnapshotResult get_property_snapshot(
         uint64_t handle,
-        const PropertyOperationContext&) override {
+        const PropertyOperationContext& context) override {
         const auto commandId = next_command_id();
         auto raw = send_property_command(
             "GET_PROPERTIES " + std::to_string(commandId) + " " +
-            std::to_string(handle), commandId);
+            std::to_string(handle) + " " +
+            encode_allowed_roots(context.allowedProviderRoots),
+            commandId);
         PropertySnapshotResult result;
         result.ok = raw.ok;
         result.hresult = raw.hresult;
@@ -651,7 +653,7 @@ public:
     PropertyMutationResult set_property(
         uint64_t handle, const std::string& descriptorId,
         const std::string& value,
-        const PropertyOperationContext&) override {
+        const PropertyOperationContext& context) override {
         PropertyMutationResult result;
         CachedMutation mutation;
         if (!resolve_mutation(handle, descriptorId, true, mutation, result))
@@ -673,7 +675,10 @@ public:
         const auto commandId = next_command_id();
         std::ostringstream command;
         command << "SET_PROPERTY " << commandId << " " << handle << " "
-                << mutation.propertyIndex << " " << hex_encode(valueToSet);
+                << encode_allowed_roots(
+                       context.allowedProviderRoots)
+                << " " << mutation.propertyIndex << " "
+                << hex_encode(valueToSet);
         auto raw = send_property_command(command.str(), commandId);
         result.ok = raw.ok;
         result.hresult = raw.hresult;
@@ -704,7 +709,7 @@ public:
 
     PropertyMutationResult clear_property(
         uint64_t handle, const std::string& descriptorId,
-        const PropertyOperationContext&) override {
+        const PropertyOperationContext& context) override {
         PropertyMutationResult result;
         CachedMutation mutation;
         if (!resolve_mutation(handle, descriptorId, false, mutation, result))
@@ -713,7 +718,9 @@ public:
         const auto commandId = next_command_id();
         std::ostringstream command;
         command << "CLEAR_PROPERTY " << commandId << " " << handle << " "
-                << mutation.propertyIndex;
+                << encode_allowed_roots(
+                       context.allowedProviderRoots)
+                << " " << mutation.propertyIndex;
         auto raw = send_property_command(command.str(), commandId);
         result.ok = raw.ok;
         result.hresult = raw.hresult;
@@ -744,6 +751,35 @@ public:
     }
 
 private:
+    static std::string encode_allowed_roots(
+        const std::vector<uint64_t>& roots) {
+        char eventName[192]{};
+        const DWORD length = GetEnvironmentVariableA(
+            "LVT_TEST_XAML_PROPERTY_REPARENT_EVENT",
+            eventName,
+            static_cast<DWORD>(_countof(eventName)));
+        bool simulateReparent = false;
+        if (length > 0 && length < _countof(eventName)) {
+            wil::unique_handle event(OpenEventA(
+                SYNCHRONIZE, FALSE, eventName));
+            simulateReparent =
+                event &&
+                WaitForSingleObject(event.get(), 0) ==
+                    WAIT_OBJECT_0;
+        }
+        if (roots.empty())
+            return simulateReparent ? "!-" : "-";
+        std::ostringstream encoded;
+        if (simulateReparent)
+            encoded << "!";
+        for (size_t index = 0; index < roots.size(); ++index) {
+            if (index != 0)
+                encoded << ",";
+            encoded << roots[index];
+        }
+        return encoded.str();
+    }
+
     struct CachedMutation {
         std::string schemaId;
         uint32_t propertyIndex = 0;

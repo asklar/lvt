@@ -589,7 +589,7 @@ namespace LvtWinFormsTap
             {
                 throw new CommandException(
                     "The WinForms control no longer belongs to the authorized session window",
-                    ManagedProtocol.EAccessDenied);
+                    ManagedProtocol.TargetOutsideSession);
             }
         }
 

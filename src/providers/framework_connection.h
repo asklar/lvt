@@ -10,6 +10,10 @@
 
 namespace lvt {
 
+inline constexpr HRESULT
+    LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION =
+        MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x201);
+
 enum class PropertyEditorKind {
     readonly,
     string,
@@ -94,6 +98,7 @@ struct PropertyMutationResult {
 
 struct PropertyOperationContext {
     HWND expectedRootHwnd = nullptr;
+    std::vector<uint64_t> allowedProviderRoots;
 };
 
 // A live, reusable connection to one framework "island" (e.g. one XAML or

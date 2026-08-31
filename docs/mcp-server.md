@@ -212,6 +212,17 @@ WPF and WinForms operations additionally revalidate the live object's current
 top-level native window inside the managed TAP immediately before each read,
 mutation, and readback, so moving an object to another window revokes the old
 session without waiting for another tree snapshot.
+XAML and WinUI operations carry the accepted snapshot's provider root handles
+to the TAP, which follows its callback-maintained parent graph immediately
+before and after property work; detached objects or objects moved to another
+island are refused the same way. Authorization publication also rechecks the
+session's disconnect tombstone while holding the session lock, so a delayed
+response cannot recreate authorization after disconnect.
+
+UI Automation identity reads preserve the original COM and SAFEARRAY HRESULT.
+Only successful PID, process-lifetime, window-generation, and RuntimeId reads
+that prove a mismatch become `ownershipLost`; rejected calls and malformed or
+failed RuntimeId reads remain transient and retryable.
 
 Visual-mode actions validate that same original identity rather than trusting
 only the current numeric HWND. Both visual and UIA synthetic input paths require
@@ -230,6 +241,12 @@ the bounds, text, content, and basic state needed to render and search the tree;
 full selected-node dependency properties come separately from
 `get_editable_properties`, avoiding multi-second full-property walks every tick.
 UIA resources use their normal default options.
+
+Screenshots use an internal staging file for both inline and path output. The
+original session identity is checked immediately before and after capture (and
+again after inline encoding or before publishing a requested path). A replaced
+target therefore returns structured `ownershipLost`, removes the staging file,
+and never exposes replacement pixels or overwrites the caller's existing file.
 
 The poll result is cached before the notification is sent, so the following
 `resources/read` is fast and drains that cached patch rather than walking the

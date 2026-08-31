@@ -11,6 +11,7 @@
 #include <wil/com.h>
 #include <wil/resource.h>
 #include <string>
+#include <string_view>
 #include <map>
 #include <set>
 #include <sstream>
@@ -46,6 +47,10 @@
 #else
 #define LVT_HAS_WINUI3_PROJECTION 0
 #endif
+
+constexpr HRESULT
+    LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION =
+        MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x201);
 
 // Stub for C++/WinRT error origination (avoid linking windowsapp.lib)
 extern "C" int32_t __stdcall WINRT_IMPL_RoOriginateLanguageException(
@@ -175,6 +180,8 @@ struct TapPropertyCommand {
     TapPropertyCommandKind kind = TapPropertyCommandKind::getProperties;
     uint64_t commandId = 0;
     InstanceHandle object = 0;
+    std::vector<InstanceHandle> allowedRoots;
+    bool simulateReparent = false;
     unsigned int propertyIndex = 0;
     std::wstring value;
 
@@ -469,6 +476,44 @@ public:
         return parsed.ec == std::errc() && parsed.ptr == text.data() + text.size();
     }
 
+    static bool ParseAllowedRoots(
+        const std::string& text,
+        std::vector<InstanceHandle>& roots,
+        bool& simulateReparent) {
+        roots.clear();
+        simulateReparent = false;
+        std::string_view encoded = text;
+        if (!encoded.empty() && encoded.front() == '!') {
+            simulateReparent = true;
+            encoded.remove_prefix(1);
+        }
+        if (encoded == "-")
+            return true;
+        size_t start = 0;
+        while (start < encoded.size()) {
+            const size_t separator = encoded.find(',', start);
+            const size_t end = separator == std::string::npos
+         ? encoded.size()
+         : separator;
+            uint64_t root = 0;
+            if (end == start ||
+         !ParseUint64(
+             std::string(
+                 encoded.substr(
+                     start, end - start)),
+             root) ||
+         root == 0) {
+         return false;
+            }
+            roots.push_back(
+         static_cast<InstanceHandle>(root));
+            if (separator == std::string::npos)
+         break;
+            start = separator + 1;
+        }
+        return !roots.empty();
+    }
+
     static bool DecodeHexUtf8(const std::string& encoded, std::wstring& value) {
         if (encoded == "-") {
             value.clear();
@@ -679,16 +724,133 @@ public:
         return true;
     }
 
+    bool ValidatePropertyRoot(
+        TapPropertyCommand& command,
+        const wchar_t* operation) {
+        if (command.allowedRoots.empty()) {
+            command.hresult =
+                LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+            command.error =
+                std::wstring(operation) +
+                L" has no authorized XAML root";
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(m_nodesMutex);
+        auto current = m_nodes.find(command.object);
+        if (current == m_nodes.end()) {
+            command.hresult =
+                LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+            command.error =
+                std::wstring(operation) +
+                L" target is detached or no longer tracked";
+            return false;
+        }
+
+        std::set<InstanceHandle> visited;
+        InstanceHandle root = current->first;
+        while (current->second.parent != 0) {
+            if (!visited.insert(root).second) {
+                command.hresult =
+                    LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+                command.error =
+                    std::wstring(operation) +
+                    L" target has an invalid parent cycle";
+                return false;
+            }
+            root = current->second.parent;
+            current = m_nodes.find(root);
+            if (current == m_nodes.end()) {
+                command.hresult =
+                    LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+                command.error =
+                    std::wstring(operation) +
+                    L" target has a detached parent chain";
+                return false;
+            }
+        }
+
+        if (std::find(
+                command.allowedRoots.begin(),
+                command.allowedRoots.end(),
+                root) == command.allowedRoots.end()) {
+            command.hresult =
+                LVT_E_PROPERTY_TARGET_OUTSIDE_SESSION;
+            command.error =
+                std::wstring(operation) +
+                L" target no longer belongs to an authorized XAML root";
+            return false;
+        }
+        return true;
+    }
+
+    void ApplyPropertyReparentForTesting(
+        const TapPropertyCommand& command) {
+        if (!command.simulateReparent)
+            return;
+
+        std::lock_guard<std::mutex> lock(m_nodesMutex);
+        auto target = m_nodes.find(command.object);
+        if (target == m_nodes.end() ||
+            target->second.parent ==
+                static_cast<InstanceHandle>(~0ull)) {
+            return;
+        }
+        const InstanceHandle oldParent =
+            target->second.parent;
+        if (oldParent != 0) {
+            auto parent = m_nodes.find(oldParent);
+            if (parent != m_nodes.end()) {
+                auto& children =
+                    parent->second.childHandles;
+                children.erase(
+                    std::remove(
+                        children.begin(), children.end(),
+                        command.object),
+                    children.end());
+            }
+        } else {
+            m_roots.erase(
+                std::remove(
+                    m_roots.begin(), m_roots.end(),
+                    command.object),
+                m_roots.end());
+        }
+
+        const InstanceHandle syntheticRoot =
+            static_cast<InstanceHandle>(~0ull);
+        TreeNode root;
+        root.handle = syntheticRoot;
+        root.type =
+            L"Microsoft.UI.Xaml.Hosting.DesktopWindowXamlSource";
+        root.parent = 0;
+        root.numChildren = 1;
+        root.childHandles.push_back(command.object);
+        m_nodes[syntheticRoot] = std::move(root);
+        target = m_nodes.find(command.object);
+        target->second.parent = syntheticRoot;
+        m_roots.push_back(syntheticRoot);
+    }
+
     void ExecutePropertyCommand(TapPropertyCommand& command) {
         if (!m_vts) {
             command.hresult = E_NOINTERFACE;
             command.error = L"IVisualTreeService is unavailable";
             return;
         }
+        ApplyPropertyReparentForTesting(command);
+        if (!ValidatePropertyRoot(
+                command, L"Property operation")) {
+            return;
+        }
 
         if (command.kind == TapPropertyCommandKind::getProperties) {
             command.hresult = CollectPropertyChain(
                 command.object, command.properties, command.error);
+            if (SUCCEEDED(command.hresult)) {
+                ValidatePropertyRoot(
+                    command, L"Property readback");
+            }
             return;
         }
 
@@ -725,7 +887,16 @@ public:
                     command.error = L"ClearProperty failed";
                     return;
                 }
+                if (!ValidatePropertyRoot(
+                        command, L"ClearProperty readback")) {
+                    return;
+                }
                 ReadBackProperty(command, L"ClearProperty");
+                if (SUCCEEDED(command.hresult)) {
+                    ValidatePropertyRoot(
+                        command,
+                        L"ClearProperty completed readback");
+                }
                 return;
             }
 
@@ -777,7 +948,16 @@ public:
                 command.error = L"SetProperty failed after CreateInstance succeeded";
                 return;
             }
+            if (!ValidatePropertyRoot(
+                    command, L"SetProperty readback")) {
+                return;
+            }
             ReadBackProperty(command, L"SetProperty");
+            if (SUCCEEDED(command.hresult)) {
+                ValidatePropertyRoot(
+                    command,
+                    L"SetProperty completed readback");
+            }
             return;
         }
     }
@@ -858,6 +1038,18 @@ public:
             return;
         }
         command.object = static_cast<InstanceHandle>(object);
+
+        std::string rootsText;
+        tokens >> rootsText;
+        if (!ParseAllowedRoots(
+                rootsText, command.allowedRoots,
+                command.simulateReparent)) {
+            command.hresult = E_INVALIDARG;
+            command.error =
+                L"Malformed authorized XAML root list";
+            WritePropertyResult(command);
+            return;
+        }
 
         if (verb == "GET_PROPERTIES") {
             command.kind = TapPropertyCommandKind::getProperties;

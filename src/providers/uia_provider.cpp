@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <future>
@@ -56,25 +57,37 @@ public:
     }
 
     bool matches() {
+        return SUCCEEDED(validation_status());
+    }
+
+    HRESULT validation_status() {
         if (m_testInvalidation &&
             WaitForSingleObject(
                 m_testInvalidation.get(), 0) ==
                 WAIT_OBJECT_0) {
-            return false;
+            return HRESULT_FROM_WIN32(
+                ERROR_INVALID_OWNER);
         }
         if (!exact_owner_and_process())
-            return false;
+            return HRESULT_FROM_WIN32(
+                ERROR_INVALID_OWNER);
         if (m_propertyInstalled) {
             return GetPropW(
                        m_hwnd, m_propertyName.c_str()) ==
-                   m_propertyValue;
+                       m_propertyValue
+                ? S_OK
+                : HRESULT_FROM_WIN32(
+                      ERROR_INVALID_OWNER);
         }
-        if (!m_destroyWatcher ||
-            !m_destroyWatcher->synchronize()) {
-            return false;
-        }
-        return !m_destroyWatcher->root_destroyed() &&
-               !m_destroyWatcher->target_exited();
+        if (!m_destroyWatcher)
+            return E_FAIL;
+        if (!m_destroyWatcher->synchronize())
+            return HRESULT_FROM_WIN32(ERROR_RETRY);
+        return (!m_destroyWatcher->root_destroyed() &&
+                !m_destroyWatcher->target_exited())
+            ? S_OK
+            : HRESULT_FROM_WIN32(
+                  ERROR_INVALID_OWNER);
     }
 
 private:
@@ -287,67 +300,171 @@ bool force_identity_contention_for_testing() {
                WAIT_OBJECT_0;
 }
 
-bool target_process_matches(
+HRESULT target_process_status(
     const UiaTargetIdentity& identity, HANDLE retainedProcess) {
     if (retainedProcess) {
         return process_identity_matches(
-            retainedProcess, identity.pid,
-            identity.processCreationIdentity);
+                   retainedProcess, identity.pid,
+                   identity.processCreationIdentity)
+            ? S_OK
+            : HRESULT_FROM_WIN32(
+                  ERROR_INVALID_OWNER);
     }
+    SetLastError(ERROR_SUCCESS);
     wil::unique_process_handle process(OpenProcess(
         PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
         FALSE, identity.pid));
+    if (!process) {
+        const DWORD error = GetLastError();
+        return HRESULT_FROM_WIN32(
+            error == ERROR_SUCCESS ? ERROR_OPEN_FAILED
+                                   : error);
+    }
     return process_identity_matches(
-        process.get(), identity.pid,
-        identity.processCreationIdentity);
+               process.get(), identity.pid,
+               identity.processCreationIdentity)
+        ? S_OK
+        : HRESULT_FROM_WIN32(
+              ERROR_INVALID_OWNER);
+}
+
+bool target_process_matches(
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess) {
+    return SUCCEEDED(target_process_status(
+        identity, retainedProcess));
+}
+
+HRESULT target_identity_status(
+    const UiaTargetIdentity& identity,
+    HANDLE retainedProcess) {
+    if (!identity.valid() ||
+        !exact_window_matches(
+            identity.hwnd, identity.pid)) {
+        return HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER);
+    }
+    const HRESULT processStatus =
+        target_process_status(
+            identity, retainedProcess);
+    if (FAILED(processStatus))
+        return processStatus;
+    return identity.windowLifetime->validation_status();
 }
 
 bool target_identity_matches(
     const UiaTargetIdentity& identity,
     HANDLE retainedProcess) {
-    return identity.valid() &&
-           exact_window_matches(
-               identity.hwnd, identity.pid) &&
-           target_process_matches(
-               identity, retainedProcess) &&
-           identity.windowLifetime->matches();
+    return SUCCEEDED(target_identity_status(
+        identity, retainedProcess));
 }
 
-bool read_runtime_id(
+HRESULT forced_runtime_id_failure_for_testing(
+    const char* stage) {
+    char eventName[192]{};
+    const DWORD eventLength = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_RUNTIME_ID_FAILURE_EVENT",
+        eventName, static_cast<DWORD>(_countof(eventName)));
+    if (eventLength == 0 ||
+        eventLength >= _countof(eventName)) {
+        return S_OK;
+    }
+    wil::unique_handle event(OpenEventA(
+        SYNCHRONIZE, FALSE, eventName));
+    if (!event ||
+        WaitForSingleObject(event.get(), 0) !=
+            WAIT_OBJECT_0) {
+        return S_OK;
+    }
+    char configuredStage[32]{};
+    const DWORD stageLength = GetEnvironmentVariableA(
+        "LVT_TEST_UIA_RUNTIME_ID_FAILURE_STAGE",
+        configuredStage,
+        static_cast<DWORD>(_countof(configuredStage)));
+    if (stageLength == 0 ||
+        stageLength >= _countof(configuredStage) ||
+        strcmp(configuredStage, stage) != 0) {
+        return S_OK;
+    }
+    if (strcmp(stage, "property") == 0)
+        return RPC_E_CALL_REJECTED;
+    if (strcmp(stage, "type") == 0)
+        return DISP_E_TYPEMISMATCH;
+    if (strcmp(stage, "bounds") == 0)
+        return DISP_E_BADINDEX;
+    if (strcmp(stage, "element") == 0)
+        return E_OUTOFMEMORY;
+    if (strcmp(stage, "process") == 0)
+        return RPC_E_SERVERCALL_RETRYLATER;
+    return E_FAIL;
+}
+
+HRESULT read_runtime_id(
     IUIAutomationElement* element,
     std::vector<int>& runtimeId) {
     runtimeId.clear();
     if (!element)
-        return false;
+        return E_POINTER;
+    HRESULT forced =
+        forced_runtime_id_failure_for_testing(
+            "property");
+    if (FAILED(forced))
+        return forced;
     wil::unique_variant value;
-    if (FAILED(element->GetCurrentPropertyValue(
-            UIA_RuntimeIdPropertyId, &value)) ||
-        value.vt != (VT_ARRAY | VT_I4) ||
+    const HRESULT propertyHr =
+        element->GetCurrentPropertyValue(
+            UIA_RuntimeIdPropertyId, &value);
+    if (FAILED(propertyHr))
+        return propertyHr;
+    forced =
+        forced_runtime_id_failure_for_testing("type");
+    if (FAILED(forced))
+        return forced;
+    if (value.vt != (VT_ARRAY | VT_I4) ||
         !value.parray ||
         SafeArrayGetDim(value.parray) != 1) {
-        return false;
+        return DISP_E_TYPEMISMATCH;
     }
+    forced =
+        forced_runtime_id_failure_for_testing(
+            "bounds");
+    if (FAILED(forced))
+        return forced;
     LONG lower = 0;
     LONG upper = -1;
-    if (FAILED(SafeArrayGetLBound(
-            value.parray, 1, &lower)) ||
-        FAILED(SafeArrayGetUBound(
-            value.parray, 1, &upper)) ||
-        upper < lower) {
-        return false;
-    }
+    const HRESULT lowerHr = SafeArrayGetLBound(
+        value.parray, 1, &lower);
+    if (FAILED(lowerHr))
+        return lowerHr;
+    const HRESULT upperHr = SafeArrayGetUBound(
+        value.parray, 1, &upper);
+    if (FAILED(upperHr))
+        return upperHr;
+    if (upper < lower)
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     runtimeId.reserve(
         static_cast<size_t>(upper - lower + 1));
     for (LONG index = lower; index <= upper; ++index) {
-        int component = 0;
-        if (FAILED(SafeArrayGetElement(
-                value.parray, &index, &component))) {
+        forced =
+            forced_runtime_id_failure_for_testing(
+                "element");
+        if (FAILED(forced)) {
             runtimeId.clear();
-            return false;
+            return forced;
+        }
+        int component = 0;
+        const HRESULT elementHr =
+            SafeArrayGetElement(
+                value.parray, &index, &component);
+        if (FAILED(elementHr)) {
+            runtimeId.clear();
+            return elementHr;
         }
         runtimeId.push_back(component);
     }
-    return !runtimeId.empty();
+    return runtimeId.empty()
+        ? HRESULT_FROM_WIN32(ERROR_INVALID_DATA)
+        : S_OK;
 }
 
 void wait_after_element_from_handle_test_gate(
@@ -1094,19 +1211,18 @@ HRESULT get_validated_uia_root(
     RETURN_HR_IF_NULL(E_POINTER, root);
     *root = nullptr;
     RETURN_HR_IF(E_INVALIDARG, !identity.valid());
-    RETURN_HR_IF(
-        HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
-        !target_identity_matches(
-            identity, retainedProcess));
+    RETURN_IF_FAILED(target_identity_status(
+        identity, retainedProcess));
 
     wil::com_ptr<IUIAutomationElement> candidate;
     const HRESULT elementHr = automation->ElementFromHandle(
         identity.hwnd, &candidate);
     if (FAILED(elementHr)) {
-        RETURN_HR_IF(
-            HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
-            !target_identity_matches(
-                identity, retainedProcess));
+        const HRESULT currentStatus =
+            target_identity_status(
+                identity, retainedProcess);
+        if (FAILED(currentStatus))
+            return currentStatus;
         RETURN_HR(elementHr);
     }
     RETURN_HR_IF_NULL(E_FAIL, candidate.get());
@@ -1116,11 +1232,14 @@ HRESULT get_validated_uia_root(
     // precheck and this cross-process acquisition.
     wait_after_element_from_handle_test_gate(
         testGateEnvironment);
-    RETURN_HR_IF(
-        HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
-        !target_identity_matches(
-            identity, retainedProcess));
+    RETURN_IF_FAILED(target_identity_status(
+        identity, retainedProcess));
 
+    const HRESULT processIdFailure =
+        forced_runtime_id_failure_for_testing(
+            "process");
+    if (FAILED(processIdFailure))
+        return processIdFailure;
     int rootPid = 0;
     RETURN_IF_FAILED(candidate->get_CurrentProcessId(&rootPid));
     RETURN_HR_IF(
@@ -1129,9 +1248,10 @@ HRESULT get_validated_uia_root(
         static_cast<DWORD>(rootPid) != identity.pid);
 
     std::vector<int> runtimeId;
+    RETURN_IF_FAILED(
+        read_runtime_id(candidate.get(), runtimeId));
     RETURN_HR_IF(
         HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
-        !read_runtime_id(candidate.get(), runtimeId) ||
         runtimeId != identity.rootRuntimeId);
 
     *root = candidate.detach();
@@ -1140,22 +1260,45 @@ HRESULT get_validated_uia_root(
 
 std::optional<UiaTargetIdentity> capture_uia_target_identity(
     HWND hwnd, DWORD expectedPid,
-    uint64_t expectedProcessCreationIdentity) {
-    if (!expectedPid || !exact_window_matches(hwnd, expectedPid))
-        return std::nullopt;
+    uint64_t expectedProcessCreationIdentity,
+    HRESULT* status) {
+    if (status)
+        *status = S_OK;
+    const auto fail =
+        [status](HRESULT hresult)
+            -> std::optional<UiaTargetIdentity> {
+            if (status)
+                *status = hresult;
+            return std::nullopt;
+        };
+    if (!expectedPid ||
+        !exact_window_matches(hwnd, expectedPid)) {
+        return fail(HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER));
+    }
 
+    SetLastError(ERROR_SUCCESS);
     wil::unique_process_handle process(OpenProcess(
         PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
         FALSE, expectedPid));
-    if (!process)
-        return std::nullopt;
+    if (!process) {
+        const DWORD error = GetLastError();
+        if (!exact_window_matches(hwnd, expectedPid)) {
+            return fail(HRESULT_FROM_WIN32(
+                ERROR_INVALID_OWNER));
+        }
+        return fail(HRESULT_FROM_WIN32(
+            error == ERROR_SUCCESS ? ERROR_OPEN_FAILED
+                                   : error));
+    }
     const uint64_t creationIdentity =
         expectedProcessCreationIdentity
             ? expectedProcessCreationIdentity
             : process_creation_identity(process.get());
     if (!process_identity_matches(
             process.get(), expectedPid, creationIdentity)) {
-        return std::nullopt;
+        return fail(HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER));
     }
 
     UiaTargetIdentity identity;
@@ -1165,8 +1308,15 @@ std::optional<UiaTargetIdentity> capture_uia_target_identity(
     identity.windowLifetime =
         UiaWindowLifetimeToken::create(
             hwnd, expectedPid, creationIdentity);
-    if (!identity.windowLifetime)
-        return std::nullopt;
+    if (!identity.windowLifetime) {
+        const HRESULT processStatus =
+            target_process_status(
+                identity, process.get());
+        return fail(
+            FAILED(processStatus)
+                ? processStatus
+                : E_FAIL);
+    }
     const HRESULT hr = run_on_mta([&]() -> HRESULT {
         wil::com_ptr<IUIAutomation> automation;
         UiaOptions options;
@@ -1180,10 +1330,11 @@ std::optional<UiaTargetIdentity> capture_uia_target_identity(
         RETURN_HR_IF(
             HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
             !exact_window_matches(
-                identity.hwnd, identity.pid) ||
-            !target_process_matches(
-                identity, process.get()) ||
-            !identity.windowLifetime->matches());
+                identity.hwnd, identity.pid));
+        RETURN_IF_FAILED(target_process_status(
+            identity, process.get()));
+        RETURN_IF_FAILED(
+            identity.windowLifetime->validation_status());
 
         int rootPid = 0;
         RETURN_IF_FAILED(root->get_CurrentProcessId(&rootPid));
@@ -1191,13 +1342,14 @@ std::optional<UiaTargetIdentity> capture_uia_target_identity(
             HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
             rootPid <= 0 ||
             static_cast<DWORD>(rootPid) != identity.pid);
-        RETURN_HR_IF(
-            HRESULT_FROM_WIN32(ERROR_INVALID_OWNER),
-            !read_runtime_id(root.get(), identity.rootRuntimeId));
+        RETURN_IF_FAILED(read_runtime_id(
+            root.get(), identity.rootRuntimeId));
         return S_OK;
     });
-    if (FAILED(hr) || !identity.valid())
-        return std::nullopt;
+    if (FAILED(hr))
+        return fail(hr);
+    if (!identity.valid())
+        return fail(E_FAIL);
     return identity;
 }
 
@@ -1307,11 +1459,14 @@ std::optional<Element> UiaProvider::build(
     const UiaTargetIdentity& identity,
     const UiaOptions& options,
     bool* truncated,
-    bool* ownershipLost) {
+    bool* ownershipLost,
+    HRESULT* status) {
     Element root;
     bool wasTruncated = false;
     if (ownershipLost)
         *ownershipLost = false;
+    if (status)
+        *status = S_OK;
 
     const HRESULT hr = run_on_mta([&] {
         return build_tree_on_mta(
@@ -1320,13 +1475,13 @@ std::optional<Element> UiaProvider::build(
 
     if (truncated)
         *truncated = wasTruncated;
+    if (status)
+        *status = hr;
 
     if (FAILED(hr)) {
         if (ownershipLost) {
             *ownershipLost =
-                hr == HRESULT_FROM_WIN32(ERROR_INVALID_OWNER) ||
-                hr == HRESULT_FROM_WIN32(
-                    ERROR_INVALID_WINDOW_HANDLE);
+                is_uia_target_ownership_failure(hr);
         }
         LOG_IF_FAILED(hr);
         return std::nullopt;
@@ -1999,19 +2154,43 @@ bool UiaConnection::get_tree(Element& root, bool fastProperties,
 }
 
 bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& options,
-                                          bool* truncated) {
+                                          bool* truncated,
+                                          HRESULT* status) {
     if (truncated)
         *truncated = false;
+    if (status)
+        *status = S_OK;
 
     // All COM work is dispatched to the connection's one persistent MTA
     // thread. The operation lock serializes tree/property/event consumers
     // before they enqueue work, while the worker owns every COM reference.
     std::unique_lock<std::mutex> lock(m_state->operationMutex);
-    if (!matches_target(m_hwnd) || !m_state->connected())
+    if (m_hwnd != m_identity.hwnd) {
+        if (status) {
+            *status = HRESULT_FROM_WIN32(
+                ERROR_INVALID_OWNER);
+        }
         return false;
+    }
+    const HRESULT localStatus =
+        target_identity_status(m_identity, nullptr);
+    if (FAILED(localStatus)) {
+        if (status)
+            *status = localStatus;
+        return false;
+    }
+    if (!m_state->connected()) {
+        if (status) {
+            *status = HRESULT_FROM_WIN32(
+                ERROR_CONNECTION_INVALID);
+        }
+        return false;
+    }
     if (m_state->failNextTree.exchange(
             false, std::memory_order_acq_rel) ||
         fail_connected_tree_for_testing()) {
+        if (status)
+            *status = E_FAIL;
         return false;
     }
 
@@ -2036,6 +2215,10 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
             m_state->identityError =
                 "The UI Automation tree exceeds lvt's bounded identity capacity; "
                 "use a narrower view or element scope";
+            if (status) {
+                *status = HRESULT_FROM_WIN32(
+                    ERROR_BUFFER_OVERFLOW);
+            }
             lock.unlock();
             return false;
         }
@@ -2045,6 +2228,8 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
 
     if (truncated)
         *truncated = wasTruncated;
+    if (status)
+        *status = hr;
 
     if (FAILED(hr)) {
         LOG_IF_FAILED(hr);
@@ -2061,7 +2246,7 @@ bool UiaConnection::get_tree_with_options(Element& root, const UiaOptions& optio
 bool UiaConnection::attach_property_identities(
     Element& root, const UiaOptions& options, bool completeSnapshot) {
     std::lock_guard<std::mutex> lock(m_state->operationMutex);
-    if (!validate_target_identity_locked())
+    if (FAILED(validate_target_identity_locked()))
         return false;
     const bool attached = m_state->identities.attach(
         root, uia_identity_scope(options), completeSnapshot);
@@ -2076,7 +2261,7 @@ bool UiaConnection::remember_property_references(
     const Element& root, const UiaOptions& options,
     bool completeSnapshot) {
     std::lock_guard<std::mutex> lock(m_state->operationMutex);
-    if (!validate_target_identity_locked())
+    if (FAILED(validate_target_identity_locked()))
         return false;
     const bool remembered =
         m_state->identities.remember(
@@ -2096,7 +2281,7 @@ std::string UiaConnection::property_identity_error() {
 std::optional<uint64_t> UiaConnection::resolve_property_reference(
     const std::string& reference, std::string& error) {
     std::lock_guard<std::mutex> lock(m_state->operationMutex);
-    if (!validate_target_identity_locked()) {
+    if (FAILED(validate_target_identity_locked())) {
         error = "The UI Automation connection no longer matches this session's target window";
         return std::nullopt;
     }
@@ -2109,10 +2294,18 @@ bool UiaConnection::matches_target(HWND hwnd) const {
            target_identity_matches(m_identity, nullptr);
 }
 
-bool UiaConnection::validate_target_identity_locked() const {
-    if (!m_state->connected() || !matches_target(m_hwnd))
-        return false;
-    const HRESULT hr = m_state->invoke(
+HRESULT UiaConnection::validate_target_identity_locked() const {
+    if (!m_state->connected())
+        return HRESULT_FROM_WIN32(
+            ERROR_CONNECTION_INVALID);
+    if (m_hwnd != m_identity.hwnd)
+        return HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER);
+    const HRESULT localStatus =
+        target_identity_status(m_identity, nullptr);
+    if (FAILED(localStatus))
+        return localStatus;
+    return m_state->invoke(
         [state = m_state.get()]() -> HRESULT {
             wil::com_ptr<IUIAutomationElement> root;
             const HRESULT validateHr = get_validated_uia_root(
@@ -2122,32 +2315,45 @@ bool UiaConnection::validate_target_identity_locked() const {
                 state->teardown_on_mta();
             return validateHr;
         });
-    return SUCCEEDED(hr);
 }
 
 PropertySnapshotResult UiaConnection::get_property_snapshot(
     uint64_t handle,
     const PropertyOperationContext&) {
-    if (!matches_target(m_hwnd)) {
+    const HRESULT localStatus =
+        m_hwnd == m_identity.hwnd
+            ? target_identity_status(
+                  m_identity, nullptr)
+            : HRESULT_FROM_WIN32(
+                  ERROR_INVALID_OWNER);
+    if (FAILED(localStatus)) {
         PropertySnapshotResult result;
-        result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
+        result.hresult = localStatus;
         result.error =
-            "The UI Automation connection no longer matches this session's target window";
+            is_uia_target_ownership_failure(localStatus)
+                ? "The UI Automation connection no longer matches this session's target window"
+                : "The UI Automation target identity could not be validated";
         return result;
     }
 
     Element tree;
     bool refreshed = false;
+    HRESULT refreshStatus = E_FAIL;
     UiaOptions options;
     options.view = UiaView::raw;
     for (int attempt = 0; attempt < 3 && !refreshed; ++attempt) {
         if (attempt > 0)
             Sleep(static_cast<DWORD>(120 * attempt));
-        refreshed = get_tree_with_options(tree, options);
+        refreshed = get_tree_with_options(
+            tree, options, nullptr, &refreshStatus);
+        if (is_uia_target_ownership_failure(
+                refreshStatus)) {
+            break;
+        }
     }
     if (!refreshed) {
         PropertySnapshotResult result;
-        result.hresult = E_FAIL;
+        result.hresult = refreshStatus;
         result.error = "Could not refresh the UI Automation tree";
         return result;
     }
@@ -2242,11 +2448,15 @@ PropertyMutationResult UiaConnection::set_property(
     wait_after_element_from_handle_test_gate(
         "LVT_TEST_UIA_BEFORE_PROPERTY_MUTATION_GATE");
     std::unique_lock<std::mutex> lock(m_state->operationMutex);
-    if (!validate_target_identity_locked()) {
+    const HRESULT validationHr =
+        validate_target_identity_locked();
+    if (FAILED(validationHr)) {
         PropertyMutationResult result;
-        result.hresult = HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
+        result.hresult = validationHr;
         result.error =
-            "The UI Automation connection no longer matches this session's target window";
+            is_uia_target_ownership_failure(validationHr)
+                ? "The UI Automation connection no longer matches this session's target window"
+                : "The UI Automation target identity could not be validated";
         return result;
     }
     const auto runtime = m_state->identities.runtime_id(handle);
@@ -2305,12 +2515,15 @@ PropertyMutationResult UiaConnection::clear_property(
     {
         std::lock_guard<std::mutex> lock(
             m_state->operationMutex);
-        if (!validate_target_identity_locked()) {
+        const HRESULT validationHr =
+            validate_target_identity_locked();
+        if (FAILED(validationHr)) {
             PropertyMutationResult result;
-            result.hresult =
-                HRESULT_FROM_WIN32(ERROR_INVALID_OWNER);
+            result.hresult = validationHr;
             result.error =
-                "ownershipLost: the UI Automation target identity changed";
+                is_uia_target_ownership_failure(validationHr)
+                    ? "ownershipLost: the UI Automation target identity changed"
+                    : "The UI Automation target identity could not be validated";
             return result;
         }
     }
@@ -2379,7 +2592,8 @@ bool UiaConnection::refresh_events() {
 
 bool UiaConnection::is_alive() const {
     std::lock_guard<std::mutex> lock(m_state->operationMutex);
-    return validate_target_identity_locked();
+    return SUCCEEDED(
+        validate_target_identity_locked());
 }
 
 void UiaConnection::fail_next_tree_for_testing() {

@@ -1241,6 +1241,85 @@ TEST(McpUiaIdentity, ConcurrentIdentityContentionIsTransientAndSessionRecovers) 
         << recoveredProperties.dump(2);
 }
 
+TEST(McpUiaIdentity, RuntimeIdFailuresPreserveTheirTransientHresults) {
+    const std::array<std::pair<const char*, const char*>, 5>
+        failures{{
+            {"property", "0x80010001"},
+            {"type", "0x80020005"},
+            {"bounds", "0x8002000B"},
+            {"element", "0x8007000E"},
+            {"process", "0x8001010A"},
+        }};
+
+    for (const auto& [stage, expectedHresult] :
+         failures) {
+        SCOPED_TRACE(stage);
+        ManagedSampleProcess sample;
+        ASSERT_TRUE(sample.start(
+            NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+        const std::string eventName =
+            "Local\\LvtRuntimeIdFailure_" +
+            std::to_string(GetCurrentProcessId()) +
+            "_" + std::to_string(GetTickCount64()) +
+            "_" + stage;
+        wil::unique_event failure(CreateEventA(
+            nullptr, TRUE, FALSE,
+            eventName.c_str()));
+        ASSERT_TRUE(failure);
+        ScopedEnvironmentVariable failureEvent(
+            "LVT_TEST_UIA_RUNTIME_ID_FAILURE_EVENT",
+            eventName);
+        ScopedEnvironmentVariable failureStage(
+            "LVT_TEST_UIA_RUNTIME_ID_FAILURE_STAGE",
+            stage);
+
+        McpClient client(false);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd", sample.hwnd_string()},
+                 {"mode", "visual"}});
+        const auto session =
+            connected.value("session", "");
+        ASSERT_FALSE(session.empty())
+            << connected.dump(2);
+        bool isError = false;
+        auto baseline = client.call_tool(
+            "get_visual_tree",
+            json{{"session", session}}, &isError);
+        ASSERT_FALSE(isError) << baseline.dump(2);
+
+        ASSERT_TRUE(SetEvent(failure.get()));
+        auto failed = client.call_tool(
+            "get_visual_tree",
+            json{{"session", session}}, &isError);
+        ASSERT_TRUE(isError) << failed.dump(2);
+        EXPECT_EQ(
+            failed.value("code", ""),
+            "targetIdentityValidationFailed")
+            << failed.dump(2);
+        EXPECT_EQ(
+            failed.value("errorDisposition", ""),
+            "transient")
+            << failed.dump(2);
+        EXPECT_TRUE(
+            failed.value("retryable", false))
+            << failed.dump(2);
+        EXPECT_EQ(
+            failed.value("hresult", ""),
+            expectedHresult)
+            << failed.dump(2);
+
+        ASSERT_TRUE(ResetEvent(failure.get()));
+        auto recovered = client.call_tool(
+            "get_visual_tree",
+            json{{"session", session}}, &isError);
+        EXPECT_FALSE(isError)
+            << recovered.dump(2);
+    }
+}
+
 TEST(McpUiaIdentity, ReplacementDuringFallbackFailsOwnershipLost) {
     ManagedSampleProcess sample;
     ASSERT_TRUE(sample.start(NATIVE_CONTROLS_FIXTURE_EXE_PATH));
@@ -2451,6 +2530,197 @@ TEST(McpUiaIdentity, ExactRecycledHwndRejectsOldSessionAndActions) {
         EXPECT_TRUE(isError) << result.dump(2);
         expect_typed_property_session_disconnected(
             result);
+    }
+}
+
+TEST(McpUiaIdentity, ScreenshotLifetimeFenceNeverPublishesReplacementCapture) {
+    int exactAchieved = 0;
+    const auto runCase = [&](
+        const char* mode,
+        lvt::test_support::ExactHwndRecycleTestMode recycleMode,
+        bool inlineImage) {
+        ManagedSampleProcess sample;
+        ASSERT_TRUE(sample.start(
+            NATIVE_CONTROLS_FIXTURE_EXE_PATH));
+        struct FixtureWindow {
+            DWORD pid = 0;
+            HWND root = nullptr;
+        } fixture{sample.pid()};
+        EnumWindows(
+            [](HWND candidate, LPARAM parameter) -> BOOL {
+                auto* fixture =
+                    reinterpret_cast<FixtureWindow*>(
+                        parameter);
+                DWORD owner = 0;
+                GetWindowThreadProcessId(
+                    candidate, &owner);
+                if (owner == fixture->pid &&
+                    GetDlgItem(
+                        candidate,
+                        native_fixture::kEditId)) {
+                    fixture->root = candidate;
+                    return FALSE;
+                }
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(&fixture));
+        ASSERT_TRUE(IsWindow(fixture.root));
+        const HWND original = GetDlgItem(
+            fixture.root, native_fixture::kEditId);
+        ASSERT_TRUE(IsWindow(original));
+
+        const std::string gateBase =
+            "Local\\LvtScreenshotFence_" +
+            std::to_string(GetCurrentProcessId()) +
+            "_" + std::to_string(GetTickCount64()) +
+            "_" + mode +
+            (inlineImage ? "_inline" : "_path");
+        wil::unique_event entered(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-entered").c_str()));
+        wil::unique_event release(CreateEventA(
+            nullptr, TRUE, FALSE,
+            (gateBase + "-release").c_str()));
+        ASSERT_TRUE(entered);
+        ASSERT_TRUE(release);
+        ScopedEnvironmentVariable fakeCapture(
+            "LVT_TEST_FAKE_SCREENSHOT_CAPTURE", "1");
+        ScopedEnvironmentVariable captureGate(
+            "LVT_TEST_SCREENSHOT_AFTER_CAPTURE_GATE",
+            gateBase);
+
+        McpClient client(true);
+        ASSERT_TRUE(client.started());
+        ASSERT_TRUE(client.handshake());
+        const auto connected = client.call_tool(
+            "connect",
+            json{{"hwnd",
+                  ManagedSampleProcess::hwnd_string(
+                      original)},
+                 {"mode", mode}});
+        const auto session =
+            connected.value("session", "");
+        ASSERT_FALSE(session.empty())
+            << connected.dump(2);
+
+        const auto output =
+            fs::path(get_lvt_path()).parent_path() /
+            ("screenshot-fence-" +
+             std::to_string(GetCurrentProcessId()) +
+             "-" + mode + ".png");
+        const std::string sentinel =
+            "existing caller file";
+        std::error_code ignored;
+        fs::remove(output, ignored);
+        if (!inlineImage) {
+            std::ofstream file(
+                output, std::ios::binary);
+            file << sentinel;
+            ASSERT_TRUE(file.good());
+        }
+        auto cleanup = wil::scope_exit([&] {
+            SetEvent(release.get());
+            fs::remove(output, ignored);
+        });
+
+        json arguments{{"session", session}};
+        if (!inlineImage)
+            arguments["path"] = output.string();
+        const int request = client.send_request(
+            "tools/call",
+            json{{"name", "screenshot"},
+                 {"arguments", arguments}});
+        ASSERT_EQ(
+            WaitForSingleObject(
+                entered.get(), 10000),
+            WAIT_OBJECT_0)
+            << "screenshot did not reach the post-capture gate";
+
+        lvt::test_support::ExactHwndRecycleOptions options;
+        options.testMode = recycleMode;
+        options.rememberUnavailable = false;
+        const auto recycled =
+            lvt::test_support::recycle_event_child_exact(
+                fixture.root, original,
+                native_fixture::kEditId, options);
+        ASSERT_NE(
+            recycled.outcome,
+            lvt::test_support::ExactHwndRecycleOutcome::
+                hardFailure)
+            << recycled.reason;
+        SetEvent(release.get());
+
+        const auto response =
+            client.await_response(request);
+        ASSERT_TRUE(response.contains("result"))
+            << response.dump(2);
+        const auto& result = response["result"];
+        ASSERT_TRUE(result.value("isError", false))
+            << response.dump(2);
+        const auto error =
+            result.value(
+                "structuredContent", json::object());
+        EXPECT_EQ(
+            error.value("code", ""),
+            "ownershipLost")
+            << error.dump(2);
+        EXPECT_FALSE(error.contains("imageBase64"))
+            << error.dump(2);
+
+        if (!inlineImage) {
+            std::ifstream file(
+                output, std::ios::binary);
+            const std::string current(
+                (std::istreambuf_iterator<char>(file)),
+                std::istreambuf_iterator<char>());
+            EXPECT_EQ(current, sentinel)
+                << "replacement capture overwrote the caller output";
+            const auto stagingPrefix =
+                output.filename().string() +
+                ".lvt-staging-";
+            for (const auto& entry :
+                 fs::directory_iterator(
+                     output.parent_path())) {
+                EXPECT_NE(
+                    entry.path().filename().string().rfind(
+                        stagingPrefix, 0),
+                    0u)
+                    << "screenshot staging file leaked: "
+                    << entry.path();
+            }
+        }
+        if (recycleMode ==
+                lvt::test_support::ExactHwndRecycleTestMode::
+                    normal &&
+            recycled.outcome ==
+                lvt::test_support::ExactHwndRecycleOutcome::
+                    achieved) {
+            ++exactAchieved;
+        }
+    };
+
+    runCase(
+        "uia",
+        lvt::test_support::ExactHwndRecycleTestMode::
+            forceUnavailable,
+        false);
+    runCase(
+        "visual",
+        lvt::test_support::ExactHwndRecycleTestMode::
+            forceUnavailable,
+        true);
+    runCase(
+        "uia",
+        lvt::test_support::ExactHwndRecycleTestMode::normal,
+        true);
+    runCase(
+        "visual",
+        lvt::test_support::ExactHwndRecycleTestMode::normal,
+        false);
+    if (exactAchieved == 0) {
+        RecordProperty(
+            "exactHwndRecycle",
+            "unavailable in shared USER handle table");
     }
 }
 
@@ -6255,6 +6525,17 @@ TEST_F(
     DisconnectClearsTargetsWhilePublishedResponseAwaitsDelivery) {
     NativePublicationGate gate("get_visual_tree");
     ASSERT_TRUE(gate.valid());
+    const std::string skippedCommitName =
+        "Local\\LvtSkippedAuthorizationCommit_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event skippedCommit(CreateEventA(
+        nullptr, TRUE, FALSE,
+        skippedCommitName.c_str()));
+    ASSERT_TRUE(skippedCommit);
+    ScopedEnvironmentVariable skippedCommitEvent(
+        "LVT_TEST_AUTHORIZATION_COMMIT_SKIPPED_EVENT",
+        skippedCommitName);
     McpClient client(true);
     ASSERT_TRUE(client.started());
     ASSERT_TRUE(client.handshake());
@@ -6288,6 +6569,10 @@ TEST_F(
         << treeResponse.dump(2);
     ASSERT_FALSE(treeResponse["result"].value("isError", true))
         << treeResponse.dump(2);
+    EXPECT_EQ(
+        WaitForSingleObject(skippedCommit.get(), 5000),
+        WAIT_OBJECT_0)
+        << "the delayed post-disconnect authorization commit was not rejected";
 
     bool isError = false;
     const auto disconnected = client.call_tool(
@@ -6557,6 +6842,89 @@ TEST_F(
         &isError);
     EXPECT_FALSE(isError)
         << recoveredProperties.dump(2);
+}
+
+TEST_F(
+    McpSampleFixture,
+    XamlPropertyOperationsRejectLiveRootGraphReparent) {
+    SkipIfNotReady();
+    const std::string eventName =
+        "Local\\LvtXamlPropertyReparent_" +
+        std::to_string(GetCurrentProcessId()) + "_" +
+        std::to_string(GetTickCount64());
+    wil::unique_event reparented(CreateEventA(
+        nullptr, TRUE, FALSE, eventName.c_str()));
+    ASSERT_TRUE(reparented);
+    ScopedEnvironmentVariable reparentGate(
+        "LVT_TEST_XAML_PROPERTY_REPARENT_EVENT",
+        eventName);
+
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    const auto session = connect(client, "visual");
+    ASSERT_FALSE(session.empty());
+
+    bool isError = false;
+    auto tree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_FALSE(isError) << tree.dump(2);
+    const auto* status =
+        find_managed_named_element(
+            tree["root"], "StatusText");
+    const auto* button =
+        find_managed_named_element(
+            tree["root"], "PrimaryButton");
+    ASSERT_NE(status, nullptr) << tree.dump(2);
+    ASSERT_NE(button, nullptr) << tree.dump(2);
+    const auto statusKey = status->value("key", "");
+    const auto buttonKey = button->value("key", "");
+    auto properties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", statusKey}},
+        &isError);
+    ASSERT_FALSE(isError) << properties.dump(2);
+    const auto* text =
+        find_property_descriptor(properties, "Text");
+    ASSERT_NE(text, nullptr) << properties.dump(2);
+    ASSERT_TRUE(text->value("supportsClear", false));
+    const auto descriptorId =
+        text->value("descriptorId", "");
+
+    ASSERT_TRUE(SetEvent(reparented.get()));
+    for (const auto& [tool, arguments] :
+         std::vector<std::pair<std::string, json>>{
+             {"get_editable_properties",
+              json{{"session", session},
+                   {"element", statusKey}}},
+             {"set_property",
+              json{{"session", session},
+                   {"element", statusKey},
+                   {"descriptorId", descriptorId},
+                   {"value", "must-not-cross-root"}}},
+             {"clear_property",
+              json{{"session", session},
+                   {"element", statusKey},
+                   {"descriptorId", descriptorId}}}}) {
+        isError = false;
+        const auto denied = client.call_tool(
+            tool, arguments, &isError);
+        ASSERT_TRUE(isError) << denied.dump(2);
+        expect_typed_property_target_membership_lost(
+            denied);
+    }
+
+    ASSERT_TRUE(ResetEvent(reparented.get()));
+    auto unaffected = client.call_tool(
+        "get_editable_properties",
+        json{{"session", session},
+             {"element", buttonKey}},
+        &isError);
+    EXPECT_FALSE(isError)
+        << "a moved XAML object poisoned its live session: "
+        << unaffected.dump(2);
 }
 
 TEST_F(McpSampleFixture, ResourcesMatchEachSessionsFixedTreeMode) {
