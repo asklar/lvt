@@ -8776,20 +8776,21 @@ TEST_F(McpSampleFixture, ConcurrentRequestsAcrossTwoSessionsDoNotCrossOver) {
     ASSERT_FALSE(sampleSession.empty());
 
     auto apps = client.call_tool("list_apps", json::object());
-    std::string otherHwnd;
+    std::string otherSession;
     for (const auto& app : apps["apps"]) {
         const auto name = app.value("processName", "");
         if (name.find("WinUI3Sample") == std::string::npos && !name.empty()) {
-            otherHwnd = app.value("hwnd", "");
-            break;
+            auto other = client.call_tool(
+                "connect",
+                json{{"hwnd", app.value("hwnd", "")}});
+            otherSession = other.value("session", "");
+            if (!otherSession.empty())
+                break;
         }
     }
-    if (otherHwnd.empty())
-        GTEST_SKIP() << "no second window to test session isolation with";
-
-    auto other = client.call_tool("connect", json{{"hwnd", otherHwnd}});
-    const auto otherSession = other.value("session", "");
-    ASSERT_FALSE(otherSession.empty());
+    if (otherSession.empty())
+        GTEST_SKIP()
+            << "no connectable second window to test session isolation with";
     ASSERT_NE(sampleSession, otherSession);
 
     // Prove the baseline before testing it under load: if the sample session

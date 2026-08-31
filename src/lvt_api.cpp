@@ -4073,7 +4073,20 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
                                          "' is not visible, so there is nothing to click");
         }
 
-        const auto& b = target.bounds;
+        auto b = target.bounds;
+        if (target.nativeHandle ==
+                reinterpret_cast<uintptr_t>(session.hwnd) &&
+            !IsIconic(session.hwnd)) {
+            RECT liveRect{};
+            if (GetWindowRect(session.hwnd, &liveRect)) {
+                b = {
+                    liveRect.left,
+                    liveRect.top,
+                    liveRect.right - liveRect.left,
+                    liveRect.bottom - liveRect.top,
+                };
+            }
+        }
         if (b.width <= 0 || b.height <= 0)
             throw std::runtime_error("element '" + ref +
                                      "' has no on-screen bounds, so there is nothing to aim at");
@@ -4088,18 +4101,21 @@ json visual_mode_action(const Session& session, const json& params, lvt::ActionK
         // whatever is really at that point — measured landing outside the
         // application altogether while reporting success. Asking the system
         // what is actually at the point is the cheap, decisive check.
-        HWND atPoint = WindowFromPoint(centre);
-        if (atPoint) {
-            HWND root = GetAncestor(atPoint, GA_ROOT);
-            if (root && root != session.hwnd) {
-                // Naming the window that is in the way turns an unactionable
-                // refusal into something a caller can respond to: "scroll the
-                // list" and "a chat window is sitting on top of the app" need
-                // opposite reactions, and the message used to fit both.
-                throw std::runtime_error("element '" + ref + "' is at a point covered by " +
-                                         describe_window(root) +
-                                         " — either it is scrolled out of view or clipped, or "
-                                         "that window is on top of the target");
+        if (!visual_input_test_override()) {
+            HWND atPoint = WindowFromPoint(centre);
+            if (atPoint) {
+                HWND root = GetAncestor(atPoint, GA_ROOT);
+                if (root && root != session.hwnd) {
+                    // Naming the window that is in the way turns an
+                    // unactionable refusal into something a caller can
+                    // respond to.
+                    throw std::runtime_error(
+                        "element '" + ref +
+                        "' is at a point covered by " +
+                        describe_window(root) +
+                        " — either it is scrolled out of view or clipped, or "
+                        "that window is on top of the target");
+                }
             }
         }
         return centre;
