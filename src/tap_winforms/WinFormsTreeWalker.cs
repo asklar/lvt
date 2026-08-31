@@ -579,13 +579,18 @@ namespace LvtWinFormsTap
         {
             if (expectedRoot == 0)
                 return;
-            Control root = target.TopLevelControl;
-            ulong actualRoot =
-                root == null || root.IsDisposed ||
-                !root.IsHandleCreated
-                    ? 0
-                    : unchecked((ulong)root.Handle.ToInt64());
-            if (actualRoot != expectedRoot)
+            IntPtr expectedHandle =
+                unchecked((IntPtr)(long)expectedRoot);
+            Control root = Control.FromHandle(expectedHandle);
+            bool allowed =
+                root != null &&
+                !root.IsDisposed &&
+                !root.Disposing &&
+                root.IsHandleCreated &&
+                root.Handle == expectedHandle &&
+                (ReferenceEquals(root, target) ||
+                 root.Contains(target));
+            if (!allowed)
             {
                 throw new CommandException(
                     "The WinForms control no longer belongs to the authorized session window",

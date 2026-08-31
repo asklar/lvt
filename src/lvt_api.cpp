@@ -2990,18 +2990,19 @@ json method_get_tree_changes(const json& params, bool uia) {
             }
         }
 
-        if (retryReset) {
-            const int retry =
-                get_int(params, "_generationRetry", 0);
-            if (retry >= 3) {
-                throw std::runtime_error(
-                    "could not obtain a generation-current reset snapshot; retry the request");
-            }
-            json retryParams = params;
-            retryParams["_generationRetry"] = retry + 1;
-            return method_get_tree_changes(
-                retryParams, uia);
+    }
+
+    if (retryReset) {
+        const int retry =
+            get_int(params, "_generationRetry", 0);
+        if (retry >= 3) {
+            throw std::runtime_error(
+                "could not obtain a generation-current reset snapshot; retry the request");
         }
+        json retryParams = params;
+        retryParams["_generationRetry"] = retry + 1;
+        return method_get_tree_changes(
+            retryParams, uia);
     }
 
     json events = json::array();

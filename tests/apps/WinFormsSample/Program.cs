@@ -114,10 +114,30 @@ namespace WinFormsSample
                 AutoSize = true
             };
 
+            var childScopePanel = new Panel
+            {
+                Name = secondary
+                    ? "secondaryChildScopePanel"
+                    : "childScopePanel",
+                Location = new Point(260, 55),
+                Size = new Size(130, 80)
+            };
+            var childScopeTextBox = new TextBox
+            {
+                Name = secondary
+                    ? "secondaryChildScopeTextBox"
+                    : "childScopeTextBox",
+                Text = "Child scoped text",
+                Location = new Point(5, 5),
+                Width = 115
+            };
+            childScopePanel.Controls.Add(childScopeTextBox);
+
             Controls.Add(label);
             Controls.Add(inputTextBox);
             Controls.Add(button);
             Controls.Add(checkBox);
+            Controls.Add(childScopePanel);
 
             var prefix = $@"Local\LvtWinFormsSampleUiBlock_{Process.GetCurrentProcess().Id}";
             blockTrigger = new EventWaitHandle(

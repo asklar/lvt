@@ -4180,6 +4180,94 @@ TEST(McpManagedFrameworks, WinFormsPropertyHandlesStayInsideTheirSessionWindow) 
         "Text");
 }
 
+TEST(McpManagedFrameworks, WinFormsChildHwndSessionOwnsOnlyItsSubtree) {
+    ManagedSampleProcess sample;
+    ASSERT_TRUE(sample.start(WINFORMS_SAMPLE_EXE_PATH));
+    McpClient client(true);
+    ASSERT_TRUE(client.started());
+    ASSERT_TRUE(client.handshake());
+    auto formConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", sample.hwnd_string()},
+             {"mode", "visual"}});
+    const auto formSession =
+        formConnected.value("session", "");
+    ASSERT_FALSE(formSession.empty());
+    auto formTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", formSession}});
+    const auto* panel = find_managed_named_element(
+        formTree["root"], "childScopePanel");
+    const auto* sibling = find_managed_named_element(
+        formTree["root"], "okButton");
+    ASSERT_NE(panel, nullptr) << formTree.dump(2);
+    ASSERT_NE(sibling, nullptr) << formTree.dump(2);
+    const auto panelHwnd = panel->value(
+        "properties", json::object()).value("hwnd", "");
+    ASSERT_FALSE(panelHwnd.empty());
+
+    auto childConnected = client.call_tool(
+        "connect",
+        json{{"hwnd", panelHwnd}, {"mode", "visual"}});
+    const auto childSession =
+        childConnected.value("session", "");
+    ASSERT_FALSE(childSession.empty())
+        << childConnected.dump(2);
+    bool isError = false;
+    auto childTree = client.call_tool(
+        "get_visual_tree",
+        json{{"session", childSession}}, &isError);
+    ASSERT_FALSE(isError) << childTree.dump(2);
+    const auto* childPanel = find_managed_named_element(
+        childTree["root"], "childScopePanel");
+    const auto* textBox = find_managed_named_element(
+        childTree["root"], "childScopeTextBox");
+    ASSERT_NE(childPanel, nullptr) << childTree.dump(2);
+    ASSERT_NE(textBox, nullptr) << childTree.dump(2);
+
+    auto panelProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", childSession},
+             {"element", childPanel->value("key", "")}},
+        &isError);
+    ASSERT_FALSE(isError) << panelProperties.dump(2);
+    const auto textKey = textBox->value("key", "");
+    auto textProperties = client.call_tool(
+        "get_editable_properties",
+        json{{"session", childSession},
+             {"element", textKey}},
+        &isError);
+    ASSERT_FALSE(isError) << textProperties.dump(2);
+    const auto* text = find_property_descriptor(
+        textProperties, "Text");
+    ASSERT_NE(text, nullptr) << textProperties.dump(2);
+    const auto descriptorId =
+        text->value("descriptorId", "");
+    auto set = client.call_tool(
+        "set_property",
+        json{{"session", childSession},
+             {"element", textKey},
+             {"descriptorId", descriptorId},
+             {"value", "child session value"}},
+        &isError);
+    ASSERT_FALSE(isError) << set.dump(2);
+    auto clear = client.call_tool(
+        "clear_property",
+        json{{"session", childSession},
+             {"element", textKey},
+             {"descriptorId", descriptorId}},
+        &isError);
+    ASSERT_FALSE(isError) << clear.dump(2);
+
+    auto denied = client.call_tool(
+        "get_editable_properties",
+        json{{"session", childSession},
+             {"element", sibling->value("key", "")}},
+        &isError);
+    EXPECT_TRUE(isError) << denied.dump(2);
+    expect_typed_property_target_not_authorized(denied);
+}
+
 TEST(McpManagedFrameworks, WinFormsTypedPropertiesAreConservative) {
     ManagedSampleProcess sample;
     ASSERT_TRUE(sample.start(WINFORMS_SAMPLE_EXE_PATH));
