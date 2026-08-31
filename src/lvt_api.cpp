@@ -252,13 +252,22 @@ bool session_target_ownership_lost(HRESULT hresult) {
 }
 
 [[noreturn]] void throw_session_target_identity_failure(
-    HRESULT status, const std::string& operation) {
+    HRESULT status, const std::string& operation,
+    const Session* session = nullptr) {
     const bool ownershipLost =
         session_target_ownership_lost(status);
-    const std::string message =
-        ownershipLost
+    std::string message;
+    if (status == HRESULT_FROM_WIN32(
+                      ERROR_INVALID_WINDOW_HANDLE)) {
+        message = session
+            ? "ownershipLost: the window for session '" +
+                  session->id + "' has closed "
+            : "ownershipLost: the target window has closed ";
+    } else {
+        message = ownershipLost
             ? "ownershipLost: the session target identity changed "
             : "the session target identity could not be validated ";
+    }
     throw std::runtime_error(json{
         {"error", message + operation},
         {"code", ownershipLost
@@ -279,7 +288,7 @@ void ensure_session_target_identity_current(
         session_target_identity_status(session);
     if (FAILED(status)) {
         throw_session_target_identity_failure(
-            status, operation);
+            status, operation, &session);
     }
 }
 
@@ -291,6 +300,7 @@ struct SessionPropertyAuthorization {
     std::set<AuthorizedPropertyTarget> targets;
     std::map<std::string, std::set<uint64_t>>
         providerRoots;
+    std::map<std::string, bool> injectedHosts;
     uint64_t generation = 0;
 };
 std::map<std::string, SessionPropertyAuthorization>
@@ -301,9 +311,14 @@ struct StagedPropertyAuthorization {
     std::set<AuthorizedPropertyTarget> targets;
     std::map<std::string, std::set<uint64_t>>
         providerRoots;
+    std::map<std::string, bool> injectedHosts;
     uint64_t generation = 0;
     bool complete = false;
 };
+
+void collect_injected_host_state(
+    const lvt::Element& element,
+    std::map<std::string, bool>& hosts);
 
 void collect_session_property_targets(
     const Session& session, const lvt::Element& element,
@@ -360,6 +375,8 @@ StagedPropertyAuthorization stage_session_property_authorization(
     StagedPropertyAuthorization staged;
     collect_session_property_targets(
         session, root, true, std::nullopt, staged);
+    collect_injected_host_state(
+        root, staged.injectedHosts);
     staged.generation =
         g_nextPropertyAuthorizationGeneration.fetch_add(
             1);
@@ -411,7 +428,35 @@ void commit_session_property_authorization(
     current.targets = std::move(staged.targets);
     current.providerRoots =
         std::move(staged.providerRoots);
+    current.injectedHosts =
+        std::move(staged.injectedHosts);
     current.generation = staged.generation;
+}
+
+bool staged_authorization_preserves_populated_hosts(
+    const Session& session,
+    const StagedPropertyAuthorization& staged) {
+    std::lock_guard<std::mutex> lock(
+        g_propertyAuthorizationMutex);
+    const auto current =
+        g_sessionAuthorizedPropertyTargets.find(
+            session.id);
+    if (current ==
+        g_sessionAuthorizedPropertyTargets.end()) {
+        return true;
+    }
+    for (const auto& [identity, populated] :
+         current->second.injectedHosts) {
+        if (!populated)
+            continue;
+        const auto next =
+            staged.injectedHosts.find(identity);
+        if (next != staged.injectedHosts.end() &&
+            !next->second) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool session_authorizes_property_target(
@@ -1541,7 +1586,8 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             if (FAILED(failureStatus)) {
                 throw_session_target_identity_failure(
                     failureStatus,
-                    "while reading the UI Automation tree");
+                    "while reading the UI Automation tree",
+                    &session);
             }
             error = ownershipLost
                 ? "ownershipLost: the session target window or process identity changed"
@@ -1652,11 +1698,18 @@ bool build_tree_for(const Session& session, const json& params, bool uia,
             // depth trimming, correlation, diffing, and MCP delivery all
             // happen later and must never replace authorization with only the
             // subset one response happened to expose.
-            if (stagedAuthorization) {
-                *stagedAuthorization =
-                    stage_session_property_authorization(
-                        session, tree);
+            auto staged =
+                stage_session_property_authorization(
+                    session, tree);
+            if (!staged_authorization_preserves_populated_hosts(
+                    session, staged)) {
+                error =
+                    "one XAML/WinUI host temporarily lost its framework subtree; "
+                    "the previous complete snapshot and authorization were preserved";
+                return false;
             }
+            if (stagedAuthorization)
+                *stagedAuthorization = std::move(staged);
             ensure_session_target_identity_current(
                 session, "before publishing native property targets");
             publish_native_property_targets(session, tree);
@@ -1913,7 +1966,7 @@ Session require_session(const json& params) {
         throw_session_target_identity_failure(
             HRESULT_FROM_WIN32(
                 ERROR_INVALID_WINDOW_HANDLE),
-            "while opening the session");
+            "while opening the session", &session);
     }
     return session;
 }
@@ -2153,8 +2206,13 @@ void ensure_typed_property_target_identity_current(
         return;
     if (session_target_ownership_lost(status)) {
         throw_typed_property_session_disconnected(
-            "the typed-property target identity changed " +
-            operation);
+            status == HRESULT_FROM_WIN32(
+                          ERROR_INVALID_WINDOW_HANDLE)
+                ? "the window for typed-property session '" +
+                      session.id + "' has closed " +
+                      operation
+                : "the typed-property target identity changed " +
+                      operation);
     }
     throw_typed_property_error(
         "typed_property_identity_validation_failed",
@@ -2878,7 +2936,11 @@ json method_get_tree_changes(const json& params, bool uia) {
 
 json method_get_frameworks(const json& params) {
     const auto session = require_session(params);
+    ensure_session_target_identity_current(
+        session, "before framework detection");
     auto frameworks = lvt::detect_frameworks(session.hwnd, session.pid);
+    ensure_session_target_identity_current(
+        session, "after framework detection");
     json names = json::array();
     for (const auto& fi : frameworks) {
         auto display = lvt::framework_display_name(fi);

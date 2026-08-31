@@ -68,6 +68,9 @@ public:
             return HRESULT_FROM_WIN32(
                 ERROR_INVALID_OWNER);
         }
+        if (!m_hwnd || !IsWindow(m_hwnd))
+            return HRESULT_FROM_WIN32(
+                ERROR_INVALID_WINDOW_HANDLE);
         if (!exact_owner_and_process())
             return HRESULT_FROM_WIN32(
                 ERROR_INVALID_OWNER);
@@ -338,12 +341,16 @@ bool target_process_matches(
 HRESULT target_identity_status(
     const UiaTargetIdentity& identity,
     HANDLE retainedProcess) {
-    if (!identity.valid() ||
-        !exact_window_matches(
-            identity.hwnd, identity.pid)) {
+    if (!identity.valid())
         return HRESULT_FROM_WIN32(
             ERROR_INVALID_OWNER);
-    }
+    if (!IsWindow(identity.hwnd))
+        return HRESULT_FROM_WIN32(
+            ERROR_INVALID_WINDOW_HANDLE);
+    if (!exact_window_matches(
+            identity.hwnd, identity.pid))
+        return HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER);
     const HRESULT processStatus =
         target_process_status(
             identity, retainedProcess);
@@ -1271,11 +1278,15 @@ std::optional<UiaTargetIdentity> capture_uia_target_identity(
                 *status = hresult;
             return std::nullopt;
         };
-    if (!expectedPid ||
-        !exact_window_matches(hwnd, expectedPid)) {
+    if (!expectedPid)
         return fail(HRESULT_FROM_WIN32(
             ERROR_INVALID_OWNER));
-    }
+    if (!IsWindow(hwnd))
+        return fail(HRESULT_FROM_WIN32(
+            ERROR_INVALID_WINDOW_HANDLE));
+    if (!exact_window_matches(hwnd, expectedPid))
+        return fail(HRESULT_FROM_WIN32(
+            ERROR_INVALID_OWNER));
 
     SetLastError(ERROR_SUCCESS);
     wil::unique_process_handle process(OpenProcess(

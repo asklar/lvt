@@ -1599,6 +1599,17 @@ TEST(McpUiaIdentity, ElementlessKeyboardActionsReturnStructuredOwnershipLost) {
     ASSERT_FALSE(visualDescriptorId.empty());
 
     SetEvent(invalidated.get());
+    auto frameworks = client.call_tool(
+        "get_frameworks",
+        json{{"session", visualSession}},
+        &isError);
+    ASSERT_TRUE(isError) << frameworks.dump(2);
+    EXPECT_EQ(
+        frameworks.value("code", ""),
+        "ownershipLost")
+        << frameworks.dump(2);
+    EXPECT_FALSE(frameworks.contains("frameworks"))
+        << frameworks.dump(2);
     for (const char* tool :
          {"get_visual_tree",
           "get_visual_tree_changes"}) {
@@ -6798,6 +6809,27 @@ TEST_F(
         << resourceBaseline.dump(2);
 
     ASSERT_TRUE(SetEvent(partialHost.get()));
+    auto rejectedPlain = client.call_tool(
+        "get_visual_tree",
+        json{{"session", session}}, &isError);
+    ASSERT_TRUE(isError) << rejectedPlain.dump(2);
+    EXPECT_NE(
+        rejectedPlain.value("error", "")
+            .find("previous complete snapshot"),
+        std::string::npos)
+        << rejectedPlain.dump(2);
+    auto rejectedReset = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session},
+             {"reset", true}},
+        &isError);
+    ASSERT_TRUE(isError) << rejectedReset.dump(2);
+    auto rejectedOptions = client.call_tool(
+        "get_visual_tree_changes",
+        json{{"session", session},
+             {"fast", true}},
+        &isError);
+    ASSERT_TRUE(isError) << rejectedOptions.dump(2);
     auto rejected = client.call_tool(
         "get_visual_tree_changes",
         json{{"session", session}}, &isError);
@@ -8240,6 +8272,14 @@ TEST_F(McpSampleFixture, SessionsFailCleanlyOnceTheirWindowIsGone) {
     EXPECT_TRUE(isError) << "a session whose window closed must not keep answering";
     EXPECT_NE(result.value("error", "").find("closed"), std::string::npos)
         << "the error should say the window closed: " << result.dump(2);
+    EXPECT_EQ(result.value("code", ""), "ownershipLost")
+        << result.dump(2);
+    EXPECT_EQ(
+        result.value("errorDisposition", ""),
+        "ownershipLost")
+        << result.dump(2);
+    EXPECT_FALSE(result.value("retryable", true))
+        << result.dump(2);
 
     const std::array<std::pair<const char*, json>, 3> typedCalls{{
         {"get_editable_properties",
