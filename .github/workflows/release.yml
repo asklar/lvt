@@ -28,6 +28,7 @@ jobs:
             build_tests: 'ON'
             build_winui_fixture: 'ON'
             build_viewer: 'ON'
+            viewer_rid: win-x64
             rust_target: x86_64-pc-windows-msvc
           - arch: x86
             msvc_arch: amd64_x86
@@ -35,7 +36,8 @@ jobs:
             build_dir: build-x86
             build_tests: 'OFF'
             build_winui_fixture: 'ON'
-            build_viewer: 'OFF'
+            build_viewer: 'ON'
+            viewer_rid: win-x86
             rust_target: i686-pc-windows-msvc
           - arch: arm64
             msvc_arch: amd64_arm64
@@ -43,7 +45,8 @@ jobs:
             build_dir: build-arm64
             build_tests: 'OFF'
             build_winui_fixture: 'ON'
-            build_viewer: 'OFF'
+            build_viewer: 'ON'
+            viewer_rid: win-arm64
             rust_target: aarch64-pc-windows-msvc
 
     steps:
@@ -87,6 +90,7 @@ jobs:
           -DLVT_BUILD_TESTS=${{ matrix.build_tests }}
           -DLVT_BUILD_WINUI3_TEST_FIXTURE=${{ matrix.build_winui_fixture }}
           -DLVT_BUILD_VIEWER=${{ matrix.build_viewer }}
+          -DLVT_VIEWER_RUNTIME_IDENTIFIER=${{ matrix.viewer_rid }}
           -DLVT_ENABLE_MCP=ON
 
       - name: Build managed WPF assembly
@@ -162,8 +166,8 @@ jobs:
 
       # Keep the normal CLI archive lean. The viewer has a .NET Desktop
       # Runtime dependency and is published as a separate, version-matched
-      # x64 asset. It still includes the complete matching lvt runtime so
-      # users never have to combine two archives by hand.
+      # architecture-matched asset. It still includes the complete matching
+      # lvt runtime so users never have to combine two archives by hand.
       - name: Package viewer
         if: matrix.build_viewer == 'ON'
         run: |
@@ -186,7 +190,7 @@ jobs:
             -PackageMode Viewer `
             -Layout Package
           Compress-Archive -Path viewer-release\* `
-            -DestinationPath lvt-viewer-${{ env.RELEASE_TAG }}-x64.zip
+            -DestinationPath lvt-viewer-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
@@ -198,8 +202,8 @@ jobs:
         if: matrix.build_viewer == 'ON'
         uses: actions/upload-artifact@v4
         with:
-          name: release-viewer-x64
-          path: lvt-viewer-${{ env.RELEASE_TAG }}-x64.zip
+          name: release-viewer-${{ matrix.arch }}
+          path: lvt-viewer-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip
 
   publish:
     runs-on: ubuntu-latest

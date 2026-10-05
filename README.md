@@ -24,7 +24,7 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 Grab the latest release from **[GitHub Releases](https://github.com/asklar/lvt/releases/latest)**.
 The `lvt-vX.Y.Z-<arch>.zip` assets are the lean command-line packages; extract
 one and run `lvt.exe` from any terminal. The graphical viewer is published
-separately as `lvt-viewer-vX.Y.Z-x64.zip`.
+separately as `lvt-viewer-vX.Y.Z-<arch>.zip`.
 
 ### Install the Copilot skill
 
@@ -427,9 +427,9 @@ Live Visual Tree or the Windows SDK's Inspect.exe. Drag a crosshair onto a
 window to target it; a tree on one side and a property panel on the other
 both update live as the target's UI changes.
 
-Download `lvt-viewer-vX.Y.Z-x64.zip` from the matching
+Download `lvt-viewer-vX.Y.Z-<arch>.zip` from the matching
 [GitHub release](https://github.com/asklar/lvt/releases/latest), extract the
-whole archive, and run `LvtViewer.exe`. The archive contains the matching x64
+whole archive, and run `LvtViewer.exe`. The archive contains the matching
 CLI, TAP DLLs, managed walkers, and plugins; it requires the
 [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0).
 

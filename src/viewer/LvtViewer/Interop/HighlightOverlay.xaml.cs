@@ -70,9 +70,8 @@ public partial class HighlightOverlay : Window
     [DllImport("user32.dll")]
     private static extern int SetWindowLong(IntPtr hwnd, int index, int value);
 
-    // GWLP_HWNDPARENT stores a window handle, which is pointer-sized (64-bit
-    // on x64 — this whole project is x64-only, but the distinction still
-    // matters here specifically): the plain 32-bit SetWindowLong/GetWindowLong
+    // GWLP_HWNDPARENT stores a pointer-sized window handle. The plain 32-bit
+    // SetWindowLong/GetWindowLong
     // pair above is fine for GWL_EXSTYLE (a genuinely 32-bit style bitmask)
     // but would silently truncate an HWND passed through it, so the owner
     // relationship needs its own, pointer-width pair.

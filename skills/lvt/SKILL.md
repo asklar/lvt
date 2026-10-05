@@ -64,9 +64,9 @@ session, so re-run it whenever picking lvt back up rather than assuming a
 previously-downloaded copy is still current.
 
 The GUI Viewer is published separately as
-`lvt-viewer-v<version>-x64.zip`. Do not select that archive when installing the
-CLI: the Viewer archive is larger because it contains the Viewer plus a complete
-matching lvt runtime.
+`lvt-viewer-v<version>-<arch>.zip`. Do not select any `lvt-viewer-*` archive
+when installing the CLI: Viewer archives are larger because they contain the
+Viewer plus a complete matching lvt runtime.
 
 ## Usage
 
