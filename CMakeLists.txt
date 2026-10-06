@@ -243,13 +243,35 @@ if(LVT_BUILD_VIEWER)
             "or configure with -DLVT_BUILD_VIEWER=OFF to build without the viewer.")
     endif()
 
+    set(LVT_VIEWER_RUNTIME_IDENTIFIER "" CACHE STRING
+        "Runtime identifier for the framework-dependent Viewer apphost")
+    if(NOT LVT_VIEWER_RUNTIME_IDENTIFIER)
+        if(VCPKG_TARGET_TRIPLET MATCHES "^arm64-"
+                OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|aarch64)$")
+            set(LVT_VIEWER_RUNTIME_IDENTIFIER "win-arm64")
+        elseif(VCPKG_TARGET_TRIPLET MATCHES "^x86-" OR CMAKE_SIZEOF_VOID_P EQUAL 4)
+            set(LVT_VIEWER_RUNTIME_IDENTIFIER "win-x86")
+        else()
+            set(LVT_VIEWER_RUNTIME_IDENTIFIER "win-x64")
+        endif()
+    endif()
+    if(NOT LVT_VIEWER_RUNTIME_IDENTIFIER MATCHES "^win-(x86|x64|arm64)$")
+        message(FATAL_ERROR
+            "LVT_VIEWER_RUNTIME_IDENTIFIER must be win-x86, win-x64, or win-arm64; "
+            "got '${LVT_VIEWER_RUNTIME_IDENTIFIER}'.")
+    endif()
+
     set(LVT_VIEWER_PROJECT "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer/LvtViewer.csproj")
     set(LVT_VIEWER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/viewer")
     add_custom_target(lvt_viewer ALL
-        COMMAND "${LVT_DOTNET_EXE}" build "${LVT_VIEWER_PROJECT}" -c Release -o "${LVT_VIEWER_OUTPUT_DIR}"
+        COMMAND "${LVT_DOTNET_EXE}" build "${LVT_VIEWER_PROJECT}"
+            -c Release
+            -r "${LVT_VIEWER_RUNTIME_IDENTIFIER}"
+            --self-contained false
+            -o "${LVT_VIEWER_OUTPUT_DIR}"
         BYPRODUCTS "${LVT_VIEWER_OUTPUT_DIR}/LvtViewer.exe"
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Building lvt Viewer (WPF)"
+        COMMENT "Building lvt Viewer (WPF, ${LVT_VIEWER_RUNTIME_IDENTIFIER})"
     )
     if(LVT_BUILD_TOOL)
         # A copy of lvt.exe with none of its TAP DLLs/plugins next to it is
@@ -273,15 +295,17 @@ if(LVT_BUILD_VIEWER)
         add_dependencies(lvt_viewer lvt)
     endif()
 
-    set(LVT_VIEWER_TEST_PROJECT
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer.Tests/LvtViewer.Tests.csproj")
-    add_custom_target(lvt_viewer_tests ALL
-        COMMAND "${LVT_DOTNET_EXE}" build "${LVT_VIEWER_TEST_PROJECT}"
-            -c Release -p:Platform=x64
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        COMMENT "Building lvt Viewer regression tests"
-    )
-    add_dependencies(lvt_viewer_tests lvt_viewer)
+    if(LVT_BUILD_TESTS)
+        set(LVT_VIEWER_TEST_PROJECT
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/viewer/LvtViewer.Tests/LvtViewer.Tests.csproj")
+        add_custom_target(lvt_viewer_tests ALL
+            COMMAND "${LVT_DOTNET_EXE}" build "${LVT_VIEWER_TEST_PROJECT}"
+                -c Release -p:Platform=x64
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            COMMENT "Building lvt Viewer regression tests"
+        )
+        add_dependencies(lvt_viewer_tests lvt_viewer)
+    endif()
 endif()
 
 # --- MCP server (Rust) -----------------------------------------------------
@@ -581,10 +605,11 @@ if(LVT_ENABLE_WINUI3)
                 file(WRITE "${WINUI3_SIGNATURE_FILE}" "${_lvt_projection_signature}")
                 message(STATUS "WinUI3 C++/WinRT headers generated in ${WINUI3_CPPWINRT_DIR}")
             else()
-                message(WARNING "cppwinrt failed (${_cppwinrt_result}); TAP DLL WinUI3 features will be limited")
+                message(FATAL_ERROR
+                    "cppwinrt failed (${_cppwinrt_result}); cannot build with LVT_ENABLE_WINUI3=ON")
             endif()
         else()
-            message(WARNING "Cannot generate WinUI3 C++/WinRT headers:"
+            message(FATAL_ERROR "Cannot generate WinUI3 C++/WinRT headers:"
                 " cppwinrt=${LVT_CPPWINRT_EXE} winmd_dir=${LVT_WASDK_WINMD_DIR} union=${WIN_UNION_WINMD}")
         endif()
     endif()

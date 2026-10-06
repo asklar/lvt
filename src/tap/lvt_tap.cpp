@@ -41,9 +41,18 @@
 
 #if __has_include(<winrt/Microsoft.UI.Xaml.h>)
 #define LVT_HAS_WINUI3_PROJECTION 1
+#ifdef GetCurrentTime
+#pragma push_macro("GetCurrentTime")
+#undef GetCurrentTime
+#define LVT_RESTORE_GETCURRENTTIME_MACRO 1
+#endif
 #include <winrt/Microsoft.UI.Xaml.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
+#ifdef LVT_RESTORE_GETCURRENTTIME_MACRO
+#pragma pop_macro("GetCurrentTime")
+#undef LVT_RESTORE_GETCURRENTTIME_MACRO
+#endif
 #else
 #define LVT_HAS_WINUI3_PROJECTION 0
 #endif

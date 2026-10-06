@@ -4,7 +4,7 @@ lvt Viewer
 Requirements
 ------------
 
-- Windows x64
+- Windows x86, x64, or ARM64 matching this archive
 - .NET 10 Desktop Runtime:
   https://dotnet.microsoft.com/download/dotnet/10.0
 

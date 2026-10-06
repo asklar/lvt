@@ -28,6 +28,7 @@ jobs:
             build_tests: 'ON'
             build_winui_fixture: 'ON'
             build_viewer: 'ON'
+            viewer_rid: win-x64
             rust_target: x86_64-pc-windows-msvc
           - arch: x86
             msvc_arch: amd64_x86
@@ -35,7 +36,8 @@ jobs:
             build_dir: build-x86
             build_tests: 'OFF'
             build_winui_fixture: 'ON'
-            build_viewer: 'OFF'
+            build_viewer: 'ON'
+            viewer_rid: win-x86
             rust_target: i686-pc-windows-msvc
           - arch: arm64
             msvc_arch: amd64_arm64
@@ -43,18 +45,17 @@ jobs:
             build_dir: build-arm64
             build_tests: 'OFF'
             build_winui_fixture: 'ON'
-            build_viewer: 'OFF'
+            build_viewer: 'ON'
+            viewer_rid: win-arm64
             rust_target: aarch64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.msvc_arch }}
+        run: .\.github\scripts\setup-msvc.ps1 -Architecture ${{ matrix.msvc_arch }}
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
@@ -72,7 +73,7 @@ jobs:
 
       - name: Set up .NET 10 and .NET 6
         if: matrix.build_winui_fixture == 'ON'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             10.0.x
@@ -87,6 +88,8 @@ jobs:
           -DLVT_BUILD_TESTS=${{ matrix.build_tests }}
           -DLVT_BUILD_WINUI3_TEST_FIXTURE=${{ matrix.build_winui_fixture }}
           -DLVT_BUILD_VIEWER=${{ matrix.build_viewer }}
+          -DLVT_VIEWER_RUNTIME_IDENTIFIER=${{ matrix.viewer_rid }}
+          -DLVT_WASDK_WINMD_DIR=${{ github.workspace }}/packages/Microsoft.WindowsAppSDK.1.5.240607001/lib/uap10.0
           -DLVT_ENABLE_MCP=ON
 
       - name: Build managed WPF assembly
@@ -162,8 +165,8 @@ jobs:
 
       # Keep the normal CLI archive lean. The viewer has a .NET Desktop
       # Runtime dependency and is published as a separate, version-matched
-      # x64 asset. It still includes the complete matching lvt runtime so
-      # users never have to combine two archives by hand.
+      # architecture-matched asset. It still includes the complete matching
+      # lvt runtime so users never have to combine two archives by hand.
       - name: Package viewer
         if: matrix.build_viewer == 'ON'
         run: |
@@ -186,20 +189,20 @@ jobs:
             -PackageMode Viewer `
             -Layout Package
           Compress-Archive -Path viewer-release\* `
-            -DestinationPath lvt-viewer-${{ env.RELEASE_TAG }}-x64.zip
+            -DestinationPath lvt-viewer-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.arch }}
           path: lvt-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip
 
       - name: Upload viewer release artifact
         if: matrix.build_viewer == 'ON'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: release-viewer-x64
-          path: lvt-viewer-${{ env.RELEASE_TAG }}-x64.zip
+          name: release-viewer-${{ matrix.arch }}
+          path: lvt-viewer-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip
 
   publish:
     runs-on: ubuntu-latest
@@ -207,14 +210,14 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Download all release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: release-*

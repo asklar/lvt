@@ -19,10 +19,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-if ($PackageMode -eq "Viewer" -and $Architecture -ne "x64") {
-    throw "The Viewer release is x64-only; architecture '$Architecture' is not valid."
-}
-
 try {
     $unresolvedRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Root)
 }

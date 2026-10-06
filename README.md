@@ -24,7 +24,7 @@ A Windows CLI tool that inspects the visual tree of running applications. Design
 Grab the latest release from **[GitHub Releases](https://github.com/asklar/lvt/releases/latest)**.
 The `lvt-vX.Y.Z-<arch>.zip` assets are the lean command-line packages; extract
 one and run `lvt.exe` from any terminal. The graphical viewer is published
-separately as `lvt-viewer-vX.Y.Z-x64.zip`.
+separately as `lvt-viewer-vX.Y.Z-<arch>.zip`.
 
 ### Install the Copilot skill
 
@@ -112,6 +112,9 @@ Both halves must be produced by the same cppwinrt version, or the generated head
 The generated projection is cached in `src/tap/winui3/` (gitignored) and regenerated whenever the generator or the Windows App SDK inputs change, tracked via `src/tap/winui3/.cppwinrt-signature`. Two escape hatches:
 
 ```powershell
+# Install the pinned Windows App SDK package when it is not already cached
+nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
+
 # Use a specific generator or Windows App SDK package
 cmake --preset default -DLVT_CPPWINRT_EXE=... -DLVT_WASDK_WINMD_DIR=...
 
@@ -427,9 +430,9 @@ Live Visual Tree or the Windows SDK's Inspect.exe. Drag a crosshair onto a
 window to target it; a tree on one side and a property panel on the other
 both update live as the target's UI changes.
 
-Download `lvt-viewer-vX.Y.Z-x64.zip` from the matching
+Download `lvt-viewer-vX.Y.Z-<arch>.zip` from the matching
 [GitHub release](https://github.com/asklar/lvt/releases/latest), extract the
-whole archive, and run `LvtViewer.exe`. The archive contains the matching x64
+whole archive, and run `LvtViewer.exe`. The archive contains the matching
 CLI, TAP DLLs, managed walkers, and plugins; it requires the
 [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0).
 
