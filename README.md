@@ -112,6 +112,9 @@ Both halves must be produced by the same cppwinrt version, or the generated head
 The generated projection is cached in `src/tap/winui3/` (gitignored) and regenerated whenever the generator or the Windows App SDK inputs change, tracked via `src/tap/winui3/.cppwinrt-signature`. Two escape hatches:
 
 ```powershell
+# Install the pinned Windows App SDK package when it is not already cached
+nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
+
 # Use a specific generator or Windows App SDK package
 cmake --preset default -DLVT_CPPWINRT_EXE=... -DLVT_WASDK_WINMD_DIR=...
 

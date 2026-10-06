@@ -605,10 +605,11 @@ if(LVT_ENABLE_WINUI3)
                 file(WRITE "${WINUI3_SIGNATURE_FILE}" "${_lvt_projection_signature}")
                 message(STATUS "WinUI3 C++/WinRT headers generated in ${WINUI3_CPPWINRT_DIR}")
             else()
-                message(WARNING "cppwinrt failed (${_cppwinrt_result}); TAP DLL WinUI3 features will be limited")
+                message(FATAL_ERROR
+                    "cppwinrt failed (${_cppwinrt_result}); cannot build with LVT_ENABLE_WINUI3=ON")
             endif()
         else()
-            message(WARNING "Cannot generate WinUI3 C++/WinRT headers:"
+            message(FATAL_ERROR "Cannot generate WinUI3 C++/WinRT headers:"
                 " cppwinrt=${LVT_CPPWINRT_EXE} winmd_dir=${LVT_WASDK_WINMD_DIR} union=${WIN_UNION_WINMD}")
         endif()
     endif()

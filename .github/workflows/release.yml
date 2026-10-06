@@ -50,14 +50,12 @@ jobs:
             rust_target: aarch64-pc-windows-msvc
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.msvc_arch }}
+        run: .\.github\scripts\setup-msvc.ps1 -Architecture ${{ matrix.msvc_arch }}
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
@@ -75,7 +73,7 @@ jobs:
 
       - name: Set up .NET 10 and .NET 6
         if: matrix.build_winui_fixture == 'ON'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             10.0.x
@@ -91,6 +89,7 @@ jobs:
           -DLVT_BUILD_WINUI3_TEST_FIXTURE=${{ matrix.build_winui_fixture }}
           -DLVT_BUILD_VIEWER=${{ matrix.build_viewer }}
           -DLVT_VIEWER_RUNTIME_IDENTIFIER=${{ matrix.viewer_rid }}
+          -DLVT_WASDK_WINMD_DIR=${{ github.workspace }}/packages/Microsoft.WindowsAppSDK.1.5.240607001/lib/uap10.0
           -DLVT_ENABLE_MCP=ON
 
       - name: Build managed WPF assembly
@@ -193,14 +192,14 @@ jobs:
             -DestinationPath lvt-viewer-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.arch }}
           path: lvt-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip
 
       - name: Upload viewer release artifact
         if: matrix.build_viewer == 'ON'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-viewer-${{ matrix.arch }}
           path: lvt-viewer-${{ env.RELEASE_TAG }}-${{ matrix.arch }}.zip
@@ -211,14 +210,14 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Download all release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: release-*

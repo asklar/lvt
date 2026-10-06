@@ -11,12 +11,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+        run: .\.github\scripts\setup-msvc.ps1 -Architecture x64
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
@@ -24,7 +22,7 @@ jobs:
           vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
       - name: Set up .NET 10 (for the Viewer)
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             10.0.x
@@ -42,7 +40,7 @@ jobs:
           cargo --version
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -52,7 +50,11 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
 
       - name: Configure
-        run: cmake --preset default -DLVT_ENABLE_MCP=ON -DLVT_BUILD_VIEWER=ON
+        run: >
+          cmake --preset default
+          -DLVT_ENABLE_MCP=ON
+          -DLVT_BUILD_VIEWER=ON
+          -DLVT_WASDK_WINMD_DIR=${{ github.workspace }}/packages/Microsoft.WindowsAppSDK.1.5.240607001/lib/uap10.0
 
       - name: Build managed WPF assembly
         run: msbuild src/tap_wpf/LvtWpfTap.csproj /p:Configuration=Release /p:Platform=AnyCPU /restore /v:minimal
@@ -94,13 +96,13 @@ jobs:
         run: build\lvt_mcp_tests.exe --gtest_output=xml:build\mcp_test_results.xml
 
       - name: Upload test results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: test-results
           path: build\*_test_results.xml
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: lvt-binaries
@@ -121,15 +123,13 @@ jobs:
     needs: build-and-test
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: amd64_x86
+        run: .\.github\scripts\setup-msvc.ps1 -Architecture amd64_x86
 
       - name: Set up .NET SDK
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             10.0.x
@@ -144,7 +144,7 @@ jobs:
         run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
 
       - name: Download x64 native fixture
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: lvt-binaries
           path: cross-x64
@@ -164,6 +164,7 @@ jobs:
           cmake --preset x86
           -DCMAKE_BUILD_TYPE=Debug
           -DLVT_ENABLE_MCP=ON
+          -DLVT_WASDK_WINMD_DIR=${{ github.workspace }}/packages/Microsoft.WindowsAppSDK.1.5.240607001/lib/uap10.0
 
       - name: Build x86 integration tests
         run: >
@@ -214,7 +215,7 @@ jobs:
           --gtest_output=xml:build-x86\chromium_x86_test_results.xml
 
       - name: Upload x86 test results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: x86-test-results
@@ -251,12 +252,10 @@ jobs:
             can_run: false
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.msvc_arch }}
+        run: .\.github\scripts\setup-msvc.ps1 -Architecture ${{ matrix.msvc_arch }}
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
@@ -265,7 +264,7 @@ jobs:
 
       - name: Set up .NET 10 for ARM64 fixture compile coverage
         if: matrix.arch == 'arm64'
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: |
             10.0.x
@@ -324,7 +323,7 @@ jobs:
     name: vcpkg port
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
