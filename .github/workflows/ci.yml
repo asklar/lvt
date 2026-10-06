@@ -262,6 +262,9 @@ jobs:
         with:
           vcpkgGitCommitId: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3
 
+      - name: Install Windows App SDK (for WinUI3 C++/WinRT headers)
+        run: nuget install Microsoft.WindowsAppSDK -Version 1.5.240607001 -OutputDirectory packages
+
       - name: Set up .NET 10 for ARM64 fixture compile coverage
         if: matrix.arch == 'arm64'
         uses: actions/setup-dotnet@v6
@@ -280,6 +283,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DLVT_BUILD_MANAGED=OFF
           -DLVT_BUILD_TESTS=OFF
+          -DLVT_WASDK_WINMD_DIR=${{ github.workspace }}/packages/Microsoft.WindowsAppSDK.1.5.240607001/lib/uap10.0
 
       - name: Build
         run: cmake --build ${{ matrix.build_dir }}
@@ -313,7 +317,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DLVT_BUILD_MANAGED=OFF `
             -DLVT_BUILD_TESTS=OFF `
-            -DLVT_BUILD_WINUI3_TEST_FIXTURE=ON
+            -DLVT_BUILD_WINUI3_TEST_FIXTURE=ON `
+            -DLVT_WASDK_WINMD_DIR=${{ github.workspace }}/packages/Microsoft.WindowsAppSDK.1.5.240607001/lib/uap10.0
           cmake --build build-arm64 --target winui3_sample_app
 
   # The registry is only usable if the port manifest is in vcpkg's canonical
