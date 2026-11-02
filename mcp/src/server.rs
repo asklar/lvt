@@ -2360,6 +2360,12 @@ mod tests {
                 .as_ref()
                 .unwrap_or_else(|| panic!("tool '{}' declares no output schema", tool.name));
             let schema = serde_json::to_value(schema.as_ref()).unwrap();
+            assert_eq!(
+                schema.get("type"),
+                Some(&json!("object")),
+                "tool '{}' must declare an object output schema for legacy MCP clients",
+                tool.name
+            );
 
             let branches = schema
                 .get("anyOf")

@@ -53,6 +53,7 @@ fn failure() -> Value {
 fn result(success: Value) -> Arc<JsonObject> {
     object(json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
         "anyOf": [success, failure()]
     }))
 }
@@ -82,6 +83,7 @@ fn property_mutation_failure() -> Value {
 fn property_mutation_result(success: Value) -> Arc<JsonObject> {
     object(json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
         "anyOf": [success, property_mutation_failure()]
     }))
 }

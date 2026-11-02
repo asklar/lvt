@@ -4801,6 +4801,8 @@ TEST(McpServer, EveryToolAdvertisesADescriptionAndSchema) {
             << name << " needs a description explaining when to use it";
         ASSERT_TRUE(tool.contains("inputSchema")) << name;
         EXPECT_EQ(tool["inputSchema"].value("type", ""), "object") << name;
+        ASSERT_TRUE(tool.contains("outputSchema")) << name;
+        EXPECT_EQ(tool["outputSchema"].value("type", ""), "object") << name;
     }
 }
 
